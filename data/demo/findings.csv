@@ -1,0 +1,15 @@
+finding_id,asset_id,cve_id,detected_date,scanner_severity,product,version,port,service,evidence
+F01,A02,CVE-2021-26855,2026-08-01,critical,Microsoft Exchange Server,2016 CU19,443,https,OWA endpoint vulnerable to pre-auth SSRF chain (ProxyLogon)
+F02,A03,CVE-2021-26855,2026-08-01,critical,Microsoft Exchange Server,2016 CU19,443,https,OWA endpoint vulnerable to pre-auth SSRF chain (ProxyLogon)
+F03,A04,CVE-2021-26855,2026-08-01,critical,Microsoft Exchange Server,2016 CU19,443,https,OWA endpoint vulnerable to pre-auth SSRF chain (ProxyLogon)
+F04,A01,CVE-2020-1472,2026-08-02,critical,Netlogon (Windows Server),n/a,135,rpc,Netlogon RPC allows elevation of privilege (ZeroLogon)
+F05,A07,CVE-2021-34527,2026-08-02,high,Windows Print Spooler,n/a,445,spoolsv,Print Spooler service permits remote code execution (PrintNightmare)
+F06,A08,CVE-2021-34527,2026-08-02,high,Windows Print Spooler,n/a,445,spoolsv,Print Spooler service permits remote code execution (PrintNightmare)
+F07,A09,CVE-2022-30190,2026-08-03,high,Microsoft Office / MSDT,n/a,n/a,msdt,MSDT URL protocol handler allows remote code execution via crafted document (Follina)
+F08,A11,CVE-2022-30190,2026-08-03,high,Microsoft Office / MSDT,n/a,n/a,msdt,MSDT URL protocol handler allows remote code execution via crafted document (Follina)
+F09,A05,CVE-2022-21907,2026-08-03,critical,Windows HTTP Stack (http.sys),n/a,443,https,HTTP protocol stack remote code execution
+F10,A06,CVE-2020-0618,2026-08-04,high,SQL Server Reporting Services,2016,1433,mssql,Deserialization vulnerability in Report Server allows remote code execution
+F11,A10,CVE-2020-0796,2026-08-04,critical,Windows SMBv3,n/a,445,microsoft-ds,SMBv3 compression transform vulnerability allows remote code execution (SMBGhost)
+F12,A08,CVE-2023-21554,2026-08-05,medium,Microsoft Message Queuing,n/a,1801,msmq,MSMQ TCP listener accepts malformed packet triggering remote code execution (QueueJumper)
+F13,A03,CVE-2021-31207,2026-08-05,medium,Microsoft Exchange Server,2016 CU19,443,https,Exchange PowerShell backend allows privilege escalation post-authentication
+F14,A09,CVE-2023-23397,2026-08-06,low,Microsoft Outlook,365,n/a,outlook,Reminder task triggers NTLM hash leak via crafted appointment

@@ -1,0 +1,12 @@
+asset_id,hostname,os,os_build,role,business_function,criticality,internet_exposed,environment,data_sensitivity,patch_window,patch_restrictions,compensating_controls,owner
+A01,DC01,Windows Server 2019,17763,dc,Primary domain controller,5,False,prod,regulated,Sun 02:00-06:00,no reboot during business hours,,infra-team
+A02,EXCH01,Windows Server 2019,17763,exchange,Primary mail server - internet-facing OWA,5,True,prod,confidential,Sun 02:00-06:00,no reboot during business hours,,messaging-team
+A03,EXCH02,Windows Server 2019,17763,exchange,Internal mail relay - not internet facing,3,False,prod,internal,Sun 02:00-06:00,,,messaging-team
+A04,EXCHDEV01,Windows Server 2019,17763,exchange,Exchange lab box - isolated test environment,1,False,dev,none,,,network isolated,messaging-team
+A05,WEB01,Windows Server 2022,20348,iis_web,Public marketing website,3,True,prod,internal,Sat 22:00-Sun 04:00,,WAF,web-team
+A06,SQL01,Windows Server 2019,17763,sql,Finance database backend,5,False,prod,regulated,Sun 02:00-06:00,no reboot during business hours,network isolated,db-team
+A07,FS01,Windows Server 2016,14393,file,Departmental file server,2,False,prod,internal,Sun 02:00-06:00,,,infra-team
+A08,PAY01,Windows Server 2016,14393,file,Payroll application server,4,False,prod,regulated,Sun 02:00-04:00,no reboot outside window; payroll runs Fri,,hr-team
+A09,WKS-FIN12,Windows 10,19045,workstation,Finance analyst workstation,2,False,prod,confidential,,,,it-helpdesk
+A10,WKS-IT05,Windows 10,19045,workstation,IT admin workstation,3,False,prod,internal,,,,it-helpdesk
+A11,DEVBOX01,Windows 10,19045,dev,Isolated dev/lab sandbox,1,False,dev,none,,,network isolated,dev-team
