@@ -53,10 +53,13 @@ whether they disagreed) is recorded on every finding's rationale. 10 of 24 findi
 `F14`'s risk climbs 1.99 → 30.62 (15.4x) once applied — the correction the earlier F14 decision
 named. Bug caught along the way: NVD's metric arrays can hold two scorers (vendor CNA + NVD
 itself) and aren't reliably ordered NVD-first; a naive `entries[0]` silently took Microsoft's
-5.5/medium for ZeroLogon over NVD's own 10.0/critical. Fixed to select by NVD's `"Primary"` tag
-instead of position. Also corrected the risk-normalization ceiling (`MAX_SEVERITY_BASE`), which
-still assumed severity topped out at 9.5 (the old scanner-tier proxy) even though NVD's real
-scores can reach 10.0 — no finding was close enough to the old ceiling to have visibly clipped,
+5.5/medium for ZeroLogon over NVD's own 10.0/critical. Caught by inspection, not by a test:
+5.5/medium contradicted ZeroLogon's well-known real-world severity (an unauthenticated
+domain-controller takeover), which is what prompted checking the raw response instead of
+trusting the parsed value. Fixed to select by NVD's `"Primary"` tag instead of position.
+Also corrected the risk-normalization ceiling (`MAX_SEVERITY_BASE`), which still assumed
+severity topped out at 9.5 (the old scanner-tier proxy) even though NVD's real scores can
+reach 10.0 — no finding was close enough to the old ceiling to have visibly clipped,
 but it would have.
 
 **Fixture correction: 10/24 scanner/NVD disagreements was too many to be deliberate.** `F16`-
@@ -69,3 +72,13 @@ specific reason: `F12` (under-called), `F14` (under-called, the designated bad-d
 3/24 (12.5%) reads as a realistic scanner; 10/24 (42%) read as a broken one. No scoring output
 changed — `_resolve_severity` was already using NVD's real score for all 7 regardless of what
 the CSV said — confirmed the bucket distribution and every finding's risk score are unchanged.
+
+**The thesis demonstrating itself.** Seven of those nine mundane findings (`F17`-`F23`) had
+`scanner_severity` corrected up to 7.8/high once matched to NVD, and their risk scores rose
+with it — up to roughly 10x (e.g. `F17`: 0.95 → 9.26). None crossed `ACTIONABLE_THRESHOLD`
+(18); the highest landed at 10.32. Their EPSS stayed under 0.05 throughout, so the threat term
+never moved enough to matter, regardless of how technically severe NVD rated them. This is
+CLAUDE.md Section 1's thesis — "CVSS alone is an insufficient prioritization signal" — playing
+out on real data rather than being asserted: a high-severity, low-exploitation-probability
+finding correctly stays low priority, because Risk = Threat × Impact means a strong score on
+one axis can't rescue a weak one on the other.
