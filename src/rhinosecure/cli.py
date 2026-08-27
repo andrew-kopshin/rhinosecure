@@ -1,4 +1,7 @@
-"""`rhino run` — Slice 1: ingest, score, rank. No LLM calls, no network."""
+"""`rhino run` — ingest, enrich with live KEV/EPSS threat signals, score,
+rank. Scoring itself stays LLM-free and network-free (see scoring.py);
+enrichment goes through SnapshotCache, which makes it offline-capable and
+lets --offline force that rather than silently reaching the network."""
 
 from __future__ import annotations
 
@@ -7,7 +10,11 @@ import random
 import sys
 from pathlib import Path
 
+from rhinosecure.enrich.cache import OfflineCacheMissError, SnapshotCache
+from rhinosecure.enrich.epss import lookup as epss_lookup
+from rhinosecure.enrich.kev import KevCatalog, load_catalog as load_kev_catalog
 from rhinosecure.ingest import IngestError, join_findings
+from rhinosecure.schema import EnrichedFinding
 from rhinosecure.scoring import ScoredFinding, rank, score_finding
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -23,18 +30,35 @@ def _resolve_data_dir(data_arg: str) -> Path:
     raise SystemExit(f"no such data set: {data_arg!r} (looked for {named} and {path})")
 
 
+def _attach_threat_signals(
+    enriched: EnrichedFinding, kev_catalog: KevCatalog, cache: SnapshotCache
+) -> EnrichedFinding:
+    cve_id = enriched.finding.cve_id
+    epss = epss_lookup(cve_id, cache)
+    return enriched.model_copy(
+        update={
+            "is_kev": kev_catalog.status(cve_id).is_listed,
+            "epss": epss.score if epss.is_scored else None,
+        }
+    )
+
+
 def run(data_dir: Path, seed: int, *, offline: bool = False) -> list[ScoredFinding]:
-    # Scoring is fully deterministic today (no sampling, no enrichment
-    # lookups yet); the seed is accepted now so the CLI contract does not
-    # change once Slice 2+ introduces anything seed-sensitive. Same for
-    # offline: Slice 1 makes no network calls, so there is nothing yet for
-    # it to gate -- it is threaded through now so Slice 2 enrichment can
-    # pass it straight to SnapshotCache(offline=...) without a CLI change.
+    # Scoring is fully deterministic (no sampling); the seed is accepted
+    # now so the CLI contract does not change once Slice 4's ToT beam
+    # search introduces anything seed-sensitive.
     random.seed(seed)
 
     assets_path = data_dir / "assets.csv"
     findings_path = data_dir / "findings.csv"
-    scored = [score_finding(e) for e in join_findings(findings_path, assets_path)]
+
+    cache = SnapshotCache(offline=offline)
+    kev_catalog = load_kev_catalog(cache)  # one bulk feed, loaded once for the whole run
+
+    scored = [
+        score_finding(_attach_threat_signals(e, kev_catalog, cache))
+        for e in join_findings(findings_path, assets_path)
+    ]
     return rank(scored)
 
 
@@ -74,6 +98,9 @@ def main(argv: list[str] | None = None) -> int:
             scored = run(data_dir, args.seed, offline=args.offline)
         except IngestError as exc:
             print(f"ingest error: {exc}", file=sys.stderr)
+            return 1
+        except OfflineCacheMissError as exc:
+            print(f"offline error: {exc}", file=sys.stderr)
             return 1
 
         _print_table(scored)

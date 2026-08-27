@@ -69,14 +69,19 @@ class Finding(BaseModel):
 
 
 class EnrichedFinding(BaseModel):
-    """A Finding joined to its Asset.
+    """A Finding joined to its Asset, plus whatever live threat signals have
+    been attached so far.
 
-    Later slices attach live NVD/KEV/EPSS/ATT&CK data to a finding before
-    scoring; this is the seam that enrichment plugs into without scoring.py
-    or ingest.py needing to change shape.
+    `is_kev`/`epss` are populated by `rhino run` after `join_findings`
+    (see `cli.py`) via `enrich/kev.py` and `enrich/epss.py`, going through
+    `SnapshotCache` -- ingest.py itself does no enrichment or network
+    access. NVD and ATT&CK data are still not wired in; this is the seam
+    they plug into without scoring.py or ingest.py needing to change shape.
     """
 
     model_config = ConfigDict(frozen=True)
 
     finding: Finding
     asset: Asset
+    is_kev: bool = False
+    epss: float | None = None

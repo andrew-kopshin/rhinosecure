@@ -146,9 +146,24 @@ combines these four as a weighted sum instead; see below.
 **Threat** (likelihood the finding is actually attacked)
 - CVSS exploitability sub-metrics
 - EPSS probability
-- CISA KEV membership (strong multiplier — known exploited in the wild)
+- CISA KEV membership (floor, not multiplier — see below)
 - Internet exposure of the host asset
 - Whether mapped ATT&CK techniques are commonly observed
+
+KEV and EPSS are different kinds of claim, and the scoring formula treats them differently on
+purpose. EPSS is a model's probability estimate; KEV is CISA's record of confirmed real-world
+exploitation. An observation should not be diluted by — or, worse, multiplicatively compounded
+with — a prediction that disagrees with it. So EPSS sets a likelihood multiplier
+(`0.6 + epss`, ranging 0.6–1.6; unscored CVEs get a neutral ×1.0), and KEV sets a **floor**
+under that multiplier (`max(epss_multiplier, 1.5)`) rather than stacking another factor on top
+of it. A KEV-listed CVE the model happens to underrate gets pulled up to the floor; a KEV
+finding the model already rates highly is left alone, because the floor adds nothing once EPSS
+already clears it. This resolves a live case in the demo fixture: `F15` (`CVE-2019-1068` on
+`SQL02`) is KEV-listed but EPSS only rates it 0.53 — well below every other KEV finding in the
+fixture (all ≥0.92) — so under a naive `KEV_multiplier × EPSS_multiplier` design it would have
+been *penalized* for the model's disagreement instead of credited for CISA's confirmation. The
+floor fixes that without inflating findings where both signals already agree. See
+`_likelihood_multiplier` in `scoring.py`.
 
 **Impact** (what it costs if it succeeds): `severity_base × composite`, where `composite` is
 an equal-weighted sum (25% each) of:
@@ -178,10 +193,15 @@ which bucket within that tier applies:
 
 - Thresholds: `patch_now` at risk ≥ 70, `accept` below risk 18, `next_window` /
   `mitigate_monitor` occupy the range between. These are named constants in `scoring.py`
-  (`PATCH_NOW_THRESHOLD`, `ACTIONABLE_THRESHOLD`) and are expected to be retuned once Slice 2
-  wires in KEV and EPSS — they were calibrated against a Threat side that is currently
-  near-binary (only severity and internet exposure vary it), and KEV/EPSS will add spread
-  there that the current cutoffs don't yet account for.
+  (`PATCH_NOW_THRESHOLD`, `ACTIONABLE_THRESHOLD`) and were calibrated back when the Threat side
+  was near-binary (only severity and internet exposure varied it). KEV and EPSS are wired in
+  now (see above) and do add real spread to Threat — on the demo fixture, no finding's bucket
+  actually flipped as a result, but several findings re-sorted within `accept` (a KEV-listed
+  Exchange privesc finding, `F13`, now correctly outranks non-KEV info-disclosure findings that
+  used to sit above it purely on stale multiplier weight). Retuning these two constants is
+  still an open, separate decision — not bundled into the KEV/EPSS wiring — since it requires
+  judgment about where the tier boundaries should sit against the new, wider Threat
+  distribution, not just a mechanical recompute.
 - `mitigate_monitor` requires **both** a compensating control **and** the absence of a
   declared patch window. A control alone, on an asset that still has a scheduled patch
   window, is not "blocked" — it will be patched on schedule with the control covering it

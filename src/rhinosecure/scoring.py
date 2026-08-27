@@ -1,14 +1,17 @@
 """Deterministic Risk = Threat x Impact scoring.
 
-No LLM calls anywhere in this module. Same EnrichedFinding plus same
-enrichment snapshot must always produce the same score — that is what makes
-runs reproducible and what tests in this repo check for.
+No LLM calls anywhere in this module, and no network or cache access either
+-- `EnrichedFinding.is_kev`/`epss` arrive already resolved (see cli.py,
+which reads them through SnapshotCache before calling score_finding). Same
+EnrichedFinding plus same enrichment snapshot must always produce the same
+score — that is what makes runs reproducible and what tests in this repo
+check for.
 
-Slice 1 has no live NVD/KEV/EPSS/ATT&CK data yet, so `ThreatInputs` and
-`ImpactInputs` are built from scanner-reported severity and asset context
-only; the KEV/EPSS/ATT&CK fields default to "not yet known" (None / False)
-rather than being omitted, so Slice 2 can populate them from real enrichment
-without changing this module's interface or the shape of a score.
+KEV and EPSS are wired into the threat term as of Slice 2. ATT&CK is not
+yet, so `ThreatInputs.attack_prevalence` still defaults to "not yet known"
+(None) rather than being omitted, so a later commit can populate it from
+real enrichment without changing this module's interface or the shape of
+a score.
 
 Nothing here may reference a specific asset_id, cve_id, or fixture row. The
 lookup tables below are general domain weights (how much a compromised
@@ -64,7 +67,22 @@ DATA_SENSITIVITY_WEIGHT: dict[DataSensitivity, float] = {
 
 INTERNET_EXPOSED_MULTIPLIER = 1.35
 NOT_EXPOSED_MULTIPLIER = 0.7
-KEV_MULTIPLIER = 1.5
+
+# EPSS and KEV both feed a single "how likely is this to be attacked"
+# multiplier, but they are different kinds of claim: EPSS is a model's
+# probability estimate, KEV is CISA's record of confirmed real-world
+# exploitation. An observation should not be diluted by, or -- worse --
+# multiplicatively compounded with, a prediction that disagrees with it.
+# So EPSS sets the multiplier (0.6 at epss=0 up to 1.6 at epss=1, unscored
+# CVEs get a neutral x1.0 -- same as the pre-Slice-2 no-op), and KEV sets a
+# FLOOR under that multiplier rather than stacking another factor on top of
+# it. A KEV CVE the model happens to underrate is pulled up to the floor;
+# a KEV CVE the model already rates highly is left alone, because the
+# floor does not add anything once EPSS already clears it. See
+# `_likelihood_multiplier` and CLAUDE.md Section 3.
+EPSS_MULTIPLIER_BASELINE = 0.6
+KEV_FLOOR_MULTIPLIER = 1.5
+
 COMPENSATING_CONTROL_DECAY = 0.85  # per control, diminishing, capped below
 MAX_CONTROLS_COUNTED = 3
 
@@ -83,9 +101,15 @@ IMPACT_COMPOSITE_WEIGHTS: dict[str, float] = {
     "role": 0.25,
 }
 
-# Theoretical max of score_threat/score_impact with Slice-1 inputs only
-# (no EPSS/KEV/ATT&CK yet); used to normalize risk onto a 0-100 scale.
-_MAX_THREAT = max(SEVERITY_BASE_SCORE.values()) * INTERNET_EXPOSED_MULTIPLIER
+# Theoretical max of score_threat/score_impact with everything wired in so
+# far (KEV+EPSS; ATT&CK still not) -- used to normalize risk onto a 0-100
+# scale. The likelihood multiplier maxes out at EPSS=1.0 (x1.6), which
+# already exceeds the KEV floor (x1.5), so the floor never raises the
+# ceiling -- it only pulls up cases the model underrates.
+_MAX_LIKELIHOOD_MULTIPLIER = max(EPSS_MULTIPLIER_BASELINE + 1.0, KEV_FLOOR_MULTIPLIER)
+_MAX_THREAT = (
+    max(SEVERITY_BASE_SCORE.values()) * INTERNET_EXPOSED_MULTIPLIER * _MAX_LIKELIHOOD_MULTIPLIER
+)
 _MAX_IMPACT_COMPOSITE = (
     IMPACT_COMPOSITE_WEIGHTS["criticality"] * 1.0  # criticality/5 maxes at 5/5
     + IMPACT_COMPOSITE_WEIGHTS["environment"] * max(ENVIRONMENT_WEIGHT.values())
@@ -107,9 +131,9 @@ class Bucket(str, Enum):
 class ThreatInputs:
     exploitability_base: float
     internet_exposed: bool
-    epss: float | None = None  # populated in Slice 2
-    is_kev: bool = False  # populated in Slice 2
-    attack_prevalence: float | None = None  # populated in Slice 2
+    epss: float | None = None  # from EnrichedFinding.epss (Slice 2, wired)
+    is_kev: bool = False  # from EnrichedFinding.is_kev (Slice 2, wired)
+    attack_prevalence: float | None = None  # ATT&CK -- not wired yet
 
 
 @dataclass(frozen=True)
@@ -135,13 +159,22 @@ class ScoredFinding:
     rationale: tuple[str, ...]
 
 
+def _likelihood_multiplier(epss: float | None, is_kev: bool) -> float:
+    """How much more likely this finding is to actually be attacked.
+
+    EPSS sets the base multiplier; KEV sets a floor under it rather than
+    multiplying on top of it -- see the constants block above for why.
+    """
+    multiplier = EPSS_MULTIPLIER_BASELINE + epss if epss is not None else 1.0
+    if is_kev:
+        multiplier = max(multiplier, KEV_FLOOR_MULTIPLIER)
+    return multiplier
+
+
 def score_threat(inputs: ThreatInputs) -> float:
     score = inputs.exploitability_base
     score *= INTERNET_EXPOSED_MULTIPLIER if inputs.internet_exposed else NOT_EXPOSED_MULTIPLIER
-    if inputs.is_kev:
-        score *= KEV_MULTIPLIER
-    if inputs.epss is not None:
-        score *= 0.6 + inputs.epss
+    score *= _likelihood_multiplier(inputs.epss, inputs.is_kev)
     if inputs.attack_prevalence is not None:
         score *= 0.8 + 0.4 * inputs.attack_prevalence
     return score
@@ -198,6 +231,8 @@ def build_threat_inputs(enriched: EnrichedFinding) -> ThreatInputs:
     return ThreatInputs(
         exploitability_base=base,
         internet_exposed=enriched.asset.internet_exposed,
+        epss=enriched.epss,
+        is_kev=enriched.is_kev,
     )
 
 
@@ -219,9 +254,19 @@ def _rationale(
 ) -> tuple[str, ...]:
     asset = enriched.asset
     composite = impact_composite(impact)
+    epss_multiplier = EPSS_MULTIPLIER_BASELINE + threat.epss if threat.epss is not None else 1.0
+    likelihood = _likelihood_multiplier(threat.epss, threat.is_kev)
+    epss_desc = f"epss={threat.epss:.3f}" if threat.epss is not None else "epss=unscored"
+    if threat.is_kev and epss_multiplier < KEV_FLOOR_MULTIPLIER:
+        kev_desc = f"is_kev=True -> KEV floor applies (observation outranks the model's {epss_multiplier:.3f})"
+    elif threat.is_kev:
+        kev_desc = "is_kev=True -> EPSS already clears the KEV floor, no adjustment needed"
+    else:
+        kev_desc = "is_kev=False"
     lines = [
         f"scanner severity '{enriched.finding.scanner_severity}' -> base score {impact.impact_base:.1f}",
         f"internet_exposed={asset.internet_exposed} ({'x' + str(INTERNET_EXPOSED_MULTIPLIER) if asset.internet_exposed else 'x' + str(NOT_EXPOSED_MULTIPLIER)} threat)",
+        f"{epss_desc}, {kev_desc} -> x{likelihood:.3f} likelihood multiplier",
         f"criticality={asset.criticality}/5 (weight {IMPACT_COMPOSITE_WEIGHTS['criticality']} -> +{IMPACT_COMPOSITE_WEIGHTS['criticality'] * (asset.criticality / 5):.3f} to impact composite)",
         f"environment={asset.environment} (weight {IMPACT_COMPOSITE_WEIGHTS['environment']} -> +{IMPACT_COMPOSITE_WEIGHTS['environment'] * ENVIRONMENT_WEIGHT[asset.environment]:.3f} to impact composite)",
         f"data_sensitivity={asset.data_sensitivity} (weight {IMPACT_COMPOSITE_WEIGHTS['data_sensitivity']} -> +{IMPACT_COMPOSITE_WEIGHTS['data_sensitivity'] * DATA_SENSITIVITY_WEIGHT[asset.data_sensitivity]:.3f} to impact composite)",

@@ -1,14 +1,24 @@
 from pathlib import Path
 
+import pytest
+
 from rhinosecure.cli import run as cli_run
-from rhinosecure.ingest import join_findings
-from rhinosecure.scoring import Bucket, score_finding
+from rhinosecure.scoring import (
+    EPSS_MULTIPLIER_BASELINE,
+    KEV_FLOOR_MULTIPLIER,
+    Bucket,
+    ThreatInputs,
+    score_threat,
+)
 
 DEMO_DIR = Path(__file__).resolve().parents[1] / "data" / "demo"
 
 
 def _scored_by_finding_id():
-    scored = [score_finding(e) for e in join_findings(DEMO_DIR / "findings.csv", DEMO_DIR / "assets.csv")]
+    # Goes through cli.run(), not raw join_findings+score_finding, so KEV
+    # and EPSS are actually attached -- these tests check real end-to-end
+    # behavior, not the pre-Slice-2 unenriched shortcut.
+    scored = cli_run(DEMO_DIR, seed=42)
     return {s.finding_id: s for s in scored}
 
 
@@ -65,6 +75,53 @@ def test_bucket_values_match_spec():
     assert allowed == {"patch_now", "next_window", "mitigate_monitor", "accept"}
     for s in scored:
         assert s.bucket.value in allowed
+
+
+def _threat(*, epss=None, is_kev=False, exposed=False):
+    return ThreatInputs(exploitability_base=9.5, internet_exposed=exposed, epss=epss, is_kev=is_kev)
+
+
+def test_no_signals_leaves_threat_unchanged():
+    """Regression: with no EPSS data and no KEV listing, the likelihood
+    multiplier must stay a neutral x1.0 -- the pre-Slice-2 behavior."""
+    unenriched = score_threat(_threat())
+    baseline = 9.5 * 0.7  # exploitability_base * NOT_EXPOSED_MULTIPLIER
+    assert unenriched == pytest.approx(baseline)
+
+
+def test_kev_alone_uses_the_floor():
+    """No EPSS data yet, but KEV-listed: floor applies, matching the old
+    flat KEV_MULTIPLIER's value even though the mechanism changed."""
+    score = score_threat(_threat(is_kev=True))
+    baseline = 9.5 * 0.7
+    assert score == pytest.approx(baseline * KEV_FLOOR_MULTIPLIER)
+
+
+def test_kev_floors_a_low_epss_reading_instead_of_stacking():
+    """This is the F15 case: EPSS underrates a confirmed-exploited CVE.
+    The floor must pull the multiplier up to KEV_FLOOR_MULTIPLIER, not
+    multiply the floor on top of the (already low) EPSS multiplier."""
+    low_epss = 0.1  # epss multiplier would be 0.6 + 0.1 = 0.7, well under the floor
+    score = score_threat(_threat(epss=low_epss, is_kev=True))
+    baseline = 9.5 * 0.7
+    assert score == pytest.approx(baseline * KEV_FLOOR_MULTIPLIER)
+    # The old design multiplied KEV_MULTIPLIER by the EPSS multiplier
+    # (floor * epss multiplier) instead of taking the max of the two. With
+    # a below-baseline EPSS reading that stacked product actually comes in
+    # *under* the floor guarantee -- exactly the under-counting the floor
+    # design exists to prevent.
+    stacked = baseline * KEV_FLOOR_MULTIPLIER * (EPSS_MULTIPLIER_BASELINE + low_epss)
+    assert stacked < score
+
+
+def test_kev_does_not_inflate_an_already_high_epss_reading():
+    """This is the F01 case: EPSS already agrees the CVE is dangerous.
+    KEV must not multiply another 1.5x on top of that -- the floor is a
+    no-op once EPSS alone clears it."""
+    high_epss = 0.99996
+    with_kev = score_threat(_threat(epss=high_epss, is_kev=True))
+    without_kev = score_threat(_threat(epss=high_epss, is_kev=False))
+    assert with_kev == pytest.approx(without_kev)
 
 
 def test_mitigate_monitor_is_reachable_on_the_demo_fixture():
