@@ -173,19 +173,21 @@ def score_impact(inputs: ImpactInputs) -> float:
 
 
 PATCH_NOW_THRESHOLD = 70
-NEXT_WINDOW_HIGH_THRESHOLD = 40
-NEXT_WINDOW_LOW_THRESHOLD = 18
+ACTIONABLE_THRESHOLD = 18  # below this, risk is low enough to formally accept
 
 
 def bucket_for(risk_pct: float, *, has_patch_window: bool, has_compensating_controls: bool) -> Bucket:
     if risk_pct >= PATCH_NOW_THRESHOLD:
         return Bucket.PATCH_NOW
-    if risk_pct >= NEXT_WINDOW_HIGH_THRESHOLD:
+    if risk_pct >= ACTIONABLE_THRESHOLD:
+        # mitigate_monitor means "patch blocked or deferred; apply a
+        # compensating control and watch" -- it requires both an actual
+        # control to point to AND the absence of a patch window (otherwise
+        # patching isn't blocked, it's just scheduled). A missing patch
+        # window with no compensating control is not "blocked" either: it
+        # means the asset has no declared scheduling restriction, so it
+        # still lands in next_window rather than mitigate_monitor.
         if has_compensating_controls and not has_patch_window:
-            return Bucket.MITIGATE_MONITOR
-        return Bucket.NEXT_WINDOW
-    if risk_pct >= NEXT_WINDOW_LOW_THRESHOLD:
-        if has_compensating_controls:
             return Bucket.MITIGATE_MONITOR
         return Bucket.NEXT_WINDOW
     return Bucket.ACCEPT
@@ -233,6 +235,10 @@ def _rationale(
         lines.append(
             f"compensating_controls={list(impact.compensating_controls)} (x{decay:.2f} impact, applied after composite)"
         )
+    if asset.has_patch_window:
+        lines.append(f"patch_window='{asset.patch_window}' declared -> defer to this window")
+    else:
+        lines.append("no patch_window declared -> no scheduling restriction, may be patched at any time")
     lines.append(f"risk_score={risk_pct:.1f}/100")
     return tuple(lines)
 
