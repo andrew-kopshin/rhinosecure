@@ -58,3 +58,14 @@ instead of position. Also corrected the risk-normalization ceiling (`MAX_SEVERIT
 still assumed severity topped out at 9.5 (the old scanner-tier proxy) even though NVD's real
 scores can reach 10.0 — no finding was close enough to the old ceiling to have visibly clipped,
 but it would have.
+
+**Fixture correction: 10/24 scanner/NVD disagreements was too many to be deliberate.** `F16`-
+`F24`'s `scanner_severity` values were assigned by hand for narrative variety when those rows
+were added, not derived from anything real. 7 of the 9 turned out to disagree with NVD, all in
+the same direction (NVD higher) — unexamined placeholder data, not a realistic scanner failure
+mode. Corrected those 7 to match NVD. Left exactly three deliberate disagreements, each with a
+specific reason: `F12` (under-called), `F14` (under-called, the designated bad-data case),
+`F15` (over-called — the opposite direction, enrichment pulling a score down instead of up).
+3/24 (12.5%) reads as a realistic scanner; 10/24 (42%) read as a broken one. No scoring output
+changed — `_resolve_severity` was already using NVD's real score for all 7 regardless of what
+the CSV said — confirmed the bucket distribution and every finding's risk score are unchanged.
