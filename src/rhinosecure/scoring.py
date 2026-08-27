@@ -68,10 +68,31 @@ KEV_MULTIPLIER = 1.5
 COMPENSATING_CONTROL_DECAY = 0.85  # per control, diminishing, capped below
 MAX_CONTROLS_COUNTED = 3
 
+# Criticality, environment, data sensitivity, and role blast radius all
+# measure the same underlying question -- how much does this asset matter --
+# so they are combined as a weighted sum, not multiplied. Multiplying near-1
+# factors that overlap in what they measure compounds them into near-zero
+# values for any asset that scores low on more than one axis, which
+# overstates how much low-end assets differ from each other. Compensating
+# controls are not a facet of "how much this asset matters" -- they are an
+# actual reduction in realized impact -- so that one stays multiplicative.
+IMPACT_COMPOSITE_WEIGHTS: dict[str, float] = {
+    "criticality": 0.25,
+    "environment": 0.25,
+    "data_sensitivity": 0.25,
+    "role": 0.25,
+}
+
 # Theoretical max of score_threat/score_impact with Slice-1 inputs only
 # (no EPSS/KEV/ATT&CK yet); used to normalize risk onto a 0-100 scale.
 _MAX_THREAT = max(SEVERITY_BASE_SCORE.values()) * INTERNET_EXPOSED_MULTIPLIER
-_MAX_IMPACT = max(SEVERITY_BASE_SCORE.values()) * max(ROLE_BLAST_RADIUS.values())
+_MAX_IMPACT_COMPOSITE = (
+    IMPACT_COMPOSITE_WEIGHTS["criticality"] * 1.0  # criticality/5 maxes at 5/5
+    + IMPACT_COMPOSITE_WEIGHTS["environment"] * max(ENVIRONMENT_WEIGHT.values())
+    + IMPACT_COMPOSITE_WEIGHTS["data_sensitivity"] * max(DATA_SENSITIVITY_WEIGHT.values())
+    + IMPACT_COMPOSITE_WEIGHTS["role"] * max(ROLE_BLAST_RADIUS.values())
+)
+_MAX_IMPACT = max(SEVERITY_BASE_SCORE.values()) * _MAX_IMPACT_COMPOSITE
 RISK_NORMALIZATION = _MAX_THREAT * _MAX_IMPACT
 
 
@@ -126,12 +147,24 @@ def score_threat(inputs: ThreatInputs) -> float:
     return score
 
 
+def impact_composite(inputs: ImpactInputs) -> float:
+    """Weighted sum of the four "how much does this asset matter" factors.
+
+    These overlap in what they measure (criticality, environment, data
+    sensitivity, and role blast radius are all facets of asset importance),
+    so they are added, not multiplied -- an asset should not need to score
+    high on every axis at once to register as mattering.
+    """
+    return (
+        IMPACT_COMPOSITE_WEIGHTS["criticality"] * (inputs.criticality / 5)
+        + IMPACT_COMPOSITE_WEIGHTS["environment"] * ENVIRONMENT_WEIGHT[inputs.environment]
+        + IMPACT_COMPOSITE_WEIGHTS["data_sensitivity"] * DATA_SENSITIVITY_WEIGHT[inputs.data_sensitivity]
+        + IMPACT_COMPOSITE_WEIGHTS["role"] * ROLE_BLAST_RADIUS[inputs.role]
+    )
+
+
 def score_impact(inputs: ImpactInputs) -> float:
-    score = inputs.impact_base
-    score *= inputs.criticality / 5
-    score *= ENVIRONMENT_WEIGHT[inputs.environment]
-    score *= DATA_SENSITIVITY_WEIGHT[inputs.data_sensitivity]
-    score *= ROLE_BLAST_RADIUS[inputs.role]
+    score = inputs.impact_base * impact_composite(inputs)
     if inputs.compensating_controls:
         score *= COMPENSATING_CONTROL_DECAY ** min(
             len(inputs.compensating_controls), MAX_CONTROLS_COUNTED
@@ -139,14 +172,19 @@ def score_impact(inputs: ImpactInputs) -> float:
     return score
 
 
+PATCH_NOW_THRESHOLD = 70
+NEXT_WINDOW_HIGH_THRESHOLD = 40
+NEXT_WINDOW_LOW_THRESHOLD = 18
+
+
 def bucket_for(risk_pct: float, *, has_patch_window: bool, has_compensating_controls: bool) -> Bucket:
-    if risk_pct >= 65:
+    if risk_pct >= PATCH_NOW_THRESHOLD:
         return Bucket.PATCH_NOW
-    if risk_pct >= 35:
+    if risk_pct >= NEXT_WINDOW_HIGH_THRESHOLD:
         if has_compensating_controls and not has_patch_window:
             return Bucket.MITIGATE_MONITOR
         return Bucket.NEXT_WINDOW
-    if risk_pct >= 12:
+    if risk_pct >= NEXT_WINDOW_LOW_THRESHOLD:
         if has_compensating_controls:
             return Bucket.MITIGATE_MONITOR
         return Bucket.NEXT_WINDOW
@@ -178,20 +216,22 @@ def _rationale(
     enriched: EnrichedFinding, threat: ThreatInputs, impact: ImpactInputs, risk_pct: float
 ) -> tuple[str, ...]:
     asset = enriched.asset
+    composite = impact_composite(impact)
     lines = [
         f"scanner severity '{enriched.finding.scanner_severity}' -> base score {impact.impact_base:.1f}",
         f"internet_exposed={asset.internet_exposed} ({'x' + str(INTERNET_EXPOSED_MULTIPLIER) if asset.internet_exposed else 'x' + str(NOT_EXPOSED_MULTIPLIER)} threat)",
-        f"role={asset.role} (x{ROLE_BLAST_RADIUS[asset.role]} impact, blast radius)",
-        f"criticality={asset.criticality}/5",
-        f"environment={asset.environment} (x{ENVIRONMENT_WEIGHT[asset.environment]} impact)",
-        f"data_sensitivity={asset.data_sensitivity} (x{DATA_SENSITIVITY_WEIGHT[asset.data_sensitivity]} impact)",
+        f"criticality={asset.criticality}/5 (weight {IMPACT_COMPOSITE_WEIGHTS['criticality']} -> +{IMPACT_COMPOSITE_WEIGHTS['criticality'] * (asset.criticality / 5):.3f} to impact composite)",
+        f"environment={asset.environment} (weight {IMPACT_COMPOSITE_WEIGHTS['environment']} -> +{IMPACT_COMPOSITE_WEIGHTS['environment'] * ENVIRONMENT_WEIGHT[asset.environment]:.3f} to impact composite)",
+        f"data_sensitivity={asset.data_sensitivity} (weight {IMPACT_COMPOSITE_WEIGHTS['data_sensitivity']} -> +{IMPACT_COMPOSITE_WEIGHTS['data_sensitivity'] * DATA_SENSITIVITY_WEIGHT[asset.data_sensitivity]:.3f} to impact composite)",
+        f"role={asset.role} (weight {IMPACT_COMPOSITE_WEIGHTS['role']} -> +{IMPACT_COMPOSITE_WEIGHTS['role'] * ROLE_BLAST_RADIUS[asset.role]:.3f} to impact composite, blast radius)",
+        f"impact composite={composite:.3f} (of max {_MAX_IMPACT_COMPOSITE:.3f})",
     ]
     if impact.compensating_controls:
         decay = COMPENSATING_CONTROL_DECAY ** min(
             len(impact.compensating_controls), MAX_CONTROLS_COUNTED
         )
         lines.append(
-            f"compensating_controls={list(impact.compensating_controls)} (x{decay:.2f} impact)"
+            f"compensating_controls={list(impact.compensating_controls)} (x{decay:.2f} impact, applied after composite)"
         )
     lines.append(f"risk_score={risk_pct:.1f}/100")
     return tuple(lines)
