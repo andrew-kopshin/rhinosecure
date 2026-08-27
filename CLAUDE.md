@@ -143,6 +143,21 @@ compounds overlapping signal: an asset that is merely mid-range on more than one
 axes gets driven toward zero, even though nothing about it is actually negligible. Impact
 combines these four as a weighted sum instead; see below.
 
+**Severity source.** `severity_base` feeds both axes (`exploitability_base` in Threat,
+`impact_base` in Impact) and comes from one of two places: `scanner_severity`'s fixed per-tier
+proxy (critical=9.5, high=7.5, medium=5.0, low=2.5, informational=0.5) when NVD has no CVSS
+record for the CVE, or NVD's authoritative CVSS `base_score` when it does. NVD overrides the
+scanner's tier outright when the two disagree, and is still preferred when they happen to
+agree, because it's a real sourced number instead of a fixed proxy. Which source was used, and
+whether it disagreed with the scanner, is recorded on every finding and always visible in its
+rationale (`rhino run --explain`) — see `scoring._resolve_severity`. On the demo fixture, 10 of
+24 findings disagree, all but one in the direction of NVD rating it *more* severe than the
+scanner did (`F15` is the exception — scanner said critical, NVD says high). `F14`
+(`CVE-2023-23397`) is the sharpest case: scanner said low (2.5), NVD says 9.8/critical — its
+risk score climbs from 1.99 to 30.62 (15.4x) once NVD is applied, fulfilling the correction the
+"Decided" note below anticipated. Its bucket stays `contested` either way, since that rule
+depends on `is_kev` plus control/window state, not severity.
+
 **Threat** (likelihood the finding is actually attacked)
 - CVSS exploitability sub-metrics
 - EPSS probability
@@ -238,12 +253,13 @@ PrintNightmare, ZeroLogon, BlueKeep, Follina. A Java/Log4j anchor also works if 
 Windows IIS or VMware-adjacent asset, but at least one anchor should be Windows-native so the
 Windows scoping earns its keep.
 
-**Decided.** `F14` (`CVE-2023-23397` on WKS-FIN12) stays at `scanner_severity=low`. This is
-intentional bad data, not a mistake: `CVE-2023-23397` is a KEV-listed Critical, and the low
-scanner value models a scanner under-calling severity on a known-exploited vulnerability. It
-is a Slice 2 exit-criteria case — enrichment (NVD + KEV) must correct the assessed severity
-from authoritative sources, overriding the scanner's stale/wrong call. Do not "fix" the CSV;
-the mismatch is the point.
+**Decided, and resolved.** `F14` (`CVE-2023-23397` on WKS-FIN12) stays at `scanner_severity=low`
+in the CSV — do not "fix" it, the mismatch is the point. This was intentional bad data, not a
+mistake: `CVE-2023-23397` is a KEV-listed Critical, and the low scanner value models a scanner
+under-calling severity on a known-exploited vulnerability. It was a Slice 2 exit-criteria case
+— enrichment must correct the assessed severity from authoritative sources — and now does: NVD
+rates it 9.8/critical, `_resolve_severity` uses that instead of the scanner's proxy, and its
+risk score climbs 15.4x (1.99 → 30.62). See "Severity source" above.
 
 **Decided.** The demo fixture now includes `A12` (`SQL02`), a legacy SQL Server host running an
 ERP backend that the vendor only certifies at its current patch level — a realistic asset for
@@ -269,6 +285,16 @@ it uniformly would be theater.
 
 **Structured lookup** — for anything keyed by CVE ID. NVD records, KEV membership, EPSS
 scores. These are exact-key retrievals; embedding them adds cost and loses precision.
+
+NVD enforces real rate limits (5 req/30s unauthenticated, 50/30s with `NVD_API_KEY`) and
+returns 403/429 once exceeded; `enrich/nvd.py` retries with exponential backoff rather than
+failing on the first throttle — fetching the demo fixture's 20 unique CVEs unauthenticated hit
+this repeatedly and recovered every time. NVD's per-CVE response can carry more than one CVSS
+entry for the same version (the reporting vendor's own score alongside NVD's own analysis, and
+they can disagree substantially — ZeroLogon's Microsoft-reported score is 5.5/medium against
+NVD's own 10.0/critical); array order does not reliably put NVD's entry first, so the fetcher
+selects by NVD's `"type": "Primary"` tag, falling back to `source == "nvd@nist.gov"`, not by
+position.
 
 **Vector retrieval with MMR reranking** — for prose where the query genuinely is not an exact
 key. MITRE ATT&CK technique descriptions, vendor remediation guidance, mitigation writeups.

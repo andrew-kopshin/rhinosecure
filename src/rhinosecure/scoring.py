@@ -1,17 +1,19 @@
 """Deterministic Risk = Threat x Impact scoring.
 
 No LLM calls anywhere in this module, and no network or cache access either
--- `EnrichedFinding.is_kev`/`epss` arrive already resolved (see cli.py,
-which reads them through SnapshotCache before calling score_finding). Same
-EnrichedFinding plus same enrichment snapshot must always produce the same
-score — that is what makes runs reproducible and what tests in this repo
-check for.
+-- `EnrichedFinding.is_kev`/`epss`/`nvd_base_score`/`nvd_severity` arrive
+already resolved (see cli.py, which reads them through SnapshotCache
+before calling score_finding). Same EnrichedFinding plus same enrichment
+snapshot must always produce the same score — that is what makes runs
+reproducible and what tests in this repo check for.
 
-KEV and EPSS are wired into the threat term as of Slice 2. ATT&CK is not
-yet, so `ThreatInputs.attack_prevalence` still defaults to "not yet known"
-(None) rather than being omitted, so a later commit can populate it from
-real enrichment without changing this module's interface or the shape of
-a score.
+KEV and EPSS are wired into the threat term, and NVD's authoritative CVSS
+score into both Threat and Impact's severity_base (see
+`_resolve_severity`), as of Slice 2. ATT&CK is not yet, so
+`ThreatInputs.attack_prevalence` still defaults to "not yet known" (None)
+rather than being omitted, so a later commit can populate it from real
+enrichment without changing this module's interface or the shape of a
+score.
 
 Nothing here may reference a specific asset_id, cve_id, or fixture row. The
 lookup tables below are general domain weights (how much a compromised
@@ -32,7 +34,9 @@ from rhinosecure.schema import (
     ScannerSeverity,
 )
 
-# Proxy for a CVSS base/impact score until Slice 2 supplies the real vector.
+# Proxy for a CVSS base/impact score, used only when NVD has no CVSS data
+# for a CVE. When NVD has scored it, _resolve_severity uses NVD's real
+# base_score instead -- see that function.
 SEVERITY_BASE_SCORE: dict[ScannerSeverity, float] = {
     "critical": 9.5,
     "high": 7.5,
@@ -101,22 +105,28 @@ IMPACT_COMPOSITE_WEIGHTS: dict[str, float] = {
     "role": 0.25,
 }
 
+# The true ceiling severity_base can reach. SEVERITY_BASE_SCORE's own max
+# (9.5, "critical") is only the proxy's ceiling -- once NVD has scored a
+# CVE, _resolve_severity uses its real CVSS base_score instead, and CVSS
+# itself tops out at 10.0. Normalizing against 9.5 would silently
+# under-normalize once any finding's authoritative score gets close to
+# that true ceiling.
+MAX_SEVERITY_BASE = 10.0
+
 # Theoretical max of score_threat/score_impact with everything wired in so
-# far (KEV+EPSS; ATT&CK still not) -- used to normalize risk onto a 0-100
-# scale. The likelihood multiplier maxes out at EPSS=1.0 (x1.6), which
-# already exceeds the KEV floor (x1.5), so the floor never raises the
-# ceiling -- it only pulls up cases the model underrates.
+# far (KEV+EPSS+NVD; ATT&CK still not) -- used to normalize risk onto a
+# 0-100 scale. The likelihood multiplier maxes out at EPSS=1.0 (x1.6),
+# which already exceeds the KEV floor (x1.5), so the floor never raises
+# the ceiling -- it only pulls up cases the model underrates.
 _MAX_LIKELIHOOD_MULTIPLIER = max(EPSS_MULTIPLIER_BASELINE + 1.0, KEV_FLOOR_MULTIPLIER)
-_MAX_THREAT = (
-    max(SEVERITY_BASE_SCORE.values()) * INTERNET_EXPOSED_MULTIPLIER * _MAX_LIKELIHOOD_MULTIPLIER
-)
+_MAX_THREAT = MAX_SEVERITY_BASE * INTERNET_EXPOSED_MULTIPLIER * _MAX_LIKELIHOOD_MULTIPLIER
 _MAX_IMPACT_COMPOSITE = (
     IMPACT_COMPOSITE_WEIGHTS["criticality"] * 1.0  # criticality/5 maxes at 5/5
     + IMPACT_COMPOSITE_WEIGHTS["environment"] * max(ENVIRONMENT_WEIGHT.values())
     + IMPACT_COMPOSITE_WEIGHTS["data_sensitivity"] * max(DATA_SENSITIVITY_WEIGHT.values())
     + IMPACT_COMPOSITE_WEIGHTS["role"] * max(ROLE_BLAST_RADIUS.values())
 )
-_MAX_IMPACT = max(SEVERITY_BASE_SCORE.values()) * _MAX_IMPACT_COMPOSITE
+_MAX_IMPACT = MAX_SEVERITY_BASE * _MAX_IMPACT_COMPOSITE
 RISK_NORMALIZATION = _MAX_THREAT * _MAX_IMPACT
 
 
@@ -254,8 +264,26 @@ def bucket_for(
     return Bucket.ACCEPT
 
 
+def _resolve_severity(enriched: EnrichedFinding) -> tuple[float, str]:
+    """The severity_base fed to both Threat and Impact, plus which source
+    it came from ("nvd" or "scanner") -- provenance the rationale surfaces.
+
+    NVD's CVSS base score is authoritative when NVD has scored the CVE: a
+    real, sourced number, not the fixed per-tier proxy scanner_severity
+    maps to (SEVERITY_BASE_SCORE was always documented as a stand-in
+    "until Slice 2 supplies the real vector" -- this is that). It
+    overrides scanner_severity outright when the two disagree at the tier
+    level, and is still preferred for precision when they happen to
+    agree. Falls back to the scanner's tier proxy only when NVD has no
+    CVSS data for this CVE.
+    """
+    if enriched.nvd_base_score is not None:
+        return enriched.nvd_base_score, "nvd"
+    return SEVERITY_BASE_SCORE[enriched.finding.scanner_severity], "scanner"
+
+
 def build_threat_inputs(enriched: EnrichedFinding) -> ThreatInputs:
-    base = SEVERITY_BASE_SCORE[enriched.finding.scanner_severity]
+    base, _source = _resolve_severity(enriched)
     return ThreatInputs(
         exploitability_base=base,
         internet_exposed=enriched.asset.internet_exposed,
@@ -265,7 +293,7 @@ def build_threat_inputs(enriched: EnrichedFinding) -> ThreatInputs:
 
 
 def build_impact_inputs(enriched: EnrichedFinding) -> ImpactInputs:
-    base = SEVERITY_BASE_SCORE[enriched.finding.scanner_severity]
+    base, _source = _resolve_severity(enriched)
     asset = enriched.asset
     return ImpactInputs(
         impact_base=base,
@@ -295,8 +323,27 @@ def _rationale(
         kev_desc = "is_kev=True -> EPSS already clears the KEV floor, no adjustment needed"
     else:
         kev_desc = "is_kev=False"
+    severity_base, severity_source = _resolve_severity(enriched)
+    scanner_tier = enriched.finding.scanner_severity
+    if severity_source == "nvd":
+        nvd_tier = enriched.nvd_severity or "unscored"
+        if enriched.nvd_severity and enriched.nvd_severity != scanner_tier:
+            severity_line = (
+                f"scanner_severity='{scanner_tier}' vs NVD CVSS {severity_base:.1f} ({nvd_tier}) "
+                f"-> disagreement: NVD is authoritative, overriding the scanner's call (source=nvd)"
+            )
+        else:
+            severity_line = (
+                f"scanner_severity='{scanner_tier}' agrees with NVD's tier ({nvd_tier}) -> using "
+                f"NVD's precise CVSS base score {severity_base:.1f} rather than the tier proxy (source=nvd)"
+            )
+    else:
+        severity_line = (
+            f"scanner severity '{scanner_tier}' -> base score {severity_base:.1f} "
+            f"(source=scanner; NVD has no CVSS data for this CVE)"
+        )
     lines = [
-        f"scanner severity '{enriched.finding.scanner_severity}' -> base score {impact.impact_base:.1f}",
+        severity_line,
         f"internet_exposed={asset.internet_exposed} ({'x' + str(INTERNET_EXPOSED_MULTIPLIER) if asset.internet_exposed else 'x' + str(NOT_EXPOSED_MULTIPLIER)} threat)",
         f"{epss_desc}, {kev_desc} -> x{likelihood:.3f} likelihood multiplier",
         f"criticality={asset.criticality}/5 (weight {IMPACT_COMPOSITE_WEIGHTS['criticality']} -> +{IMPACT_COMPOSITE_WEIGHTS['criticality'] * (asset.criticality / 5):.3f} to impact composite)",

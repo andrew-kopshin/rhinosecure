@@ -1,7 +1,8 @@
-"""`rhino run` — ingest, enrich with live KEV/EPSS threat signals, score,
-rank. Scoring itself stays LLM-free and network-free (see scoring.py);
-enrichment goes through SnapshotCache, which makes it offline-capable and
-lets --offline force that rather than silently reaching the network."""
+"""`rhino run` — ingest, enrich with live KEV/EPSS/NVD threat signals,
+score, rank. Scoring itself stays LLM-free and network-free (see
+scoring.py); enrichment goes through SnapshotCache, which makes it
+offline-capable and lets --offline force that rather than silently
+reaching the network."""
 
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from pathlib import Path
 from rhinosecure.enrich.cache import OfflineCacheMissError, SnapshotCache
 from rhinosecure.enrich.epss import lookup as epss_lookup
 from rhinosecure.enrich.kev import KevCatalog, load_catalog as load_kev_catalog
+from rhinosecure.enrich.nvd import lookup as nvd_lookup
 from rhinosecure.ingest import IngestError, join_findings
 from rhinosecure.schema import EnrichedFinding
 from rhinosecure.scoring import ScoredFinding, rank, score_finding
@@ -35,10 +37,13 @@ def _attach_threat_signals(
 ) -> EnrichedFinding:
     cve_id = enriched.finding.cve_id
     epss = epss_lookup(cve_id, cache)
+    nvd_cvss = nvd_lookup(cve_id, cache)
     return enriched.model_copy(
         update={
             "is_kev": kev_catalog.status(cve_id).is_listed,
             "epss": epss.score if epss.is_scored else None,
+            "nvd_base_score": nvd_cvss.base_score if nvd_cvss is not None else None,
+            "nvd_severity": nvd_cvss.base_severity if nvd_cvss is not None else None,
         }
     )
 
