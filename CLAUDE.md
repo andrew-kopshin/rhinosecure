@@ -373,8 +373,8 @@ rhinosecure/
       assets.csv
       findings.csv
     snapshots/
-      kev.json
-      epss.json
+      kev.json                 # bulk catalog, one file
+      epss/                    # per-CVE, queried live against api.first.org
       nvd/
       attack/
   src/rhinosecure/
