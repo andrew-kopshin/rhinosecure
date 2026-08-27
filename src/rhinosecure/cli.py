@@ -23,10 +23,13 @@ def _resolve_data_dir(data_arg: str) -> Path:
     raise SystemExit(f"no such data set: {data_arg!r} (looked for {named} and {path})")
 
 
-def run(data_dir: Path, seed: int) -> list[ScoredFinding]:
+def run(data_dir: Path, seed: int, *, offline: bool = False) -> list[ScoredFinding]:
     # Scoring is fully deterministic today (no sampling, no enrichment
     # lookups yet); the seed is accepted now so the CLI contract does not
-    # change once Slice 2+ introduces anything seed-sensitive.
+    # change once Slice 2+ introduces anything seed-sensitive. Same for
+    # offline: Slice 1 makes no network calls, so there is nothing yet for
+    # it to gate -- it is threaded through now so Slice 2 enrichment can
+    # pass it straight to SnapshotCache(offline=...) without a CLI change.
     random.seed(seed)
 
     assets_path = data_dir / "assets.csv"
@@ -57,13 +60,18 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--data", default="demo", help="dataset name under data/, or a path")
     run_parser.add_argument("--seed", type=int, default=42)
     run_parser.add_argument("--explain", action="store_true", help="print rationale for every finding")
+    run_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="forbid network fetches; fail loudly on any snapshot cache miss instead of fetching",
+    )
 
     args = parser.parse_args(argv)
 
     if args.command == "run":
         data_dir = _resolve_data_dir(args.data)
         try:
-            scored = run(data_dir, args.seed)
+            scored = run(data_dir, args.seed, offline=args.offline)
         except IngestError as exc:
             print(f"ingest error: {exc}", file=sys.stderr)
             return 1
