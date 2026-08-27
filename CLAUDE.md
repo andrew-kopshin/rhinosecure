@@ -199,22 +199,27 @@ PrintNightmare, ZeroLogon, BlueKeep, Follina. A Java/Log4j anchor also works if 
 Windows IIS or VMware-adjacent asset, but at least one anchor should be Windows-native so the
 Windows scoping earns its keep.
 
+**Decided.** `F14` (`CVE-2023-23397` on WKS-FIN12) stays at `scanner_severity=low`. This is
+intentional bad data, not a mistake: `CVE-2023-23397` is a KEV-listed Critical, and the low
+scanner value models a scanner under-calling severity on a known-exploited vulnerability. It
+is a Slice 2 exit-criteria case — enrichment (NVD + KEV) must correct the assessed severity
+from authoritative sources, overriding the scanner's stale/wrong call. Do not "fix" the CSV;
+the mismatch is the point.
+
+**Decided.** The demo fixture now includes `A12` (`SQL02`), a legacy SQL Server host running an
+ERP backend that the vendor only certifies at its current patch level — a realistic asset for
+the "compensating control, no patch window" combination the fixture previously had zero
+coverage for. `F15` (`CVE-2019-1068`, critical) on `A12` scores 34.2, landing squarely in
+`mitigate_monitor`. This is additive fixture coverage, not the regeneration Section 8 rule 1
+prohibits — see the note there. Fixture is now 12 assets / 15 findings.
+
 ### Open items
 
-- The demo fixture's `F14` (`CVE-2023-23397` on WKS-FIN12) is recorded with
-  `scanner_severity=low`. That CVE was Critical in reality; the low value was chosen to model
-  a scanner under-calling severity, but it hasn't been reviewed for whether it still serves
-  that purpose or just reads as a mistake. Needs a decision, not a silent fix — the fixture is
-  frozen.
 - The schema has no way to distinguish "no patch window recorded" (a data gap — nobody has
   documented one yet) from "patching is genuinely unconstrained" (a deliberate fact about the
   asset). Both currently produce the same blank `patch_window` value and the same downstream
   treatment. This matters more once real scanner data replaces the fixture, where blank
   fields are far more likely to mean "not collected" than "not applicable."
-- No finding in the demo fixture currently lands in `mitigate_monitor` — it requires a
-  compensating control with no patch window at a risk level above the accept threshold, and
-  no fixture row satisfies all three at once. The fixture is frozen (Section 8, rule 1), so
-  this is a known gap to account for, not something to patch by editing the CSV.
 
 ---
 
@@ -311,8 +316,11 @@ Inspect with DB Browser for SQLite (sqlitebrowser.org).
 
 ## 8. Non-negotiable build rules
 
-1. The 14-finding demo dataset is a **fixture**. It proves specific behaviors. Do not
-   regenerate it.
+1. The 15-finding demo dataset is a **fixture**. It proves specific behaviors. Do not
+   regenerate it — the rule bars wholesale regeneration (reshuffling or re-deriving the
+   dataset to make numbers look better), not a deliberate, individually-justified row added to
+   close a named coverage gap (e.g. the `A12`/`F15` addition for `mitigate_monitor`, Section 3).
+   Any such addition lands in its own commit stating the reason.
 2. Everything in `scoring.py` and the tool layer stays **deterministic**. No LLM calls in the
    scoring path. Same inputs plus same snapshots must produce byte-identical output.
 3. `--seed 42` is the seed for all reported results.
@@ -358,7 +366,7 @@ rhinosecure/
   pyproject.toml
   .env.example
   data/
-    demo/                    # 14-finding fixture — FROZEN
+    demo/                    # 15-finding fixture — FROZEN
       assets.csv
       findings.csv
     full/                    # generated, seed 42
