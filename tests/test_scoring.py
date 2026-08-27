@@ -56,7 +56,7 @@ def test_ranking_is_sorted_descending_by_risk():
 
 def test_all_demo_findings_are_scored():
     scored = cli_run(DEMO_DIR, seed=42)
-    assert len(scored) == 14
+    assert len(scored) == 15
 
 
 def test_bucket_values_match_spec():
@@ -65,3 +65,12 @@ def test_bucket_values_match_spec():
     assert allowed == {"patch_now", "next_window", "mitigate_monitor", "accept"}
     for s in scored:
         assert s.bucket.value in allowed
+
+
+def test_mitigate_monitor_is_reachable_on_the_demo_fixture():
+    """A12, the legacy SQL server (SQL02), has a compensating control and no
+    declared patch window, at a risk level above the accept threshold --
+    the one combination that produces mitigate_monitor. Without it nothing
+    in the fixture ever exercises this bucket."""
+    by_id = _scored_by_finding_id()
+    assert by_id["F15"].bucket == Bucket.MITIGATE_MONITOR

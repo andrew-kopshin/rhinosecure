@@ -22,7 +22,7 @@ def test_load_findings_is_lazy():
 
 def test_join_findings_resolves_every_asset():
     joined = list(join_findings(DEMO_DIR / "findings.csv", DEMO_DIR / "assets.csv"))
-    assert len(joined) == 14
+    assert len(joined) == 15
     for enriched in joined:
         assert enriched.asset.asset_id == enriched.finding.asset_id
 

@@ -13,3 +13,4 @@ F11,A10,CVE-2020-0796,2026-08-04,critical,Windows SMBv3,n/a,445,microsoft-ds,SMB
 F12,A08,CVE-2023-21554,2026-08-05,medium,Microsoft Message Queuing,n/a,1801,msmq,MSMQ TCP listener accepts malformed packet triggering remote code execution (QueueJumper)
 F13,A03,CVE-2021-31207,2026-08-05,medium,Microsoft Exchange Server,2016 CU19,443,https,Exchange PowerShell backend allows privilege escalation post-authentication
 F14,A09,CVE-2023-23397,2026-08-06,low,Microsoft Outlook,365,n/a,outlook,Reminder task triggers NTLM hash leak via crafted appointment
+F15,A12,CVE-2019-1068,2026-08-07,critical,Microsoft SQL Server Analysis Services,2014,2383,ssas,Malformed OLE DB provider request to Analysis Services enables remote code execution; vendor ERP module is certified only against this build

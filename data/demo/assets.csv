@@ -10,3 +10,4 @@ A08,PAY01,Windows Server 2016,14393,file,Payroll application server,4,False,prod
 A09,WKS-FIN12,Windows 10,19045,workstation,Finance analyst workstation,2,False,prod,confidential,,,,it-helpdesk
 A10,WKS-IT05,Windows 10,19045,workstation,IT admin workstation,3,False,prod,internal,,,,it-helpdesk
 A11,DEVBOX01,Windows 10,19045,dev,Isolated dev/lab sandbox,1,False,dev,none,,,network isolated,dev-team
+A12,SQL02,Windows Server 2012 R2,9600,sql,Legacy ERP database backend - vendor certifies only this patch level,5,False,prod,confidential,,vendor support voided by any OS or SQL engine patch; ERP recertification required before update,network segmentation; enhanced logging and alerting,db-team
