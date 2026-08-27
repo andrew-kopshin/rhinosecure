@@ -322,6 +322,33 @@ Inspect with DB Browser for SQLite (sqlitebrowser.org).
 
 ---
 
+## Trust boundary and provider independence
+
+RhinoSecure is a program that runs independently of the tooling used to build it. At runtime
+it holds its own API key and calls an LLM as its reasoning engine. This creates a data-egress
+property worth stating explicitly.
+
+**What leaves the machine.** From Slice 3 onward, findings sent to the agents are transmitted
+to a third-party API. With synthetic data this is immaterial. Under the Section 1 rule that no
+component may assume synthetic input, it is not: real vulnerability data is a map of where an
+organization is weak.
+
+**Design consequences.**
+
+- The deterministic scoring path stays LLM-free. `scoring.py` never transmits anything, so the
+  core prioritization runs entirely locally and remains reproducible.
+- Agents receive enriched findings, not raw fleet inventory. Send what reasoning requires.
+- **All LLM calls go through a single seam.** One module owns client construction and request
+  dispatch; agent code calls that interface and never instantiates a provider client directly.
+  This keeps a self-hosted or on-premises model a substitution rather than a rewrite — the
+  realistic requirement for any organization unwilling to transmit its vulnerability data.
+
+**Operational properties inherited from the LLM dependency:** per-run cost, availability tied
+to an external service, and non-deterministic output. The first two are accepted. The third is
+why the deterministic path is fenced off from the agents.
+
+---
+
 ## 9. Repository layout
 
 ```
