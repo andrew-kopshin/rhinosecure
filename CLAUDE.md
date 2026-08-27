@@ -132,9 +132,16 @@ workstations, isolated dev/lab box.
 
 ## 3. Scoring model
 
-**Risk = Threat × Impact.** Multiplicative, not additive. This is the concrete realization of
-the CP3 commitment that no single factor automatically decides the outcome — a maximal score
-on one axis cannot rescue a near-zero on the other.
+**Risk = Threat × Impact.** Multiplicative, not additive, between these two axes. This is the
+concrete realization of the CP3 commitment that no single factor automatically decides the
+outcome — a maximal score on one axis cannot rescue a near-zero on the other.
+
+That multiplication is correct **between** Threat and Impact. It is wrong **within** Impact.
+Criticality, environment, data sensitivity, and role blast radius all measure facets of the
+same underlying question — how much does this asset matter — so multiplying them together
+compounds overlapping signal: an asset that is merely mid-range on more than one of these
+axes gets driven toward zero, even though nothing about it is actually negligible. Impact
+combines these four as a weighted sum instead; see below.
 
 **Threat** (likelihood the finding is actually attacked)
 - CVSS exploitability sub-metrics
@@ -143,13 +150,19 @@ on one axis cannot rescue a near-zero on the other.
 - Internet exposure of the host asset
 - Whether mapped ATT&CK techniques are commonly observed
 
-**Impact** (what it costs if it succeeds)
-- CVSS impact sub-metrics (C/I/A)
-- Asset criticality
+**Impact** (what it costs if it succeeds): `severity_base × composite`, where `composite` is
+an equal-weighted sum (25% each) of:
+- Asset criticality (normalized to 0–1)
 - Environment (prod > staging > dev)
 - Data sensitivity
 - Blast radius implied by role (a DC compromise is not a workstation compromise)
-- Compensating controls reduce effective impact
+
+Compensating controls are applied **after** the composite, as a separate multiplicative
+decay — not folded into the weighted sum. A control is an actual reduction in realized
+impact, not another facet of how much the asset matters, so it stays multiplicative while the
+four "does this asset matter" factors do not. Controls are counted exactly once, here, in the
+impact decay; `bucket_for` reads whether a control exists only to help decide whether patching
+is blocked (see below) — it does not apply a second reduction.
 
 ### Output buckets
 
@@ -160,6 +173,23 @@ on one axis cannot rescue a near-zero on the other.
 | `mitigate_monitor` | Patch blocked or deferred; apply compensating control and watch |
 | `accept` | Documented acceptance with rationale |
 
+Bucket assignment is a risk-score threshold picking a tier, then asset attributes deciding
+which bucket within that tier applies:
+
+- Thresholds: `patch_now` at risk ≥ 70, `accept` below risk 18, `next_window` /
+  `mitigate_monitor` occupy the range between. These are named constants in `scoring.py`
+  (`PATCH_NOW_THRESHOLD`, `ACTIONABLE_THRESHOLD`) and are expected to be retuned once Slice 2
+  wires in KEV and EPSS — they were calibrated against a Threat side that is currently
+  near-binary (only severity and internet exposure vary it), and KEV/EPSS will add spread
+  there that the current cutoffs don't yet account for.
+- `mitigate_monitor` requires **both** a compensating control **and** the absence of a
+  declared patch window. A control alone, on an asset that still has a scheduled patch
+  window, is not "blocked" — it will be patched on schedule with the control covering it
+  meanwhile.
+- A blank `patch_window` means **no declared scheduling restriction**, not that patching is
+  impossible. On its own it does not push a finding toward `mitigate_monitor` or `patch_now`;
+  absent a compensating control as well, it stays in `next_window`.
+
 ### Anchor demonstration
 
 The headline result must be reproducible on the demo fixture: **one identical CVE, three
@@ -168,6 +198,23 @@ Windows-native anchors with strong KEV and ATT&CK coverage: ProxyLogon, ProxyShe
 PrintNightmare, ZeroLogon, BlueKeep, Follina. A Java/Log4j anchor also works if hosted on a
 Windows IIS or VMware-adjacent asset, but at least one anchor should be Windows-native so the
 Windows scoping earns its keep.
+
+### Open items
+
+- The demo fixture's `F14` (`CVE-2023-23397` on WKS-FIN12) is recorded with
+  `scanner_severity=low`. That CVE was Critical in reality; the low value was chosen to model
+  a scanner under-calling severity, but it hasn't been reviewed for whether it still serves
+  that purpose or just reads as a mistake. Needs a decision, not a silent fix — the fixture is
+  frozen.
+- The schema has no way to distinguish "no patch window recorded" (a data gap — nobody has
+  documented one yet) from "patching is genuinely unconstrained" (a deliberate fact about the
+  asset). Both currently produce the same blank `patch_window` value and the same downstream
+  treatment. This matters more once real scanner data replaces the fixture, where blank
+  fields are far more likely to mean "not collected" than "not applicable."
+- No finding in the demo fixture currently lands in `mitigate_monitor` — it requires a
+  compensating control with no patch window at a risk level above the accept threshold, and
+  no fixture row satisfies all three at once. The fixture is frozen (Section 8, rule 1), so
+  this is a known gap to account for, not something to patch by editing the CSV.
 
 ---
 
