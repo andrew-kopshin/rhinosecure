@@ -150,13 +150,38 @@ record for the CVE, or NVD's authoritative CVSS `base_score` when it does. NVD o
 scanner's tier outright when the two disagree, and is still preferred when they happen to
 agree, because it's a real sourced number instead of a fixed proxy. Which source was used, and
 whether it disagreed with the scanner, is recorded on every finding and always visible in its
-rationale (`rhino run --explain`) — see `scoring._resolve_severity`. On the demo fixture, 10 of
-24 findings disagree, all but one in the direction of NVD rating it *more* severe than the
-scanner did (`F15` is the exception — scanner said critical, NVD says high). `F14`
-(`CVE-2023-23397`) is the sharpest case: scanner said low (2.5), NVD says 9.8/critical — its
-risk score climbs from 1.99 to 30.62 (15.4x) once NVD is applied, fulfilling the correction the
-"Decided" note below anticipated. Its bucket stays `contested` either way, since that rule
-depends on `is_kev` plus control/window state, not severity.
+rationale (`rhino run --explain`) — see `scoring._resolve_severity`.
+
+**Decided.** `F16`–`F24` (the 9 mundane CVEs added to give the threat axis spread — Section 3
+"Decided" note below) originally carried `scanner_severity` values assigned by hand, for
+narrative variety, not derived from any real source. Checked against NVD, 7 of the 9 turned out
+to disagree — all in the same direction, NVD rating them higher (up to 7.8/high against
+low/medium scanner calls). That is not a realistic scanner behavior to model; it is unexamined
+placeholder data that happened to disagree with authoritative CVSS by accident. Corrected
+`scanner_severity` on those 7 rows to match NVD's tier (`F16` and `F24` already agreed, no
+change). This leaves exactly **three** deliberate scanner/NVD disagreements on the fixture, each
+retained because it demonstrates something specific:
+
+| Finding | CVE | Scanner said | NVD says | Direction | Why it stays |
+|---|---|---|---|---|---|
+| `F12` | `CVE-2023-21554` | medium | 9.8 / critical | under-called | A scanner missing a critical RCE (QueueJumper) is a realistic failure mode, not an edge case |
+| `F14` | `CVE-2023-23397` | low | 9.8 / critical | under-called | The fixture's designated bad-data case — see below |
+| `F15` | `CVE-2019-1068` | critical | 8.8 / high | **over-called** | The opposite failure mode: a scanner *overstating* severity, which enrichment should pull back down, not just up |
+
+A 10-of-24 (42%) disagreement rate read as a broken scanner, not a realistic one — real scanner
+deployments disagree with authoritative CVSS on a real but small minority of findings, not
+nearly half. 3 of 24 (12.5%) is defensible; each of the three now has a specific, named reason
+to exist rather than being noise. `F14` remains the sharpest case: scanner said low (2.5), NVD
+says 9.8/critical — its risk score climbs from 1.99 to 30.62 (15.4x) once NVD is applied,
+fulfilling the correction the "Decided" note below anticipated. Its bucket stays `contested`
+either way, since that rule depends on `is_kev` plus control/window state, not severity.
+Re-running `rhino run --data demo --seed 42` after this correction reproduces an **unchanged**
+bucket distribution (`patch_now=1, next_window=8, contested=3, mitigate_monitor=3, accept=9`)
+and identical scores throughout — `_resolve_severity` was already using NVD's real score for
+every one of these 7 findings regardless of what the CSV said, so fixing the CSV's
+`scanner_severity` column only corrects what the rationale reports, not what was scored. This
+is additive fixture *correction*, the same category as the other Section 8 rule 1 exceptions —
+see the note there.
 
 **Threat** (likelihood the finding is actually attacked)
 - CVSS exploitability sub-metrics
@@ -397,11 +422,13 @@ Inspect with DB Browser for SQLite (sqlitebrowser.org).
 
 1. The 24-finding demo dataset is a **fixture**. It proves specific behaviors. Do not
    regenerate it — the rule bars wholesale regeneration (reshuffling or re-deriving the
-   dataset to make numbers look better), not a deliberate, individually-justified row added to
-   close a named coverage gap (e.g. the `A12`/`F15` addition for `mitigate_monitor`, Section 3;
-   `F16`–`F24`, nine real low-EPSS non-KEV Windows CVEs added so the threat axis has spread
-   instead of being dominated by famous anchor CVEs). Any such addition lands in its own
-   commit stating the reason.
+   dataset to make numbers look better), not a deliberate, individually-justified row added or
+   value corrected to close a named gap (e.g. the `A12`/`F15` addition for `mitigate_monitor`,
+   Section 3; `F16`–`F24`, nine real low-EPSS non-KEV Windows CVEs added so the threat axis has
+   spread instead of being dominated by famous anchor CVEs; correcting `F16`–`F24`'s
+   arbitrarily-assigned `scanner_severity` to match NVD once it disagreed by accident rather
+   than by design, Section 3). Any such addition or correction lands in its own commit stating
+   the reason.
 2. Everything in `scoring.py` and the tool layer stays **deterministic**. No LLM calls in the
    scoring path. Same inputs plus same snapshots must produce byte-identical output.
 3. `--seed 42` is the seed for all reported results.
