@@ -44,3 +44,17 @@ Mid-project, a fixture CVE picked for an unrelated reason became actively exploi
 active remediation deadline. `data/snapshots/kev.json` is pinned to the version fetched this
 session; without that, a rerun next week would silently produce different KEV/EPSS numbers for
 the same fixture, breaking the reproducibility CLAUDE.md Section 4 requires.
+
+**NVD wired: authoritative CVSS overrides scanner_severity.** `enrich/nvd.py` queries the v2.0
+API per CVE with retry-with-backoff on 403/429 (real NVD throttling hit repeatedly while
+fetching the fixture's 20 CVEs unauthenticated, and recovered every time). NVD's base_score
+overrides the scanner's severity tier on disagreement, and provenance (which source, and
+whether they disagreed) is recorded on every finding's rationale. 10 of 24 findings disagree.
+`F14`'s risk climbs 1.99 → 30.62 (15.4x) once applied — the correction the earlier F14 decision
+named. Bug caught along the way: NVD's metric arrays can hold two scorers (vendor CNA + NVD
+itself) and aren't reliably ordered NVD-first; a naive `entries[0]` silently took Microsoft's
+5.5/medium for ZeroLogon over NVD's own 10.0/critical. Fixed to select by NVD's `"Primary"` tag
+instead of position. Also corrected the risk-normalization ceiling (`MAX_SEVERITY_BASE`), which
+still assumed severity topped out at 9.5 (the old scanner-tier proxy) even though NVD's real
+scores can reach 10.0 — no finding was close enough to the old ceiling to have visibly clipped,
+but it would have.
