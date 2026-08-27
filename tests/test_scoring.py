@@ -56,7 +56,7 @@ def test_ranking_is_sorted_descending_by_risk():
 
 def test_all_demo_findings_are_scored():
     scored = cli_run(DEMO_DIR, seed=42)
-    assert len(scored) == 15
+    assert len(scored) == 24
 
 
 def test_bucket_values_match_spec():

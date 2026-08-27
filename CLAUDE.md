@@ -316,11 +316,13 @@ Inspect with DB Browser for SQLite (sqlitebrowser.org).
 
 ## 8. Non-negotiable build rules
 
-1. The 15-finding demo dataset is a **fixture**. It proves specific behaviors. Do not
+1. The 24-finding demo dataset is a **fixture**. It proves specific behaviors. Do not
    regenerate it — the rule bars wholesale regeneration (reshuffling or re-deriving the
    dataset to make numbers look better), not a deliberate, individually-justified row added to
-   close a named coverage gap (e.g. the `A12`/`F15` addition for `mitigate_monitor`, Section 3).
-   Any such addition lands in its own commit stating the reason.
+   close a named coverage gap (e.g. the `A12`/`F15` addition for `mitigate_monitor`, Section 3;
+   `F16`–`F24`, nine real low-EPSS non-KEV Windows CVEs added so the threat axis has spread
+   instead of being dominated by famous anchor CVEs). Any such addition lands in its own
+   commit stating the reason.
 2. Everything in `scoring.py` and the tool layer stays **deterministic**. No LLM calls in the
    scoring path. Same inputs plus same snapshots must produce byte-identical output.
 3. `--seed 42` is the seed for all reported results.
@@ -366,7 +368,7 @@ rhinosecure/
   pyproject.toml
   .env.example
   data/
-    demo/                    # 15-finding fixture — FROZEN
+    demo/                    # 24-finding fixture — FROZEN
       assets.csv
       findings.csv
     full/                    # generated, seed 42
