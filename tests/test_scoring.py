@@ -4,10 +4,12 @@ import pytest
 
 from rhinosecure.cli import run as cli_run
 from rhinosecure.scoring import (
+    ACTIONABLE_THRESHOLD,
     EPSS_MULTIPLIER_BASELINE,
     KEV_FLOOR_MULTIPLIER,
     Bucket,
     ThreatInputs,
+    bucket_for,
     score_threat,
 )
 
@@ -25,7 +27,14 @@ def _scored_by_finding_id():
 def test_anchor_cve_produces_three_distinct_buckets_across_hosts():
     """CVE-2021-26855 (ProxyLogon) appears on three Exchange hosts with
     identical technical severity; only business context differs. That must
-    be enough, on its own, to land each in a different bucket."""
+    be enough, on its own, to land each in a different bucket.
+
+    ProxyLogon is KEV-listed, so is_kev disqualifies EXCHDEV01's finding
+    from accept (see bucket_for) even though its risk_score alone would
+    have landed there -- it has a compensating control ("network
+    isolated") and no patch window, so it resolves to mitigate_monitor,
+    not the "no honest bucket" contested case (that needs no control
+    either)."""
     by_id = _scored_by_finding_id()
     anchor_findings = [s for s in by_id.values() if s.cve_id == "CVE-2021-26855"]
     assert len(anchor_findings) == 3
@@ -40,7 +49,7 @@ def test_anchor_cve_produces_three_distinct_buckets_across_hosts():
     assert internet_facing_prod.bucket == Bucket.PATCH_NOW
     assert internal_prod.risk_score < internet_facing_prod.risk_score
     assert isolated_dev.risk_score < internal_prod.risk_score
-    assert isolated_dev.bucket == Bucket.ACCEPT
+    assert isolated_dev.bucket == Bucket.MITIGATE_MONITOR
 
 
 def test_scoring_is_deterministic_across_repeated_runs():
@@ -71,8 +80,10 @@ def test_all_demo_findings_are_scored():
 
 def test_bucket_values_match_spec():
     scored = cli_run(DEMO_DIR, seed=42)
-    allowed = {b.value for b in Bucket}
-    assert allowed == {"patch_now", "next_window", "mitigate_monitor", "accept"}
+    # contested is not a remediation bucket -- see Bucket.CONTESTED's
+    # docstring -- but it is a legitimate value bucket_for can return.
+    allowed = {"patch_now", "next_window", "mitigate_monitor", "accept", "contested"}
+    assert allowed == {b.value for b in Bucket}
     for s in scored:
         assert s.bucket.value in allowed
 
@@ -114,6 +125,70 @@ def test_kev_floors_a_low_epss_reading_instead_of_stacking():
     assert stacked < score
 
 
+# --- KEV disqualifies accept (bucket_for) -----------------------------------
+
+_LOW_RISK = ACTIONABLE_THRESHOLD - 5  # below the tier on risk alone
+
+
+def test_non_kev_low_risk_is_accept():
+    """Regression: nothing changes for a non-KEV finding below the
+    actionable threshold -- accept is still reachable."""
+    bucket = bucket_for(
+        _LOW_RISK, has_patch_window=False, has_compensating_controls=False, is_kev=False
+    )
+    assert bucket == Bucket.ACCEPT
+
+
+def test_kev_with_control_and_no_window_is_mitigate_monitor_even_below_threshold():
+    """F03/F08 case: is_kev pulls a below-threshold finding into the
+    actionable tier, and a real compensating control makes
+    mitigate_monitor an honest bucket for it."""
+    bucket = bucket_for(
+        _LOW_RISK, has_patch_window=False, has_compensating_controls=True, is_kev=True
+    )
+    assert bucket == Bucket.MITIGATE_MONITOR
+
+
+def test_kev_with_window_and_no_control_is_next_window_even_below_threshold():
+    """F13 case: a patch window already exists, so next_window is honest
+    even though there's no compensating control to point to."""
+    bucket = bucket_for(
+        _LOW_RISK, has_patch_window=True, has_compensating_controls=False, is_kev=True
+    )
+    assert bucket == Bucket.NEXT_WINDOW
+
+
+def test_kev_with_no_control_and_no_window_is_contested():
+    """F14 case: confirmed exploitation, no control to lean on, nothing
+    scheduled -- no bucket honestly describes this, so it's contested
+    rather than forced into next_window."""
+    bucket = bucket_for(
+        _LOW_RISK, has_patch_window=False, has_compensating_controls=False, is_kev=True
+    )
+    assert bucket == Bucket.CONTESTED
+
+
+def test_non_kev_no_control_and_no_window_above_threshold_stays_next_window():
+    """Regression: the contested case is specific to is_kev. A non-KEV
+    finding with no control and no window above the threshold keeps its
+    pre-existing meaning -- no scheduling restriction -- and lands in
+    next_window, not contested."""
+    bucket = bucket_for(
+        ACTIONABLE_THRESHOLD, has_patch_window=False, has_compensating_controls=False, is_kev=False
+    )
+    assert bucket == Bucket.NEXT_WINDOW
+
+
+def test_kev_does_not_override_patch_now():
+    """A KEV finding whose risk already clears PATCH_NOW_THRESHOLD stays
+    patch_now regardless of control/window -- contested only applies
+    below that, where the control/window ambiguity actually exists."""
+    bucket = bucket_for(
+        95, has_patch_window=False, has_compensating_controls=False, is_kev=True
+    )
+    assert bucket == Bucket.PATCH_NOW
+
+
 def test_kev_does_not_inflate_an_already_high_epss_reading():
     """This is the F01 case: EPSS already agrees the CVE is dangerous.
     KEV must not multiply another 1.5x on top of that -- the floor is a
@@ -131,3 +206,13 @@ def test_mitigate_monitor_is_reachable_on_the_demo_fixture():
     in the fixture ever exercises this bucket."""
     by_id = _scored_by_finding_id()
     assert by_id["F15"].bucket == Bucket.MITIGATE_MONITOR
+
+
+def test_f14_is_contested_on_the_demo_fixture():
+    """F14 (CVE-2023-23397 on WKS-FIN12) is KEV-listed with neither a
+    compensating control nor a declared patch window -- the demo fixture's
+    real instance of the contested case, and the reason it exists."""
+    by_id = _scored_by_finding_id()
+    f14 = by_id["F14"]
+    assert f14.bucket == Bucket.CONTESTED
+    assert any("contested" in line for line in f14.rationale)

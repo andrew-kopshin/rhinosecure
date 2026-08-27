@@ -187,6 +187,12 @@ is blocked (see below) — it does not apply a second reduction.
 | `next_window` | Schedule into the asset's declared patch window |
 | `mitigate_monitor` | Patch blocked or deferred; apply compensating control and watch |
 | `accept` | Documented acceptance with rationale |
+| `contested`† | No honest bucket exists among the four above — see below and Section 6 |
+
+† Not a remediation category a human acts on directly. It means the deterministic scorer
+could not truthfully assign one of the four real buckets and the finding needs Tree-of-Thought
+or human reasoning instead (Section 6). Currently emitted only for a KEV-listed finding with
+neither a compensating control nor a declared patch window.
 
 Bucket assignment is a risk-score threshold picking a tier, then asset attributes deciding
 which bucket within that tier applies:
@@ -195,20 +201,33 @@ which bucket within that tier applies:
   `mitigate_monitor` occupy the range between. These are named constants in `scoring.py`
   (`PATCH_NOW_THRESHOLD`, `ACTIONABLE_THRESHOLD`) and were calibrated back when the Threat side
   was near-binary (only severity and internet exposure varied it). KEV and EPSS are wired in
-  now (see above) and do add real spread to Threat — on the demo fixture, no finding's bucket
-  actually flipped as a result, but several findings re-sorted within `accept` (a KEV-listed
-  Exchange privesc finding, `F13`, now correctly outranks non-KEV info-disclosure findings that
-  used to sit above it purely on stale multiplier weight). Retuning these two constants is
-  still an open, separate decision — not bundled into the KEV/EPSS wiring — since it requires
-  judgment about where the tier boundaries should sit against the new, wider Threat
-  distribution, not just a mechanical recompute.
+  now (see above) and do add real spread to Threat. Retuning these two constants is still an
+  open, separate decision — not bundled into the KEV/EPSS wiring — since it requires judgment
+  about where the tier boundaries should sit against the new, wider Threat distribution, not
+  just a mechanical recompute.
+- **A KEV-listed finding can never be `accept`.** Confirmed real-world exploitation is not a
+  fact a plan can be silent about; landing in `accept` says "we are fine with this," which is
+  never true of a finding CISA has recorded as actively exploited. `is_kev` forces at least the
+  actionable tier regardless of where raw `risk_pct` falls — it does not by itself pick a
+  bucket, though; the control/window logic immediately below still decides which one, exactly
+  as it does for any other finding already in that tier. This changed real fixture output:
+  `F03`, `F08`, `F13`, and `F14` all moved out of `accept` (see the worked table above/below).
 - `mitigate_monitor` requires **both** a compensating control **and** the absence of a
   declared patch window. A control alone, on an asset that still has a scheduled patch
   window, is not "blocked" — it will be patched on schedule with the control covering it
   meanwhile.
 - A blank `patch_window` means **no declared scheduling restriction**, not that patching is
   impossible. On its own it does not push a finding toward `mitigate_monitor` or `patch_now`;
-  absent a compensating control as well, it stays in `next_window`.
+  absent a compensating control as well, it stays in `next_window` — **unless** the finding is
+  KEV-listed, in which case neither `next_window` ("on schedule" — nothing is) nor
+  `mitigate_monitor` ("a control is covering it" — none exists) is an honest description, and
+  it resolves to `contested` instead of being forced into either. The demo fixture's `F14`
+  (`CVE-2023-23397` on `WKS-FIN12`) is this case: KEV-listed, no compensating control, no patch
+  window. It is also the fixture's designated bad-data case (Section 3, "Decided" note above) —
+  its `scanner_severity=low` is still uncorrected pending the NVD fetcher, so its risk score is
+  artificially low today; `contested` surfaces the bucket-assignment problem independently of
+  that, since fixing severity alone wouldn't fix the fact that no bucket honestly describes a
+  confirmed-exploited finding with no control and no schedule.
 
 ### Anchor demonstration
 
@@ -304,6 +323,20 @@ signals genuinely conflict, e.g. high EPSS and KEV membership on an asset whose 
 is blocked, or high CVSS with strong compensating controls. The gate should keep contested
 findings under roughly 1% of the corpus; this is the quantitative answer to CP4's
 branch-explosion risk.
+
+**First concrete gate.** `bucket_for` (Section 3) already detects one structural instance of
+this deterministically, ahead of Slice 4 existing: a KEV-listed finding with neither a
+compensating control nor a declared patch window has no honest bucket among the four real
+ones, and `score_finding` returns `Bucket.CONTESTED` for it rather than guessing. The demo
+fixture's `F14` is this case today. Until `tot.py` exists, `contested` is a terminal CLI output
+— a flag for human judgment, not yet a routed beam search. When Slice 4 is built, `Bucket.CONTESTED`
+is the trigger condition that should drive findings into the ToT root, and this specific case
+is the first one to validate against. Note it also complicates the canonical branch set below:
+"accept and monitor" is not a valid branch for it — a KEV finding is disqualified from `accept`
+by definition — so the three initial branches will need a fourth option (or a substitute for
+that one) for findings that reach ToT this way. Other contested paths (e.g. EPSS/KEV disagreement
+on a blocked patch window) are qualitative, not yet formalized as a `bucket_for` rule, and remain
+future work.
 
 - **A thought is a remediation strategy**, not an explanation
 - Root: the contested finding plus all gathered evidence

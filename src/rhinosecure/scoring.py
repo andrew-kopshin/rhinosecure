@@ -125,6 +125,14 @@ class Bucket(str, Enum):
     NEXT_WINDOW = "next_window"
     MITIGATE_MONITOR = "mitigate_monitor"
     ACCEPT = "accept"
+    # Not a remediation category -- a "no honest bucket exists" signal.
+    # Emitted only for a KEV-listed finding with neither a compensating
+    # control nor a declared patch window: confirmed exploitation rules out
+    # accept, but there is no control to justify mitigate_monitor and
+    # nothing scheduled to justify next_window. See bucket_for and
+    # CLAUDE.md Section 6 -- this is the seed case for Slice 4's
+    # Tree-of-Thought contested-finding gate.
+    CONTESTED = "contested"
 
 
 @dataclass(frozen=True)
@@ -209,19 +217,39 @@ PATCH_NOW_THRESHOLD = 70
 ACTIONABLE_THRESHOLD = 18  # below this, risk is low enough to formally accept
 
 
-def bucket_for(risk_pct: float, *, has_patch_window: bool, has_compensating_controls: bool) -> Bucket:
+def bucket_for(
+    risk_pct: float,
+    *,
+    has_patch_window: bool,
+    has_compensating_controls: bool,
+    is_kev: bool = False,
+) -> Bucket:
     if risk_pct >= PATCH_NOW_THRESHOLD:
         return Bucket.PATCH_NOW
-    if risk_pct >= ACTIONABLE_THRESHOLD:
+    # A KEV-listed finding is confirmed exploited in the wild -- that rules
+    # out accept ("we are fine with this") on its own, regardless of where
+    # raw risk_pct falls. It does not by itself pick which bucket applies;
+    # the control/window logic below still decides that, same as it does
+    # for any other finding already in this tier.
+    if risk_pct >= ACTIONABLE_THRESHOLD or is_kev:
         # mitigate_monitor means "patch blocked or deferred; apply a
         # compensating control and watch" -- it requires both an actual
         # control to point to AND the absence of a patch window (otherwise
-        # patching isn't blocked, it's just scheduled). A missing patch
-        # window with no compensating control is not "blocked" either: it
-        # means the asset has no declared scheduling restriction, so it
-        # still lands in next_window rather than mitigate_monitor.
+        # patching isn't blocked, it's just scheduled).
         if has_compensating_controls and not has_patch_window:
             return Bucket.MITIGATE_MONITOR
+        if has_patch_window:
+            return Bucket.NEXT_WINDOW
+        # No control, no window. For a finding that reached this tier on
+        # risk_pct alone, that's "no declared scheduling restriction" and
+        # next_window is still honest -- nothing is blocked, there's just
+        # no window recorded. For a KEV finding it is not honest: confirmed
+        # exploitation with no control to lean on and nothing scheduled is
+        # neither "on schedule" nor "monitored via a control." No bucket
+        # says that truthfully, so it is surfaced as contested instead of
+        # forced into one. See CLAUDE.md Section 6.
+        if is_kev:
+            return Bucket.CONTESTED
         return Bucket.NEXT_WINDOW
     return Bucket.ACCEPT
 
@@ -250,7 +278,11 @@ def build_impact_inputs(enriched: EnrichedFinding) -> ImpactInputs:
 
 
 def _rationale(
-    enriched: EnrichedFinding, threat: ThreatInputs, impact: ImpactInputs, risk_pct: float
+    enriched: EnrichedFinding,
+    threat: ThreatInputs,
+    impact: ImpactInputs,
+    risk_pct: float,
+    bucket: Bucket,
 ) -> tuple[str, ...]:
     asset = enriched.asset
     composite = impact_composite(impact)
@@ -285,6 +317,13 @@ def _rationale(
     else:
         lines.append("no patch_window declared -> no scheduling restriction, may be patched at any time")
     lines.append(f"risk_score={risk_pct:.1f}/100")
+    if bucket is Bucket.CONTESTED:
+        lines.append(
+            "bucket=contested: is_kev=True with no compensating control and no patch window -- "
+            "not accept (confirmed exploitation), not mitigate_monitor (no control to point to), "
+            "not next_window (nothing scheduled). No bucket honestly describes this; routed to "
+            "Tree-of-Thought (Slice 4, not yet built) for human/agent reasoning."
+        )
     return tuple(lines)
 
 
@@ -299,8 +338,9 @@ def score_finding(enriched: EnrichedFinding) -> ScoredFinding:
         risk_pct,
         has_patch_window=enriched.asset.has_patch_window,
         has_compensating_controls=bool(impact_inputs.compensating_controls),
+        is_kev=threat_inputs.is_kev,
     )
-    rationale = _rationale(enriched, threat_inputs, impact_inputs, risk_pct)
+    rationale = _rationale(enriched, threat_inputs, impact_inputs, risk_pct, bucket)
     return ScoredFinding(
         finding_id=enriched.finding.finding_id,
         cve_id=enriched.finding.cve_id,
