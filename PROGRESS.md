@@ -138,3 +138,46 @@ confirmed/candidate split was the right call beyond the CAPEC/CWE-bridge argumen
 fixture, confirmed-tier ATT&CK data added least exactly where the score already had the most
 reason to be high, and the candidate tier — informational rather than score-moving — is where
 the mundane, non-KEV, low-EPSS findings' only ATT&CK context actually shows up.
+
+**The candidate tier's keyword heuristic replaced with real vector retrieval + MMR.**
+CLAUDE.md Section 11 names chromadb for this; it fails outright on Python 3.14 — its `Settings`
+class subclasses `pydantic.v1.BaseSettings`, and pydantic's v1-compat shim does not support
+3.14, raising `ConfigError: unable to infer type for attribute "chroma_server_nofile"` before a
+single document is ever embedded. Confirmed by actually running it, not assumed. faiss-cpu
+installs cleanly but only indexes vectors someone else generates — it doesn't solve the "where
+do the vectors come from" problem, and at ~500 short documents a nearest-neighbor index buys
+nothing over brute force anyway. Built `retrieval/vector.py` (TF-IDF + cosine similarity) and
+`retrieval/mmr.py` (Carbonell & Goldstein reranking) instead: no new dependency, fully local and
+deterministic — the same offline/reproducibility bar as the rest of Slice 2, which a neural
+embedding model would not clear as cleanly — and not a fallback in the pejorative sense, since
+TF-IDF vector space is the actual substrate the original 1998 MMR paper was built and evaluated
+on, predating neural embeddings by over a decade. `enrich/attack.py`'s candidate tier now
+retrieves a 20-wide pool by cosine similarity and reranks to 5 with MMR; the old hand-curated
+CVE-advisory-boilerplate stopword list is gone, since IDF weighting down-weights common corpus
+terms in proportion to how common they actually are, rather than by a hand-picked list tuned
+against one fixture's wording.
+
+**MMR's own effect, isolated from the vector-vs-keyword swap: F14 (Outlook, CVE-2023-23397).**
+Before reranking, the top-5 candidate pool by cosine similarity alone was dominated by a
+redundant cluster — Outlook Forms (0.301), Outlook Rules (0.260), Local Email Collection
+(0.228), and Outlook Home Page (0.212) are 0.36–0.59 pairwise-similar to each other, all
+restating "Outlook abuse" rather than adding distinct evidence. MMR at λ=0.5 kept Outlook Forms
+(still the most relevant single match) but broke up the rest of the cluster, surfacing Pass the
+Hash (T1550.002) instead — which is arguably the mechanistically correct technique for this
+specific CVE (an NTLM hash leak) and which plain top-5 relevance ranking had buried outside the
+returned set entirely. This is CLAUDE.md Section 4's literal argument playing out on real data:
+"rather than eight restatements of the same CVSS score."
+
+**Limitation: TF-IDF can still produce a confident coincidence, and no threshold fixes that.**
+`F12` (MSMQ, `CVE-2023-21554`/QueueJumper) matches the credential-attack family — Credential
+Stuffing, Password Spraying, AS-REP Roasting — at cosine similarity 0.26–0.29, purely on
+"listener"/"accepts"-type vocabulary overlap with no real topical connection to message queuing.
+That score is *higher* than several genuinely correct matches elsewhere in the fixture (e.g.
+`F19`'s OLE-DB-to-SQL-Stored-Procedures match at 0.177), so `MIN_CANDIDATE_SIMILARITY` cannot be
+tuned to separate true from coincidental matches by magnitude alone — some false positives
+outscore true positives. This is a real, disclosed property of lexical/statistical similarity
+generally (see `retrieval/vector.py`'s and `enrich/attack.py`'s docstrings), not a bug to chase
+with a different cutoff. It doesn't matter for scoring: candidates stay informational regardless
+of how confident-looking their similarity score is, and only confirmed CVE-mention matches ever
+feed `attack_prevalence` — bucket distribution and every finding's risk score are byte-identical
+before and after this change.
