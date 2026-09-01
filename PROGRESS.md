@@ -82,3 +82,59 @@ CLAUDE.md Section 1's thesis — "CVSS alone is an insufficient prioritization s
 out on real data rather than being asserted: a high-severity, low-exploitation-probability
 finding correctly stays low priority, because Risk = Threat × Impact means a strong score on
 one axis can't rescue a weak one on the other.
+
+## 2026-09-01
+
+**ATT&CK wired in, two-tier: confirmed feeds the score, candidate stays informational.**
+`enrich/attack.py` fetches the Enterprise STIX bundle and filters to Windows-platform
+techniques, but there is no direct CVE → technique edge anywhere in ATT&CK's own data — that
+bridge normally runs through CAPEC/CWE, which CLAUDE.md Section 11 does not name as a source
+for this project. Two tiers instead: **confirmed**, when a CVE is explicitly named in an
+ATT&CK "uses" relationship's procedure-example text (a tracked group or malware/tool STIX
+object documented exploiting it — e.g. HAFNIUM's relationship to T1190 cites CVE-2021-26855 by
+name), and **candidate**, IDF-weighted keyword overlap between the finding's product/evidence
+text and technique name+description, for CVEs no procedure example happens to mention. Only
+confirmed matches feed `ThreatInputs.attack_prevalence`; candidates are attached to the finding
+and shown in rationale but never move a score. Candidate matching is a hand-tuned stand-in for
+the MMR-reranked vector retrieval CLAUDE.md Section 4 actually specifies for ATT&CK prose —
+`retrieval/vector.py`/`mmr.py` don't exist yet — and lexical overlap can't reliably distinguish
+"rare because specific" from "rare because unusual phrasing," so it isn't confident enough
+evidence for a deterministic score the way an explicit procedure-example citation is.
+
+**Bundle filtered before it touches disk, not after.** The raw Enterprise bundle is 53,835,637
+bytes (~51MB) and covers every platform (macOS, Linux, cloud, network devices, PRE) and STIX
+object type (mitigations, campaigns, data sources) this project has no use for. Committing it
+verbatim, the way kev.py/epss.py/nvd.py cache their raw responses, would have bloated the repo
+with data nothing here reads. `_fetch_and_filter` does the filtering inline — Windows platform,
+not revoked, not deprecated — before anything is written, so only the reduced structure is
+persisted: `data/snapshots/attack/enterprise-windows.json`, 765,060 bytes (~747KB), 474 of the
+bundle's 858 total techniques, plus a 161-entry CVE-mention index built by regex-scanning kept
+relationships' descriptions. ~70x smaller than the source, and the only artifact this project
+ever reads back.
+
+**Real split: 7 confirmed / 14 candidate / 3 none, across the 24-finding fixture.** Three
+techniques got confirmed matches, each because a famous, heavily-tracked anchor CVE is
+well-documented enough for ATT&CK's own procedure examples to name it: T1190 Exploit
+Public-Facing Application (`CVE-2021-26855`/`CVE-2021-31207`, ProxyLogon/ProxyShell — `F01`,
+`F02`, `F03`, `F13`), T1210 Exploitation of Remote Services (`CVE-2020-1472`, ZeroLogon —
+`F04`), and T1203 Exploitation for Client Execution (`CVE-2022-30190`, Follina — `F07`, `F08`).
+The remaining 14 findings got only unconfirmed keyword candidates, and 3 (`F10`, `F23`, `F24`)
+got nothing above the candidate-tier confidence bar at all. Bucket distribution is unchanged
+from before this session (`patch_now=1, next_window=8, contested=3, mitigate_monitor=3,
+accept=9`) — ATT&CK prevalence is refining risk scores within buckets, not reshuffling them.
+
+**Limitation: the confirmed tier mostly re-confirms what KEV/EPSS already said.** Checked the
+four distinct CVEs behind the 7 confirmed matches against the fixture's own KEV/EPSS snapshots:
+all four are KEV-listed, and all four carry EPSS ≥ 0.992 — the same near-saturated territory
+the 2026-08-27 entry above already documented for the fixture's famous anchors ("13/15 KEV,
+14/15 EPSS > 0.92"). ATT&CK's confirmed tier is not surfacing new information about which
+findings matter; it is re-deriving, from a third independent-in-principle source, the same
+"this one is famous" signal KEV and EPSS were already saturated on. That is a real property of
+public threat-intel sources, not a mapping bug: KEV, EPSS, and ATT&CK procedure-example
+documentation all preferentially track whichever CVEs are well-documented, so three sources
+that each individually look independent correlate heavily in practice once a CVE is famous
+enough for all three to have noticed it. It is also, after the fact, a second reason the
+confirmed/candidate split was the right call beyond the CAPEC/CWE-bridge argument above: on this
+fixture, confirmed-tier ATT&CK data added least exactly where the score already had the most
+reason to be high, and the candidate tier — informational rather than score-moving — is where
+the mundane, non-KEV, low-EPSS findings' only ATT&CK context actually shows up.
