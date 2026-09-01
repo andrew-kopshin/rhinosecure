@@ -30,16 +30,19 @@ name as a source for this project). Two tiers, in order:
    cve_id -> technique_id index sourced entirely from ATT&CK's own
    documentation. This is exact-key structured retrieval, same spirit as
    nvd.py/epss.py/kev.py -- CLAUDE.md Section 4.
-2. Candidate: keyword overlap (IDF-weighted against this technique corpus)
-   between the finding's product/evidence text and technique name+description,
-   for CVEs no ATT&CK procedure example happens to mention -- expected to be
-   most of a fixture's obscure, low-EPSS CVEs; famous anchors like ProxyLogon/
-   ZeroLogon/Follina are exactly the ones well-documented enough for tier 1.
-   This is a stand-in for the MMR-reranked vector retrieval CLAUDE.md Section 4
-   specifies for ATT&CK prose -- retrieval/vector.py and retrieval/mmr.py do
-   not exist yet. Lexical overlap cannot distinguish "rare because specific"
-   from "rare because unusual phrasing," so tier 2 is real but noisier than
-   tier 1; see cli.py, which only lets *confirmed* matches feed
+2. Candidate: vector retrieval over technique descriptions (retrieval/vector.py,
+   a TF-IDF space fit to this technique corpus), reranked with MMR
+   (retrieval/mmr.py) so the returned set is diverse rather than several
+   restatements of the same technique family -- CLAUDE.md Section 4's
+   "retrieve a wider candidate set, then rerank down to roughly 5-8 items."
+   Used for CVEs no ATT&CK procedure example happens to mention -- expected to
+   be most of a fixture's obscure, low-EPSS CVEs; famous anchors like
+   ProxyLogon/ZeroLogon/Follina are exactly the ones well-documented enough
+   for tier 1. Even genuine semantic retrieval over a small, specific corpus
+   is not certain evidence the way an explicit procedure-example citation is
+   -- lexical/statistical similarity can still coincide without real topical
+   relevance (see MIN_CANDIDATE_SIMILARITY below) -- so tier 2 stays
+   candidate-only; see cli.py, which only lets *confirmed* matches feed
    attack_prevalence and keeps candidates informational.
 
 Prevalence ("Whether mapped ATT&CK techniques are commonly observed" --
@@ -56,7 +59,6 @@ meaning what it says.
 
 from __future__ import annotations
 
-import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -65,6 +67,8 @@ from typing import Any
 import requests
 
 from rhinosecure.enrich.cache import SnapshotCache
+from rhinosecure.retrieval import mmr
+from rhinosecure.retrieval.vector import VectorIndex
 
 BUNDLE_URL = (
     "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/"
@@ -77,57 +81,26 @@ CACHE_KEY = "enterprise-windows"
 REQUEST_TIMEOUT_SECONDS = 120
 
 DEFAULT_LIMIT = 5
-# Empirically chosen against the live bundle (474 Windows techniques as of
-# this writing): low enough that a single genuinely rare, specific term
-# (e.g. "dhcp", "spooler") clears it, high enough that a couple of merely
-# uncommon words don't. Like PATCH_NOW_THRESHOLD in scoring.py, this is a
-# calibrated constant, not a derived one -- open to retuning.
-MIN_CANDIDATE_SCORE = 6.0
+# The wide candidate pool retrieval.vector.VectorIndex.search returns before
+# retrieval.mmr.rerank narrows it to DEFAULT_LIMIT -- CLAUDE.md Section 4's
+# "retrieve a wider candidate set, then rerank down." 4x the final limit is
+# enough headroom for MMR to actually have redundant near-duplicates to
+# diversify away from (see the Outlook Forms/Rules/Home Page cluster in
+# PROGRESS.md); at this corpus size (474 documents) a wider pool costs
+# nothing -- cosine similarity over all of them is already computed.
+CANDIDATE_POOL_SIZE = 20
+# Empirically chosen against the live bundle: queries with no real topical
+# overlap with the corpus (e.g. a PDF-viewer memory-disclosure CVE, which has
+# no natural ATT&CK vocabulary) top out under this; queries with at least
+# some genuine signal clear it. Like PATCH_NOW_THRESHOLD in scoring.py, this
+# is a calibrated constant, not a derived one -- open to retuning. It is not,
+# and cannot be, a guarantee of topical relevance: lexical cosine similarity
+# can still coincide by chance (see the module docstring's tier 2 note), so
+# this filters out clear noise, not false positives in general.
+MIN_CANDIDATE_SIMILARITY = 0.10
 
 _CVE_PATTERN = re.compile(r"CVE-\d{4}-\d{4,7}")
 _CITATION_PATTERN = re.compile(r"\s*\(Citation: [^)]*\)")
-_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
-
-# Standard English stopwords -- no signal about which technique applies.
-_STOPWORDS = frozenset(
-    """
-    a an the of to in on for and or is are this that these those be been being
-    may can will allow allows allowed allowing using used use via with without
-    by as at from into when which who whom its their they them not no nor if
-    then than but also over under out up down
-    """.split()
-)
-
-# Recurring vulnerability-advisory boilerplate: verbs/nouns/adjectives that
-# show up in almost any CVE writeup regardless of the underlying flaw, so they
-# carry no signal about WHICH technique applies (curated from the genre of
-# advisory prose in general, not from any one project's fixture wording).
-# Without stripping these, keyword overlap keeps matching on words like
-# "remote"/"execution"/"server"/"vulnerability" that are simply how CVE
-# descriptions are written, not evidence of a specific technique.
-_CVE_BOILERPLATE = frozenset(
-    """
-    vulnerability vulnerabilities malformed improper improperly mishandle
-    mishandles mishandling discloses disclosure disclosing enables enabling
-    enable triggers triggering trigger crafted arbitrary contents overwrite
-    overwrites initializes uninitialized outdated deserialization deserialize
-    letting lets let gain gains gaining permits permitting race repair fails
-    failing enforce setup string connection linked queries query viewer opened
-    opening read reads reading heap object objects operation request requests
-    protocol remote execution code system systems local privileges privilege
-    memory server service services win during certain specific affected
-    successfully successful attempt attempts result results due leads
-    potentially could would send sends sent
-    """.split()
-)
-
-
-def _keywords(text: str) -> frozenset[str]:
-    return frozenset(
-        tok
-        for tok in _TOKEN_PATTERN.findall(text.lower())
-        if len(tok) > 2 and tok not in _STOPWORDS and tok not in _CVE_BOILERPLATE
-    )
 
 
 @dataclass(frozen=True)
@@ -240,41 +213,35 @@ class TechniqueIndex:
         self._cve_mentions: dict[str, tuple[str, ...]] = {
             cve_id: tuple(tids) for cve_id, tids in payload["cve_mentions"].items()
         }
+        self._vector_index = VectorIndex(
+            {technique_id: f"{t.name} {t.description}" for technique_id, t in self._techniques.items()}
+        )
 
-        self._corpus: list[tuple[str, frozenset[str]]] = [
-            (technique_id, _keywords(f"{t.name} {t.description}"))
-            for technique_id, t in self._techniques.items()
+    def _semantic_candidates(self, text: str, limit: int) -> list[TechniqueMatch]:
+        pool = [
+            (technique_id, score)
+            for technique_id, score in self._vector_index.search(text, top_k=CANDIDATE_POOL_SIZE)
+            if score >= MIN_CANDIDATE_SIMILARITY
         ]
-        self._doc_freq: Counter[str] = Counter()
-        for _technique_id, kw in self._corpus:
-            self._doc_freq.update(kw)
-        self._corpus_size = len(self._corpus)
-
-    def _idf(self, token: str) -> float:
-        df = self._doc_freq.get(token, 0)
-        return math.log(self._corpus_size / df) if df else 0.0
-
-    def _keyword_candidates(self, text: str, limit: int) -> list[TechniqueMatch]:
-        query = _keywords(text)
-        if not query:
+        if not pool:
             return []
-        scored: list[tuple[float, str, frozenset[str]]] = []
-        for technique_id, corpus_kw in self._corpus:
-            overlap = query & corpus_kw
-            if not overlap:
-                continue
-            score = sum(self._idf(t) for t in overlap)
-            if score < MIN_CANDIDATE_SCORE:
-                continue
-            scored.append((score, technique_id, overlap))
-        scored.sort(key=lambda item: (-item[0], item[1]))
+        relevance = dict(pool)
+        reranked = mmr.rerank(
+            [technique_id for technique_id, _score in pool],
+            relevance=relevance,
+            similarity=self._vector_index.similarity,
+            k=limit,
+        )
         return [
             TechniqueMatch(
                 technique=self._techniques[technique_id],
                 confidence="candidate",
-                reason=f"keyword overlap: {', '.join(sorted(overlap))}",
+                reason=(
+                    f"semantic similarity={relevance[technique_id]:.3f} "
+                    f"(MMR-reranked from a {len(pool)}-candidate pool)"
+                ),
             )
-            for _score, technique_id, overlap in scored[:limit]
+            for technique_id in reranked
         ]
 
     def lookup(
@@ -283,10 +250,10 @@ class TechniqueIndex:
         """Techniques implicated by this CVE, most confident first.
 
         Returns confirmed matches only when ATT&CK's own procedure-example
-        text names this CVE explicitly; otherwise falls back to keyword-
-        overlap candidates against `product`/`evidence`, which may be empty.
+        text names this CVE explicitly; otherwise falls back to MMR-reranked
+        semantic candidates against `product`/`evidence`, which may be empty.
         Never mixes the two tiers in one result -- a confirmed hit is not
-        made more or less certain by whatever a keyword search would also
+        made more or less certain by whatever vector retrieval would also
         have found.
         """
         confirmed_ids = self._cve_mentions.get(cve_id)
@@ -300,7 +267,7 @@ class TechniqueIndex:
                 for technique_id in confirmed_ids[:limit]
                 if technique_id in self._techniques
             ]
-        return self._keyword_candidates(f"{product} {evidence}", limit)
+        return self._semantic_candidates(f"{product} {evidence}", limit)
 
 
 def load_index(cache: SnapshotCache) -> TechniqueIndex:

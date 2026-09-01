@@ -13,7 +13,8 @@ ATT&CK technique prevalence into the threat term, as of Slice 2.
 `ThreatInputs.attack_prevalence` stays None -- a deliberate no-op in
 score_threat, not just an unset default -- whenever enrich/attack.py found no
 *confirmed* technique mapping for a finding's CVE (see EnrichedFinding and
-enrich/attack.py's module docstring): a keyword-matched candidate technique is
+enrich/attack.py's module docstring): a candidate technique (MMR-reranked
+vector retrieval, unconfirmed by any ATT&CK procedure-example citation) is
 not confident enough evidence to move a deterministic score, so it stays
 visible in rationale without touching attack_prevalence.
 
@@ -337,7 +338,7 @@ def _attack_rationale_lines(enriched: EnrichedFinding, threat: ThreatInputs) -> 
     elif candidates:
         names = ", ".join(f"{t.technique_id} ({t.name})" for t in candidates)
         lines.append(
-            f"ATT&CK: no confirmed technique, {len(candidates)} unconfirmed keyword candidate(s) -- "
+            f"ATT&CK: no confirmed technique, {len(candidates)} unconfirmed candidate(s) -- "
             f"{names} -- not used in scoring"
         )
     else:

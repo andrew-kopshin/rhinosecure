@@ -159,9 +159,9 @@ def test_excluded_technique_relationship_does_not_leak_a_cve_mention(tmp_path: P
 
 def test_prevalence_reflects_relative_use_count(tmp_path: Path, monkeypatch):
     index = _index(tmp_path)
-    # Same reasoning as test_keyword_fallback_ranks_...: this fixture's IDF
-    # scale doesn't reach the real-corpus-calibrated cutoff.
-    monkeypatch.setattr(attack, "MIN_CANDIDATE_SCORE", 0.0)
+    # Same reasoning as test_semantic_fallback_...: this fixture's cosine
+    # similarities don't reach the real-corpus-calibrated cutoff.
+    monkeypatch.setattr(attack, "MIN_CANDIDATE_SIMILARITY", 0.0)
 
     exploit_public_facing = index.lookup("CVE-2021-26855")[0].technique  # use_count=3
     port_monitors = index.lookup(
@@ -174,13 +174,13 @@ def test_prevalence_reflects_relative_use_count(tmp_path: Path, monkeypatch):
     assert 0.0 <= exploit_public_facing.prevalence <= 1.0
 
 
-def test_keyword_fallback_ranks_product_specific_term_above_generic_overlap(tmp_path: Path, monkeypatch):
+def test_semantic_fallback_ranks_product_specific_technique_higher(tmp_path: Path, monkeypatch):
     index = _index(tmp_path)
-    # This tiny 2-technique fixture can't reproduce the IDF scale the real
-    # ~474-technique corpus calibrates MIN_CANDIDATE_SCORE against (see
-    # attack.py's module comment) -- lower it so this test can isolate the
-    # ranking behavior itself rather than the calibrated cutoff.
-    monkeypatch.setattr(attack, "MIN_CANDIDATE_SCORE", 0.0)
+    # This tiny 2-technique fixture can't reproduce the cosine-similarity
+    # scale the real ~474-technique corpus calibrates MIN_CANDIDATE_SIMILARITY
+    # against (see attack.py's module comment) -- lower it so this test can
+    # isolate the ranking behavior itself rather than the calibrated cutoff.
+    monkeypatch.setattr(attack, "MIN_CANDIDATE_SIMILARITY", 0.0)
 
     matches = index.lookup(
         "CVE-NOT-MENTIONED-ANYWHERE",
@@ -191,12 +191,12 @@ def test_keyword_fallback_ranks_product_specific_term_above_generic_overlap(tmp_
     assert matches
     assert matches[0].confidence == "candidate"
     assert matches[0].technique.technique_id == "T1547.010"
-    assert "spooler" in matches[0].reason or "monitor" in matches[0].reason
+    assert "semantic similarity=" in matches[0].reason
 
 
 def test_no_match_in_either_tier_returns_empty(tmp_path: Path, monkeypatch):
     index = _index(tmp_path)
-    monkeypatch.setattr(attack, "MIN_CANDIDATE_SCORE", 0.0)
+    monkeypatch.setattr(attack, "MIN_CANDIDATE_SIMILARITY", 0.0)
 
     matches = index.lookup("CVE-NOT-MENTIONED-ANYWHERE", product="", evidence="")
 
@@ -205,7 +205,7 @@ def test_no_match_in_either_tier_returns_empty(tmp_path: Path, monkeypatch):
 
 def test_confirmed_match_ignores_product_and_evidence_text(tmp_path: Path):
     """A confirmed CVE-mention match must win outright -- it is never
-    diluted or replaced by whatever a keyword search over product/evidence
+    diluted or replaced by whatever vector retrieval over product/evidence
     would separately have found. See attack.py's lookup docstring."""
     index = _index(tmp_path)
 
@@ -216,15 +216,6 @@ def test_confirmed_match_ignores_product_and_evidence_text(tmp_path: Path):
     assert len(matches) == 1
     assert matches[0].confidence == "confirmed"
     assert matches[0].technique.technique_id == "T1190"
-
-
-def test_keywords_strips_stopwords_and_cve_boilerplate_but_keeps_specific_terms():
-    kw = attack._keywords(
-        "The vulnerability allows a remote attacker to execute arbitrary code via a malformed DHCP request"
-    )
-    assert "dhcp" in kw
-    for noise in ("the", "allows", "vulnerability", "remote", "code", "arbitrary", "malformed", "via", "a"):
-        assert noise not in kw
 
 
 def test_online_miss_fetches_via_requests_and_caches(tmp_path: Path, monkeypatch):
