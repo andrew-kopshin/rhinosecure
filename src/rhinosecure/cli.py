@@ -1,5 +1,5 @@
-"""`rhino run` — ingest, enrich with live KEV/EPSS/NVD threat signals,
-score, rank. Scoring itself stays LLM-free and network-free (see
+"""`rhino run` — ingest, enrich with live KEV/EPSS/NVD/ATT&CK threat
+signals, score, rank. Scoring itself stays LLM-free and network-free (see
 scoring.py); enrichment goes through SnapshotCache, which makes it
 offline-capable and lets --offline force that rather than silently
 reaching the network."""
@@ -11,12 +11,13 @@ import random
 import sys
 from pathlib import Path
 
+from rhinosecure.enrich.attack import TechniqueIndex, load_index as load_attack_index
 from rhinosecure.enrich.cache import OfflineCacheMissError, SnapshotCache
 from rhinosecure.enrich.epss import lookup as epss_lookup
 from rhinosecure.enrich.kev import KevCatalog, load_catalog as load_kev_catalog
 from rhinosecure.enrich.nvd import lookup as nvd_lookup
 from rhinosecure.ingest import IngestError, join_findings
-from rhinosecure.schema import EnrichedFinding
+from rhinosecure.schema import AttackTechniqueRef, EnrichedFinding
 from rhinosecure.scoring import ScoredFinding, rank, score_finding
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -33,17 +34,31 @@ def _resolve_data_dir(data_arg: str) -> Path:
 
 
 def _attach_threat_signals(
-    enriched: EnrichedFinding, kev_catalog: KevCatalog, cache: SnapshotCache
+    enriched: EnrichedFinding,
+    kev_catalog: KevCatalog,
+    attack_index: TechniqueIndex,
+    cache: SnapshotCache,
 ) -> EnrichedFinding:
     cve_id = enriched.finding.cve_id
     epss = epss_lookup(cve_id, cache)
     nvd_cvss = nvd_lookup(cve_id, cache)
+    matches = attack_index.lookup(cve_id, enriched.finding.product, enriched.finding.evidence)
+    confirmed_prevalence = [m.technique.prevalence for m in matches if m.confidence == "confirmed"]
     return enriched.model_copy(
         update={
             "is_kev": kev_catalog.status(cve_id).is_listed,
             "epss": epss.score if epss.is_scored else None,
             "nvd_base_score": nvd_cvss.base_score if nvd_cvss is not None else None,
             "nvd_severity": nvd_cvss.base_severity if nvd_cvss is not None else None,
+            "attack_techniques": tuple(
+                AttackTechniqueRef(
+                    technique_id=m.technique.technique_id,
+                    name=m.technique.name,
+                    confidence=m.confidence,
+                )
+                for m in matches
+            ),
+            "attack_prevalence": max(confirmed_prevalence, default=None),
         }
     )
 
@@ -59,9 +74,10 @@ def run(data_dir: Path, seed: int, *, offline: bool = False) -> list[ScoredFindi
 
     cache = SnapshotCache(offline=offline)
     kev_catalog = load_kev_catalog(cache)  # one bulk feed, loaded once for the whole run
+    attack_index = load_attack_index(cache)  # same shape: one filtered bundle, loaded once
 
     scored = [
-        score_finding(_attach_threat_signals(e, kev_catalog, cache))
+        score_finding(_attach_threat_signals(e, kev_catalog, attack_index, cache))
         for e in join_findings(findings_path, assets_path)
     ]
     return rank(scored)

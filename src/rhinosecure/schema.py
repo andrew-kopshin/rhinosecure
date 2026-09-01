@@ -68,16 +68,34 @@ class Finding(BaseModel):
     evidence: str = ""
 
 
+class AttackTechniqueRef(BaseModel):
+    """One technique enrich/attack.py's lookup matched to a finding.
+
+    `confidence` is "confirmed" (the CVE is explicitly named in an ATT&CK
+    procedure example for this technique) or "candidate" (keyword-matched
+    against the finding's product/evidence text, unconfirmed) -- see
+    enrich/attack.py's module docstring for why these are never mixed within
+    one finding's matches. Only "confirmed" matches feed
+    EnrichedFinding.attack_prevalence; "candidate" matches are informational,
+    surfaced in rationale but never moving a score.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    technique_id: str
+    name: str
+    confidence: str
+
+
 class EnrichedFinding(BaseModel):
     """A Finding joined to its Asset, plus whatever live threat signals have
     been attached so far.
 
-    `is_kev`/`epss`/`nvd_base_score`/`nvd_severity` are populated by
-    `rhino run` after `join_findings` (see `cli.py`) via `enrich/kev.py`,
-    `enrich/epss.py`, and `enrich/nvd.py`, going through `SnapshotCache` --
-    ingest.py itself does no enrichment or network access. ATT&CK data is
-    still not wired in; this is the seam it plugs into without scoring.py
-    or ingest.py needing to change shape.
+    `is_kev`/`epss`/`nvd_base_score`/`nvd_severity`/`attack_techniques`/
+    `attack_prevalence` are populated by `rhino run` after `join_findings`
+    (see `cli.py`) via `enrich/kev.py`, `enrich/epss.py`, `enrich/nvd.py`, and
+    `enrich/attack.py`, going through `SnapshotCache` -- ingest.py itself does
+    no enrichment or network access.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -88,3 +106,5 @@ class EnrichedFinding(BaseModel):
     epss: float | None = None
     nvd_base_score: float | None = None
     nvd_severity: str | None = None
+    attack_techniques: tuple[AttackTechniqueRef, ...] = ()
+    attack_prevalence: float | None = None

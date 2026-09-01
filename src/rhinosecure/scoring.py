@@ -7,13 +7,15 @@ before calling score_finding). Same EnrichedFinding plus same enrichment
 snapshot must always produce the same score — that is what makes runs
 reproducible and what tests in this repo check for.
 
-KEV and EPSS are wired into the threat term, and NVD's authoritative CVSS
-score into both Threat and Impact's severity_base (see
-`_resolve_severity`), as of Slice 2. ATT&CK is not yet, so
-`ThreatInputs.attack_prevalence` still defaults to "not yet known" (None)
-rather than being omitted, so a later commit can populate it from real
-enrichment without changing this module's interface or the shape of a
-score.
+KEV and EPSS are wired into the threat term, NVD's authoritative CVSS score
+into both Threat and Impact's severity_base (see `_resolve_severity`), and
+ATT&CK technique prevalence into the threat term, as of Slice 2.
+`ThreatInputs.attack_prevalence` stays None -- a deliberate no-op in
+score_threat, not just an unset default -- whenever enrich/attack.py found no
+*confirmed* technique mapping for a finding's CVE (see EnrichedFinding and
+enrich/attack.py's module docstring): a keyword-matched candidate technique is
+not confident enough evidence to move a deterministic score, so it stays
+visible in rationale without touching attack_prevalence.
 
 Nothing here may reference a specific asset_id, cve_id, or fixture row. The
 lookup tables below are general domain weights (how much a compromised
@@ -114,12 +116,23 @@ IMPACT_COMPOSITE_WEIGHTS: dict[str, float] = {
 MAX_SEVERITY_BASE = 10.0
 
 # Theoretical max of score_threat/score_impact with everything wired in so
-# far (KEV+EPSS+NVD; ATT&CK still not) -- used to normalize risk onto a
-# 0-100 scale. The likelihood multiplier maxes out at EPSS=1.0 (x1.6),
-# which already exceeds the KEV floor (x1.5), so the floor never raises
-# the ceiling -- it only pulls up cases the model underrates.
+# far (KEV+EPSS+NVD+ATT&CK) -- used to normalize risk onto a 0-100 scale.
+# The likelihood multiplier maxes out at EPSS=1.0 (x1.6), which already
+# exceeds the KEV floor (x1.5), so the floor never raises the ceiling -- it
+# only pulls up cases the model underrates.
 _MAX_LIKELIHOOD_MULTIPLIER = max(EPSS_MULTIPLIER_BASELINE + 1.0, KEV_FLOOR_MULTIPLIER)
-_MAX_THREAT = MAX_SEVERITY_BASE * INTERNET_EXPOSED_MULTIPLIER * _MAX_LIKELIHOOD_MULTIPLIER
+# attack_prevalence maxes at 1.0 (percentile rank is bounded by construction --
+# see enrich/attack.py), giving score_threat's `0.8 + 0.4 * prevalence` term a
+# x1.2 ceiling. Omitting this factor here would under-normalize once any
+# finding's confirmed technique gets close to it, same failure mode
+# MAX_SEVERITY_BASE documents above for NVD's real CVSS scores.
+_MAX_ATTACK_MULTIPLIER = 0.8 + 0.4 * 1.0
+_MAX_THREAT = (
+    MAX_SEVERITY_BASE
+    * INTERNET_EXPOSED_MULTIPLIER
+    * _MAX_LIKELIHOOD_MULTIPLIER
+    * _MAX_ATTACK_MULTIPLIER
+)
 _MAX_IMPACT_COMPOSITE = (
     IMPACT_COMPOSITE_WEIGHTS["criticality"] * 1.0  # criticality/5 maxes at 5/5
     + IMPACT_COMPOSITE_WEIGHTS["environment"] * max(ENVIRONMENT_WEIGHT.values())
@@ -289,6 +302,7 @@ def build_threat_inputs(enriched: EnrichedFinding) -> ThreatInputs:
         internet_exposed=enriched.asset.internet_exposed,
         epss=enriched.epss,
         is_kev=enriched.is_kev,
+        attack_prevalence=enriched.attack_prevalence,
     )
 
 
@@ -303,6 +317,32 @@ def build_impact_inputs(enriched: EnrichedFinding) -> ImpactInputs:
         role=asset.role,
         compensating_controls=asset.compensating_control_list,
     )
+
+
+def _attack_rationale_lines(enriched: EnrichedFinding, threat: ThreatInputs) -> list[str]:
+    """Describes what enrich/attack.py matched, and whether it moved the
+    score -- see AttackTechniqueRef and CLAUDE.md Section 3's "commonly
+    observed" bullet. Confirmed matches drive attack_prevalence; candidate
+    matches are shown but never do (see build_threat_inputs)."""
+    confirmed = [t for t in enriched.attack_techniques if t.confidence == "confirmed"]
+    candidates = [t for t in enriched.attack_techniques if t.confidence == "candidate"]
+    lines: list[str] = []
+    if confirmed:
+        names = ", ".join(f"{t.technique_id} ({t.name})" for t in confirmed)
+        multiplier = 0.8 + 0.4 * threat.attack_prevalence if threat.attack_prevalence is not None else 1.0
+        lines.append(
+            f"ATT&CK: confirmed via procedure example -- {names}, prevalence={threat.attack_prevalence:.3f} "
+            f"-> x{multiplier:.3f} threat multiplier"
+        )
+    elif candidates:
+        names = ", ".join(f"{t.technique_id} ({t.name})" for t in candidates)
+        lines.append(
+            f"ATT&CK: no confirmed technique, {len(candidates)} unconfirmed keyword candidate(s) -- "
+            f"{names} -- not used in scoring"
+        )
+    else:
+        lines.append("ATT&CK: no technique mapping found -> no threat adjustment")
+    return lines
 
 
 def _rationale(
@@ -346,6 +386,7 @@ def _rationale(
         severity_line,
         f"internet_exposed={asset.internet_exposed} ({'x' + str(INTERNET_EXPOSED_MULTIPLIER) if asset.internet_exposed else 'x' + str(NOT_EXPOSED_MULTIPLIER)} threat)",
         f"{epss_desc}, {kev_desc} -> x{likelihood:.3f} likelihood multiplier",
+        *_attack_rationale_lines(enriched, threat),
         f"criticality={asset.criticality}/5 (weight {IMPACT_COMPOSITE_WEIGHTS['criticality']} -> +{IMPACT_COMPOSITE_WEIGHTS['criticality'] * (asset.criticality / 5):.3f} to impact composite)",
         f"environment={asset.environment} (weight {IMPACT_COMPOSITE_WEIGHTS['environment']} -> +{IMPACT_COMPOSITE_WEIGHTS['environment'] * ENVIRONMENT_WEIGHT[asset.environment]:.3f} to impact composite)",
         f"data_sensitivity={asset.data_sensitivity} (weight {IMPACT_COMPOSITE_WEIGHTS['data_sensitivity']} -> +{IMPACT_COMPOSITE_WEIGHTS['data_sensitivity'] * DATA_SENSITIVITY_WEIGHT[asset.data_sensitivity]:.3f} to impact composite)",

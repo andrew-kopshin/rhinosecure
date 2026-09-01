@@ -88,8 +88,14 @@ def test_bucket_values_match_spec():
         assert s.bucket.value in allowed
 
 
-def _threat(*, epss=None, is_kev=False, exposed=False):
-    return ThreatInputs(exploitability_base=9.5, internet_exposed=exposed, epss=epss, is_kev=is_kev)
+def _threat(*, epss=None, is_kev=False, exposed=False, attack_prevalence=None):
+    return ThreatInputs(
+        exploitability_base=9.5,
+        internet_exposed=exposed,
+        epss=epss,
+        is_kev=is_kev,
+        attack_prevalence=attack_prevalence,
+    )
 
 
 def test_no_signals_leaves_threat_unchanged():
@@ -123,6 +129,35 @@ def test_kev_floors_a_low_epss_reading_instead_of_stacking():
     # design exists to prevent.
     stacked = baseline * KEV_FLOOR_MULTIPLIER * (EPSS_MULTIPLIER_BASELINE + low_epss)
     assert stacked < score
+
+
+# --- ATT&CK prevalence ------------------------------------------------------
+
+
+def test_no_attack_mapping_leaves_threat_unchanged():
+    """None (enrich/attack.py found no *confirmed* technique) must stay a
+    no-op, same as unscored EPSS -- a missing/unconfirmed signal is not
+    evidence of low prevalence."""
+    with_none = score_threat(_threat(attack_prevalence=None))
+    baseline = 9.5 * 0.7
+    assert with_none == pytest.approx(baseline)
+
+
+def test_max_attack_prevalence_applies_the_full_multiplier():
+    score = score_threat(_threat(attack_prevalence=1.0))
+    baseline = 9.5 * 0.7
+    assert score == pytest.approx(baseline * 1.2)
+
+
+def test_zero_attack_prevalence_pulls_the_score_down():
+    """A confirmed technique that is nonetheless rarely used by tracked
+    groups/software (prevalence near 0) should modestly reduce threat, not
+    leave it untouched -- distinguishing 'confirmed but obscure' from 'no
+    mapping at all' (which stays neutral, see the None case above)."""
+    score = score_threat(_threat(attack_prevalence=0.0))
+    baseline = 9.5 * 0.7
+    assert score == pytest.approx(baseline * 0.8)
+    assert score < baseline
 
 
 # --- KEV disqualifies accept (bucket_for) -----------------------------------
