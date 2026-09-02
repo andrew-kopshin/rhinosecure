@@ -39,6 +39,13 @@ class AttackTechniqueSummary(BaseModel):
     technique_id: str
     name: str
     confidence: str  # "confirmed" or "candidate" -- enrich/attack.py's two tiers
+    # Percentile-rank prevalence (Technique.prevalence in enrich/attack.py).
+    # Needed downstream: scoring.py's attack_prevalence threat term is the
+    # max prevalence among a finding's *confirmed* techniques (see
+    # cli.py's _attach_threat_signals), and Risk & Recommendation
+    # reconstructs that same input from this field rather than re-fetching
+    # ATT&CK data itself -- see agents/risk.py.
+    prevalence: float
 
 
 class ResearchFinding(BaseModel):
@@ -146,6 +153,7 @@ def build_research_tools(
                     "name": m.technique.name,
                     "confidence": m.confidence,
                     "reason": m.reason,
+                    "prevalence": m.technique.prevalence,
                 }
                 for m in matches
             ],

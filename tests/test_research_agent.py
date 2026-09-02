@@ -180,6 +180,7 @@ def test_lookup_attack_techniques_confirmed_match_and_logs(tmp_path: Path):
             "name": "Exploit Public-Facing Application",
             "confidence": "confirmed",
             "reason": "CVE-2021-26855 is explicitly named in an ATT&CK procedure example for T1190",
+            "prevalence": 1.0,
         }
     ]
     assert call_log[0]["tool"] == "lookup_attack_techniques"
