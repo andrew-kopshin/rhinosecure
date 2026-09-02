@@ -181,3 +181,63 @@ with a different cutoff. It doesn't matter for scoring: candidates stay informat
 of how confident-looking their similarity score is, and only confirmed CVE-mention matches ever
 feed `attack_prevalence` — bucket distribution and every finding's risk score are byte-identical
 before and after this change.
+
+## 2026-09-02
+
+**CrewAI hard-imports chromadb; chromadb doesn't run on Python 3.14.** Installing CrewAI and
+langchain-anthropic into the existing `.venv` (Python 3.14) and running the full suite showed
+nothing wrong — all 93 tests passed, because no code anywhere imports `crewai` yet
+(`src/rhinosecure/agents/` is still empty; Slice 3 hasn't started). A separate throwaway runtime
+check (`from crewai import Agent`) caught what the test suite structurally couldn't: `import
+crewai` itself raises before any of this project's code or `langchain_anthropic` is even
+reached. CrewAI's own `__init__` chain pulls in its memory subsystem unconditionally —
+`crewai` → `crewai.memory.unified_memory` → `crewai.rag.chromadb.config` → `chromadb.config
+.Settings` — and `Settings` subclasses `pydantic.v1.BaseSettings`, whose v1-compat shim cannot
+construct on Python 3.14: `pydantic.v1.errors.ConfigError: unable to infer type for attribute
+"chroma_server_nofile"`. This is one step worse than the 2026-09-01 finding that chromadb fails
+when *this project* constructs it — CrewAI can't even be imported, independent of anything
+RhinoSecure does.
+
+**Confirmed there's no newer CrewAI release to fix it.** `pip index versions crewai` reported
+`LATEST: 0.11.2`, which looked like a viable downgrade-and-retry path until checked against
+PyPI's JSON API directly: `info.version` is `1.15.18` — the version already installed — and
+`pip`'s answer was wrong because it string-sorted version numbers lexicographically
+(`"1.15.18" < "1.9.3"` as strings, so `1.15.x` releases sorted before and were dropped from its
+notion of "latest"). Enumerating all 1.15.x releases by parsed version confirms 1.15.18 is the
+newest non-yanked build. The chromadb hard-import isn't a regression an upgrade fixes; it's the
+current shipped state of CrewAI's dependency tree.
+
+**No Python 3.11–3.13 was installed on this machine.** Only 3.14 (`AppData\Local\Programs
+\Python\Python314`, what `.venv` was built from). `uv` was already present in `.venv/Scripts`
+as a transitive CrewAI-CLI dependency; used `uv python install 3.12` to fetch a standalone
+build directly (~20.9MiB, from the same `python-build-standalone` project uv's own Python
+management is built on) rather than a system-wide installer. Its convenience symlink step
+errored (`Missing expected target directory for Python minor version link`) but the interpreter
+itself downloaded and runs fine — verified by invoking it directly before trusting it. Chose
+3.12 over 3.11/3.13 as the most mature match for this exact dependency stack (chromadb's
+`pydantic.v1` shim, crewai, langchain-anthropic); 3.11 and 3.13 were not tested.
+
+**`.venv312` built alongside `.venv`, not in place of it.** `uv venv --python <3.12 interpreter
+path> .venv312`. uv-created venvs ship without pip, so installs went through `uv pip install
+--python .venv312/Scripts/python.exe -e ".[agents,dev]"` rather than `pip install -e` directly.
+All 93 tests pass under 3.12, same as under 3.14 — expected, since the suite doesn't touch
+CrewAI either way. `import crewai` succeeds under 3.12 with no chromadb error, confirming the
+Python version, not this project's code, was the actual variable. `.venv` (3.14) was left
+completely untouched throughout — never reinstalled into, never deleted.
+
+**CrewAI's `Agent.llm` rejects a raw `langchain_anthropic.ChatAnthropic` instance.** Constructing
+`Agent(role=..., goal=..., backstory=..., llm=ChatAnthropic(...))` under 3.12 raised a pydantic
+validation error: CrewAI's `llm` field accepts a plain model string or an instance of CrewAI's
+own `BaseLLM` wrapper, not a langchain object — `ChatAnthropic` itself imported and constructed
+cleanly standalone, so this is CrewAI's API surface, not a Python-version or langchain-anthropic
+problem. Passing `llm="anthropic/claude-sonnet-5"` (litellm-style provider/model string)
+constructed the `Agent` cleanly and printed its role with no API call made. This is the form
+Slice 3's agent wiring needs to use — CrewAI is not a langchain-object consumer here despite
+`langchain-anthropic` being one of CLAUDE.md's named packages.
+
+**Switched the working environment to `.venv312`.** CLAUDE.md Section 11 now pins Python 3.12
+exactly (was "3.11+") with this episode's reasoning, and drops chromadb/faiss-cpu from the
+packages this project itself installs — Slice 2's TF-IDF + MMR retrieval (2026-09-01, above)
+already replaced chromadb before this session, so **no RhinoSecure code needed to change** to
+fix the CrewAI import; the fix was entirely at the interpreter level. `.gitignore` now covers
+both `.venv/` and `.venv312/`.

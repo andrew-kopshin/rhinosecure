@@ -539,11 +539,26 @@ under ~1%.
 Implementation runs in **Claude Code**. This spec file lives in the repo root so Claude Code
 reads it on every session.
 
-**Runtime:** Python 3.11+, virtual environment via `uv` or `venv`.
+**Runtime:** Python 3.12, virtual environment via `uv` (`.venv312`). Pinned exactly, not the
+general "3.11+" floor a spec section like this would otherwise state, because CrewAI 1.x
+hard-imports `chromadb` in its own `__init__` chain (`crewai` → `crewai.memory.unified_memory`
+→ `crewai.rag.chromadb.config` → `chromadb.config.Settings`) whether or not this project ever
+touches CrewAI's memory subsystem. `chromadb.config.Settings` subclasses `pydantic.v1
+.BaseSettings`, and that shim cannot construct on Python 3.14 — `import crewai` itself raises
+`pydantic.v1.errors.ConfigError: unable to infer type for attribute "chroma_server_nofile"`
+before any of this project's code runs. Confirmed CrewAI 1.15.18 is PyPI's current latest, so
+this isn't fixed by upgrading; confirmed Python 3.12 imports and constructs a CrewAI `Agent`
+cleanly. 3.11 and 3.13 were not tested — 3.12 is the one verified to work, so it's the one
+specified. `.venv` (3.14) is kept alongside `.venv312` for the rest of the toolchain that
+doesn't touch CrewAI; `.venv312` is the working environment from Slice 3 onward.
 
 **Packages:** `crewai`, `langchain`, `langchain-anthropic`, `requests`, `pydantic`,
-`pandas`, `python-dotenv`, `pytest`. Vector store for Slice 2 retrieval: `chromadb` or
-`faiss-cpu`. `sqlite3` is standard library — no install.
+`pandas`, `python-dotenv`, `pytest`. `chromadb` and `faiss-cpu` are no longer installed for
+this project's own use — Slice 2's retrieval layer (`retrieval/vector.py`/`mmr.py`) replaced
+chromadb with a from-scratch TF-IDF + MMR implementation after chromadb failed outright on
+Python 3.14 (see PROGRESS.md 2026-09-01), so **no RhinoSecure code needed to change** for the
+Python 3.12 pin above — chromadb is reachable only as CrewAI's own transitive dependency, not
+anything this project imports. `sqlite3` is standard library — no install.
 
 **Model:** `claude-sonnet-5` for all agent calls. Pin this exact string — from the 4.6
 generation onward, a dateless model ID maps to one fixed snapshot rather than floating to the
