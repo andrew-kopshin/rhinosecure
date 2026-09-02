@@ -465,6 +465,65 @@ why the deterministic path is fenced off from the agents.
 
 ---
 
+## Safety and guardrails
+
+**Checkpoint 6 correction.** CP6 described the agent as monitoring live system activity,
+ingesting telemetry and system logs, and taking high-impact actions on a system — deleting
+files, permanently blocking software, changing security settings — that must be gated behind
+human approval. None of that describes RhinoSecure. Per Section 1, live scanning,
+EDR/telemetry ingestion, and automated remediation execution are explicitly out of scope.
+RhinoSecure ingests two static CSVs (`assets.csv`, `findings.csv`), enriches from read-only
+public sources, and emits a ranked plan — a document, not an action. It holds no write path to
+any monitored system, so "gate destructive actions behind human approval" doesn't apply: there
+is no system action to gate, because the agent's only write access is to its own SQLite memory
+(Section 7) and `out/` plan files. Where CP6's underlying concern is real — the agent shouldn't
+force a conclusion it can't support, and a human should be the backstop when signals conflict —
+that concern is honored here, just realized as escalation inside a *report* rather than a
+permission check on a *system call*. The rest of this section keeps what CP6 got right
+(trusted-source-only enrichment, least-privilege tool access, escalate rather than force) and
+drops what described a different product.
+
+### Implemented
+
+- **Trusted-source-only enrichment.** All external evidence comes from NVD, CISA KEV, FIRST
+  EPSS, and MITRE ATT&CK (Section 4, Section 11) — the same sources CP6 named. No enrichment
+  source is agent-selected or free-form-fetched; the source list is fixed in `enrich/`.
+- **No agent write access to the scoring path.** `scoring.py` is deterministic and LLM-free
+  (Section 8 rule 2; "Trust boundary and provider independence" above) — no agent can write to
+  it, call it with model output, or shift a score except through the structured, auditable
+  inputs (enriched findings, asset context) it's designed to take. This is the concrete form of
+  CP6's least-privilege request: agent tool access doesn't extend to the risk arithmetic itself.
+- **`contested` as escalation.** When the deterministic scorer can't truthfully assign one of
+  the four real buckets — currently: KEV-listed, no compensating control, no declared patch
+  window — it returns `Bucket.CONTESTED` instead of guessing (Section 3, Section 6). This is
+  CP6's "know when to stop and ask for human help rather than force a decision," implemented as
+  a bucket a human must read and resolve, not one a plan silently ships.
+- **Refusal to force a bucket when none is honest.** `bucket_for` (`scoring.py`) is written as
+  conditions that must hold, not a fallback chain that always terminates in some answer.
+  `contested` exists specifically because forcing `F14` (Section 3) into `next_window` or
+  `mitigate_monitor` would each assert something false about the finding. This is a design
+  property, not a special case for one finding — any future finding with the same shape resolves
+  to `contested` the same way.
+
+### Open
+
+Not yet built. Listed here so the drift CP6 introduced doesn't happen again by omission — do
+not mark any of these done until there's a specific module and test to point to.
+
+1. **Prompt-injection resistance in CVE description text.** NVD descriptions, KEV notes, and
+   scanner `evidence` fields are free text pulled from external sources — exactly the kind of
+   untrusted content CP6 warned about ("malicious or manipulated information would affect the
+   agent's judgment"). Nothing currently sanitizes or isolates this text before it reaches an
+   agent prompt.
+2. **Grounding validation.** Agents should be checked to confirm their rationale cites the
+   retrieved evidence actually passed to them (Section 4's "source and timestamp" requirement),
+   not restated model knowledge dressed up as a citation. No such check exists yet.
+3. **Tool-call retry cap.** No bound yet on how many times an agent may retry a failed tool call
+   (an NVD timeout, a malformed EPSS response) before it must stop and escalate instead of
+   looping.
+
+---
+
 ## 9. Repository layout
 
 ```
