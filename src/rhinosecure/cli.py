@@ -2,7 +2,17 @@
 signals, score, rank. Scoring itself stays LLM-free and network-free (see
 scoring.py); enrichment goes through SnapshotCache, which makes it
 offline-capable and lets --offline force that rather than silently
-reaching the network."""
+reaching the network.
+
+`--agents` switches the same command to the Slice 3 crew (Coordinator
+dispatching Research -> Environment -> Risk, agents/coordinator.py)
+instead of the deterministic pipeline above -- same --data/--seed/
+--offline/--explain flags, so the two paths are invoked identically and
+their output is directly comparable. Importing agents.coordinator pulls
+in crewai, which only imports on Python 3.12 (see CLAUDE.md Section 11)
+-- deferred to inside run_agents() so `rhino run` without --agents keeps
+working on any interpreter this project's deterministic half supports.
+"""
 
 from __future__ import annotations
 
@@ -83,18 +93,45 @@ def run(data_dir: Path, seed: int, *, offline: bool = False) -> list[ScoredFindi
     return rank(scored)
 
 
-def _print_table(scored: list[ScoredFinding]) -> None:
-    headers = ("finding_id", "cve_id", "hostname", "bucket", "risk_score")
-    rows = [
-        (s.finding_id, s.cve_id, s.hostname, s.bucket.value, f"{s.risk_score:.1f}")
-        for s in scored
-    ]
+def run_agents(data_dir: Path, seed: int, *, offline: bool = False) -> list:
+    """The same ingest-and-rank contract as `run`, dispatched through the
+    Slice 3 crew instead of the deterministic pipeline. Imports agents.*
+    lazily -- see the module docstring for why."""
+    from rhinosecure.agents.coordinator import Coordinator
+
+    random.seed(seed)  # see run()'s comment -- still a no-op for now
+    assets_path = data_dir / "assets.csv"
+    findings_path = data_dir / "findings.csv"
+    findings = list(join_findings(findings_path, assets_path))
+    coordinator = Coordinator(data_dir, cache=SnapshotCache(offline=offline))
+    return coordinator.run(findings)
+
+
+def _print_rows(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> None:
     widths = [max(len(h), *(len(r[i]) for r in rows)) if rows else len(h) for i, h in enumerate(headers)]
     line = "  ".join(h.ljust(w) for h, w in zip(headers, widths))
     print(line)
     print("  ".join("-" * w for w in widths))
     for row in rows:
         print("  ".join(c.ljust(w) for c, w in zip(row, widths)))
+
+
+def _print_table(scored: list[ScoredFinding]) -> None:
+    headers = ("finding_id", "cve_id", "hostname", "bucket", "risk_score")
+    rows = [
+        (s.finding_id, s.cve_id, s.hostname, s.bucket.value, f"{s.risk_score:.1f}")
+        for s in scored
+    ]
+    _print_rows(headers, rows)
+
+
+def _print_agent_table(recommendations: list) -> None:
+    headers = ("finding_id", "cve_id", "hostname", "bucket", "risk_score")
+    rows = [
+        (r.finding_id, r.cve_id, r.hostname, r.bucket, f"{r.risk_score:.1f}")
+        for r in recommendations
+    ]
+    _print_rows(headers, rows)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -110,11 +147,54 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="forbid network fetches; fail loudly on any snapshot cache miss instead of fetching",
     )
+    run_parser.add_argument(
+        "--agents",
+        action="store_true",
+        help=(
+            "dispatch the Slice 3 crew (Research -> Environment -> Risk) instead of the "
+            "deterministic pipeline -- makes real LLM calls, one per finding per stage"
+        ),
+    )
 
     args = parser.parse_args(argv)
 
     if args.command == "run":
         data_dir = _resolve_data_dir(args.data)
+
+        if args.agents:
+            from rhinosecure.agents.coordinator import CoordinatorError
+            from rhinosecure.agents.risk import ScoringMismatchError
+            from rhinosecure.llm import LLMConfigError
+
+            try:
+                recommendations = run_agents(data_dir, args.seed, offline=args.offline)
+            except IngestError as exc:
+                print(f"ingest error: {exc}", file=sys.stderr)
+                return 1
+            except OfflineCacheMissError as exc:
+                print(f"offline error: {exc}", file=sys.stderr)
+                return 1
+            except LLMConfigError as exc:
+                print(f"LLM config error: {exc}", file=sys.stderr)
+                return 1
+            except CoordinatorError as exc:
+                print(f"coordinator error: {exc}", file=sys.stderr)
+                return 1
+            except ScoringMismatchError as exc:
+                print(f"scoring verification failed: {exc}", file=sys.stderr)
+                return 1
+
+            _print_agent_table(recommendations)
+
+            if args.explain:
+                for r in recommendations:
+                    print(f"\n{r.finding_id} ({r.cve_id} on {r.hostname}) -> {r.bucket}")
+                    for line in r.scoring_rationale:
+                        print(f"  - {line}")
+                    print(f"\n  {r.narrative}")
+
+            return 0
+
         try:
             scored = run(data_dir, args.seed, offline=args.offline)
         except IngestError as exc:

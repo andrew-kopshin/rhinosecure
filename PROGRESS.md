@@ -241,3 +241,81 @@ packages this project itself installs — Slice 2's TF-IDF + MMR retrieval (2026
 already replaced chromadb before this session, so **no RhinoSecure code needed to change** to
 fix the CrewAI import; the fix was entirely at the interpreter level. `.gitignore` now covers
 both `.venv/` and `.venv312/`.
+
+**Slice 3 complete: all four CrewAI roles built, chained, and verified against the deterministic
+pipeline.** `agents/research.py`, `environment.py`, `risk.py`, `coordinator.py` — every role
+CLAUDE.md Section 5 names now exists. Research wraps NVD/KEV/EPSS/ATT&CK as four tools bound to
+one `SnapshotCache`; Environment wraps a local asset-inventory lookup as one tool (OS build,
+exposure, controls, and patch constraints are facets of one Asset record, unlike Research's four
+independent sources, so one tool covers all of it); Risk wraps `scoring.score_finding` as one
+tool and is structurally barred from computing a score or bucket any other way (see below);
+Coordinator dispatches all three in sequence and owns the shared state threading their structured
+payloads together. Every tool call is logged (name, args, result) independent of CrewAI's own
+execution tracing, and every agent's output is locked to a pydantic schema via `output_pydantic`
+— CVE ID, severity, exploitation status, ATT&CK techniques (Research); OS/build consistency,
+exposure, controls, patch constraints (Environment); risk_score, bucket, rationale, narrative
+(Risk). No agent anywhere computes a risk score or bucket except by calling the one tool built
+for that purpose.
+
+**Coordinator is plain Python, not a CrewAI `Agent` — a deliberate, scope-bound choice.** Section
+5 lists it in the same responsibility table as the three LLM-backed roles ("Plans the run,
+dispatches work, owns shared state, owns every re-plan loop"), which reads as if it should be
+symmetric with them. It isn't, on purpose: none of those four responsibilities needs model
+reasoning at the scope built so far. The primary path's sequencing is fixed (`Research ->
+Environment -> Risk`, not model-decided), and "re-plan" as built today —
+`Coordinator.replan(finding_ids)` — is a mechanical re-dispatch of Environment and Risk for given
+finding_ids, reusing Research's already-cached output, since Research is CVE-keyed and doesn't
+depend on operational constraints. Interpreting free-form human constraint text into which
+finding_ids need re-planning is genuinely LLM-shaped work — that's Slice 4 (constraint intake,
+ToT, `tot.py`), not built yet, and it slots in ahead of `replan`'s argument, not inside Coordinator
+itself. If Slice 4 changes that calculus, Coordinator becoming an actual `Agent` is the natural
+next step; this is a decision scoped to what's built today, not a permanent architectural stance.
+`RunState` holds everything Coordinator owns: per-stage results by finding_id, per-stage call
+logs, and per-stage `crewai` `UsageMetrics` for cost visibility — CP4's "MCP correction"
+(Section 1): agent state lives in the Coordinator, not passed through MCP or left implicit in a
+crew's internal history.
+
+**`verify_scoring_matches_tool`: grounding validation gets a first real enforcement check,
+narrowly scoped.** Risk's task prompt tells the model to copy `score_finding`'s
+risk_score/bucket/rationale verbatim, but a prompt instruction isn't a guarantee — the model's
+final `output_pydantic` pass is itself an LLM call that could in principle round a number, swap a
+bucket, or paraphrase a rationale line. `verify_scoring_matches_tool` (`agents/risk.py`) checks
+the agent's final answer against the actual tool-call log entry for that finding_id and raises
+`ScoringMismatchError` on any mismatch; `Coordinator._dispatch_risk` calls it after every Risk
+task and propagates the exception rather than silently accepting drift. This is real, tested
+enforcement — not the general "does every agent's rationale cite the evidence it was actually
+given" checker CLAUDE.md's "Grounding validation" open item still asks for (that would also need
+to check Research's and Environment's own outputs against their own call logs, which nothing does
+yet). CLAUDE.md's open item is updated to reflect exactly this distinction rather than marked
+done.
+
+**Found a real gap while wiring Risk: `ResearchFinding` was missing ATT&CK prevalence.**
+`AttackTechniqueSummary` carried `technique_id`/`name`/`confidence` but not `prevalence`
+(enrich/attack.py's percentile-rank field) — without it, Risk's reconstruction of
+`attack_prevalence` (a real threat-term input) had nothing to compute from. Added the field and
+threaded it through `lookup_attack_techniques`'s tool JSON. Caught by writing a test that compared
+the tool's reconstructed score against calling `scoring.score_finding` directly on equivalent
+inputs — the two didn't agree until the fix, confirming it wasn't just a schema gap but an actual
+scoring input gap.
+
+**`rhino run --agents` wired into the CLI; the deterministic path's Python 3.14 compatibility
+protected by a lazy import.** `cli.py` has no top-level import of anything crewai-shaped —
+`agents.coordinator` is imported inside `run_agents()` and inside `main()`'s `--agents` branch
+only, so plain `rhino run` keeps working on `.venv` (3.14), where `import crewai` itself fails
+(this date, above). Confirmed by an AST-based test that parses `cli.py`'s source and asserts
+nothing crewai/agents-shaped appears in its module-level import statements, and separately by
+actually running `rhino run --data demo --seed 42 --offline` under `.venv` after the change —
+unaffected, full 24-finding table, no import error.
+
+**Verified: the agent crew reproduces the deterministic pipeline exactly.** Ran the full crew
+(`Coordinator` dispatching Research → Environment → Risk) against F01 (ProxyLogon, patch_now),
+F14 (the scanner/NVD severity-disagreement case, contested), and F19 (mundane/non-KEV, accept) —
+both via `Coordinator` directly and via `rhino run --agents --explain` against a 3-finding subset.
+Agent-produced risk_score/bucket matched the deterministic `cli.run()` output exactly for all
+three (85.5/patch_now, 25.5/contested, 8.6/accept), `verify_scoring_matches_tool` passed silently
+throughout, and the narratives correctly explain the non-obvious cases in plain language — e.g.
+F14's narrative states why `contested` is the honest bucket rather than treating it as a scoring
+quirk, and F19's separates "high severity" from "low priority" via the compensating-control
+discount. 27 LLM requests (9 per stage) for the 3-finding run, ~130K tokens, **≈$0.41** at Sonnet
+5 pricing ($2/$10 per MTok, cache write ≈1.25x, cache read ≈0.1x) — extrapolating linearly, a full
+24-finding run would be on the order of $3-4, not yet run.

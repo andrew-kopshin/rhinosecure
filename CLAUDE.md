@@ -517,18 +517,27 @@ not mark any of these done until there's a specific module and test to point to.
    agent prompt.
 2. **Grounding validation.** Agents should be checked to confirm their rationale cites the
    retrieved evidence actually passed to them (Section 4's "source and timestamp" requirement),
-   not restated model knowledge dressed up as a citation. No such check exists yet.
-   **Partial, narrow start:** Environment Analysis's `EnvironmentAssessment.os_build_consistent`
+   not restated model knowledge dressed up as a citation. Two partial pieces exist; the item stays
+   open because neither is the general mechanism this item asks for.
+   **Labeling, not checking:** Environment Analysis's `EnvironmentAssessment.os_build_consistent`
    (`agents/environment.py`) has no tool answer to check against — there is no live "which KB
    applies to which OS build" source named in Section 11, so it is the model's own judgment from
    the finding's product/version text against the asset's declared os/os_build, not a database
    fact. `os_build_consistent_provenance` (a fixed `Literal["model_judgment"]`, so the schema
    itself cannot mislabel it) marks that explicitly rather than leaving it implicit in
-   `applicability_summary`'s prose. This does not build the validator this item still asks for —
-   nothing yet checks a rationale's citations against the evidence actually passed in, for this
-   agent or any other — it only makes the one field that needs that check machine-identifiable
-   instead of requiring a human to reread the prose to notice it isn't sourced. Do not mark this
-   item done on the strength of this alone.
+   `applicability_summary`'s prose — a human or downstream consumer can tell it's unsourced, but
+   nothing stops it from being wrong.
+   **Actual enforcement, narrowly scoped:** Risk & Recommendation's `verify_scoring_matches_tool`
+   (`agents/risk.py`) is a real pass/fail check, not a label — it compares the agent's final
+   `risk_score`/`bucket`/`scoring_rationale` against what the `score_finding` tool actually
+   returned for that finding_id (from the call log, not the model's retelling) and raises
+   `ScoringMismatchError` on any drift; `Coordinator._dispatch_risk` calls it after every Risk
+   task and propagates the exception rather than accepting a silently-diverged result. This is
+   still narrow: it checks one agent's one tool against its own output, not that any agent's
+   rationale cites the specific evidence strings it was actually given (e.g. nothing yet checks
+   that Research's `nvd_base_score` field matches what `lookup_nvd` returned, or that
+   Environment's `has_patch_window` matches `lookup_asset_context`'s result). Do not mark this
+   item done — a general citation-vs-evidence checker across all three agents is still unbuilt.
 3. **Tool-call retry cap.** No bound yet on how many times an agent may retry a failed tool call
    (an NVD timeout, a malformed EPSS response) before it must stop and escalate instead of
    looping.
