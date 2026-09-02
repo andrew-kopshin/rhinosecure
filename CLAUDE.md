@@ -518,6 +518,17 @@ not mark any of these done until there's a specific module and test to point to.
 2. **Grounding validation.** Agents should be checked to confirm their rationale cites the
    retrieved evidence actually passed to them (Section 4's "source and timestamp" requirement),
    not restated model knowledge dressed up as a citation. No such check exists yet.
+   **Partial, narrow start:** Environment Analysis's `EnvironmentAssessment.os_build_consistent`
+   (`agents/environment.py`) has no tool answer to check against — there is no live "which KB
+   applies to which OS build" source named in Section 11, so it is the model's own judgment from
+   the finding's product/version text against the asset's declared os/os_build, not a database
+   fact. `os_build_consistent_provenance` (a fixed `Literal["model_judgment"]`, so the schema
+   itself cannot mislabel it) marks that explicitly rather than leaving it implicit in
+   `applicability_summary`'s prose. This does not build the validator this item still asks for —
+   nothing yet checks a rationale's citations against the evidence actually passed in, for this
+   agent or any other — it only makes the one field that needs that check machine-identifiable
+   instead of requiring a human to reread the prose to notice it isn't sourced. Do not mark this
+   item done on the strength of this alone.
 3. **Tool-call retry cap.** No bound yet on how many times an agent may retry a failed tool call
    (an NVD timeout, a malformed EPSS response) before it must stop and escalate instead of
    looping.
