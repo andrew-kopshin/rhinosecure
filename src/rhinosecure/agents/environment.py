@@ -36,6 +36,13 @@ to reread the prose to notice it isn't sourced.
 
 All LLM calls route through `rhinosecure.llm.get_llm` -- this module never
 constructs a provider client itself (Trust boundary section).
+
+`build_environment_task` does not set `output_pydantic` -- CrewAI's own
+structured-output conversion caused an unbounded retry loop on a 24-finding
+run (`agents/parsing.py`'s module docstring has the full trace). The task's
+final raw text is parsed into `EnvironmentAssessment` by
+`agents.parsing.parse_structured_output`, dispatched with a retry cap by
+`agents/coordinator.py`.
 """
 
 from __future__ import annotations
@@ -190,14 +197,17 @@ def build_environment_task(
             "lookup_asset_context or the finding text above."
         ),
         expected_output=(
-            "An EnvironmentAssessment: hostname, OS and build, whether the "
-            "finding's product/version is consistent with that OS/build "
-            "(os_build_consistent, marked via os_build_consistent_provenance "
-            "as your own judgment rather than a sourced fact), role, "
-            "environment, internet exposure, compensating controls, patch "
-            "window/restrictions as declared, a short summary, and the "
-            "source of every other fact used."
+            "Return ONLY a single JSON object, with these keys directly at "
+            'the top level -- not wrapped in any container key such as '
+            '{"assessment": {...}} or {"result": {...}}, and no markdown '
+            "code fences or prose before or after it: finding_id, cve_id, "
+            "asset_id, hostname, os, os_build, os_build_consistent (bool), "
+            'os_build_consistent_provenance (always the literal string '
+            '"model_judgment"), role, environment, internet_exposed (bool), '
+            "compensating_controls (a list of strings), has_patch_window "
+            "(bool), patch_window, patch_restrictions, "
+            "applicability_summary (a short prose summary), and sources (a "
+            "list of strings citing each source used)."
         ),
         agent=agent,
-        output_pydantic=EnvironmentAssessment,
     )

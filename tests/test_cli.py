@@ -1,6 +1,7 @@
 import ast
 import inspect
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -77,27 +78,37 @@ def test_cli_module_does_not_import_crewai_at_module_level():
 class _FakeCoordinator:
     """Stands in for agents.coordinator.Coordinator so these tests never
     construct a real one (which would load KEV/ATT&CK snapshots) or call a
-    real Crew (which would make real LLM calls)."""
+    real Crew (which would make real LLM calls). Mirrors the real
+    Coordinator's public surface -- run(), ranked(), .state.*_failures --
+    since cli.py now reads all three (a failed finding is recorded and
+    skipped inside Coordinator.run, never raised; see
+    agents/coordinator.py)."""
 
     result: list = []
-    raises: Exception | None = None
+    failures: dict = {}
     last_init_args: tuple | None = None
     last_run_findings: list | None = None
 
     def __init__(self, data_dir, cache=None, *, verbose=False):
         _FakeCoordinator.last_init_args = (data_dir, cache)
+        self.state = SimpleNamespace(
+            research_failures=_FakeCoordinator.failures.get("research", {}),
+            environment_failures=_FakeCoordinator.failures.get("environment", {}),
+            risk_failures=_FakeCoordinator.failures.get("risk", {}),
+        )
 
     def run(self, findings):
         _FakeCoordinator.last_run_findings = findings
-        if _FakeCoordinator.raises is not None:
-            raise _FakeCoordinator.raises
+        return _FakeCoordinator.result
+
+    def ranked(self):
         return _FakeCoordinator.result
 
 
 @pytest.fixture(autouse=True)
 def _reset_fake_coordinator():
     _FakeCoordinator.result = []
-    _FakeCoordinator.raises = None
+    _FakeCoordinator.failures = {}
     _FakeCoordinator.last_init_args = None
     _FakeCoordinator.last_run_findings = None
 
@@ -122,9 +133,10 @@ def test_run_agents_wires_data_dir_seed_and_offline_to_coordinator(monkeypatch):
     monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
     _FakeCoordinator.result = [_fake_recommendation()]
 
-    result = run_agents(DEMO_DIR, seed=42, offline=True)
+    coordinator = run_agents(DEMO_DIR, seed=42, offline=True)
 
-    assert result == [_fake_recommendation()]
+    assert isinstance(coordinator, _FakeCoordinator)
+    assert coordinator.ranked() == [_fake_recommendation()]
     data_dir, cache = _FakeCoordinator.last_init_args
     assert data_dir == DEMO_DIR
     assert cache.offline is True
@@ -148,22 +160,27 @@ def test_main_with_agents_flag_and_explain_prints_narrative(monkeypatch, capsys)
     assert "fake rationale line" in out
 
 
-def test_main_with_agents_flag_maps_coordinator_error_to_exit_1(monkeypatch):
-    from rhinosecure.agents.coordinator import CoordinatorError
-
+def test_main_with_agents_flag_prints_recorded_failures(monkeypatch, capsys):
+    """A finding recorded and skipped (agents/coordinator.py) must still
+    be surfaced to the user, not silently absent from the table."""
     monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
-    _FakeCoordinator.raises = CoordinatorError("no upstream state")
+    _FakeCoordinator.result = [_fake_recommendation()]
+    _FakeCoordinator.failures = {
+        "research": {"F07": "gave up after 3 attempt(s): no valid JSON object found"},
+    }
 
-    assert main(["run", "--data", "demo", "--agents"]) == 1
+    assert main(["run", "--data", "demo", "--agents"]) == 0
+    err = capsys.readouterr().err
+    assert "F07" in err
+    assert "research" in err
 
 
-def test_main_with_agents_flag_maps_scoring_mismatch_to_exit_1(monkeypatch):
-    from rhinosecure.agents.risk import ScoringMismatchError
-
+def test_main_with_agents_flag_prints_nothing_extra_when_no_failures(monkeypatch, capsys):
     monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
-    _FakeCoordinator.raises = ScoringMismatchError("F01: risk_score mismatch")
+    _FakeCoordinator.result = [_fake_recommendation()]
 
-    assert main(["run", "--data", "demo", "--agents"]) == 1
+    assert main(["run", "--data", "demo", "--agents"]) == 0
+    assert capsys.readouterr().err == ""
 
 
 def test_main_without_agents_flag_still_uses_the_deterministic_path(monkeypatch):

@@ -319,3 +319,64 @@ quirk, and F19's separates "high severity" from "low priority" via the compensat
 discount. 27 LLM requests (9 per stage) for the 3-finding run, ~130K tokens, **≈$0.41** at Sonnet
 5 pricing ($2/$10 per MTok, cache write ≈1.25x, cache read ≈0.1x) — extrapolating linearly, a full
 24-finding run would be on the order of $3-4, not yet run.
+
+**Incident: the extrapolation above was optimistic. A real 24-finding `--agents` run hung on the
+first finding, retrying an identical failure indefinitely.** `agentrun.txt` (the user's captured
+run output, UTF-16-encoded) showed steady progress through 15 findings' worth of Research tool
+calls, then nothing further — no traceback, no new activity, consistent with an internal retry
+loop that stops producing any new visible output rather than a clean crash. Root cause, traced in
+the installed `crewai` package (`crewai/utilities/converter.py`), not guessed: the model's final
+answer for the stuck finding was syntactically valid JSON but shaped as `{"finding": {...fields}}`
+instead of the fields directly. `Task._export_output` routes that through `convert_to_model`,
+which catches the resulting `pydantic.ValidationError` and retries once via `handle_partial_json`
+— but that function's own retry (`model.model_validate(parsed)`) fails identically and **re-raises
+the `ValidationError` uncaught** (`except ValidationError: raise`, converter.py:317-318), with no
+enclosing handler anywhere in that call chain. That exception then escapes `Task._export_output`
+and `crew.kickoff()` entirely, into whatever retry logic sits above it in CrewAI's own execution
+loop — which kept reproducing the same malformed shape rather than converging, and had no visible
+bound.
+
+**Fix: stop depending on CrewAI's own structured-output conversion for correctness at all.** Three
+changes, all in service of that one decision:
+
+1. **`agents/parsing.py`** (new) — `parse_structured_output(raw, model)` parses an agent's raw
+   final-answer text into the target pydantic schema itself, tolerating exactly one shape beyond a
+   direct match: a single top-level key wrapping the real fields (`{"finding": {...}}`,
+   `{"result": {...}}` — any one key, not hardcoded to `"finding"`). Anything else (two-plus keys,
+   non-JSON text, a wrapper whose inner value still doesn't validate) raises
+   `AgentOutputParseError` rather than guessing further. 8 tests, all offline.
+2. **No Task built by `research.py`/`environment.py`/`risk.py` sets `output_pydantic` any more.**
+   Each task's raw text (`TaskOutput.raw`, always populated regardless of whether any conversion
+   succeeds or even runs) is what gets parsed, by code this project owns instead of CrewAI's
+   converter. `expected_output` on all three was rewritten to explicitly say "not wrapped in any
+   container key" and spell out every top-level field name, since removing `output_pydantic` also
+   removes whatever schema-injection prompting CrewAI was doing automatically.
+3. **`Coordinator._resolve_output`** (new) is this project's own retry loop, capped at
+   `max_parse_attempts` (default 3, configurable) fresh single-task re-dispatches — not CrewAI's.
+   A finding that still won't parse (or, for Risk, still fails `verify_scoring_matches_tool` —
+   folded into the same retry-then-skip loop, since a scoring mismatch is the same kind of
+   untrustworthy-answer problem as a parse failure) after the cap is recorded into
+   `RunState.research_failures`/`environment_failures`/`risk_failures` (finding_id -> reason) and
+   excluded from that stage's `*_by_id` — never raised. A finding missing from an upstream stage
+   because it failed there is skipped at every stage after that, recorded again at each one
+   ("skipped: no ResearchFinding (Research failed for this finding)"), rather than the old
+   behavior of `_dispatch_environment`/`_dispatch_risk` raising `CoordinatorError` and aborting
+   every other finding along with it. `CoordinatorError` is now reserved for actual Coordinator
+   misuse (`replan` before any `run`, `replan` naming an unknown finding_id) — provably nothing in
+   `run()`'s own call path can raise it any more, so `cli.py`'s `--agents` branch no longer catches
+   it or `ScoringMismatchError` (dead code otherwise); `rhino run --agents` now prints a `finding
+   failed and were skipped` summary to stderr when `coordinator.state.*_failures` is non-empty.
+
+**Verified two ways.** `tests/test_coordinator.py`'s fake `Crew` now feeds raw JSON text strings
+(including a deliberately `{"finding": {...}}`-wrapped one) through the real
+`parse_structured_output` path instead of injecting pre-built pydantic objects, so these tests
+exercise the actual fix, not an assumption it works: a wrapped response resolves on the first
+attempt with zero extra dispatches; a persistently-unparseable finding is retried exactly
+`max_parse_attempts` times (counted precisely via Crew-instantiation count) then recorded and
+skipped, without blocking a second, healthy finding in the same run; a Risk scoring mismatch is
+recorded and skipped rather than raised. Separately, live: re-ran the same F01/F14/F19 trio from
+the entry above end to end with the redesigned (no-`output_pydantic`) agents — identical results
+(85.52/patch_now, 25.52/contested, 8.60/accept), zero recorded failures, and the console output
+showed the model wrapping one answer in markdown code fences this run, which
+`parse_structured_output`'s regex-based extraction handled transparently — a live example of the
+defensive parsing already pulling its weight, not just passing synthetic tests.

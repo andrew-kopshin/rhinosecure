@@ -39,6 +39,15 @@ channel scoring inputs travel through.
 
 All LLM calls route through `rhinosecure.llm.get_llm` -- this module never
 constructs a provider client itself (Trust boundary section).
+
+`build_risk_task` does not set `output_pydantic` -- CrewAI's own
+structured-output conversion caused an unbounded retry loop on a 24-finding
+run (`agents/parsing.py`'s module docstring has the full trace). The task's
+final raw text is parsed into `RiskRecommendation` by
+`agents.parsing.parse_structured_output`, and `verify_scoring_matches_tool`
+below runs as part of the same retry-then-skip loop in
+`agents/coordinator.py` -- a mismatch is treated exactly like a parse
+failure, not a separate hard stop.
 """
 
 from __future__ import annotations
@@ -206,12 +215,17 @@ def build_risk_task(
             "given or returned by the tool."
         ),
         expected_output=(
-            "A RiskRecommendation: risk_score and bucket copied exactly from "
-            "score_finding, its rationale list copied verbatim, and a narrative "
-            "citing Research, Environment, and the scoring rationale."
+            "Return ONLY a single JSON object, with these keys directly at "
+            'the top level -- not wrapped in any container key such as '
+            '{"recommendation": {...}} or {"result": {...}}, and no '
+            "markdown code fences or prose before or after it: finding_id, "
+            "cve_id, asset_id, hostname, risk_score and bucket (copied "
+            "exactly from score_finding), scoring_rationale (its rationale "
+            "list, copied verbatim as an array of strings), narrative (a "
+            "prose synthesis citing Research, Environment, and the scoring "
+            "rationale), and sources (a list of strings)."
         ),
         agent=agent,
-        output_pydantic=RiskRecommendation,
     )
 
 

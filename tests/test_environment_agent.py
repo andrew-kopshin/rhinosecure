@@ -157,7 +157,10 @@ def test_build_environment_task_embeds_finding_and_upstream_research_context():
     task = build_environment_task(enriched, research, agent)
 
     assert isinstance(task, Task)
-    assert task.output_pydantic is EnvironmentAssessment
+    # No output_pydantic: CrewAI's own conversion caused an unbounded retry
+    # loop on a malformed response (PROGRESS.md) -- parsing is now this
+    # project's own code (agents/parsing.py), not CrewAI's.
+    assert task.output_pydantic is None
     assert task.agent is agent
     assert "F01" in task.description
     assert "CVE-2021-26855" in task.description
@@ -166,3 +169,4 @@ def test_build_environment_task_embeds_finding_and_upstream_research_context():
     assert "Confirmed actively exploited, KEV-listed." in task.description
     assert "os_build_consistent_provenance" in task.description
     assert "os_build_consistent_provenance" in task.expected_output
+    assert "not wrapped in any container key" in task.expected_output

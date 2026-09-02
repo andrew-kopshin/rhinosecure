@@ -173,10 +173,14 @@ def test_build_risk_task_embeds_finding_research_and_environment_context():
     task = build_risk_task(ENRICHED, RESEARCH, ENVIRONMENT, agent)
 
     assert isinstance(task, Task)
-    assert task.output_pydantic is RiskRecommendation
+    # No output_pydantic: CrewAI's own conversion caused an unbounded retry
+    # loop on a malformed response (PROGRESS.md) -- parsing is now this
+    # project's own code (agents/parsing.py), not CrewAI's.
+    assert task.output_pydantic is None
     assert task.agent is agent
     assert "F01" in task.description
     assert "CVE-2021-26855" in task.description
+    assert "not wrapped in any container key" in task.expected_output
     assert "EXCH01" in task.description
     assert "KEV-listed: True" in task.description
     assert "Confirmed KEV-listed, near-maximal EPSS" in task.description

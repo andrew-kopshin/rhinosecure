@@ -93,10 +93,15 @@ def run(data_dir: Path, seed: int, *, offline: bool = False) -> list[ScoredFindi
     return rank(scored)
 
 
-def run_agents(data_dir: Path, seed: int, *, offline: bool = False) -> list:
-    """The same ingest-and-rank contract as `run`, dispatched through the
-    Slice 3 crew instead of the deterministic pipeline. Imports agents.*
-    lazily -- see the module docstring for why."""
+def run_agents(data_dir: Path, seed: int, *, offline: bool = False) -> Coordinator:
+    """Dispatches the Slice 3 crew over every finding in `data_dir`, the
+    agent equivalent of `run`. Returns the `Coordinator` itself, not just
+    the ranked list -- `coordinator.state.*_failures` is how a caller sees
+    which findings (if any) were recorded and skipped rather than
+    blocking the run (agents/coordinator.py's module docstring has the
+    full incident this exists to survive). Imports agents.* lazily -- see
+    this module's own docstring for why.
+    """
     from rhinosecure.agents.coordinator import Coordinator
 
     random.seed(seed)  # see run()'s comment -- still a no-op for now
@@ -104,7 +109,8 @@ def run_agents(data_dir: Path, seed: int, *, offline: bool = False) -> list:
     findings_path = data_dir / "findings.csv"
     findings = list(join_findings(findings_path, assets_path))
     coordinator = Coordinator(data_dir, cache=SnapshotCache(offline=offline))
-    return coordinator.run(findings)
+    coordinator.run(findings)
+    return coordinator
 
 
 def _print_rows(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> None:
@@ -132,6 +138,23 @@ def _print_agent_table(recommendations: list) -> None:
         for r in recommendations
     ]
     _print_rows(headers, rows)
+
+
+def _print_failures(coordinator: Coordinator) -> None:
+    """Findings recorded and skipped (rather than left blocking the run)
+    at any stage -- see agents/coordinator.py's module docstring."""
+    stages = (
+        ("research", coordinator.state.research_failures),
+        ("environment", coordinator.state.environment_failures),
+        ("risk", coordinator.state.risk_failures),
+    )
+    total = sum(len(failures) for _stage, failures in stages)
+    if total == 0:
+        return
+    print(f"\n{total} finding(s) failed and were skipped:", file=sys.stderr)
+    for stage, failures in stages:
+        for finding_id, reason in failures.items():
+            print(f"  {finding_id} ({stage}): {reason}", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -162,12 +185,14 @@ def main(argv: list[str] | None = None) -> int:
         data_dir = _resolve_data_dir(args.data)
 
         if args.agents:
-            from rhinosecure.agents.coordinator import CoordinatorError
-            from rhinosecure.agents.risk import ScoringMismatchError
             from rhinosecure.llm import LLMConfigError
 
+            # No CoordinatorError/ScoringMismatchError handler here: a
+            # per-finding failure is recorded and skipped inside
+            # Coordinator.run (see agents/coordinator.py), not raised --
+            # neither exception can propagate out of run_agents.
             try:
-                recommendations = run_agents(data_dir, args.seed, offline=args.offline)
+                coordinator = run_agents(data_dir, args.seed, offline=args.offline)
             except IngestError as exc:
                 print(f"ingest error: {exc}", file=sys.stderr)
                 return 1
@@ -177,14 +202,10 @@ def main(argv: list[str] | None = None) -> int:
             except LLMConfigError as exc:
                 print(f"LLM config error: {exc}", file=sys.stderr)
                 return 1
-            except CoordinatorError as exc:
-                print(f"coordinator error: {exc}", file=sys.stderr)
-                return 1
-            except ScoringMismatchError as exc:
-                print(f"scoring verification failed: {exc}", file=sys.stderr)
-                return 1
 
+            recommendations = coordinator.ranked()
             _print_agent_table(recommendations)
+            _print_failures(coordinator)
 
             if args.explain:
                 for r in recommendations:

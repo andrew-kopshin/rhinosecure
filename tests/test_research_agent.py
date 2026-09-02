@@ -4,7 +4,6 @@ from pathlib import Path
 from crewai import Task
 
 from rhinosecure.agents.research import (
-    ResearchFinding,
     build_research_agent,
     build_research_task,
     build_research_tools,
@@ -256,9 +255,13 @@ def test_build_research_task_embeds_finding_fields_and_targets_research_output(t
     task = build_research_task(enriched, agent)
 
     assert isinstance(task, Task)
-    assert task.output_pydantic is ResearchFinding
+    # No output_pydantic: CrewAI's own conversion caused an unbounded retry
+    # loop on a malformed response (PROGRESS.md) -- parsing is now this
+    # project's own code (agents/parsing.py), not CrewAI's.
+    assert task.output_pydantic is None
     assert task.agent is agent
     assert "F01" in task.description
     assert "CVE-2021-26855" in task.description
     assert "Microsoft Exchange Server" in task.description
     assert "critical" in task.description
+    assert "not wrapped in any container key" in task.expected_output

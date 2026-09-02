@@ -26,12 +26,34 @@ step (Slice 4: constraint intake, ToT, `tot.py`) is genuinely LLM-shaped
 work and is not built yet. If and when it is, it slots in ahead of
 `replan`'s `finding_ids` argument, not inside this class.
 
-**Grounding is enforced, not assumed.** After each Risk task completes,
-`verify_scoring_matches_tool` (`agents/risk.py`) checks its risk_score/
-bucket/rationale against what score_finding actually computed --
-Coordinator raises rather than silently accepting a mismatch, which is
-what "owns shared state" has to mean if the state is going to be trusted
-by anything downstream.
+**A failed finding is recorded and skipped, never left to block the whole
+run.** Incident (PROGRESS.md, this date): a 24-finding run hung on the
+first finding, retrying an identical failure indefinitely, because the
+model's answer for that finding was shaped as `{"finding": {...}}` instead
+of the fields directly, and CrewAI's own structured-output conversion
+re-raises that validation failure uncaught rather than recovering or
+giving up (traced in `agents/parsing.py`'s docstring). Two changes follow
+from that:
+
+1. No Task built by `agents/research.py`, `environment.py`, or `risk.py`
+   sets `output_pydantic` any more -- each stage's raw final-answer text
+   is parsed by `agents.parsing.parse_structured_output`, which tolerates
+   a single-key wrapper, so the exact incident shape now succeeds without
+   needing a retry at all.
+2. `_resolve_output` below is this module's own retry loop, capped at
+   `max_parse_attempts` (default 3) fresh re-dispatches -- not CrewAI's.
+   If a finding still won't parse (or, for Risk, still disagrees with
+   `verify_scoring_matches_tool`) after the cap, it is recorded in the
+   relevant `RunState.*_failures` dict and excluded from that stage's
+   `*_by_id` -- never raised, never left retrying. A finding missing from
+   an upstream stage (because it failed there) is skipped at every stage
+   after that, recorded again at each one, rather than treated as a
+   Coordinator misuse error.
+
+`CoordinatorError` is reserved for actual misuse of this class (`replan`
+before any `run`, or `replan` naming a finding_id `run` never saw) --
+never for an individual finding's processing failure, which is what the
+mechanism above exists to make survivable.
 
 All LLM calls happen inside the agents this module dispatches -- this
 module itself never constructs a provider client or calls `get_llm`.
@@ -41,9 +63,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
-from crewai import Crew, Process
+from crewai import Agent, Crew, Process, Task
+from pydantic import BaseModel
 
 from rhinosecure.agents.environment import (
     EnvironmentAssessment,
@@ -51,6 +74,7 @@ from rhinosecure.agents.environment import (
     build_environment_task,
     build_environment_tools,
 )
+from rhinosecure.agents.parsing import AgentOutputParseError, parse_structured_output
 from rhinosecure.agents.research import (
     ResearchFinding,
     build_research_agent,
@@ -59,6 +83,7 @@ from rhinosecure.agents.research import (
 )
 from rhinosecure.agents.risk import (
     RiskRecommendation,
+    ScoringMismatchError,
     build_risk_agent,
     build_risk_task,
     build_risk_tools,
@@ -68,11 +93,15 @@ from rhinosecure.enrich.cache import SnapshotCache
 from rhinosecure.ingest import load_asset_index
 from rhinosecure.schema import EnrichedFinding
 
+ModelT = TypeVar("ModelT", bound=BaseModel)
+
+DEFAULT_MAX_PARSE_ATTEMPTS = 3
+
 
 class CoordinatorError(RuntimeError):
-    """Raised when a stage is dispatched without the upstream state it
-    depends on -- e.g. `replan` before any `run`, or Environment/Risk for a
-    finding_id Research never produced output for."""
+    """Raised for misuse of this class -- `replan` before any `run`, or
+    naming a finding_id `run` never saw. Never raised for one finding's
+    processing failure; see the module docstring."""
 
 
 @dataclass
@@ -93,13 +122,26 @@ class RunState:
     research_usage: Any = None
     environment_usage: Any = None
     risk_usage: Any = None
+    # finding_id -> why it has no result for that stage, whether it failed
+    # there directly or was skipped because an earlier stage failed for it.
+    research_failures: dict[str, str] = field(default_factory=dict)
+    environment_failures: dict[str, str] = field(default_factory=dict)
+    risk_failures: dict[str, str] = field(default_factory=dict)
 
 
 class Coordinator:
-    def __init__(self, data_dir: Path, cache: SnapshotCache | None = None, *, verbose: bool = False):
+    def __init__(
+        self,
+        data_dir: Path,
+        cache: SnapshotCache | None = None,
+        *,
+        verbose: bool = False,
+        max_parse_attempts: int = DEFAULT_MAX_PARSE_ATTEMPTS,
+    ):
         self.data_dir = data_dir
         self.cache = cache or SnapshotCache()
         self.verbose = verbose
+        self.max_parse_attempts = max_parse_attempts
         self._asset_index = load_asset_index(data_dir / "assets.csv")
         self.state: RunState | None = None
 
@@ -134,10 +176,49 @@ class Coordinator:
     def ranked(self) -> list[RiskRecommendation]:
         """The current plan, sorted the same way `scoring.rank` sorts the
         deterministic pipeline's output -- descending risk, finding_id as
-        the tiebreak."""
+        the tiebreak. Findings recorded as failures are simply absent, not
+        represented with a placeholder score."""
         if self.state is None:
             raise CoordinatorError("no run has been dispatched yet")
         return sorted(self.state.risk_by_id.values(), key=lambda r: (-r.risk_score, r.finding_id))
+
+    def _resolve_output(
+        self,
+        finding_id: str,
+        task: Task,
+        model: type[ModelT],
+        rebuild_task: Callable[[], Task],
+        agent: Agent,
+        failures: dict[str, str],
+        *,
+        extra_validate: Callable[[ModelT], None] | None = None,
+    ) -> ModelT | None:
+        """Parse `task`'s raw output into `model`, retrying with a fresh
+        dispatch (via `rebuild_task`) up to `self.max_parse_attempts`
+        total attempts if parsing -- or `extra_validate`, when given --
+        fails. Records `finding_id` into `failures` and returns None if
+        every attempt is exhausted; never raises for this reason. See the
+        module docstring for why this exists instead of trusting CrewAI's
+        own `output_pydantic` conversion."""
+        last_error: Exception | None = None
+        for attempt in range(1, self.max_parse_attempts + 1):
+            try:
+                result = parse_structured_output(task.output.raw, model)
+                if extra_validate is not None:
+                    extra_validate(result)
+                return result
+            except (AgentOutputParseError, ScoringMismatchError) as exc:
+                last_error = exc
+                if attempt == self.max_parse_attempts:
+                    break
+                task = rebuild_task()
+                Crew(
+                    agents=[agent], tasks=[task], process=Process.sequential, verbose=self.verbose
+                ).kickoff()
+        failures[finding_id] = (
+            f"gave up after {self.max_parse_attempts} attempt(s): {last_error}"
+        )
+        return None
 
     def _dispatch_research(self, findings: list[EnrichedFinding]) -> None:
         tools = build_research_tools(self.cache, self.state.research_call_log)
@@ -146,47 +227,100 @@ class Coordinator:
         crew = Crew(agents=[agent], tasks=tasks, process=Process.sequential, verbose=self.verbose)
         crew.kickoff()
         self.state.research_usage = crew.usage_metrics
-        for task in tasks:
-            result: ResearchFinding = task.output.pydantic
-            self.state.research_by_id[result.finding_id] = result
+        for finding, task in zip(findings, tasks):
+            fid = finding.finding.finding_id
+            result = self._resolve_output(
+                fid,
+                task,
+                ResearchFinding,
+                lambda e=finding, a=agent: build_research_task(e, a),
+                agent,
+                self.state.research_failures,
+            )
+            if result is not None:
+                self.state.research_by_id[fid] = result
 
     def _dispatch_environment(self, findings: list[EnrichedFinding]) -> None:
-        tools = build_environment_tools(self._asset_index, self.state.environment_call_log)
-        agent = build_environment_agent(tools)
-        tasks = []
+        survivors = []
         for e in findings:
             fid = e.finding.finding_id
-            research = self.state.research_by_id.get(fid)
-            if research is None:
-                raise CoordinatorError(f"{fid}: no ResearchFinding in state -- run Research first")
-            tasks.append(build_environment_task(e, research, agent))
+            if fid not in self.state.research_by_id:
+                self.state.environment_failures[fid] = (
+                    "skipped: no ResearchFinding (Research failed for this finding)"
+                )
+            else:
+                survivors.append(e)
+        if not survivors:
+            return
+
+        tools = build_environment_tools(self._asset_index, self.state.environment_call_log)
+        agent = build_environment_agent(tools)
+        tasks = [
+            build_environment_task(e, self.state.research_by_id[e.finding.finding_id], agent)
+            for e in survivors
+        ]
         crew = Crew(agents=[agent], tasks=tasks, process=Process.sequential, verbose=self.verbose)
         crew.kickoff()
         self.state.environment_usage = crew.usage_metrics
-        for task in tasks:
-            result: EnvironmentAssessment = task.output.pydantic
-            self.state.environment_by_id[result.finding_id] = result
+        for finding, task in zip(survivors, tasks):
+            fid = finding.finding.finding_id
+            research = self.state.research_by_id[fid]
+            result = self._resolve_output(
+                fid,
+                task,
+                EnvironmentAssessment,
+                lambda e=finding, r=research, a=agent: build_environment_task(e, r, a),
+                agent,
+                self.state.environment_failures,
+            )
+            if result is not None:
+                self.state.environment_by_id[fid] = result
 
     def _dispatch_risk(self, findings: list[EnrichedFinding]) -> None:
+        survivors = []
+        for e in findings:
+            fid = e.finding.finding_id
+            if fid not in self.state.research_by_id:
+                self.state.risk_failures[fid] = (
+                    "skipped: no ResearchFinding (Research failed for this finding)"
+                )
+            elif fid not in self.state.environment_by_id:
+                self.state.risk_failures[fid] = (
+                    "skipped: no EnvironmentAssessment (Environment failed for this finding)"
+                )
+            else:
+                survivors.append(e)
+        if not survivors:
+            return
+
         tools = build_risk_tools(
             self.state.enriched_by_id, self.state.research_by_id, self.state.risk_call_log
         )
         agent = build_risk_agent(tools)
-        tasks = []
-        for e in findings:
-            fid = e.finding.finding_id
-            research = self.state.research_by_id.get(fid)
-            environment = self.state.environment_by_id.get(fid)
-            if research is None or environment is None:
-                raise CoordinatorError(
-                    f"{fid}: missing upstream research/environment output -- "
-                    "run Research and Environment first"
-                )
-            tasks.append(build_risk_task(e, research, environment, agent))
+        tasks = [
+            build_risk_task(
+                e,
+                self.state.research_by_id[e.finding.finding_id],
+                self.state.environment_by_id[e.finding.finding_id],
+                agent,
+            )
+            for e in survivors
+        ]
         crew = Crew(agents=[agent], tasks=tasks, process=Process.sequential, verbose=self.verbose)
         crew.kickoff()
         self.state.risk_usage = crew.usage_metrics
-        for task in tasks:
-            result: RiskRecommendation = task.output.pydantic
-            verify_scoring_matches_tool(result, self.state.risk_call_log)
-            self.state.risk_by_id[result.finding_id] = result
+        for finding, task in zip(survivors, tasks):
+            fid = finding.finding.finding_id
+            research = self.state.research_by_id[fid]
+            environment = self.state.environment_by_id[fid]
+            result = self._resolve_output(
+                fid,
+                task,
+                RiskRecommendation,
+                lambda e=finding, r=research, env=environment, a=agent: build_risk_task(e, r, env, a),
+                agent,
+                self.state.risk_failures,
+                extra_validate=lambda rec: verify_scoring_matches_tool(rec, self.state.risk_call_log),
+            )
+            if result is not None:
+                self.state.risk_by_id[fid] = result

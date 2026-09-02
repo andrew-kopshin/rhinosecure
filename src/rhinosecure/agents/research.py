@@ -12,6 +12,13 @@ anything the model already "knows" or fetches on its own initiative.
 
 All LLM calls route through `rhinosecure.llm.get_llm` -- this module never
 constructs a provider client itself (Trust boundary section).
+
+`build_research_task` does not set `output_pydantic` -- CrewAI's own
+structured-output conversion caused an unbounded retry loop on a 24-finding
+run (`agents/parsing.py`'s module docstring has the full trace). The task's
+final raw text is parsed into `ResearchFinding` by
+`agents.parsing.parse_structured_output`, dispatched with a retry cap by
+`agents/coordinator.py`.
 """
 
 from __future__ import annotations
@@ -210,11 +217,16 @@ def build_research_task(enriched: EnrichedFinding, agent: Agent) -> Task:
             "estimate a risk score or remediation bucket."
         ),
         expected_output=(
-            "A ResearchFinding: CVE ID, NVD's authoritative severity versus "
-            "the scanner's (and whether they disagree), KEV status, EPSS "
-            "score, matched ATT&CK techniques, a short exploitation-status "
-            "summary, and the source+timestamp of every fact used."
+            "Return ONLY a single JSON object, with these keys directly at the "
+            "top level -- not wrapped in any container key such as "
+            '{"finding": {...}} or {"result": {...}}, and no markdown code '
+            "fences or prose before or after it: finding_id, cve_id, "
+            "scanner_severity, nvd_base_score, nvd_severity, "
+            "severity_disagreement (bool), is_kev (bool), kev_date_added, "
+            "epss_score, epss_percentile, attack_techniques (a list of "
+            "objects, each with technique_id, name, confidence, prevalence), "
+            "exploitation_summary (a short prose summary), and sources (a "
+            "list of strings citing each source and its retrieval time)."
         ),
         agent=agent,
-        output_pydantic=ResearchFinding,
     )
