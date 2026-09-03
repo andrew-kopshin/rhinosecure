@@ -453,6 +453,29 @@ persists and is applied automatically on the next run without being restated.
 
 Inspect with DB Browser for SQLite (sqlitebrowser.org).
 
+**Built: the persistence layer, not yet the two things that would make the worked example true
+end to end.** `memory.py`'s `Memory` class owns all four tables (local file, default
+`rhinosecure.db` at the repo root, gitignored). `constraints` is asset-scoped free text with a
+soft-delete `active` flag rather than update-in-place, so a retracted constraint stays in the
+record; `runs` stores seed, a JSON `snapshot_versions` map (keyed `"source"` or `"source:key"`,
+mirroring `enrich/cache.py`'s own `SnapshotEntry` fields), contested rate, and the four per-stage
+`UsageMetrics` blobs (nullable — the deterministic path and a `--agents` run with nothing
+contested leave some or all of them `NULL`); `decisions` is one row per finding per run, foreign-
+keyed to `runs`, with nullable ToT summary columns so a contested finding's record actually
+reflects what was decided; `feedback` is raw input plus what it changed, `run_id` nullable. Cross-
+session persistence (closing one `Memory` and opening a new one against the same file) is what
+the test suite exercises directly against Section 7's own worked example text.
+
+**Two things this module deliberately does not do, so the worked example is not yet true end to
+end.** Nothing turns free-form human text ("the payroll server only reboots on Sundays") into the
+`(asset_id, constraint_text)` pair `add_constraint` takes — that interpretation is "constraint
+intake," the same still-unbuilt LLM-shaped work `agents/coordinator.py`'s docstring names (deciding
+which `finding_ids` a stated constraint should drive `replan` for). And nothing reads a stored
+constraint back out during a run and folds it into Environment Analysis's `has_patch_window`/
+`compensating_controls` — `constraints_for_asset` exists and is correct, but no caller invokes it
+yet. Both remain open; this section stays accurate about that rather than implying the worked
+example already works.
+
 ---
 
 ## 8. Non-negotiable build rules

@@ -608,3 +608,63 @@ batched 3-task propose crew's spend, with `max_parse_attempts=1` so no retry cre
 confirming a failed contested finding's real spend still lands in `RunState.tot_usage`.
 `tests/test_cli.py`'s `_fake_tot_result` helper needed a `usage=UsageMetrics()` argument added
 now that the field is required on `ToTResult`; no behavior there changed.
+
+**`memory.py` built: the four Section 7 tables, persistence only.** `sqlite3` from the standard
+library, one local file (`rhinosecure.db` at the repo root by default — `.gitignore` already had
+`*.db` from before this session, evidently anticipating this). Zero dependency on `crewai` or
+anything under `agents/` — deliberately, so this module stays importable from both the
+deterministic and agents paths without repeating the exact problem `scoring.contested_rate` was
+moved out of `tot.py` to avoid. Record types (`RunRecord`, `Decision`, etc.) take and return plain
+JSON-serializable values rather than importing `UsageMetrics`/`ContestedRate`/`ToTResult` — a
+future caller extracts primitive fields before calling in.
+
+**Schema decisions, each traced to something already in the codebase rather than invented:**
+`constraints` is asset-scoped free text (`asset_id`, `constraint_text`) with a soft-delete
+`active` flag — `deactivate_constraint`, not an UPDATE-in-place, so a retracted constraint stays
+in the historical record, the same append-only instinct this project's own PROGRESS.md already
+follows. `runs` stores exactly the four things asked for (seed, snapshot versions, contested
+rate, usage) plus the minimum bookkeeping needed for a row to be identifiable at all
+(`started_at`, `data_dir`, `total_findings`, `offline`, `agents`) — `snapshot_versions` is a
+single JSON object keyed `"source"` or `"source:key"` (mirroring `enrich/cache.py`'s
+`SnapshotEntry.source`/`.key`/`.version` exactly) rather than a normalized child table, since nothing
+needs to query across runs by individual snapshot version, only read one run's provenance back out
+whole; the four `*_usage` columns are nullable JSON blobs of whatever `UsageMetrics`-shaped dict a
+caller passes, since the deterministic path has none at all and a `--agents` run with nothing
+contested never touches `tot_usage`. `decisions` is one row per finding per run, foreign-keyed to
+`runs` (`PRAGMA foreign_keys = ON`, enforced by SQLite itself, not re-checked in Python) — the
+`RiskRecommendation` fields that are the actual verdict, plus nullable `tot_winner_strategy`/
+`tot_near_tie`/`tot_termination_reason`, because a decision record for a contested finding that
+omitted what ToT recommended wouldn't capture what was actually decided for exactly the subset of
+findings where the historical record matters most. `feedback` is raw input plus what it changed,
+per Section 7's own description verbatim, `run_id` nullable since feedback can be recorded before
+or without a resulting replan.
+
+**Deliberately not built: constraint intake, and reading constraints back into a run.** Two gaps,
+both named explicitly in this session's instructions and now also in CLAUDE.md Section 7 itself so
+they don't get silently marked done. First, nothing turns free-form human text ("the payroll
+server only reboots on Sundays") into the `(asset_id, constraint_text)` pair `add_constraint`
+takes — `agents/coordinator.py`'s docstring already names this exact interpretation step
+("constraint intake") as the one unbuilt piece of its own wiring, unchanged by this session.
+Second, nothing calls `constraints_for_asset` from anywhere in the run pipeline — Environment
+Analysis's `has_patch_window`/`compensating_controls` still come only from the asset CSV, never
+from stored constraints. Both are real, working, tested query paths with no caller yet, which is
+the literal difference between "persistence layer" (this session's scope) and "the worked example
+actually happening automatically" (CLAUDE.md Section 7's own text, still describing target
+behavior, not current behavior).
+
+**Verification.** 24 new tests (224 total), all in `tests/test_memory.py`, no changes needed
+anywhere else — a genuinely standalone module. Confirmed importable and functional under both
+`.venv` (3.14) and `.venv312`, unlike every agents-touching module so far, since it has no crewai
+dependency to trip on. The one test written to match Section 7's worked example precisely
+(`test_the_claude_md_worked_example_survives_a_new_session`) closes one `Memory` instance and
+opens a brand new one against the same file before reading the constraint back, rather than reusing
+the same connection — the concrete difference between "this variable is still in scope" and
+"persists across sessions." Also covered: schema creation is safe to run twice against the same
+file (exercised the same way, not as a separate code path); constraints don't leak across assets
+and come back oldest-first; retracted constraints are excluded from `active_only` queries but stay
+queryable with `active_only=False`; every `runs`/`decisions`/`feedback` field round-trips through
+JSON correctly including `None` for absent usage data; `contested_pct` (a computed property,
+mirroring `scoring.ContestedRate.pct`, never stored) handles a zero-total run without dividing by
+zero; an unknown `run_id` on `record_decision`/`record_feedback` raises `sqlite3.IntegrityError`
+from the foreign key constraint itself; `decisions_for_finding` correctly spans multiple runs for
+the same finding, oldest first, with `latest_decision_for_finding` picking the most recent.
