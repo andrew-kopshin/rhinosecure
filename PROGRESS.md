@@ -951,3 +951,51 @@ console output on top of that.
 `test_constraint_add_suppresses_console_output_by_default` and
 `test_constraint_add_verbose_flag_disables_suppression`, mirroring the existing
 `run --agents` quiet-flag test pair's structure. All 297 pass.
+
+**Full Slice 4 live demonstration against the real 24-finding demo fixture: ToT on all three
+contested findings, an asset-scoped constraint, a capacity constraint layered on top of it.**
+Requested directly, not a unit test -- real LLM calls throughout (`--offline` only gates
+enrichment, not the LLM). Surfaced a real, previously-undetected bug along the way:
+`memory.py`'s `Memory` opened its SQLite connection with `check_same_thread=True` (the default),
+but `agents/environment.py`'s `lookup_asset_context` and `agents/risk.py`'s `score_finding_tool`
+call `memory.constraints_for_asset` unconditionally whenever `memory is not None` -- not only
+when a constraint exists -- and CrewAI executes tool calls from a worker thread, not the thread
+that constructed the `Memory`. A real (non-mocked-Crew) asset-scoped constraint submission failed
+on every `lookup_asset_context` call with `sqlite3.ProgrammingError: SQLite objects created in a
+thread can only be used in that same thread`, cascading into the whole Environment task
+exhausting its retries and the constraint resolving to "0 finding(s) re-planned" with no visible
+error (`cli.py`'s `_print_constraint_result` never surfaces per-finding failures for this path).
+This had been latent since the constraint-intake feature was built: `run_agents()`/
+`submit_constraint()` always construct and pass a real `Memory`, but the only real (non-mocked)
+agents smoke test since then was the capacity path, which never touches `memory` from inside a
+CrewAI tool thread. Fixed: `sqlite3.connect(..., check_same_thread=False)` plus a
+`threading.Lock` around every method body (cross-thread access alone isn't enough -- one shared
+connection still isn't safe for genuinely concurrent use). New regression test
+(`test_reads_and_writes_from_a_different_thread_than_construction_do_not_raise`) does real work
+from a `threading.Thread` against a live `Memory`; confirmed directly that it fails with the exact
+production error when temporarily reverted, so it isn't vacuous. 298 tests total (was 297).
+
+With the fix, all three pieces ran clean end to end:
+- **ToT**: `F07`/`F11`/`F14` (all KEV-listed, no compensating control, no patch window) each ran
+  the full 3-branch beam search to depth 3 and landed near-tied (`emergency_change` vs. either
+  `build_control` or `establish_window`, gaps of 0.65/1.20/1.80 -- all under the 2.0 clear-winner
+  margin), surfacing both candidates rather than forcing a winner. `establish_window` was pruned
+  after round 1 for F07 and F11 (consistent with the earlier documented run) but survived to the
+  final beam for F14 this time -- real LLM variance across runs, not a bug. F11's strategist
+  independently caught that CVE-2020-0796's vulnerable SMBv3 code path is specific to Windows 10
+  builds 1903/1909 while `WKS-IT05` reports build 19045, and built every proposal around
+  verifying that mismatch before spending remediation effort -- reasoning `scoring.py` has no way
+  to perform. Total ToT spend: 823,223 tokens, 194 requests across the three findings.
+- **Asset-scoped constraint**: "SQL02's vendor has certified a quarterly emergency patch window..."
+  correctly resolved to `A12`, `effect_kind=patch_window`, `affects: F15` -- moving `F15` from
+  `mitigate_monitor` to `next_window` with `risk_score` unchanged (20.7 -> 20.7), the exact
+  CLAUDE.md Section 3 case this asset/finding pair was added to demonstrate.
+- **Capacity constraint, layered on the same memory DB**: "only three patches fit this window"
+  found 9 `next_window` candidates -- 8 from the fixture plus `F15`, freshly moved there by the
+  constraint just above -- ranked them, kept the top 3, deferred the other 6, each framed as
+  "risk_score unchanged... lost a rank-position race." `F15`'s presence in the pool is a live
+  demonstration of the constraint-overlay fix from earlier this session: the capacity computation
+  correctly reflected the asset-scoped constraint's effect rather than the fleet's raw CSV state.
+
+Scratch memory DBs used for this run were not the repo's `rhinosecure.db` and are not part of any
+commit.

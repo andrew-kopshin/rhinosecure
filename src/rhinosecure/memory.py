@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -346,19 +347,42 @@ class Memory:
     EXISTS`) runs on every construction, so opening the same file twice,
     in the same or a different process, is always safe -- this is how
     cross-session persistence is exercised in practice, not a special
-    "first run" code path."""
+    "first run" code path.
+
+    `check_same_thread=False` plus `self._lock` around every method body
+    below: a `Memory` instance is routinely handed to `Coordinator` and
+    from there into `agents/environment.py`'s `lookup_asset_context` and
+    `agents/risk.py`'s `score_finding_tool`, both of which call
+    `constraints_for_asset` unconditionally whenever `memory is not None`
+    -- not only when a constraint actually exists. CrewAI executes tool
+    calls from a worker thread, not the thread that constructed this
+    `Memory`, and sqlite3's default `check_same_thread=True` raises
+    `ProgrammingError` ("SQLite objects created in a thread can only be
+    used in that same thread") the instant that happens -- confirmed
+    directly: a real (non-mocked-Crew) agents run against a constraint on
+    an asset failed exactly this way on every `lookup_asset_context`
+    call, cascading into the whole Environment task exhausting its
+    retries. One shared `sqlite3.Connection` is not itself safe for
+    concurrent use from multiple threads (unlike, say, opening a fresh
+    connection per thread), so allowing cross-thread access on its own
+    isn't enough -- `self._lock` serializes every operation on it, which
+    is sufficient here since nothing in this module holds the connection
+    open across an actual concurrent read+write; each method acquires the
+    lock, does its one query or write, and releases it."""
 
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path))
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(_SCHEMA_SQL)
         self._conn.commit()
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     def __enter__(self) -> Memory:
         return self
@@ -381,19 +405,21 @@ class Memory:
         against anything (no dependency on agents/constraint_intake.py's
         ConstraintEffectKind enum). Omit both to record a constraint
         that hasn't been interpreted into a structured effect yet."""
-        cur = self._conn.execute(
-            "INSERT INTO constraints (asset_id, constraint_text, effect_kind, effect_value, "
-            "created_at, active) VALUES (?, ?, ?, ?, ?, 1)",
-            (asset_id, constraint_text, effect_kind, effect_value, _now()),
-        )
-        self._conn.commit()
-        return cur.lastrowid
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO constraints (asset_id, constraint_text, effect_kind, effect_value, "
+                "created_at, active) VALUES (?, ?, ?, ?, ?, 1)",
+                (asset_id, constraint_text, effect_kind, effect_value, _now()),
+            )
+            self._conn.commit()
+            return cur.lastrowid
 
     def deactivate_constraint(self, constraint_id: int) -> None:
         """Soft-delete: retracted constraints stay in the table (active=0)
         rather than being removed, so the historical record survives."""
-        self._conn.execute("UPDATE constraints SET active = 0 WHERE id = ?", (constraint_id,))
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute("UPDATE constraints SET active = 0 WHERE id = ?", (constraint_id,))
+            self._conn.commit()
 
     def constraints_for_asset(self, asset_id: str, *, active_only: bool = True) -> list[Constraint]:
         """What CLAUDE.md's worked example describes retrieving: every
@@ -406,13 +432,15 @@ class Memory:
         if active_only:
             query += " AND active = 1"
         query += " ORDER BY created_at, id"
-        rows = self._conn.execute(query, params).fetchall()
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
         return [_constraint_from_row(r) for r in rows]
 
     def all_active_constraints(self) -> list[Constraint]:
-        rows = self._conn.execute(
-            "SELECT * FROM constraints WHERE active = 1 ORDER BY asset_id, created_at, id"
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM constraints WHERE active = 1 ORDER BY asset_id, created_at, id"
+            ).fetchall()
         return [_constraint_from_row(r) for r in rows]
 
     # --- runs -------------------------------------------------------------
@@ -433,39 +461,42 @@ class Memory:
         risk_usage: dict[str, Any] | None = None,
         tot_usage: dict[str, Any] | None = None,
     ) -> int:
-        cur = self._conn.execute(
-            """INSERT INTO runs (
-                started_at, data_dir, seed, offline, agents, total_findings,
-                contested_count, contested_total, snapshot_versions,
-                research_usage, environment_usage, risk_usage, tot_usage
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                _now(),
-                data_dir,
-                seed,
-                int(offline),
-                int(agents),
-                total_findings,
-                contested_count,
-                contested_total,
-                _dump_or_none(snapshot_versions),
-                _dump_or_none(research_usage),
-                _dump_or_none(environment_usage),
-                _dump_or_none(risk_usage),
-                _dump_or_none(tot_usage),
-            ),
-        )
-        self._conn.commit()
-        return cur.lastrowid
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO runs (
+                    started_at, data_dir, seed, offline, agents, total_findings,
+                    contested_count, contested_total, snapshot_versions,
+                    research_usage, environment_usage, risk_usage, tot_usage
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    _now(),
+                    data_dir,
+                    seed,
+                    int(offline),
+                    int(agents),
+                    total_findings,
+                    contested_count,
+                    contested_total,
+                    _dump_or_none(snapshot_versions),
+                    _dump_or_none(research_usage),
+                    _dump_or_none(environment_usage),
+                    _dump_or_none(risk_usage),
+                    _dump_or_none(tot_usage),
+                ),
+            )
+            self._conn.commit()
+            return cur.lastrowid
 
     def get_run(self, run_id: int) -> RunRecord | None:
-        row = self._conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
         return _run_from_row(row) if row is not None else None
 
     def list_runs(self, limit: int = 50) -> list[RunRecord]:
-        rows = self._conn.execute(
-            "SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
         return [_run_from_row(r) for r in rows]
 
     # --- decisions ----------------------------------------------------
@@ -500,56 +531,60 @@ class Memory:
         decision results from one (CLAUDE.md Section 10's "only five
         patches fit this window" example) so the decision record carries
         why it landed where it did."""
-        cur = self._conn.execute(
-            """INSERT INTO decisions (
-                run_id, finding_id, cve_id, asset_id, hostname, risk_score, bucket,
-                rationale, verdict_summary, narrative,
-                tot_winner_strategy, tot_near_tie, tot_termination_reason,
-                capacity_rank, capacity_pool_size, capacity_limit, decided_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                run_id,
-                finding_id,
-                cve_id,
-                asset_id,
-                hostname,
-                risk_score,
-                bucket,
-                json.dumps(list(rationale)),
-                verdict_summary,
-                narrative,
-                tot_winner_strategy,
-                None if tot_near_tie is None else int(tot_near_tie),
-                tot_termination_reason,
-                capacity_rank,
-                capacity_pool_size,
-                capacity_limit,
-                _now(),
-            ),
-        )
-        self._conn.commit()
-        return cur.lastrowid
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO decisions (
+                    run_id, finding_id, cve_id, asset_id, hostname, risk_score, bucket,
+                    rationale, verdict_summary, narrative,
+                    tot_winner_strategy, tot_near_tie, tot_termination_reason,
+                    capacity_rank, capacity_pool_size, capacity_limit, decided_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id,
+                    finding_id,
+                    cve_id,
+                    asset_id,
+                    hostname,
+                    risk_score,
+                    bucket,
+                    json.dumps(list(rationale)),
+                    verdict_summary,
+                    narrative,
+                    tot_winner_strategy,
+                    None if tot_near_tie is None else int(tot_near_tie),
+                    tot_termination_reason,
+                    capacity_rank,
+                    capacity_pool_size,
+                    capacity_limit,
+                    _now(),
+                ),
+            )
+            self._conn.commit()
+            return cur.lastrowid
 
     def decisions_for_run(self, run_id: int) -> list[Decision]:
-        rows = self._conn.execute(
-            "SELECT * FROM decisions WHERE run_id = ? ORDER BY id", (run_id,)
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM decisions WHERE run_id = ? ORDER BY id", (run_id,)
+            ).fetchall()
         return [_decision_from_row(r) for r in rows]
 
     def decisions_for_finding(self, finding_id: str) -> list[Decision]:
         """Every prior decision for one finding, oldest first, across
         every run that ever scored it -- the "prior remediation verdicts"
         Section 7 describes this table as holding."""
-        rows = self._conn.execute(
-            "SELECT * FROM decisions WHERE finding_id = ? ORDER BY id", (finding_id,)
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM decisions WHERE finding_id = ? ORDER BY id", (finding_id,)
+            ).fetchall()
         return [_decision_from_row(r) for r in rows]
 
     def latest_decision_for_finding(self, finding_id: str) -> Decision | None:
-        row = self._conn.execute(
-            "SELECT * FROM decisions WHERE finding_id = ? ORDER BY id DESC LIMIT 1",
-            (finding_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM decisions WHERE finding_id = ? ORDER BY id DESC LIMIT 1",
+                (finding_id,),
+            ).fetchone()
         return _decision_from_row(row) if row is not None else None
 
     # --- feedback ----------------------------------------------------
@@ -557,18 +592,20 @@ class Memory:
     def record_feedback(
         self, raw_input: str, change_description: str, run_id: int | None = None
     ) -> int:
-        cur = self._conn.execute(
-            "INSERT INTO feedback (raw_input, change_description, run_id, recorded_at) "
-            "VALUES (?, ?, ?, ?)",
-            (raw_input, change_description, run_id, _now()),
-        )
-        self._conn.commit()
-        return cur.lastrowid
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO feedback (raw_input, change_description, run_id, recorded_at) "
+                "VALUES (?, ?, ?, ?)",
+                (raw_input, change_description, run_id, _now()),
+            )
+            self._conn.commit()
+            return cur.lastrowid
 
     def list_feedback(self, limit: int = 50) -> list[Feedback]:
-        rows = self._conn.execute(
-            "SELECT * FROM feedback ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM feedback ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
         return [_feedback_from_row(r) for r in rows]
 
     # --- capacity constraints -------------------------------------------
@@ -590,16 +627,18 @@ class Memory:
         about some other, unrelated run; it has nothing to "still be
         true" on a later run the way an asset-scoped constraint does. It
         is scoped, recorded, and done."""
-        cur = self._conn.execute(
-            "INSERT INTO capacity_constraints (run_id, raw_text, patch_limit, pool_size, "
-            "deferred_count, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (run_id, raw_text, patch_limit, pool_size, deferred_count, _now()),
-        )
-        self._conn.commit()
-        return cur.lastrowid
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO capacity_constraints (run_id, raw_text, patch_limit, pool_size, "
+                "deferred_count, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (run_id, raw_text, patch_limit, pool_size, deferred_count, _now()),
+            )
+            self._conn.commit()
+            return cur.lastrowid
 
     def capacity_constraints_for_run(self, run_id: int) -> list[CapacityConstraint]:
-        rows = self._conn.execute(
-            "SELECT * FROM capacity_constraints WHERE run_id = ? ORDER BY id", (run_id,)
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM capacity_constraints WHERE run_id = ? ORDER BY id", (run_id,)
+            ).fetchall()
         return [_capacity_constraint_from_row(r) for r in rows]

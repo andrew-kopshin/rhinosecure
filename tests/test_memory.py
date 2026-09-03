@@ -1,4 +1,5 @@
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,54 @@ def test_opening_the_same_file_twice_is_safe(db_path: Path):
 
     with Memory(db_path) as db2:
         assert len(db2.constraints_for_asset("A12")) == 1
+
+
+def test_reads_and_writes_from_a_different_thread_than_construction_do_not_raise(db_path: Path):
+    """The real bug this guards: a Memory is routinely constructed on the
+    main thread and then handed to Coordinator, which passes it into
+    agents/environment.py's lookup_asset_context and agents/risk.py's
+    score_finding_tool -- both call constraints_for_asset unconditionally
+    whenever memory is not None, and CrewAI executes tool calls from a
+    worker thread, not the thread that built this Memory. Confirmed
+    directly against a real (non-mocked) agents run: without
+    check_same_thread=False (plus a lock serializing access, since one
+    shared connection still isn't safe for genuinely concurrent use),
+    every such call raised sqlite3.ProgrammingError ("SQLite objects
+    created in a thread can only be used in that same thread"), which
+    cascaded into the whole Environment/Risk task exhausting its retries
+    and failing outright -- reads and writes worked fine everywhere in
+    this test suite because every other test happens to run entirely on
+    one thread, the same blind spot that let this bug ship unnoticed."""
+    db = Memory(db_path)
+    try:
+        errors: list[BaseException] = []
+
+        def worker():
+            try:
+                constraint_id = db.add_constraint("A12", "written from a worker thread")
+                assert db.constraints_for_asset("A12")[0].id == constraint_id
+                run_id = db.record_run(
+                    data_dir="x", seed=42, offline=True, agents=True,
+                    total_findings=1, contested_count=0, contested_total=1,
+                )
+                db.record_decision(
+                    run_id=run_id, finding_id="F01", cve_id="CVE-0000-0000", asset_id="A12",
+                    hostname="H1", risk_score=10.0, bucket="accept", rationale=[],
+                    verdict_summary="x", narrative="x",
+                )
+            except BaseException as exc:  # noqa: BLE001 -- must observe it on the main thread to fail the test
+                errors.append(exc)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join(timeout=10)
+
+        assert not thread.is_alive(), "worker thread did not finish -- looks deadlocked"
+        assert errors == [], f"worker thread raised: {errors}"
+        assert len(db.constraints_for_asset("A12")) == 1
+        assert len(db.decisions_for_run(1)) == 1
+    finally:
+        db.close()
 
 
 def test_creates_parent_directories(tmp_path: Path):
