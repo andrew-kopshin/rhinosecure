@@ -380,3 +380,43 @@ the entry above end to end with the redesigned (no-`output_pydantic`) agents —
 showed the model wrapping one answer in markdown code fences this run, which
 `parse_structured_output`'s regex-based extraction handled transparently — a live example of the
 defensive parsing already pulling its weight, not just passing synthetic tests.
+
+**Slice 3 exit criteria confirmed on the full demo fixture: `rhino run --agents --data demo
+--explain`, all 24 findings, zero failures.** Checked against Section 10's exit criteria
+programmatically, not by eyeballing the transcript:
+
+- **Ranking match.** Parsed the agent-produced table and diffed it row-by-row against a fresh
+  `rhino run --data demo --seed 42 --offline` (the deterministic pipeline) for all 24
+  finding_ids: 0 mismatches, exact rank order match, every bucket and risk_score (to the
+  printed 0.1 precision) identical — `patch_now=1, next_window=8, contested=3,
+  mitigate_monitor=3, accept=9`, unchanged from every deterministic run logged above. Section
+  10's "any delta traceable to a named reasoning step" clause is vacuously satisfied: there is
+  no delta to trace.
+- **Rationale cites sources, on all 24, not a sample.** Every finding's `scoring_rationale`
+  carries an explicit `source=nvd` or `source=scanner` tag, and every narrative explicitly
+  names both "Research" and "Environment" by role when citing the facts that came from each —
+  confirmed by parsing all 24 narrative blocks out of the transcript and checking every one,
+  not spot-checking a few and assuming the rest match. Spot-read F01's block in full for prose
+  quality: it correctly separates what NVD/KEV/EPSS/ATT&CK (Research) established from what the
+  asset record (Environment) established, and ties both to the specific rationale line each
+  fact drove (the KEV floor, the ATT&CK prevalence multiplier, the internet-exposure
+  multiplier) rather than a generic restatement.
+- **The four roles are doing genuinely distinct work, not overlapping.** Tool-call tally across
+  the whole run: `lookup_nvd`, `lookup_kev`, `lookup_epss`, `lookup_attack_techniques` (Research)
+  each called exactly 24 times; `lookup_asset_context` (Environment) exactly 24 times;
+  `score_finding` (Risk) exactly 24 times — 144 total, 24 × 6, with zero overlap between the
+  three tool sets and zero calls attributable to Coordinator (confirmed structurally in the
+  2026-09-02 Coordinator entry above: it is plain Python, no LLM calls of its own). Every tool
+  called exactly once per finding, no more, is itself a second confirmation of zero failures:
+  a retried finding would have shown up as extra calls to whichever tool its retried stage uses.
+- **Zero failures, independently confirmed.** No `ValidationError`, `ConverterError`,
+  `Traceback`, `AgentOutputParseError`, `ScoringMismatchError`, or "gave up after" text anywhere
+  in the 819-line transcript — the incident this session's previous entry fixed does not
+  recur at 8x the finding count that originally triggered it.
+
+**Cost.** The transcript doesn't carry token counts — `rhino run --agents` doesn't print
+`usage_metrics` the way the ad hoc verification scripts earlier in this session did, a real
+gap worth closing later but not done here. Extrapolating from the 3-finding run's measured rate
+(≈$0.41 for 9 finding-stage units, i.e. ≈$0.046/finding-stage) rather than re-running the job a
+second time just to meter it: **≈$3.3** for the full 24-finding, 3-stage, 72-task run — in line
+with the "$3-4" estimate the earlier entry projected before this run existed to confirm it.
