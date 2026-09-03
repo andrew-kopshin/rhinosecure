@@ -190,3 +190,59 @@ def test_main_without_agents_flag_still_uses_the_deterministic_path(monkeypatch)
 
     assert main(["run", "--data", "demo", "--seed", "42"]) == 0
     assert _FakeCoordinator.last_init_args is None
+
+
+# --- --quiet ---------------------------------------------------------------
+
+
+def test_main_with_agents_and_quiet_suppresses_console_output(monkeypatch):
+    monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
+    _FakeCoordinator.result = [_fake_recommendation()]
+    calls = []
+    monkeypatch.setattr(
+        "crewai.events.utils.console_formatter.set_suppress_console_output",
+        lambda suppress: calls.append(suppress),
+    )
+
+    assert main(["run", "--data", "demo", "--agents", "--quiet"]) == 0
+    assert calls == [True]
+
+
+def test_main_with_agents_without_quiet_does_not_touch_console_suppression(monkeypatch):
+    monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
+    _FakeCoordinator.result = [_fake_recommendation()]
+    calls = []
+    monkeypatch.setattr(
+        "crewai.events.utils.console_formatter.set_suppress_console_output",
+        lambda suppress: calls.append(suppress),
+    )
+
+    assert main(["run", "--data", "demo", "--agents"]) == 0
+    assert calls == []
+
+
+def test_quiet_flag_without_agents_is_a_harmless_no_op():
+    """--quiet only means something on the --agents path; alone it must not
+    error or change the deterministic path's behavior."""
+    assert main(["run", "--data", "demo", "--seed", "42", "--quiet"]) == 0
+
+
+# --- _ensure_utf8_stdio ------------------------------------------------------
+
+
+def test_ensure_utf8_stdio_does_not_raise_on_real_streams():
+    from rhinosecure.cli import _ensure_utf8_stdio
+
+    _ensure_utf8_stdio()  # must not raise, whatever pytest's own capture wraps stdout in
+
+
+def test_ensure_utf8_stdio_tolerates_a_stream_without_reconfigure(monkeypatch):
+    from rhinosecure.cli import _ensure_utf8_stdio
+
+    class _NoReconfigure:
+        pass
+
+    monkeypatch.setattr("sys.stdout", _NoReconfigure())
+    monkeypatch.setattr("sys.stderr", _NoReconfigure())
+
+    _ensure_utf8_stdio()  # must not raise even when neither stream supports reconfigure()

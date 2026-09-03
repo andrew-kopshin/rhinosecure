@@ -541,6 +541,15 @@ not mark any of these done until there's a specific module and test to point to.
 3. **Tool-call retry cap.** No bound yet on how many times an agent may retry a failed tool call
    (an NVD timeout, a malformed EPSS response) before it must stop and escalate instead of
    looping.
+4. **Cost/usage visibility.** "Trust boundary and provider independence" (above) accepts
+   per-run cost as an operational property of the LLM dependency, but `rhino run --agents`
+   prints nothing about it — a run's actual token usage and dollar cost are currently invisible
+   from the CLI. `Coordinator`'s `RunState` already collects `research_usage`/
+   `environment_usage`/`risk_usage` (one `crewai` `UsageMetrics` per stage) — nothing reads them
+   back out. The 24-finding run PROGRESS.md logged as confirming Slice 3's exit criteria could
+   only report an *extrapolated* cost (≈$3.3, from an earlier smaller run's measured rate) for
+   exactly this reason. `rhino run --agents` should print total tokens and an estimated dollar
+   cost at the end of a run.
 
 ---
 

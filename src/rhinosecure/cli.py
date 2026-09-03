@@ -12,6 +12,19 @@ their output is directly comparable. Importing agents.coordinator pulls
 in crewai, which only imports on Python 3.12 (see CLAUDE.md Section 11)
 -- deferred to inside run_agents() so `rhino run` without --agents keeps
 working on any interpreter this project's deterministic half supports.
+
+`--quiet` (agents path only) silences CrewAI's own console event-bus
+logging -- "Agent Started" boxes, per-tool-call echo lines, etc. --
+via `set_suppress_console_output`, so `--agents --quiet` prints only
+what this module itself prints (the table, and --explain's rationale).
+
+`_ensure_utf8_stdio` is unconditional and independent of --quiet: on
+Windows, the default console codepage can't encode the emoji CrewAI's
+event bus prints, which without it surfaced as recurring "'charmap'
+codec can't encode character..." lines on every agent run even though
+nothing was actually failing -- reconfiguring stdout/stderr to UTF-8
+fixes that regardless of --quiet, and regardless of the console's own
+codepage.
 """
 
 from __future__ import annotations
@@ -31,6 +44,18 @@ from rhinosecure.schema import AttackTechniqueRef, EnrichedFinding
 from rhinosecure.scoring import ScoredFinding, rank, score_finding
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _ensure_utf8_stdio() -> None:
+    """Best effort: reconfigure stdout/stderr to UTF-8 regardless of the
+    console's own codepage. Some stream replacements (pytest's capsys,
+    certain redirects) don't support `reconfigure` -- silently skip those
+    rather than let a cosmetic fix break anything real."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
 
 
 def _resolve_data_dir(data_arg: str) -> Path:
@@ -178,14 +203,28 @@ def main(argv: list[str] | None = None) -> int:
             "deterministic pipeline -- makes real LLM calls, one per finding per stage"
         ),
     )
+    run_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "with --agents, silence CrewAI's own console logging (agent-started boxes, "
+            "per-tool-call echo lines) so only the table and --explain's rationale print"
+        ),
+    )
 
     args = parser.parse_args(argv)
+    _ensure_utf8_stdio()
 
     if args.command == "run":
         data_dir = _resolve_data_dir(args.data)
 
         if args.agents:
             from rhinosecure.llm import LLMConfigError
+
+            if args.quiet:
+                from crewai.events.utils.console_formatter import set_suppress_console_output
+
+                set_suppress_console_output(True)
 
             # No CoordinatorError/ScoringMismatchError handler here: a
             # per-finding failure is recorded and skipped inside
