@@ -1,0 +1,4 @@
+asset_id,hostname,os,os_build,role,business_function,criticality,internet_exposed,environment,data_sensitivity,patch_window,patch_restrictions,compensating_controls,owner
+A02,EXCH01,Windows Server 2019,17763,exchange,Primary mail server - internet-facing OWA,5,True,prod,confidential,Sun 02:00-06:00,no reboot during business hours,,messaging-team
+A03,EXCH02,Windows Server 2019,17763,exchange,Internal mail relay - not internet facing,3,False,prod,internal,Sun 02:00-06:00,,,messaging-team
+A04,EXCHDEV01,Windows Server 2019,17763,exchange,Exchange lab box - isolated test environment,1,False,dev,none,,,network isolated,messaging-team

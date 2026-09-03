@@ -1,5 +1,6 @@
 """Standalone connectivity check: one call to claude-sonnet-5, nothing wired
-into the pipeline. Run with `python smoke_test.py` after `pip install -e ".[agents]"`.
+into the pipeline. Run with `python scripts/smoke_test.py` from the repo root,
+after `pip install -e ".[agents]"`.
 """
 
 from __future__ import annotations

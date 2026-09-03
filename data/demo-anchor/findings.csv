@@ -1,0 +1,4 @@
+finding_id,asset_id,cve_id,detected_date,scanner_severity,product,version,port,service,evidence
+F01,A02,CVE-2021-26855,2026-08-01,critical,Microsoft Exchange Server,2016 CU19,443,https,OWA endpoint vulnerable to pre-auth SSRF chain (ProxyLogon)
+F02,A03,CVE-2021-26855,2026-08-01,critical,Microsoft Exchange Server,2016 CU19,443,https,OWA endpoint vulnerable to pre-auth SSRF chain (ProxyLogon)
+F03,A04,CVE-2021-26855,2026-08-01,critical,Microsoft Exchange Server,2016 CU19,443,https,OWA endpoint vulnerable to pre-auth SSRF chain (ProxyLogon)

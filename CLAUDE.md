@@ -836,6 +836,8 @@ rhinosecure/
     crew.py                  # CrewAI wiring
     cli.py
   tests/
+  scripts/
+    smoke_test.py            # standalone LLM connectivity check, not wired into the pipeline
   out/                       # generated plans, gitignored
 ```
 
