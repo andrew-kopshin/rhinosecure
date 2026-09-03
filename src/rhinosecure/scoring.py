@@ -413,17 +413,41 @@ def _rationale(
         lines.append(
             f"compensating_controls={list(impact.compensating_controls)} (x{decay:.2f} impact, applied after composite)"
         )
+    elif "compensating_controls" in asset.not_collected:
+        lines.append(
+            "compensating controls not collected -- this source exports none, so whether any control "
+            "covers this asset is unknown, not known to be absent (no impact decay applied either way)"
+        )
     if asset.has_patch_window:
         lines.append(f"patch_window='{asset.patch_window}' declared -> defer to this window")
+    elif "patch_window" in asset.not_collected:
+        lines.append(
+            "patch window not collected -- this source exports none, so when this asset may be patched "
+            "is unknown, not unrestricted; scored as if unrestricted because that is all this record "
+            "supports, and supplying the real one changes the verdict"
+        )
     else:
         lines.append("no patch_window declared -> no scheduling restriction, may be patched at any time")
     lines.append(f"risk_score={risk_pct:.1f}/100")
     if bucket is Bucket.CONTESTED:
+        # Same sentence for a native record; for a record whose source
+        # never collected these two fields, "no control and no window" is
+        # a claim the data doesn't support -- the honest version is that
+        # neither is known. bucket_for reaches contested identically
+        # either way, so only the wording varies, never the verdict.
+        control_state = (
+            "no compensating control collected"
+            if "compensating_controls" in asset.not_collected
+            else "no compensating control"
+        )
+        window_state = (
+            "no patch window collected" if "patch_window" in asset.not_collected else "no patch window"
+        )
         lines.append(
-            "bucket=contested: is_kev=True with no compensating control and no patch window -- "
+            f"bucket=contested: is_kev=True with {control_state} and {window_state} -- "
             "not accept (confirmed exploitation), not mitigate_monitor (no control to point to), "
             "not next_window (nothing scheduled). No bucket honestly describes this; routed to "
-            "Tree-of-Thought (Slice 4, not yet built) for human/agent reasoning."
+            "Tree-of-Thought for human/agent reasoning."
         )
     return tuple(lines)
 

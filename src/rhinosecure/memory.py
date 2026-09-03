@@ -99,6 +99,10 @@ CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at TEXT NOT NULL,
     data_dir TEXT NOT NULL,
+    -- Which ingest adapter read data_dir (adapters/, CLAUDE.md Section 1).
+    -- Nullable: rows written before --format existed have no answer, and
+    -- inventing "native" for them would assert something never recorded.
+    ingest_format TEXT,
     seed INTEGER NOT NULL,
     offline INTEGER NOT NULL,
     agents INTEGER NOT NULL,
@@ -184,6 +188,7 @@ class RunRecord:
     id: int
     started_at: str
     data_dir: str
+    ingest_format: str | None
     seed: int
     offline: bool
     agents: bool
@@ -282,6 +287,7 @@ def _run_from_row(row: sqlite3.Row) -> RunRecord:
         id=row["id"],
         started_at=row["started_at"],
         data_dir=row["data_dir"],
+        ingest_format=row["ingest_format"],
         seed=row["seed"],
         offline=bool(row["offline"]),
         agents=bool(row["agents"]),
@@ -378,7 +384,28 @@ class Memory:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(_SCHEMA_SQL)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was first created.
+
+        `CREATE TABLE IF NOT EXISTS` is a no-op on an existing file, so a
+        column added to `_SCHEMA_SQL` never reaches a database someone
+        already has -- the next INSERT would fail with "no such column"
+        against their real run history. Each entry here is an idempotent
+        ALTER, applied only when PRAGMA table_info says the column is
+        genuinely absent. New columns must be nullable: there is no
+        truthful value to backfill onto rows written before the column
+        existed.
+        """
+        added: list[tuple[str, str, str]] = [
+            ("runs", "ingest_format", "TEXT"),
+        ]
+        for table, column, decl in added:
+            existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def close(self) -> None:
         with self._lock:
@@ -455,6 +482,7 @@ class Memory:
         total_findings: int,
         contested_count: int,
         contested_total: int,
+        ingest_format: str | None = None,
         snapshot_versions: dict[str, int] | None = None,
         research_usage: dict[str, Any] | None = None,
         environment_usage: dict[str, Any] | None = None,
@@ -464,13 +492,14 @@ class Memory:
         with self._lock:
             cur = self._conn.execute(
                 """INSERT INTO runs (
-                    started_at, data_dir, seed, offline, agents, total_findings,
+                    started_at, data_dir, ingest_format, seed, offline, agents, total_findings,
                     contested_count, contested_total, snapshot_versions,
                     research_usage, environment_usage, risk_usage, tot_usage
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     _now(),
                     data_dir,
+                    ingest_format,
                     seed,
                     int(offline),
                     int(agents),

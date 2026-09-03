@@ -464,9 +464,14 @@ def test_load_batch_joins_and_scores_a_defender_export_offline(tmp_path):
         assert by_cve[kev_cve].bucket in (Bucket.PATCH_NOW, Bucket.CONTESTED)
         assert by_cve[kev_cve].bucket is not Bucket.NEXT_WINDOW  # never "on schedule" with no schedule known
     assert by_cve["CVE-2021-1656"].bucket in (Bucket.ACCEPT, Bucket.NEXT_WINDOW)
-    # The scorer's own rationale still says "no patch_window declared" -- scoring.py is
-    # untouched; the gap note the CLI prints alongside is what corrects the reading.
-    assert any("no patch_window declared" in line for line in by_cve["CVE-2020-1472"].rationale)
+    # The scorer says "not collected", not "none declared" -- the claim the
+    # export actually supports (scoring._rationale reads Asset.not_collected).
+    rationale = by_cve["CVE-2020-1472"].rationale
+    assert any("patch window not collected" in line for line in rationale)
+    assert any("compensating controls not collected" in line for line in rationale)
+    assert not any("no patch_window declared" in line for line in rationale)
+    contested = [line for line in rationale if line.startswith("bucket=contested")]
+    assert contested and "no patch window collected" in contested[0]
 
 
 def test_load_batch_refuses_before_any_enrichment_when_the_export_is_bad(tmp_path):

@@ -177,19 +177,33 @@ def apply_constraints(asset: Asset, constraints: list[Constraint]) -> Asset:
     replacing each other, matching how `Asset.compensating_control_list`
     already treats its own comma/semicolon-separated field as a set, not
     a single value.
+
+    **A supplied field stops being not-collected.** Any field a
+    constraint actually writes is removed from `Asset.not_collected`
+    (adapters/base.py) on the returned copy. This is the whole point of
+    the constraint path for a record ingested from a source that exports
+    no operational context: before, a Defender asset's blank
+    `patch_window` meant "unknown" and everything downstream said so;
+    after a human states the window, it is known, and continuing to flag
+    it as a data gap would be false. Fields no constraint touched keep
+    their marker, so one constraint never launders an asset's other gaps.
     """
     patch_window = asset.patch_window
     patch_restrictions = asset.patch_restrictions
     added_controls: list[str] = []
+    supplied: set[str] = set()
     for c in constraints:
         if not c.effect_value:
             continue
         if c.effect_kind == ConstraintEffectKind.PATCH_WINDOW.value:
             patch_window = c.effect_value
+            supplied.add("patch_window")
         elif c.effect_kind == ConstraintEffectKind.PATCH_RESTRICTION.value:
             patch_restrictions = c.effect_value
+            supplied.add("patch_restrictions")
         elif c.effect_kind == ConstraintEffectKind.COMPENSATING_CONTROL.value:
             added_controls.append(c.effect_value)
+            supplied.add("compensating_controls")
 
     if added_controls:
         compensating_controls = (
@@ -205,6 +219,7 @@ def apply_constraints(asset: Asset, constraints: list[Constraint]) -> Asset:
             "patch_window": patch_window,
             "patch_restrictions": patch_restrictions,
             "compensating_controls": compensating_controls,
+            "not_collected": asset.not_collected - supplied,
         }
     )
 
@@ -213,6 +228,31 @@ class ConstraintInterpretationError(RuntimeError):
     """Raised when the Interpreter's response never parses within
     max_parse_attempts -- see module docstring for why this aborts the
     whole submit_constraint call rather than being recorded and skipped."""
+
+
+SEARCHABLE_ASSET_FIELDS = ("asset_id", "hostname", "business_function", "role", "owner")
+
+
+def _matches(asset: Asset, query: str) -> bool:
+    """Substring match over the asset's identity fields, skipping any
+    field in `Asset.not_collected`.
+
+    Matching a query against a not-collected field would match its
+    *default*, not the asset (adapters/base.py). A Microsoft Defender
+    export supplies no role, business_function, or owner, so every
+    Defender server carries the same defaulted role: without this skip,
+    "the file server" would match every server in the fleet and "the
+    payroll box" would match none of them for the right reason but some
+    of them for the wrong one. Resolving an asset off a placeholder is
+    exactly the guess the whole ingest layer refuses to make, and here it
+    would land a human's constraint on the wrong machine.
+    """
+    for name in SEARCHABLE_ASSET_FIELDS:
+        if name in asset.not_collected:
+            continue
+        if query in str(getattr(asset, name)).lower():
+            return True
+    return False
 
 
 def build_constraint_tools(
@@ -238,20 +278,12 @@ def build_constraint_tools(
         """Find candidate assets by free-text match against hostname,
         business_function, role, owner, or asset_id (case-insensitive
         substring). Use this to resolve a phrase like "the payroll
-        server" to a real asset_id before doing anything else."""
+        server" to a real asset_id before doing anything else. Fields
+        this asset's source never collected are listed in not_collected
+        and are NOT matched against -- their values are placeholders,
+        not facts about the asset."""
         q = query.strip().lower()
-        matches = [
-            a
-            for a in asset_index.values()
-            if q
-            and (
-                q in a.asset_id.lower()
-                or q in a.hostname.lower()
-                or q in a.business_function.lower()
-                or q in a.role.lower()
-                or q in a.owner.lower()
-            )
-        ]
+        matches = [a for a in asset_index.values() if q and _matches(a, q)]
         result = {
             "query": query,
             "matches": [
@@ -264,6 +296,9 @@ def build_constraint_tools(
                     "patch_window": a.patch_window,
                     "patch_restrictions": a.patch_restrictions,
                     "compensating_controls": list(a.compensating_control_list),
+                    # Field names above whose value is a placeholder this
+                    # asset's source never supplied -- see _matches.
+                    "not_collected": sorted(a.not_collected),
                 }
                 for a in matches
             ],
@@ -365,6 +400,19 @@ def build_constraint_task(constraint_text: str, agent: Agent) -> Task:
             "assets match, or more than one plausible candidate exists with no way "
             "to tell which one the human meant, do not guess -- leave asset_id null "
             "and treat this as a refusal instead (constraint_kind null).\n\n"
+            "Some fleets are ingested from a scanner export that never collected "
+            "every field -- a Microsoft Defender export, for example, supplies no "
+            "role, business function, owner, patch window, or compensating controls. "
+            "Each search_assets match lists those field names in not_collected, and "
+            "the search does not match your query against them. Treat a value whose "
+            "field name appears in not_collected as a placeholder, never as a fact "
+            "about that asset: do not resolve an asset because its role or "
+            "business_function appears to match when that field is not collected, and "
+            "do not repeat such a value in your rationale as though the inventory "
+            "stated it. Matching on hostname or asset_id is always safe. If the human's "
+            "phrase describes a machine only by a role or function this fleet did not "
+            "collect, that is a refusal, not a guess -- say so in rationale and name "
+            "the field that is missing, so the human can restate it by hostname.\n\n"
             "Once (and only if) you have resolved exactly one asset, classify the "
             "constraint into exactly one effect kind:\n"
             "- patch_window: establishes or replaces when this asset may be patched "

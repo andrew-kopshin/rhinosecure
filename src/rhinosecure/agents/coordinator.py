@@ -151,12 +151,13 @@ from rhinosecure.agents.risk import (
     merge_research_into_enriched,
     verify_scoring_matches_tool,
 )
+from rhinosecure.adapters import DEFAULT_FORMAT
 from rhinosecure.enrich.attack import load_index as load_attack_index
 from rhinosecure.enrich.cache import SnapshotCache
 from rhinosecure.enrich.kev import load_catalog as load_kev_catalog
 from rhinosecure.ingest import attach_threat_signals, load_asset_index
 from rhinosecure.memory import Memory
-from rhinosecure.schema import EnrichedFinding
+from rhinosecure.schema import Asset, EnrichedFinding
 from rhinosecure.scoring import (
     Bucket,
     CapacityAllocation,
@@ -422,13 +423,31 @@ class Coordinator:
         memory: Memory | None = None,
         verbose: bool = False,
         max_parse_attempts: int = DEFAULT_MAX_PARSE_ATTEMPTS,
+        assets: dict[str, Asset] | None = None,
+        ingest_format: str = DEFAULT_FORMAT,
     ):
+        """`assets` is the fleet inventory this run reasons about, indexed
+        by asset_id -- what `_asset_index` feeds to Environment's
+        `lookup_asset_context` and the Constraint Interpreter's
+        `search_assets`. Pass it whenever the inventory came from
+        anywhere but the native `assets.csv` (i.e. any `--format` other
+        than native: `cli.load_batch` has already loaded and validated it,
+        and re-reading `data_dir` here would look for a file the export
+        does not have). Omitted, it falls back to loading the native
+        `assets.csv` under `data_dir`, which is what every native caller
+        has always done.
+
+        `ingest_format` is recorded on the `runs` row so a stored decision
+        says which adapter produced the inventory behind it; it selects
+        nothing and must match the format `assets` actually came from.
+        """
         self.data_dir = data_dir
         self.cache = cache or SnapshotCache()
         self.memory = memory
         self.verbose = verbose
         self.max_parse_attempts = max_parse_attempts
-        self._asset_index = load_asset_index(data_dir / "assets.csv")
+        self.ingest_format = ingest_format
+        self._asset_index = assets if assets is not None else load_asset_index(data_dir / "assets.csv")
         self.state: RunState | None = None
 
     def run(self, findings: list[EnrichedFinding]) -> list[RiskRecommendation]:
@@ -576,6 +595,7 @@ class Coordinator:
 
         run_id = self.memory.record_run(
             data_dir=str(self.data_dir),
+            ingest_format=self.ingest_format,
             seed=seed,
             offline=self.cache.offline,
             agents=True,
@@ -698,6 +718,7 @@ class Coordinator:
         rate = contested_rate(s.bucket.value for s in scored)
         run_id = self.memory.record_run(
             data_dir=str(self.data_dir),
+            ingest_format=self.ingest_format,
             seed=seed,
             offline=self.cache.offline,
             # agents=False: this run made no LLM calls beyond the one

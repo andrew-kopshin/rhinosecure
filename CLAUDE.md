@@ -87,13 +87,36 @@ see there for what remains. Two things the adapter deliberately does: refuse rat
 (a missing column, a non-Windows device, a non-CVE id, a finding whose host isn't in the
 inventory, or two conflicting rows for one finding all fail loudly, every offender listed in one
 message), and dedupe rather than double-count (exact duplicate rows collapse and are counted).
-`--format` is deterministic-path only: `agents/coordinator.py`'s `Coordinator` builds its own
-asset index from `<data>/assets.csv`, so `--agents` with a non-native format is refused up front
-— lifting that is an agents change, not an adapter one. Full mechanics, including the mapping
-table and each messy-reality rule: `adapters/base.py`'s and `adapters/defender.py`'s module
-docstrings. `data/defender-sample/` is a synthetic export (CVEs from the committed snapshots, so
-`--offline` works) that exercises the whole path; it is not the frozen fixture and not covered by
-Section 8 rule 1.
+`--format` works on all three paths — the deterministic pipeline, `--agents`, and `rhino
+constraint add`. `Coordinator` no longer reads `<data>/assets.csv` itself; it takes the
+already-loaded, already-validated inventory as `assets=` (plus `ingest_format=`, recorded on the
+`runs` row). That matters most for the constraint path, and is why it was worth doing rather than
+leaving refused: an export that carries no patch window, no compensating control, and no role is
+precisely the input a human has to fill in by hand, so the fill-in command is the one that has to
+accept it. Full mechanics, including the mapping table and each messy-reality rule:
+`adapters/base.py`'s and `adapters/defender.py`'s module docstrings. `data/defender-sample/` is a
+synthetic export (CVEs from the committed snapshots, so `--offline` works) that exercises the
+whole path; it is not the frozen fixture and not covered by Section 8 rule 1.
+
+**The fill-in loop, demonstrated end to end** (real LLM calls, `data/defender-sample`, scratch DB).
+`CVE-2020-1472` on `dc01.corp.example.com` scores 35.5 and lands `contested` — KEV-listed, and
+neither a control nor a window is *known*, which is the honest verdict on an export that collects
+neither. Submitting `rhino constraint add "dc01.corp.example.com can only be rebooted on Sundays
+between 02:00 and 06:00" --format defender` resolves the host by hostname, persists an
+asset-scoped `patch_window`, and moves that finding `contested → next_window` with `risk_score`
+unchanged at 35.5 — the constraint changed which bucket is *honest*, not how risky the finding is.
+The Interpreter's own rationale recorded that it relied on the hostname match and not on the
+asset's `patch_window`, "since it appears in not_collected" — the marker reaching a model's
+reasoning, not just the CLI's output. Constraints apply on `--agents` runs (which construct a
+`Memory`), not on the plain deterministic path, which never touches `memory.py` — pre-existing
+behavior, documented in `cli.py`.
+
+**Resolving an asset off a placeholder is refused.** `search_assets` skips any field named in
+`Asset.not_collected` when matching (`constraint_intake._matches`) and reports the marker on every
+candidate. Without that, all three servers in the Defender sample carry the same defaulted
+`role="file"`, so "the file server can only be patched on Saturdays" would match every one of them
+and a constraint could land on a domain controller. Confirmed against a real run: that statement
+returns zero candidates and refuses, instead of resolving to a defaulted role.
 
 **Guardrail.** This is a design constraint, not a feature list. The following remain out of
 scope for the capstone build: live scanner API connectors, credential handling, PII or
@@ -350,18 +373,25 @@ prohibits — see the note there. Fixture is now 12 assets / 15 findings.
   distinction: the value stays blank, so this section's rule for a blank window is unchanged and
   the fixture's output is byte-identical, and the field's name sits in `not_collected` whenever
   the source never collected it. The native fixture leaves it empty; the Defender adapter fills
-  it for every field Defender lacks. Two consumers still don't read the marker, because neither
-  is adapter code: `scoring._rationale` prints "no patch_window declared → no scheduling
-  restriction" for a not-collected window (the CLI's per-finding gap note corrects the reading
-  alongside it, in `cli.py`, not inside the rationale — Section 8 rule 2 kept scoring untouched),
-  and `agents/environment.py`'s `lookup_asset_context` hands an agent `patch_window: ""` with
-  no marker. One line each would close both; both are outside the adapter's remit and
-  deliberately not made yet. Likewise `--format` is not accepted by `--agents` or `rhino
-  constraint add` until `Coordinator` takes an inventory instead of reading `assets.csv` itself.
-- **The not-collected Impact enums have no fill-in path.** `rhino constraint add` can supply a
-  patch window, restriction, or compensating control per asset — the operational fields — but
-  nothing can supply `role`, `environment`, or `data_sensitivity` for an asset whose source
-  lacked them, so a Defender-sourced asset scores on `NOT_COLLECTED_DEFAULTS` indefinitely.
+  it for every field Defender lacks. Every consumer now reads it. `scoring._rationale` says
+  "patch window not collected — this source exports none, so when this asset may be patched is
+  unknown, not unrestricted" instead of the native "no patch_window declared", names
+  not-collected compensating controls rather than staying silent about them, and phrases the
+  `contested` explanation as "no patch window collected" when the field is a gap; it reads the
+  marker for *wording only* and never for arithmetic, so a score and a bucket are identical with
+  or without it (`test_scoring.py`). `agents/environment.py`'s `lookup_asset_context` and
+  `agents/constraint_intake.py`'s `search_assets` both carry the marker into the model's own view.
+  A constraint that supplies a field clears that field's marker (`apply_constraints`) — once a
+  human states the window it is known, and continuing to flag it would be false; fields no
+  constraint touched keep theirs, so one constraint never launders an asset's other gaps.
+- **The not-collected Impact enums have no fill-in path.** `rhino constraint add` supplies a
+  patch window, restriction, or compensating control per asset — the operational fields, and it
+  now accepts `--format`, so a Defender-sourced asset can be filled in — but nothing can supply
+  `role`, `environment`, or `data_sensitivity` for an asset whose source lacked them, so a
+  Defender-sourced asset scores on `NOT_COLLECTED_DEFAULTS` for those three indefinitely.
+  Extending `ConstraintEffectKind` is the obvious route and deliberately not taken here: those
+  three are scoring inputs rather than operational facts, so it is a scoring-model decision, not
+  an intake one.
   Defender-side candidates: `DeviceInfo.DeviceRoles` (JSON, undocumented vocabulary) and
   `DeviceManualTags`; the general answer is a CMDB/context sidecar keyed by device id. Related
   consequence, visible on `data/defender-sample/`: every KEV finding on a Defender asset lands
@@ -537,6 +567,13 @@ foreign-keyed to `runs`, with nullable ToT summary columns so a contested findin
 actually reflects what was decided; `feedback` is raw input plus what it changed, `run_id`
 nullable. Cross-session persistence (closing one `Memory` and opening a new one against the same
 file) is what the test suite exercises directly against Section 7's own worked example text.
+
+`runs.ingest_format` records which adapter (Section 1) produced the inventory a run reasoned
+about — nullable, because a row written before `--format` existed has no truthful answer and
+defaulting it to `native` would assert one. It arrived after the table did, which `CREATE TABLE
+IF NOT EXISTS` cannot deliver to a database someone already has, so `Memory._migrate` applies
+idempotent `ALTER TABLE` for columns added later, guarded by `PRAGMA table_info`. Any future
+column follows the same rule: added there, and nullable.
 
 **Constraint intake is built** (`agents/constraint_intake.py`'s Constraint Interpreter agent,
 dispatched by `agents/coordinator.py`'s `submit_constraint` — Section 5's "Human submits a

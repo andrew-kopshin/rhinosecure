@@ -223,3 +223,42 @@ def test_build_environment_task_embeds_finding_and_upstream_research_context():
     assert "human_constraints" in task.description
     assert "human_constraints" in task.expected_output
     assert "never blend a human constraint" in task.description
+
+
+# --- not_collected: fields the asset's source never supplied ----------------
+
+
+def test_lookup_asset_context_reports_not_collected_fields():
+    """A blank patch_window on a Defender-sourced asset means "nobody
+    recorded one", not "patching is unrestricted" (adapters/base.py).
+    Environment Analysis has to be able to tell the two apart, so the
+    tool result carries the marker alongside the values."""
+    from rhinosecure.schema import Asset
+
+    defender_asset = Asset(
+        asset_id="1a" * 20,
+        hostname="dc01.corp.example.com",
+        os="Windows Server 2019",
+        os_build="17763",
+        role="file",
+        criticality=3,
+        internet_exposed=False,
+        environment="prod",
+        data_sensitivity="internal",
+        not_collected=frozenset({"role", "patch_window", "compensating_controls", "owner"}),
+    )
+    call_log: list[dict] = []
+    tools = {t.name: t for t in build_environment_tools({defender_asset.asset_id: defender_asset}, call_log)}
+
+    result = json.loads(tools["lookup_asset_context"].run(asset_id=defender_asset.asset_id))
+
+    assert result["patch_window"] == ""  # value unchanged -- only the claim differs
+    assert result["not_collected"] == ["compensating_controls", "owner", "patch_window", "role"]
+    assert call_log[0]["result"]["not_collected"] == result["not_collected"]
+
+
+def test_lookup_asset_context_on_a_native_asset_reports_no_gaps():
+    """A native assets.csv row declares every field, so the marker is
+    always empty and the tool's output is unchanged from before it existed."""
+    tools, _ = _tools()
+    assert json.loads(tools["lookup_asset_context"].run(asset_id="A02"))["not_collected"] == []

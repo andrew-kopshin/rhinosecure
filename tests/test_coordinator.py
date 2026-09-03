@@ -957,3 +957,99 @@ def test_submit_capacity_constraint_limit_zero_is_a_real_limit_not_a_decline(
     [stored] = memory.capacity_constraints_for_run(result.run_id)
     assert stored.patch_limit == 0
     assert stored.deferred_count == 4
+
+
+# --- inventory injection: a non-native format has no assets.csv -------------
+#
+# Coordinator used to read <data_dir>/assets.csv itself, which made every
+# --format other than native impossible on the agents and constraint
+# paths. It now takes the already-loaded, already-validated inventory.
+
+
+def _defender_asset():
+    from rhinosecure.schema import Asset
+
+    return Asset(
+        asset_id="1a" * 20,
+        hostname="dc01.corp.example.com",
+        os="Windows Server 2019",
+        os_build="17763",
+        role="file",
+        criticality=3,
+        internet_exposed=False,
+        environment="prod",
+        data_sensitivity="internal",
+        not_collected=frozenset({"role", "patch_window", "compensating_controls"}),
+    )
+
+
+def test_accepts_an_inventory_and_never_reads_assets_csv(tmp_path: Path):
+    """tmp_path deliberately has no assets.csv -- a Defender export ships
+    devices.csv instead, so reading the native filename would fail."""
+    asset = _defender_asset()
+    assert not (tmp_path / "assets.csv").exists()
+
+    coordinator = Coordinator(tmp_path, assets={asset.asset_id: asset}, ingest_format="defender")
+
+    assert coordinator._asset_index == {asset.asset_id: asset}
+    assert coordinator.ingest_format == "defender"
+
+
+def test_without_an_inventory_it_still_loads_the_native_assets_csv(data_dir: Path):
+    """Every native caller omits assets= -- that path must be unchanged."""
+    coordinator = Coordinator(data_dir)
+    assert set(coordinator._asset_index) == {"A01", "A02"}
+    assert coordinator.ingest_format == "native"
+
+
+def test_without_an_inventory_and_without_assets_csv_it_fails_loudly(tmp_path: Path):
+    with pytest.raises(FileNotFoundError):
+        Coordinator(tmp_path)
+
+
+def test_the_injected_inventory_reaches_the_environment_and_constraint_tools(tmp_path: Path):
+    """The inventory is not just stored -- it is what Environment's
+    lookup_asset_context and the Interpreter's search_assets read."""
+    from rhinosecure.agents.constraint_intake import build_constraint_tools
+    from rhinosecure.agents.environment import build_environment_tools
+
+    asset = _defender_asset()
+    coordinator = Coordinator(tmp_path, assets={asset.asset_id: asset}, ingest_format="defender")
+
+    env = {t.name: t for t in build_environment_tools(coordinator._asset_index, [])}
+    looked_up = json.loads(env["lookup_asset_context"].run(asset_id=asset.asset_id))
+    assert looked_up["found"] is True
+    assert looked_up["hostname"] == "dc01.corp.example.com"
+    assert "patch_window" in looked_up["not_collected"]
+
+    search = {t.name: t for t in build_constraint_tools(coordinator._asset_index, {}, [])}
+    matches = json.loads(search["search_assets"].run(query="dc01"))["matches"]
+    assert [m["asset_id"] for m in matches] == [asset.asset_id]
+
+
+def test_ingest_format_is_recorded_on_the_runs_row(tmp_path: Path, monkeypatch):
+    """A stored decision should say which adapter produced the inventory
+    behind it. Checked through the capacity path, which is LLM-free past
+    the one interpretation call this stubs out."""
+    from rhinosecure.agents.constraint_intake import ConstraintInterpretation
+    from rhinosecure.memory import Memory
+
+    (tmp_path / "assets.csv").write_text(ASSETS_CSV, encoding="utf-8")
+    (tmp_path / "findings.csv").write_text(FINDINGS_CSV, encoding="utf-8")
+    findings = list(join_findings(tmp_path / "findings.csv", tmp_path / "assets.csv"))
+
+    memory = Memory(tmp_path / "m.db")
+    coordinator = Coordinator(tmp_path, memory=memory, ingest_format="defender")
+    monkeypatch.setattr(
+        Coordinator,
+        "interpret_constraint",
+        lambda self, text, f: ConstraintInterpretation(
+            constraint_kind="capacity", asset_id=None, effect_kind=None, effect_value=None,
+            patch_limit=1, affected_finding_ids=[], rationale="fake", sources=[],
+        ),
+    )
+
+    result = coordinator.submit_constraint("only one patch fits this window", findings)
+
+    assert memory.get_run(result.run_id).ingest_format == "defender"
+    memory.close()

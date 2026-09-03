@@ -380,3 +380,94 @@ def test_contested_rate_on_the_demo_fixture_matches_the_known_three():
     assert rate.contested == 3
     assert rate.total == 24
     assert rate.pct == pytest.approx(12.5)
+
+
+# --- rationale wording for fields the source never collected ----------------
+#
+# A blank patch_window means "no declared scheduling restriction" for a
+# native record and "nobody recorded one" for a record whose source does
+# not export the field (adapters/base.py). The verdict is identical
+# either way -- bucket_for reads the value, which is blank in both cases
+# -- but the rationale must not claim the stronger of the two.
+
+from rhinosecure.schema import Asset as _Asset  # noqa: E402
+from rhinosecure.schema import EnrichedFinding as _EnrichedFinding  # noqa: E402
+from rhinosecure.schema import Finding as _Finding  # noqa: E402
+from rhinosecure.scoring import score_finding as _score_finding  # noqa: E402
+
+_GAPS = frozenset({"patch_window", "compensating_controls", "role", "environment"})
+
+
+def _asset(**overrides):
+    base = dict(
+        asset_id="X1", hostname="host1", os="Windows Server 2019", os_build="17763",
+        role="dc", criticality=5, internet_exposed=False, environment="prod",
+        data_sensitivity="regulated",
+    )
+    base.update(overrides)
+    return _Asset(**base)
+
+
+def _scored(asset, *, is_kev=False):
+    finding = _Finding(
+        finding_id="X-1", asset_id=asset.asset_id, cve_id="CVE-2020-1472",
+        scanner_severity="critical", product="p", version="1", evidence="e",
+    )
+    return _score_finding(_EnrichedFinding(finding=finding, asset=asset, is_kev=is_kev))
+
+
+def test_native_blank_patch_window_keeps_the_declared_wording():
+    rationale = _scored(_asset()).rationale
+    assert any(
+        line == "no patch_window declared -> no scheduling restriction, may be patched at any time"
+        for line in rationale
+    )
+    assert not any("not collected" in line for line in rationale)
+
+
+def test_a_not_collected_patch_window_says_so_instead():
+    rationale = _scored(_asset(not_collected=_GAPS)).rationale
+    assert any(line.startswith("patch window not collected") for line in rationale)
+    assert not any("no patch_window declared" in line for line in rationale)
+    assert any("unknown, not unrestricted" in line for line in rationale)
+
+
+def test_not_collected_compensating_controls_are_named_rather_than_left_silent():
+    rationale = _scored(_asset(not_collected=_GAPS)).rationale
+    assert any(line.startswith("compensating controls not collected") for line in rationale)
+
+
+def test_a_declared_patch_window_or_control_wins_over_the_marker():
+    """If a value is actually present the marker is stale (the constraint
+    overlay clears it), and the real value must be reported either way."""
+    asset = _asset(
+        patch_window="Sun 02:00-06:00", compensating_controls="WAF", not_collected=_GAPS
+    )
+    rationale = _scored(asset).rationale
+    assert any("patch_window='Sun 02:00-06:00' declared" in line for line in rationale)
+    assert any("compensating_controls=['WAF']" in line for line in rationale)
+    assert not any("not collected" in line for line in rationale)
+
+
+def test_contested_line_says_collected_only_when_the_field_is_a_gap():
+    native = [line for line in _scored(_asset(), is_kev=True).rationale if line.startswith("bucket=contested")]
+    assert native and "with no compensating control and no patch window --" in native[0]
+
+    gapped = [
+        line
+        for line in _scored(_asset(not_collected=_GAPS), is_kev=True).rationale
+        if line.startswith("bucket=contested")
+    ]
+    assert gapped and "no compensating control collected and no patch window collected" in gapped[0]
+
+
+def test_not_collected_never_changes_a_score_or_a_bucket():
+    """The marker is a claim about provenance, not an input to the
+    arithmetic -- scoring must read it for wording only."""
+    for is_kev in (False, True):
+        plain = _scored(_asset(), is_kev=is_kev)
+        marked = _scored(_asset(not_collected=_GAPS), is_kev=is_kev)
+        assert plain.risk_score == marked.risk_score
+        assert plain.threat_score == marked.threat_score
+        assert plain.impact_score == marked.impact_score
+        assert plain.bucket is marked.bucket

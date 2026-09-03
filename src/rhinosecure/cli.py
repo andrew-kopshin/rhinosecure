@@ -89,14 +89,17 @@ list-of-ScoredFinding return (test_scoring.py and others call it that
 way); `run_with_report` is the same pipeline returning the assets and the
 report alongside, which is what `main` uses.
 
-`--format` is deterministic-path only for now: `--agents` (and `rhino
-constraint add`) construct `agents/coordinator.py`'s `Coordinator`, whose
-constructor builds its own asset index from `<data>/assets.csv` -- the
-native filename -- so a non-native format there is refused up front with a
-message saying so, rather than letting the Coordinator read a file that
-isn't there (or, worse, a stale native one that happens to be). Lifting
-that needs the Coordinator to accept an inventory instead of a path, an
-agents change this flag deliberately doesn't make.
+`--format` works on all three paths -- the deterministic pipeline,
+`--agents`, and `rhino constraint add`. `Coordinator` used to build its
+own asset index by reading `<data>/assets.csv` directly, which made a
+non-native format impossible there; it now takes the already-loaded,
+already-validated inventory as `assets=` (plus `ingest_format=` for the
+`runs` record), and every path here loads it the same way through
+`ingest.load_batch`. That matters most for `rhino constraint add`: an
+export that carries no patch window, no compensating control, and no
+role is exactly the input a human has to fill in by hand, so the
+constraint path is the one that has to work for it, not the one that
+refuses it.
 """
 
 from __future__ import annotations
@@ -117,7 +120,6 @@ from rhinosecure.ingest import (
     IngestError,
     IngestReport,
     attach_threat_signals,
-    join_findings,
     load_batch,
 )
 from rhinosecure.schema import Asset
@@ -201,7 +203,12 @@ def run_with_report(
 
 
 def run_agents(
-    data_dir: Path, seed: int, *, offline: bool = False, db_path: Path | str | None = None
+    data_dir: Path,
+    seed: int,
+    *,
+    offline: bool = False,
+    db_path: Path | str | None = None,
+    fmt: str = DEFAULT_FORMAT,
 ) -> Coordinator:
     """Dispatches the Slice 3 crew over every finding in `data_dir`, the
     agent equivalent of `run`. Returns the `Coordinator` itself, not just
@@ -221,11 +228,16 @@ def run_agents(
     from rhinosecure.memory import DEFAULT_DB_PATH, Memory
 
     random.seed(seed)  # see run()'s comment -- still a no-op for now
-    assets_path = data_dir / "assets.csv"
-    findings_path = data_dir / "findings.csv"
-    findings = list(join_findings(findings_path, assets_path))
+    assets, enriched = load_batch(data_dir, get_adapter(fmt))
+    findings = list(enriched)
     memory = Memory(db_path if db_path is not None else DEFAULT_DB_PATH)
-    coordinator = Coordinator(data_dir, cache=SnapshotCache(offline=offline), memory=memory)
+    coordinator = Coordinator(
+        data_dir,
+        cache=SnapshotCache(offline=offline),
+        memory=memory,
+        assets=assets,
+        ingest_format=fmt,
+    )
     coordinator.run(findings)
     return coordinator
 
@@ -237,20 +249,31 @@ def submit_constraint(
     *,
     offline: bool = False,
     db_path: Path | str | None = None,
+    fmt: str = DEFAULT_FORMAT,
 ) -> ConstraintSubmissionResult | CapacitySubmissionResult:
     """CLI entry point for `rhino constraint add` -- the agent equivalent
     of `run`/`run_agents`, dispatching `agents/coordinator.py`'s
     `submit_constraint` against every finding in `data_dir`. Imports
-    agents.*/memory lazily, same reason as `run_agents`."""
+    agents.*/memory lazily, same reason as `run_agents`.
+
+    `fmt` selects the ingest adapter exactly as it does for `run`. This is
+    the path that most needs a non-native format to work: a real scanner
+    export carries no patch window, compensating control, or role (see
+    adapters/base.py), and this command is how a human supplies them."""
     from rhinosecure.agents.coordinator import Coordinator
     from rhinosecure.memory import DEFAULT_DB_PATH, Memory
 
     random.seed(seed)
-    assets_path = data_dir / "assets.csv"
-    findings_path = data_dir / "findings.csv"
-    findings = list(join_findings(findings_path, assets_path))
+    assets, enriched = load_batch(data_dir, get_adapter(fmt))
+    findings = list(enriched)
     memory = Memory(db_path if db_path is not None else DEFAULT_DB_PATH)
-    coordinator = Coordinator(data_dir, cache=SnapshotCache(offline=offline), memory=memory)
+    coordinator = Coordinator(
+        data_dir,
+        cache=SnapshotCache(offline=offline),
+        memory=memory,
+        assets=assets,
+        ingest_format=fmt,
+    )
     return coordinator.submit_constraint(text, findings, seed=seed)
 
 
@@ -582,8 +605,7 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "ingest adapter for --data's files (adapters/): native reads assets.csv + findings.csv; "
             "defender reads Microsoft Defender Vulnerability Management exports devices.csv "
-            "(DeviceInfo) + vulnerabilities.csv (DeviceTvmSoftwareVulnerabilities). Deterministic "
-            "path only -- not yet accepted with --agents"
+            "(DeviceInfo) + vulnerabilities.csv (DeviceTvmSoftwareVulnerabilities)"
         ),
     )
 
@@ -613,22 +635,22 @@ def main(argv: list[str] | None = None) -> int:
     constraint_add_parser.add_argument(
         "--db", default=None, help="path to the memory.py SQLite file (default: memory.DEFAULT_DB_PATH)"
     )
+    constraint_add_parser.add_argument(
+        "--format",
+        default=DEFAULT_FORMAT,
+        choices=sorted(FORMATS),
+        help=(
+            "ingest adapter for --data's files, same as `rhino run --format`. A real scanner "
+            "export carries no patch window, compensating control, or role, so this is the "
+            "command that supplies them"
+        ),
+    )
 
     args = parser.parse_args(argv)
     _ensure_utf8_stdio()
 
     if args.command == "run":
         data_dir = _resolve_data_dir(args.data)
-
-        if args.agents and args.format != DEFAULT_FORMAT:
-            print(
-                f"--format {args.format} is not supported with --agents yet: agents/coordinator.py's "
-                f"Coordinator builds its own asset index from {data_dir / 'assets.csv'} (the native "
-                "format's filename), so it cannot read this export. Run without --agents, or teach "
-                "Coordinator to take an inventory instead of a path.",
-                file=sys.stderr,
-            )
-            return 2
 
         if args.agents:
             from rhinosecure.llm import LLMConfigError
@@ -643,7 +665,9 @@ def main(argv: list[str] | None = None) -> int:
             # Coordinator.run (see agents/coordinator.py), not raised --
             # neither exception can propagate out of run_agents.
             try:
-                coordinator = run_agents(data_dir, args.seed, offline=args.offline, db_path=args.db)
+                coordinator = run_agents(
+                    data_dir, args.seed, offline=args.offline, db_path=args.db, fmt=args.format
+                )
             except IngestError as exc:
                 print(f"ingest error: {exc}", file=sys.stderr)
                 return 1
@@ -707,7 +731,9 @@ def main(argv: list[str] | None = None) -> int:
             set_suppress_console_output(True)
 
         try:
-            result = submit_constraint(args.text, data_dir, args.seed, offline=args.offline, db_path=args.db)
+            result = submit_constraint(
+                args.text, data_dir, args.seed, offline=args.offline, db_path=args.db, fmt=args.format
+            )
         except IngestError as exc:
             print(f"ingest error: {exc}", file=sys.stderr)
             return 1

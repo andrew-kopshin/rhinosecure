@@ -1113,3 +1113,72 @@ constraints cover only window/restriction/control. `DeviceInfo.DeviceRoles` (JSO
 vocabulary) and `DeviceManualTags` are the natural Defender-side sources; a CMDB/context sidecar
 keyed by DeviceId is the general one. 347 tests total, up from 298; the fixture-coupling guard
 now scans `adapters/*.py` too.
+
+**`rhino constraint add` accepts `--format`; the not-collected marker reaches every consumer.**
+The adapter commit left `--format` deterministic-path only, because `Coordinator.__init__` built
+its own asset index by reading `<data_dir>/assets.csv` -- a filename a Defender export does not
+have. That was backwards: an export carrying no patch window, no compensating control and no role
+is exactly the input a human has to fill in by hand, so the fill-in command is the one that has to
+accept it. `Coordinator` now takes the already-loaded, already-validated inventory as `assets=`
+(falling back to the native load when omitted, so every existing native caller and all ~20
+`Coordinator(data_dir)` test constructions are unchanged), plus `ingest_format=` for the run
+record. `cli.py`'s `run_agents` and `submit_constraint` both go through `ingest.load_batch` now,
+the refusal branch is gone, and `constraint add` gained its own `--format`.
+
+**The scoring rationale stops overclaiming.** `scoring._rationale` said "no patch_window declared
+-> no scheduling restriction, may be patched at any time" for an asset whose source never exports
+the field -- a claim the data does not support. It now reads `Asset.not_collected`: "patch window
+not collected -- this source exports none, so when this asset may be patched is unknown, not
+unrestricted". Not-collected compensating controls get a named line instead of silence (the
+native path only ever printed a line when controls existed, so a gap was invisible), and the
+`contested` explanation says "no patch window collected" rather than "no patch window" when the
+field is a gap. The marker is read for **wording only, never arithmetic** -- a dedicated test
+asserts risk_score/threat_score/impact_score/bucket are identical with and without it, so this
+stays inside Section 8 rule 2. `agents/environment.py`'s `lookup_asset_context` and
+`agents/constraint_intake.py`'s `search_assets` also carry the marker now, so it reaches a model's
+reasoning and not just the CLI's output.
+
+**Two correctness problems found while wiring this, neither of which unit tests would have
+surfaced on their own.** First: `apply_constraints` overlaid a constraint's value but left the
+field marked not-collected, so an asset would keep reporting a data gap for a fact a human had
+just supplied. Fixed -- a supplied field is removed from `not_collected`, and only that field, so
+one constraint never launders an asset's other gaps. Second, and worse: `search_assets` matched a
+free-text query against `role`, `business_function`, and `owner` without checking whether those
+values were real. Every Defender server carries the same defaulted `role="file"`, so "the file
+server can only be patched on Saturdays" would have matched all three servers in the sample and
+invited the Interpreter to pick one -- landing a human's constraint on a domain controller.
+`_matches` now skips any field in `not_collected`; identity fields (hostname, asset_id) are never
+marked, so assets stay resolvable. Resolving off a placeholder is the same guess the ingest layer
+refuses to make, one layer up.
+
+**`runs.ingest_format`, and the first schema migration.** A run record said which `data_dir` it
+read but not which adapter read it. Added as a nullable column -- nullable because a row written
+before `--format` existed has no truthful answer, and backfilling "native" would assert one.
+`CREATE TABLE IF NOT EXISTS` is a no-op on an existing file, so the column would never have
+reached a database anyone already had and the next INSERT would have failed with "no such column"
+against their real history; `Memory._migrate` applies idempotent `ALTER TABLE`s guarded by
+`PRAGMA table_info`. Tested by hand-building the pre-migration schema, inserting a row, and
+confirming the reopen preserves it, leaves its `ingest_format` NULL, and accepts new writes.
+
+**Verified end to end with real LLM calls** (`data/defender-sample`, `--offline`, scratch DB, not
+the repo's `rhinosecure.db`). `rhino constraint add "dc01.corp.example.com can only be rebooted on
+Sundays between 02:00 and 06:00" --format defender` resolved the host by hostname, persisted an
+asset-scoped `patch_window`, and moved `CVE-2020-1472` on that host from `contested` (35.5) to
+`next_window` (35.5) -- `risk_score` unchanged, which is the point: the constraint changed which
+bucket is honest, not how risky the finding is. The removed rationale lines in the diff are the
+two new not-collected strings, so the wording fix and the constraint path are visible in one
+output. The Interpreter's own rationale volunteered that it relied on the hostname match and not
+on the asset's `patch_window` "since it appears in not_collected" -- the marker reaching a model's
+reasoning unprompted by that specific case. The refusal path was exercised too: "the file server
+can only be patched on Saturdays" returned zero candidates and refused. One honest imperfection
+there -- the prompt asks the Interpreter to name the missing field so the human can restate by
+hostname, and this run did not; the refusal was correct, the explanation less helpful than
+intended. `runs.ingest_format='defender'` confirmed in the scratch database.
+
+**One deliberate change to native output**, the first since the fixture was frozen: the
+`contested` rationale said ToT was "(Slice 4, not yet built)", which stopped being true when
+`tot.py` landed. It is a false statement shipped in the deliverable's own output, in the exact
+string being edited for the not-collected wording, so it was corrected rather than left. Diffed
+the full `rhino run --data demo --seed 42 --offline --explain` against the prior commit through a
+temporary worktree: 18 changed lines, all of them that one phrase on the three contested findings,
+with every score and bucket identical. 374 tests, up from 348.

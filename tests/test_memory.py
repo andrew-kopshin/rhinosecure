@@ -546,3 +546,90 @@ def test_record_decision_capacity_fields_round_trip_when_given(db_path: Path):
         assert decision.capacity_rank == 7
         assert decision.capacity_pool_size == 9
         assert decision.capacity_limit == 5
+
+
+# --- ingest_format: which adapter produced the inventory --------------------
+
+
+def test_record_run_stores_the_ingest_format(db_path: Path):
+    with Memory(db_path) as db:
+        run_id = db.record_run(
+            data_dir="defender-sample",
+            ingest_format="defender",
+            seed=42,
+            offline=True,
+            agents=True,
+            total_findings=9,
+            contested_count=6,
+            contested_total=9,
+        )
+        assert db.get_run(run_id).ingest_format == "defender"
+
+
+def test_ingest_format_is_null_when_not_supplied(db_path: Path):
+    """Nullable on purpose: a run recorded before --format existed has no
+    truthful answer, and defaulting it to "native" would assert one."""
+    with Memory(db_path) as db:
+        run_id = db.record_run(
+            data_dir="demo", seed=42, offline=True, agents=False,
+            total_findings=24, contested_count=3, contested_total=24,
+        )
+        assert db.get_run(run_id).ingest_format is None
+
+
+def test_a_database_created_before_ingest_format_existed_is_migrated(db_path: Path):
+    """CREATE TABLE IF NOT EXISTS is a no-op on an existing file, so a new
+    column never reaches a database someone already has -- the next INSERT
+    would fail with "no such column" against their real run history.
+    Builds the pre-migration schema by hand and confirms Memory adds the
+    column, preserves the existing row, and can write new ones."""
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at TEXT NOT NULL,
+            data_dir TEXT NOT NULL,
+            seed INTEGER NOT NULL,
+            offline INTEGER NOT NULL,
+            agents INTEGER NOT NULL,
+            total_findings INTEGER NOT NULL,
+            contested_count INTEGER NOT NULL,
+            contested_total INTEGER NOT NULL,
+            snapshot_versions TEXT,
+            research_usage TEXT,
+            environment_usage TEXT,
+            risk_usage TEXT,
+            tot_usage TEXT
+        );
+        INSERT INTO runs (started_at, data_dir, seed, offline, agents, total_findings,
+                          contested_count, contested_total)
+        VALUES ('2026-09-01T00:00:00+00:00', 'demo', 42, 1, 0, 24, 3, 24);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with Memory(db_path) as db:
+        old = db.get_run(1)
+        assert old.data_dir == "demo" and old.total_findings == 24  # history preserved
+        assert old.ingest_format is None  # nothing invented for it
+
+        new_id = db.record_run(
+            data_dir="defender-sample", ingest_format="defender", seed=42, offline=True,
+            agents=True, total_findings=9, contested_count=6, contested_total=9,
+        )
+        assert db.get_run(new_id).ingest_format == "defender"
+
+
+def test_migration_is_idempotent_across_reopens(db_path: Path):
+    for _ in range(3):
+        with Memory(db_path) as db:
+            db.record_run(
+                data_dir="demo", ingest_format="native", seed=42, offline=True, agents=False,
+                total_findings=1, contested_count=0, contested_total=1,
+            )
+    with Memory(db_path) as db:
+        assert [r.ingest_format for r in db.list_runs()] == ["native"] * 3

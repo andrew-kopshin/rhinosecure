@@ -296,3 +296,128 @@ def test_refusal_interpretation_still_validates_with_everything_null_or_empty():
     assert interpretation.asset_id is None
     assert interpretation.patch_limit is None
     assert interpretation.affected_finding_ids == []
+
+
+# --- not_collected: a source that never supplied these fields ----------------
+#
+# A Microsoft Defender export supplies no role, business_function, owner,
+# patch_window, patch_restrictions, or compensating_controls (adapters/
+# defender.py). Those fields hold documented defaults and are named in
+# Asset.not_collected. Two consequences this section pins down: the
+# Interpreter must not resolve an asset off a placeholder, and a
+# constraint that supplies a field must clear its marker.
+
+DEFENDER_ASSET = Asset(
+    asset_id="1a" * 20,
+    hostname="dc01.corp.example.com",
+    os="Windows Server 2019",
+    os_build="17763",
+    role="file",  # defaulted by OS class -- Defender exports no role
+    business_function="",
+    criticality=3,
+    internet_exposed=False,
+    environment="prod",
+    data_sensitivity="internal",
+    not_collected=frozenset(
+        {
+            "role", "business_function", "environment", "data_sensitivity",
+            "patch_window", "patch_restrictions", "compensating_controls", "owner",
+        }
+    ),
+)
+
+
+def _defender_tools():
+    call_log: list[dict] = []
+    index = {DEFENDER_ASSET.asset_id: DEFENDER_ASSET, "A09": ASSET_2}
+    tools = build_constraint_tools(index, {}, call_log)
+    return {t.name: t for t in tools}, call_log
+
+
+def test_search_assets_never_matches_a_not_collected_field():
+    """DEFENDER_ASSET's role is the defaulted "file", not a fact. A human
+    asking about "the file server" must not resolve to it -- that would
+    land their constraint on a domain controller."""
+    tools, _ = _defender_tools()
+    matches = json.loads(tools["search_assets"].run(query="file"))["matches"]
+    assert [m["asset_id"] for m in matches] == []
+    # ASSET_2's role IS collected, so role matching still works normally.
+    assert [m["asset_id"] for m in json.loads(tools["search_assets"].run(query="workstation"))["matches"]] == ["A09"]
+
+
+def test_search_assets_still_matches_hostname_and_asset_id_on_a_defender_asset():
+    """Identity fields are always collected, so a Defender asset stays
+    resolvable -- refusing to match placeholders must not make the whole
+    fleet unreachable."""
+    tools, _ = _defender_tools()
+    by_host = json.loads(tools["search_assets"].run(query="dc01"))["matches"]
+    assert [m["asset_id"] for m in by_host] == [DEFENDER_ASSET.asset_id]
+    by_id = json.loads(tools["search_assets"].run(query="1a1a1a"))["matches"]
+    assert [m["asset_id"] for m in by_id] == [DEFENDER_ASSET.asset_id]
+
+
+def test_search_assets_reports_not_collected_so_the_model_can_see_the_gap():
+    tools, _ = _defender_tools()
+    (match,) = json.loads(tools["search_assets"].run(query="dc01"))["matches"]
+    assert "role" in match["not_collected"] and "patch_window" in match["not_collected"]
+    assert match["role"] == "file"  # the placeholder is still shown, just labelled
+    native = json.loads(tools["search_assets"].run(query="wks-fin12"))["matches"][0]
+    assert native["not_collected"] == []
+
+
+def test_a_supplied_field_stops_being_not_collected():
+    """Once a human states the window, it is known -- continuing to flag
+    it as a data gap would be false, and the scoring rationale and CLI
+    gap note both read this set."""
+    result = apply_constraints(DEFENDER_ASSET, [_defender_constraint("patch_window", "Sun 02:00-06:00")])
+    assert result.patch_window == "Sun 02:00-06:00"
+    assert result.has_patch_window
+    assert "patch_window" not in result.not_collected
+
+
+def test_untouched_fields_keep_their_marker():
+    """One constraint must not launder an asset's other gaps."""
+    result = apply_constraints(DEFENDER_ASSET, [_defender_constraint("patch_window", "Sun 02:00-06:00")])
+    assert result.not_collected == DEFENDER_ASSET.not_collected - {"patch_window"}
+    assert {"role", "compensating_controls", "environment"} <= result.not_collected
+
+
+def test_each_effect_kind_clears_its_own_field():
+    for effect_kind, field_name in (
+        ("patch_window", "patch_window"),
+        ("patch_restriction", "patch_restrictions"),
+        ("compensating_control", "compensating_controls"),
+    ):
+        result = apply_constraints(DEFENDER_ASSET, [_defender_constraint(effect_kind, "a real value")])
+        assert field_name not in result.not_collected, effect_kind
+        assert result.not_collected == DEFENDER_ASSET.not_collected - {field_name}
+
+
+def test_a_constraint_with_no_effect_value_clears_nothing():
+    result = apply_constraints(DEFENDER_ASSET, [_defender_constraint("patch_window", None)])
+    assert result.not_collected == DEFENDER_ASSET.not_collected
+
+
+def test_a_native_asset_is_unaffected_by_the_clearing_logic():
+    result = apply_constraints(ASSET, [_constraint("patch_window", "Sun 02:00-06:00")])
+    assert result.not_collected == frozenset()
+    assert result.patch_window == "Sun 02:00-06:00"
+
+
+def _defender_constraint(effect_kind, effect_value, *, id_=1) -> Constraint:
+    return Constraint(
+        id=id_,
+        asset_id=DEFENDER_ASSET.asset_id,
+        constraint_text="fake constraint text",
+        created_at="2026-09-04T00:00:00+00:00",
+        active=True,
+        effect_kind=effect_kind,
+        effect_value=effect_value,
+    )
+
+
+def test_task_prompt_tells_the_interpreter_not_to_resolve_on_a_placeholder():
+    agent = build_constraint_agent([], llm=get_llm(LLMConfig(api_key="test-key-not-used")))
+    description = build_constraint_task("the file server reboots on Sundays", agent).description
+    assert "not_collected" in description
+    assert "placeholder" in description

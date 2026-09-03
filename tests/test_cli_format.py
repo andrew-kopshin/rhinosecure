@@ -72,8 +72,10 @@ def test_format_defender_explain_prints_a_per_finding_gap_note(capsys):
     assert len(notes) == 9  # one per finding, every Defender finding has gaps
     assert "environment=prod" in out and "data_sensitivity=internal" in out and "role=file" in out
     assert "role=workstation" in out
-    # scoring.py's own rationale is untouched -- the note sits next to it, not inside it
-    assert "no patch_window declared -> no scheduling restriction" in out
+    # The scoring rationale itself says "not collected" for these assets, and
+    # never the native "none declared" phrasing (scoring._rationale).
+    assert "patch window not collected" in out
+    assert "no patch_window declared" not in out
     for line in out.splitlines():
         if not line.startswith(("MDVM-", "finding_id")):  # table rows carry 40-hex-derived widths
             assert len(line) <= 100, line
@@ -91,17 +93,39 @@ def test_format_defender_sample_report_values():
     assert len(result.scored) == 9 and len(result.not_collected_by_finding) == 9
 
 
-def test_format_defender_with_agents_is_refused_before_any_agent_is_built(capsys, monkeypatch):
-    """The Coordinator reads <data>/assets.csv itself (native only); a
-    non-native --agents run must stop with a clear message, not fail
-    inside the Coordinator or read a stale native file."""
-    monkeypatch.setattr(
-        "rhinosecure.cli.run_agents", lambda *a, **k: pytest.fail("run_agents must not be called")
-    )
-    assert main(["run", "--format", "defender", "--data", "defender-sample", "--agents"]) == 2
-    err = capsys.readouterr().err
-    assert "--format defender is not supported with --agents" in err
-    assert "assets.csv" in err
+def test_format_reaches_both_agent_entry_points(monkeypatch):
+    """--format is threaded to run_agents and submit_constraint, not just
+    the deterministic path -- the constraint path is the one a
+    context-free export most needs."""
+    class _Reached(Exception):
+        """Carries the fmt that arrived, and stops main() right there --
+        neither entry point has a cheap fake return value, and what is
+        being checked is the argument, not what happens after it."""
+
+    def _capture(*a, **k):
+        raise _Reached(k.get("fmt"))
+
+    monkeypatch.setattr("rhinosecure.cli.run_agents", _capture)
+    monkeypatch.setattr("rhinosecure.cli.submit_constraint", _capture)
+
+    with pytest.raises(_Reached) as run_call:
+        main(["run", "--format", "defender", "--data", "defender-sample", "--agents"])
+    assert run_call.value.args[0] == "defender"
+
+    with pytest.raises(_Reached) as constraint_call:
+        main(["constraint", "add", "x", "--format", "defender", "--data", "defender-sample"])
+    assert constraint_call.value.args[0] == "defender"
+
+
+def test_constraint_add_defaults_to_native_format():
+    """--format is opt-in on constraint add too; omitting it must keep
+    the native behavior every existing invocation relies on."""
+    import argparse
+    import inspect
+
+    from rhinosecure.cli import submit_constraint as cli_submit
+
+    assert inspect.signature(cli_submit).parameters["fmt"].default == "native"
 
 
 def test_adapter_refusal_maps_to_ingest_error_and_exit_1(tmp_path, capsys):

@@ -141,7 +141,11 @@ def build_environment_tools(
         controls, and patch window/restrictions, as declared in the fleet
         inventory -- plus, separately, any active human-supplied
         constraint on file for this asset (see human_constraints in the
-        result), which is never merged into the asset's own fields."""
+        result), which is never merged into the asset's own fields. Any
+        field named in the result's not_collected list holds a default
+        rather than a value this asset's source supplied: a blank
+        patch_window listed there means nobody recorded one, not that
+        patching is unrestricted."""
         asset = asset_index.get(asset_id)
         if asset is None:
             result: dict[str, Any] = {"asset_id": asset_id, "found": False}
@@ -164,6 +168,13 @@ def build_environment_tools(
                 "compensating_controls": list(asset.compensating_control_list),
                 "owner": asset.owner,
                 "human_constraints": [c.constraint_text for c in human_constraints],
+                # Field names above whose value is a documented default,
+                # because this asset's source never collected them
+                # (adapters/base.py). A blank patch_window listed here
+                # means "unknown", not "none declared" -- the distinction
+                # a Defender-sourced asset needs and a native one never
+                # has (its set is always empty).
+                "not_collected": sorted(asset.not_collected),
             }
         call_log.append(
             {"tool": "lookup_asset_context", "args": {"asset_id": asset_id}, "result": result}
