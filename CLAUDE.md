@@ -228,11 +228,26 @@ is blocked (see below) — it does not apply a second reduction.
 | `mitigate_monitor` | Patch blocked or deferred; apply compensating control and watch |
 | `accept` | Documented acceptance with rationale |
 | `contested`† | No honest bucket exists among the four above — see below and Section 6 |
+| `deferred_capacity`‡ | Would be `next_window`, but lost a rank-position race under a declared fleet-wide patch-capacity limit — see below and Section 10 |
 
 † Not a remediation category a human acts on directly. It means the deterministic scorer
 could not truthfully assign one of the four real buckets and the finding needs Tree-of-Thought
 or human reasoning instead (Section 6). Currently emitted only for a KEV-listed finding with
 neither a compensating control nor a declared patch window.
+
+‡ Also not assigned by `bucket_for` — unlike every bucket above it, `deferred_capacity` is never
+a property of one finding in isolation; it only exists relative to every other finding competing
+for the same cycle's bandwidth, so no per-finding rule could produce it. `scoring
+.apply_capacity_limit` assigns it afterward, cross-finding, only when a fleet-wide capacity
+constraint (CLAUDE.md Section 10's "only five patches fit this window") is in effect: it ranks
+every `next_window` finding by `risk_score` descending and reclassifies whichever rank past the
+declared limit. `risk_score` itself is untouched — this bucket means "ranked below the cutoff,"
+not "less risky." Every other bucket (including `next_window` itself and `contested`) is exempt
+from that competition by construction, not by an exemption list: `patch_now` is never
+`next_window` in the first place (it means too urgent to wait for a window at all), and a
+contested finding stays `contested` regardless of what Tree-of-Thought recommends for it (an
+`emergency_change` winner doesn't rewrite `RiskRecommendation.bucket` — see Section 6). See
+Section 10's own note for the full mechanism.
 
 Bucket assignment is a risk-score threshold picking a tier, then asset attributes deciding
 which bucket within that tier applies:
@@ -474,11 +489,41 @@ back into a run** (`agents/environment.py`'s `lookup_asset_context` and `agents/
 `score_finding` tools both query `constraints_for_asset` when given a `Memory`) — the two gaps
 this section previously named as open. See Section 6's ToT entry's own "Decided" convention: full
 mechanics are in `agents/constraint_intake.py`'s and `agents/coordinator.py`'s module docstrings,
-not repeated here. One scope boundary worth stating plainly: this handles asset-scoped
-constraints only, matching this section's own worked example exactly (`memory.py`'s `constraints`
-table is `asset_id NOT NULL` by construction) — not Section 10's "only five patches fit this
-window," a fleet-wide capacity constraint with no single asset to resolve to. See Section 10's own
-note on this.
+not repeated here. This handles asset-scoped constraints — matching this section's own worked
+example exactly (`memory.py`'s `constraints` table is `asset_id NOT NULL` by construction).
+
+**A second, fleet-wide mechanism is now also built** for Section 10's own exit-criteria example,
+"only five patches fit this window" — a *capacity* constraint, with no single asset to resolve
+to, so it cannot live in the `constraints` table above (`asset_id NOT NULL`) or apply the same
+way (asset-scoped constraints change what `bucket_for` computes for one finding; a capacity
+limit reallocates *after* every finding already has a real bucket, competing findings against
+each other, not against their own asset's facts). Rather than a second agent,
+`agents/constraint_intake.py`'s Constraint Interpreter is extended with a third classification
+(`ConstraintKind.CAPACITY`, alongside `ASSET` and the null refusal) — the same interpretation
+call that resolves an asset-scoped statement now also recognizes a capacity-shaped one and
+extracts its integer limit into `patch_limit`, leaving `asset_id`/`effect_kind`/`effect_value`
+and `affected_finding_ids` empty (which findings compete is computed deterministically, never by
+the model). `Coordinator.submit_constraint` branches on `interpretation.constraint_kind` to
+`_submit_capacity_constraint`, which is LLM-free past that one interpretation call: it re-derives
+every finding's real, live-enriched bucket via the same deterministic pipeline `rhino run` uses
+(`ingest.attach_threat_signals` + `scoring.score_finding`, no Research/Environment/Risk/ToT
+dispatch) — folding in any active asset-scoped constraint on file first, the same way
+`agents/risk.py`'s `score_finding_tool` already does for a live agents run, so "real, current
+bucket" means what a person would actually see right now, not the fleet's raw, un-overlaid CSV
+state (an adversarial review caught this path skipping the overlay initially) — then calls
+`scoring.apply_capacity_limit` — a pure sort over every `Bucket
+.NEXT_WINDOW` finding, `deferred_capacity` past the limit — keeping the allocation itself in the
+scoring path, not in an agent (Section 8 rule 2's discipline, applied here too). Persisted via a
+fifth table, `capacity_constraints` (`memory.py`) — cycle-scoped, tied to the one `runs` row it
+was applied within, with no active/deactivate lifecycle: unlike an asset constraint, a capacity
+limit isn't a standing fact that stays true across future runs, so there is nothing to retract.
+`decisions` gained three nullable columns (`capacity_rank`/`capacity_pool_size`/`capacity_limit`)
+so a decision produced by this path records why it landed there. `cli.py`'s diff output for this
+path is framed differently from the asset-scoped diff on purpose: a capacity reallocation never
+changes a finding's `risk_score` (`agents/coordinator.py`'s `CapacityDelta` docstring) — only its
+rank position relative to the declared limit — so `_print_capacity_result` shows rank and bucket
+transition, not a risk_score before/after pair. See Section 10's own "Decided" note and
+`agents/coordinator.py`'s `_submit_capacity_constraint` docstring for the full mechanism.
 
 ---
 
@@ -693,24 +738,31 @@ with diff.
 agent explains the delta between the original and revised plan. Contested rate reported and
 under ~1%.
 
-**Decided.** This exit criteria's own example — "only five patches fit this window" — is a
-fleet-wide *capacity* constraint: no single asset to resolve to, nothing in it that maps onto one
-of `memory.py`'s asset-scoped `constraints` rows. What got built instead is exactly Section 7's
-worked example shape — "the payroll server only reboots on Sundays," an *operational* constraint
-about one asset's patch window, compensating controls, or patch restrictions — because that is
-the constraint `memory.py`'s schema (Section 7, `constraints.asset_id NOT NULL`) actually
-represents, and building a second, fleet-wide-capacity mechanism (a different table, a different
-re-ranking rule: which of the currently-scheduled findings actually fit, and what happens to the
-rest) was never asked for alongside it. `agents/constraint_intake.py`'s Constraint Interpreter is
-told explicitly to recognize this shape and refuse (`asset_id=None`) rather than force a capacity
-statement onto one asset — Section 10's own exit-criteria sentence is the worked example that
-instruction is written against. Re-plan with diff is real and exercised on the operational case:
-`agents/coordinator.py`'s `submit_constraint` re-plans exactly the resolved `affected_finding_ids`
-and returns a per-finding before/after (`FindingDelta`), and `cli.py`'s `rhino constraint add`
-prints it with the agent's own explanation of why. Contested rate has been reported since the ToT
-entry above landed (`scoring.contested_rate`, `Contested: 3/24 (12.5%)` on the demo fixture) —
-above the ~1% target for the reason already recorded there (fixture size). A fleet-wide capacity
-mechanism remains unbuilt and is not scoped into this build.
+**Decided, and now built.** This exit criteria's own example — "only five patches fit this
+window" — is a fleet-wide *capacity* constraint: no single asset to resolve to, nothing in it
+that maps onto one of `memory.py`'s asset-scoped `constraints` rows. The first thing built
+against this sentence was exactly Section 7's worked example shape — "the payroll server only
+reboots on Sundays," an *operational* constraint about one asset's patch window, compensating
+controls, or patch restrictions — because that is the constraint `memory.py`'s original schema
+(Section 7, `constraints.asset_id NOT NULL`) represents, and `agents/constraint_intake.py`'s
+Constraint Interpreter was told to recognize a capacity-shaped statement and refuse
+(`asset_id=None`) rather than force it onto one asset. **That refusal is now a real second path
+instead**, exercising Section 10's own exit-criteria sentence literally rather than only proving
+the operational case: the Interpreter's refusal shape gained a third classification
+(`constraint_kind="capacity"`) that extracts an integer `patch_limit` instead of resolving an
+asset, and `Coordinator._submit_capacity_constraint` reallocates every `Bucket.NEXT_WINDOW`
+finding fleet-wide by rank against that limit (`scoring.apply_capacity_limit`,
+`Bucket.DEFERRED_CAPACITY` — Section 3's own entry has the full mechanism; Section 7's entry
+above has the agent-side wiring). Re-plan with diff is real and exercised on both cases now:
+`agents/coordinator.py`'s `submit_constraint` re-plans exactly the resolved
+`affected_finding_ids` and returns a per-finding before/after (`FindingDelta`) for the
+operational case, while the capacity case returns a per-finding rank/bucket-transition record
+(`CapacityDelta`) instead — deliberately not a before/after risk_score pair, since a capacity
+reallocation never changes `risk_score` (only rank position does). `cli.py`'s `rhino constraint
+add` prints whichever diff shape actually applies, framed accordingly (`_print_constraint_result`
+vs. `_print_capacity_result`). Contested rate has been reported since the ToT entry above landed
+(`scoring.contested_rate`, `Contested: 3/24 (12.5%)` on the demo fixture) — above the ~1% target
+for the reason already recorded there (fixture size).
 
 ---
 

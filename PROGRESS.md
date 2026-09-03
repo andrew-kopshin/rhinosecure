@@ -773,3 +773,181 @@ deterministic path (`.venv`, Python 3.14) is unaffected and confirmed separately
 this touches it — `memory.py` stays crewai-free but this session's new code that *uses* it
 (`constraint_intake.py`, the `Coordinator`/`risk.py`/`environment.py` changes) is agents-only,
 same as everything built since Slice 3.
+
+**Fleet-wide capacity constraint built: CLAUDE.md Section 10's "only five patches fit this
+window" exit-criteria sentence, exercised literally for the first time rather than only proving
+the asset-scoped case.** The design decisions were the user's, given explicitly rather than left
+to this session to guess: global scope for the limit (no per-window-name matching), `patch_now`
+and a ToT-recommended `emergency_change` both exempt from competing (too urgent to schedule
+either way), capacity constraints cycle-scoped to one run rather than standing like asset
+constraints, a new `deferred_capacity` bucket following the `contested` precedent, the allocation
+itself kept deterministic and in the scoring path rather than an agent, the existing Constraint
+Interpreter extended with a third classification rather than a new agent, and the diff framed as
+"risk_score unchanged, lost a rank-position race" rather than a before/after score pair.
+
+**`scoring.py`: `Bucket.DEFERRED_CAPACITY`, `RankableFinding`, `CapacityAllocation`,
+`apply_capacity_limit`.** `apply_capacity_limit(findings, limit)` filters its input to
+`Bucket.NEXT_WINDOW` only — the entire exemption mechanism for `patch_now` and a
+`emergency_change`-bound `contested` finding, and deliberately not an explicit exemption list:
+neither is ever `Bucket.NEXT_WINDOW` in the first place, so restricting the competing pool to
+that one bucket excludes both by construction. Sorts by `(-risk_score, finding_id)` — the same
+tie-break `scoring.rank` already uses — and assigns `NEXT_WINDOW` for rank ≤ limit,
+`DEFERRED_CAPACITY` past it. `RankableFinding` is a minimal three-field shape (`finding_id`,
+`risk_score`, `bucket`) so a caller isn't forced to fabricate irrelevant fields from either
+`ScoredFinding` (deterministic path) or `RiskRecommendation` (agents path, which has no
+`threat_score`/`impact_score` at all).
+
+**`memory.py`: a fifth table, `capacity_constraints`, plus three nullable `decisions` columns.**
+`capacity_constraints` (`run_id`, `raw_text`, `patch_limit`, `pool_size`, `deferred_count`,
+`created_at`) has no active/deactivate lifecycle, unlike `constraints`' soft-delete — a capacity
+limit describes exactly one cycle's bandwidth and is foreign-keyed to the one `runs` row it
+applied within; there is nothing later to retract it from. `decisions` gained
+`capacity_rank`/`capacity_pool_size`/`capacity_limit` (all nullable, same pattern as the existing
+`tot_*` columns) so a decision produced by this path records why it landed where it did.
+`record_decision`'s new kwargs are fully backward compatible; `Decision`'s new fields had to be
+placed after `decided_at` specifically, since Python dataclasses require defaulted fields to
+follow non-defaulted ones.
+
+**`agents/constraint_intake.py`: a third classification, not a second agent.**
+`ConstraintKind.CAPACITY` alongside the existing `ASSET` (and the null refusal).
+`ConstraintInterpretation` gained `constraint_kind` and `patch_limit`. The task prompt now leads
+with the three-way decision before anything else, gives three example capacity phrasings, and
+explicitly forbids the model from calling `search_assets`/`list_findings_for_asset` or
+populating `affected_finding_ids` for a capacity statement — which findings a limit actually
+constrains (every current `next_window` finding) is computed deterministically elsewhere, never
+by the model. `apply_constraints` (the asset-overlay function) is untouched.
+
+**`agents/coordinator.py`: `_submit_capacity_constraint`, entirely LLM-free past the one
+interpretation call.** The hard design question was where the competing pool's real, live
+buckets come from without either (a) a full Research/Environment/Risk/ToT dispatch over the
+whole fleet (expensive, and the user's instruction was explicit that the allocation itself must
+stay out of an agent) or (b) trusting stale, unenriched scanner-only scores. Resolved by reusing
+`rhino run`'s own deterministic enrichment: `attach_threat_signals` (KEV/EPSS/NVD/ATT&CK, via
+`SnapshotCache`) was pulled out of `cli.py`, where it was private, into `ingest.py`, public and
+unchanged in behavior — `cli.run()` and `_submit_capacity_constraint` now share the exact same
+call, so "who's in `next_window`" reflects real enrichment, not a guess, while still making zero
+LLM calls. `coordinator.py` importing from `cli.py` directly would have been backwards (the
+entry-point module reaching down into a lower one); `ingest.py` already sits below both and was
+the natural shared home. `_submit_capacity_constraint` then re-scores every finding through that
+pipeline, builds `RankableFinding`s, calls `scoring.apply_capacity_limit`, and records a decision
+for every pool member — both the ones that fit and the ones deferred, not just the deferred ones
+— so `decisions_for_run` reflects the whole competing pool, not only what changed.
+`CapacityDelta` is deliberately not a `FindingDelta`: nothing about a finding's own risk_score or
+evidence changed, only its rank position did, so framing it as a risk_score before/after (like
+the asset-scoped `FindingDelta`) would misrepresent what happened — `risk_score` here is a single
+value, not a pair.
+
+**`cli.py`: a second interpretation printer and diff printer, dispatched by result type.**
+`asset_id is None` stopped uniquely meaning "declined" the moment a capacity statement also
+resolves with no asset — `_print_constraint_interpretation` now branches on
+`interpretation.constraint_kind` explicitly (`"capacity"` / `"asset"` / anything else, treated as
+refusal) rather than trusting `asset_id`'s nullness alone. `main()`'s `constraint add` dispatch
+now checks `isinstance(result, CapacitySubmissionResult)` and calls `_print_capacity_result`
+instead of `_print_constraint_result` for that case — printing the pool (rank, finding, hostname,
+risk_score, fits/deferred) and, for anything deferred, "risk_score unchanged at X — ranked N of
+M, exceeding this cycle's limit of L. This finding lost a rank-position race, not a change in
+risk," the framing given explicitly rather than the asset-scoped diff's bucket-and-score-pair
+format.
+
+**Real end-to-end smoke test against the actual 24-finding demo fixture, not just the fake-Crew
+unit tests.** `rhino constraint add "only three patches fit this window" --data demo --offline`
+made one real LLM call (the Constraint Interpreter) and correctly classified it as
+`constraint_kind="capacity"`, `patch_limit=3`; the deterministic allocation then found 8 real
+`next_window` findings in the fixture, ranked them by `risk_score` (46.6 down to 16.3), kept the
+top 3 (`F04`/`F09`/`F02`), and deferred the other 5 with the rank-position framing above. Only one
+LLM call total for the whole operation, confirming the "LLM-free past interpretation" design
+actually holds against real data, not just mocked Crews.
+
+**Verification.** 24 new tests (292 total, up from 268): `tests/test_scoring.py` (+6 —
+`apply_capacity_limit` against an empty pool, `limit=0`, `limit` ≥ pool size, the exact rank
+boundary, the tie-break, and the structural proof that `patch_now`/`mitigate_monitor`/`accept`/
+`contested` findings never enter the pool regardless of `risk_score`), `tests/test_memory.py`
+(+5 — `record_capacity_constraint`/`capacity_constraints_for_run` round-trip,
+`record_decision`'s three new optional columns, cross-session persistence for the new table),
+`tests/test_constraint_intake.py` (+5 — the three-way `ConstraintInterpretation` shape validates
+for each kind, the task description/expected_output mention the new capacity fields and an
+example phrasing), `tests/test_coordinator.py` (+4 — a capacity-kind interpretation dispatches no
+Research/Environment/Risk Crew at all, a real 4-finding pool ranks and defers correctly against a
+limit with every `memory.py` write checked, a limit that covers the whole pool defers nothing,
+and a recognized-but-unextractable-limit persists nothing), `tests/test_cli.py` (+4 — the
+capacity result routes through the capacity printer and never the asset-scoped one, the diff uses
+rank/bucket framing and never a risk_score-pair, an all-fits pool reports no changes, a missing
+limit exits 1). All 292 pass; the deterministic path (`.venv`, Python 3.14) still imports cleanly,
+confirmed directly (`ingest.py`'s `attach_threat_signals` move touched the module `cli.run()`
+depends on) since none of this feature's own code — `constraint_intake.py`,
+`coordinator.py`'s new method, `cli.py`'s new printers — is on that path.
+
+**Adversarial review (3 dimensions, each finding independently re-verified before counting)
+caught a real bug: the capacity pool skipped the constraint overlay `agents/risk.py` already
+applies.** Ran a 9-agent review/verify workflow against the whole feature -- correctness, spec
+compliance against CLAUDE.md's own new claims, and test coverage -- with every candidate finding
+handed to a separate agent instructed to try to refute it, not just rubber-stamp it. Spec
+compliance came back clean (0 findings). Correctness and test coverage surfaced 5 candidates that
+survived adversarial re-verification, one refuted (a claimed vacuous test assertion that turned
+out not to matter in practice).
+
+The one worth fixing immediately: `_submit_capacity_constraint` (`agents/coordinator.py`)
+re-scored every finding straight from ground-truth `assets.csv` via `attach_threat_signals` +
+`score_finding`, never consulting `self.memory.constraints_for_asset` the way
+`agents/risk.py`'s `score_finding_tool` already does. Concretely reproduced: an active
+`compensating_control` constraint on an asset with no declared `patch_window` should move a
+finding from `next_window` to `mitigate_monitor` (`bucket_for`'s own rule) -- but the capacity
+path, computing straight from raw CSV, would still see it as `next_window` and wrongly let it
+compete for capacity (or, the mirror case, wrongly exclude a finding a constraint had moved
+*into* `next_window` from `contested`). `ingest.py`'s own docstring claim that this path computes
+"the real bucket a finding is in" was accurate for enrichment freshness but overstated for
+constraint state. Fixed by folding in `constraint_intake.apply_constraints` per finding before
+scoring, mirroring `agents/risk.py`'s pattern exactly (`self.memory` is guaranteed non-None here
+already -- `submit_constraint` raises before this method is ever reached otherwise). Verified with
+a new regression test (`test_submit_capacity_constraint_applies_an_active_asset_constraint_before_ranking`)
+built specifically to fail without the fix: a no-window, no-control asset defaults to
+`next_window` (risk=31.73); the same asset with an active `compensating_control` constraint on
+file scores `mitigate_monitor` (risk=26.97) -- the finding must be entirely absent from the
+capacity pool once the constraint is applied, not merely deprioritized within it.
+
+Three more confirmed test-gap findings, each closed with a real test rather than noted and
+skipped: no coordinator-level test exercised `patch_limit=0` specifically (0 is a legitimate
+"zero patches fit this window" answer, and is falsy in Python -- `if interpretation.patch_limit is
+None` is one accidental rewrite away from silently misrouting a real 0 into the decline branch);
+`capacity_constraints` had no cross-session (close-then-reopen) persistence test, unlike the
+`constraints` table's own dedicated one, despite depending on the same easy-to-regress
+`self._conn.commit()` discipline; and `_print_capacity_result`'s `persisted=True, deltas=()`
+branch (a real, reachable state -- the limit was extracted and recorded, but zero `next_window`
+findings exist in the fleet right now) had no test, leaving both its message text and its
+ordering relative to the `result.deltas[0]` indexing right after it unverified.
+
+One confirmed-but-low-severity finding deliberately left unfixed here and flagged as a separate
+follow-up instead: `finding_id`-keyed dicts inside `_submit_capacity_constraint`
+(`scored_by_id`/`asset_id_by_finding_id`) would silently collapse and misattribute a
+`CapacityDelta`'s fields if `findings.csv` ever contained two rows sharing a `finding_id` --
+reproduced end-to-end, including a wrong persisted `decisions` row. Real, but requires a primary-
+key violation nothing in `ingest.py` currently guards against, and the same finding_id-keyed-dict
+assumption appears throughout `agents/coordinator.py`'s `RunState` (`research_by_id`,
+`environment_by_id`, `risk_by_id`) -- a one-off patch here would be inconsistent and wouldn't fix
+the root cause. Belongs at the ingest layer instead; spawned as its own follow-up task rather than
+folded into this change.
+
+**Verification.** 4 more tests (296 total, up from 292): the constraint-overlay regression above,
+`patch_limit=0` through the real `Coordinator`, `capacity_constraints`' cross-session test
+(`tests/test_memory.py`), and the empty-pool CLI print case (`tests/test_cli.py`). All 296 pass.
+
+**`rhino constraint add` now suppresses CrewAI's console output by default, inverted from `rhino
+run --agents`'s polarity.** Reported directly: the command was printing the full agent task
+prompt and reasoning (CrewAI's "Agent Started"/"Agent Final Answer" boxes) to the terminal.
+`--quiet` already existed for `constraint add` and, verified directly, already fully suppressed
+this via the same `set_suppress_console_output` mechanism `run --agents` uses -- so the flag
+itself was not broken. The actual ask, once clarified: `run --agents` is an exploratory command
+where per-stage agent activity is often exactly what's wanted, so verbose-by-default with opt-in
+`--quiet` fits it; `constraint add` is a single-decision command where the interpretation, the
+pool ranking, and the diff already say everything a person needs, so it should default to quiet
+instead. Replaced `--quiet` on `constraint add` with `--verbose` (opts back into CrewAI's console
+output); the underlying mechanism (`set_suppress_console_output`) is unchanged, just called by
+default now instead of behind a flag. `run --agents`'s own `--quiet` is untouched -- this only
+changes `constraint add`. Verified against the real 24-finding demo fixture with a real LLM call:
+no flag prints only the interpretation, pool ranking, and diff; `--verbose` prints CrewAI's full
+console output on top of that.
+
+**Verification.** 1 test replaced with 2 (297 total, up from 296):
+`test_constraint_add_suppresses_console_output_by_default` and
+`test_constraint_add_verbose_flag_disables_suppression`, mirroring the existing
+`run --agents` quiet-flag test pair's structure. All 297 pass.

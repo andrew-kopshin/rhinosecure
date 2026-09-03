@@ -126,6 +126,9 @@ CREATE TABLE IF NOT EXISTS decisions (
     tot_winner_strategy TEXT,
     tot_near_tie INTEGER,
     tot_termination_reason TEXT,
+    capacity_rank INTEGER,
+    capacity_pool_size INTEGER,
+    capacity_limit INTEGER,
     decided_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_run_id ON decisions (run_id);
@@ -139,6 +142,17 @@ CREATE TABLE IF NOT EXISTS feedback (
     recorded_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_feedback_run_id ON feedback (run_id);
+
+CREATE TABLE IF NOT EXISTS capacity_constraints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES runs (id),
+    raw_text TEXT NOT NULL,
+    patch_limit INTEGER NOT NULL,
+    pool_size INTEGER NOT NULL,
+    deferred_count INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_capacity_constraints_run_id ON capacity_constraints (run_id);
 """
 
 
@@ -205,6 +219,9 @@ class Decision:
     tot_near_tie: bool | None
     tot_termination_reason: str | None
     decided_at: str
+    capacity_rank: int | None = None
+    capacity_pool_size: int | None = None
+    capacity_limit: int | None = None
 
 
 @dataclass(frozen=True)
@@ -214,6 +231,25 @@ class Feedback:
     change_description: str
     run_id: int | None
     recorded_at: str
+
+
+@dataclass(frozen=True)
+class CapacityConstraint:
+    """One change cycle's declared patch bandwidth -- CLAUDE.md Section
+    10's "only five patches fit this window" example. Cycle-scoped, not
+    standing: unlike `Constraint` (asset-scoped, true until retracted),
+    a capacity constraint describes exactly one run's available
+    bandwidth and is foreign-keyed to that run. There is no
+    active/deactivate lifecycle here -- see record_capacity_constraint's
+    docstring for why."""
+
+    id: int
+    run_id: int
+    raw_text: str
+    patch_limit: int
+    pool_size: int
+    deferred_count: int
+    created_at: str
 
 
 def _json_or_none(value: str | None) -> Any:
@@ -276,6 +312,9 @@ def _decision_from_row(row: sqlite3.Row) -> Decision:
         tot_near_tie=_optional_bool(row["tot_near_tie"]),
         tot_termination_reason=row["tot_termination_reason"],
         decided_at=row["decided_at"],
+        capacity_rank=row["capacity_rank"],
+        capacity_pool_size=row["capacity_pool_size"],
+        capacity_limit=row["capacity_limit"],
     )
 
 
@@ -286,6 +325,18 @@ def _feedback_from_row(row: sqlite3.Row) -> Feedback:
         change_description=row["change_description"],
         run_id=row["run_id"],
         recorded_at=row["recorded_at"],
+    )
+
+
+def _capacity_constraint_from_row(row: sqlite3.Row) -> CapacityConstraint:
+    return CapacityConstraint(
+        id=row["id"],
+        run_id=row["run_id"],
+        raw_text=row["raw_text"],
+        patch_limit=row["patch_limit"],
+        pool_size=row["pool_size"],
+        deferred_count=row["deferred_count"],
+        created_at=row["created_at"],
     )
 
 
@@ -435,16 +486,27 @@ class Memory:
         tot_winner_strategy: str | None = None,
         tot_near_tie: bool | None = None,
         tot_termination_reason: str | None = None,
+        capacity_rank: int | None = None,
+        capacity_pool_size: int | None = None,
+        capacity_limit: int | None = None,
     ) -> int:
         """`run_id` must name a row already written by record_run --
         enforced by SQLite itself (PRAGMA foreign_keys=ON), not
-        re-checked here; an unknown run_id raises sqlite3.IntegrityError."""
+        re-checked here; an unknown run_id raises sqlite3.IntegrityError.
+
+        `capacity_rank`/`capacity_pool_size`/`capacity_limit` are
+        optional, like the `tot_*` fields above -- most decisions have
+        nothing to do with a capacity reallocation. Populate them when a
+        decision results from one (CLAUDE.md Section 10's "only five
+        patches fit this window" example) so the decision record carries
+        why it landed where it did."""
         cur = self._conn.execute(
             """INSERT INTO decisions (
                 run_id, finding_id, cve_id, asset_id, hostname, risk_score, bucket,
                 rationale, verdict_summary, narrative,
-                tot_winner_strategy, tot_near_tie, tot_termination_reason, decided_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                tot_winner_strategy, tot_near_tie, tot_termination_reason,
+                capacity_rank, capacity_pool_size, capacity_limit, decided_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run_id,
                 finding_id,
@@ -459,6 +521,9 @@ class Memory:
                 tot_winner_strategy,
                 None if tot_near_tie is None else int(tot_near_tie),
                 tot_termination_reason,
+                capacity_rank,
+                capacity_pool_size,
+                capacity_limit,
                 _now(),
             ),
         )
@@ -505,3 +570,36 @@ class Memory:
             "SELECT * FROM feedback ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
         return [_feedback_from_row(r) for r in rows]
+
+    # --- capacity constraints -------------------------------------------
+
+    def record_capacity_constraint(
+        self,
+        run_id: int,
+        raw_text: str,
+        patch_limit: int,
+        pool_size: int,
+        deferred_count: int,
+    ) -> int:
+        """Cycle-scoped, unlike `add_constraint`: a capacity constraint
+        ("only five patches fit this window") describes exactly one
+        change cycle's bandwidth, tied to the run it was applied within.
+        There is no active/deactivate concept here, unlike `constraints`'
+        soft-delete lifecycle -- a capacity constraint isn't a standing
+        fact that can later be retracted while remaining true or false
+        about some other, unrelated run; it has nothing to "still be
+        true" on a later run the way an asset-scoped constraint does. It
+        is scoped, recorded, and done."""
+        cur = self._conn.execute(
+            "INSERT INTO capacity_constraints (run_id, raw_text, patch_limit, pool_size, "
+            "deferred_count, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (run_id, raw_text, patch_limit, pool_size, deferred_count, _now()),
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    def capacity_constraints_for_run(self, run_id: int) -> list[CapacityConstraint]:
+        rows = self._conn.execute(
+            "SELECT * FROM capacity_constraints WHERE run_id = ? ORDER BY id", (run_id,)
+        ).fetchall()
+        return [_capacity_constraint_from_row(r) for r in rows]

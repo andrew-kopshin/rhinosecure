@@ -18,6 +18,18 @@ logging -- "Agent Started" boxes, per-tool-call echo lines, etc. --
 via `set_suppress_console_output`, so `--agents --quiet` prints only
 what this module itself prints (the table, and --explain's rationale).
 
+`rhino constraint add` inverts that polarity: it suppresses by default
+and takes an opt-in `--verbose` to show CrewAI's console output instead.
+`rhino run --agents` is an exploratory command where seeing per-stage
+agent activity is often exactly what's wanted, so verbose-by-default with
+opt-in `--quiet` fits it; `rhino constraint add` is a single-decision
+command where the interpretation, the pool ranking, and the diff (or, for
+an asset-scoped constraint, the before/after) already say everything a
+person needs, and the underlying agent prompt/reasoning is debugging
+detail, not the normal case -- so it defaults to quiet and `--verbose`
+opts back into the same `set_suppress_console_output` mechanism, just
+with the flag's meaning reversed.
+
 `_ensure_utf8_stdio` is unconditional and independent of --quiet: on
 Windows, the default console codepage can't encode the emoji CrewAI's
 event bus prints, which without it surfaced as recurring "'charmap'
@@ -71,13 +83,10 @@ import sys
 import textwrap
 from pathlib import Path
 
-from rhinosecure.enrich.attack import TechniqueIndex, load_index as load_attack_index
+from rhinosecure.enrich.attack import load_index as load_attack_index
 from rhinosecure.enrich.cache import OfflineCacheMissError, SnapshotCache
-from rhinosecure.enrich.epss import lookup as epss_lookup
-from rhinosecure.enrich.kev import KevCatalog, load_catalog as load_kev_catalog
-from rhinosecure.enrich.nvd import lookup as nvd_lookup
-from rhinosecure.ingest import IngestError, join_findings
-from rhinosecure.schema import AttackTechniqueRef, EnrichedFinding
+from rhinosecure.enrich.kev import load_catalog as load_kev_catalog
+from rhinosecure.ingest import IngestError, attach_threat_signals, join_findings
 from rhinosecure.scoring import ContestedRate, ScoredFinding, contested_rate, rank, score_finding
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -105,36 +114,6 @@ def _resolve_data_dir(data_arg: str) -> Path:
     raise SystemExit(f"no such data set: {data_arg!r} (looked for {named} and {path})")
 
 
-def _attach_threat_signals(
-    enriched: EnrichedFinding,
-    kev_catalog: KevCatalog,
-    attack_index: TechniqueIndex,
-    cache: SnapshotCache,
-) -> EnrichedFinding:
-    cve_id = enriched.finding.cve_id
-    epss = epss_lookup(cve_id, cache)
-    nvd_cvss = nvd_lookup(cve_id, cache)
-    matches = attack_index.lookup(cve_id, enriched.finding.product, enriched.finding.evidence)
-    confirmed_prevalence = [m.technique.prevalence for m in matches if m.confidence == "confirmed"]
-    return enriched.model_copy(
-        update={
-            "is_kev": kev_catalog.status(cve_id).is_listed,
-            "epss": epss.score if epss.is_scored else None,
-            "nvd_base_score": nvd_cvss.base_score if nvd_cvss is not None else None,
-            "nvd_severity": nvd_cvss.base_severity if nvd_cvss is not None else None,
-            "attack_techniques": tuple(
-                AttackTechniqueRef(
-                    technique_id=m.technique.technique_id,
-                    name=m.technique.name,
-                    confidence=m.confidence,
-                )
-                for m in matches
-            ),
-            "attack_prevalence": max(confirmed_prevalence, default=None),
-        }
-    )
-
-
 def run(data_dir: Path, seed: int, *, offline: bool = False) -> list[ScoredFinding]:
     # Scoring is fully deterministic (no sampling); the seed is accepted
     # now so the CLI contract does not change once Slice 4's ToT beam
@@ -149,7 +128,7 @@ def run(data_dir: Path, seed: int, *, offline: bool = False) -> list[ScoredFindi
     attack_index = load_attack_index(cache)  # same shape: one filtered bundle, loaded once
 
     scored = [
-        score_finding(_attach_threat_signals(e, kev_catalog, attack_index, cache))
+        score_finding(attach_threat_signals(e, kev_catalog, attack_index, cache))
         for e in join_findings(findings_path, assets_path)
     ]
     return rank(scored)
@@ -192,7 +171,7 @@ def submit_constraint(
     *,
     offline: bool = False,
     db_path: Path | str | None = None,
-) -> ConstraintSubmissionResult:
+) -> ConstraintSubmissionResult | CapacitySubmissionResult:
     """CLI entry point for `rhino constraint add` -- the agent equivalent
     of `run`/`run_agents`, dispatching `agents/coordinator.py`'s
     `submit_constraint` against every finding in `data_dir`. Imports
@@ -326,9 +305,17 @@ def _print_tot_result(finding_id: str, coordinator: Coordinator) -> None:
 
 
 def _print_constraint_interpretation(interpretation: ConstraintInterpretation) -> None:
+    """`asset_id is None` alone no longer means "declined" -- a fleet-wide
+    capacity statement also has no single asset to resolve to (Section 10)
+    but is a real, handled outcome, not a refusal. Branch on
+    `constraint_kind` explicitly instead."""
     print("Interpreting constraint...")
-    if interpretation.asset_id is None:
-        print(f"  could not resolve to a single asset -- {interpretation.rationale}")
+    if interpretation.constraint_kind == "capacity":
+        print(f"  capacity constraint -- patch_limit={interpretation.patch_limit}")
+        print(_wrap(interpretation.rationale, indent="  rationale: ", continuation_indent="    "))
+        return
+    if interpretation.constraint_kind != "asset" or interpretation.asset_id is None:
+        print(f"  could not resolve to a single asset or a capacity limit -- {interpretation.rationale}")
         return
     print(f"  asset: {interpretation.asset_id}")
     print(f"  effect: {interpretation.effect_kind} = {interpretation.effect_value!r}")
@@ -370,6 +357,52 @@ def _print_constraint_result(result: ConstraintSubmissionResult) -> None:
         for line in d.rationale_removed:
             print(_wrap(line, indent="    - ", continuation_indent="      "))
         print(_wrap(f"why: {d.after_verdict_summary}", indent="    ", continuation_indent="    "))
+
+
+def _print_capacity_result(result: CapacitySubmissionResult) -> None:
+    """The fleet-wide capacity diff (CLAUDE.md Section 10's "only five
+    patches fit this window") needs different framing from
+    `_print_constraint_result` above: `risk_score` is identical before and
+    after for every finding here (`agents/coordinator.py`'s `CapacityDelta`
+    docstring) -- what changed is a finding's rank-position against the
+    declared limit, not anything about its risk. Diff'd by rank and bucket
+    instead of a risk_score before/after pair."""
+    if not result.persisted:
+        print("\nNothing computed or persisted.", file=sys.stderr)
+        return
+
+    print(
+        f"\nCapacity constraint #{result.capacity_constraint_id} persisted "
+        f"(limit={result.interpretation.patch_limit})."
+    )
+    if not result.deltas:
+        print("\nNo next_window finding(s) currently in the pool -- nothing to allocate.")
+        return
+
+    limit = result.deltas[0].limit
+    pool_size = result.deltas[0].pool_size
+    print(f"\n{pool_size} next_window finding(s) competing for {limit} slot(s) this cycle:")
+    for d in sorted(result.deltas, key=lambda d: d.rank):
+        marker = "fits" if d.fits else "deferred_capacity"
+        print(f"  #{d.rank} {d.finding_id} ({d.cve_id} on {d.hostname}) risk_score={d.risk_score:.1f} -> {marker}")
+
+    changed = result.changed_deltas
+    if not changed:
+        print("\nAll findings fit within capacity -- no bucket changes.")
+        return
+
+    print(f"\nDiff ({len(changed)}/{len(result.deltas)} finding(s) deferred):")
+    for d in changed:
+        print(f"\n  {d.finding_id} ({d.cve_id} on {d.hostname}): {d.original_bucket} -> {d.effective_bucket}")
+        print(
+            _wrap(
+                f"risk_score unchanged at {d.risk_score:.1f} -- ranked {d.rank} of {d.pool_size}, "
+                f"exceeding this cycle's limit of {d.limit}. This finding lost a rank-position race, "
+                "not a change in risk.",
+                indent="    ",
+                continuation_indent="    ",
+            )
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -426,7 +459,12 @@ def main(argv: list[str] | None = None) -> int:
         help="forbid network fetches; fail loudly on any snapshot cache miss instead of fetching",
     )
     constraint_add_parser.add_argument(
-        "--quiet", action="store_true", help="silence CrewAI's own console logging"
+        "--verbose",
+        action="store_true",
+        help=(
+            "show CrewAI's own console logging (agent-started boxes, per-tool-call echo "
+            "lines) -- suppressed by default, unlike rhino run --agents"
+        ),
     )
     constraint_add_parser.add_argument(
         "--db", default=None, help="path to the memory.py SQLite file (default: memory.DEFAULT_DB_PATH)"
@@ -499,11 +537,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "constraint" and args.constraint_command == "add":
-        from rhinosecure.agents.coordinator import ConstraintInterpretationError
+        from rhinosecure.agents.coordinator import CapacitySubmissionResult, ConstraintInterpretationError
         from rhinosecure.llm import LLMConfigError
 
         data_dir = _resolve_data_dir(args.data)
-        if args.quiet:
+        if not args.verbose:
             from crewai.events.utils.console_formatter import set_suppress_console_output
 
             set_suppress_console_output(True)
@@ -524,7 +562,10 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         _print_constraint_interpretation(result.interpretation)
-        _print_constraint_result(result)
+        if isinstance(result, CapacitySubmissionResult):
+            _print_capacity_result(result)
+        else:
+            _print_constraint_result(result)
         return 0 if result.persisted else 1
 
     return 1

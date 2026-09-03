@@ -6,17 +6,27 @@ Slice 4's Coordinator-side wiring every prior commit in this repo named
 as unbuilt (`agents/coordinator.py`'s and `tot.py`'s module docstrings,
 CLAUDE.md Section 7's own "Deliberately not built" note).
 
-**Scope: asset-scoped operational constraints only, matching CLAUDE.md
-Section 7's worked example exactly** ("the payroll server only reboots
-on Sundays") -- not Section 10's "only five patches fit this window",
-which is a fleet-wide capacity constraint with no single asset to
-resolve to and no representation in `memory.py`'s `constraints` table
-(`asset_id NOT NULL`). The Interpreter is explicitly instructed to
-refuse (`asset_id=None`) rather than guess when a constraint isn't
-asset-scoped or doesn't describe one of the three effect kinds below --
-see `build_constraint_task`. A fleet-wide capacity constraint would need
-its own table and its own re-ranking mechanism; nothing here attempts
-that.
+**Scope: a three-way classification.** `ConstraintInterpretation
+.constraint_kind` (`ConstraintKind`) says which of two honest shapes a
+constraint resolved to, or neither:
+
+- `"asset"` -- an asset-scoped operational constraint, matching CLAUDE.md
+  Section 7's worked example exactly ("the payroll server only reboots on
+  Sundays"). Resolved to one asset and one of the three effect kinds
+  below, same as before this classification existed.
+- `"capacity"` -- CLAUDE.md Section 10's "only five patches fit this
+  window": a fleet-wide capacity constraint with no single asset to
+  resolve to. The Interpreter's only job here is to recognize the shape
+  and extract the integer `patch_limit` -- it does NOT decide which
+  finding_ids a capacity limit affects. That pool (every finding
+  currently in the `next_window` bucket) is computed deterministically
+  elsewhere in this codebase -- a separate, already-planned piece, not
+  built here -- and a capacity constraint also has no representation yet
+  in `memory.py`'s `constraints` table (`asset_id NOT NULL`) or its own
+  re-ranking mechanism; nothing here attempts that persistence.
+- `None` -- a refusal, same meaning as before: the statement doesn't
+  honestly resolve to either shape above. The Interpreter is explicitly
+  instructed to refuse rather than guess -- see `build_constraint_task`.
 
 **Three effect kinds, matching the three asset-level facts Environment
 Analysis and scoring.py already read** (`Asset.patch_window`/
@@ -99,16 +109,56 @@ class ConstraintEffectKind(str, Enum):
     PATCH_RESTRICTION = "patch_restriction"
 
 
-class ConstraintInterpretation(BaseModel):
-    """This agent's structured output. `asset_id`/`effect_kind`/
-    `effect_value` are all None together when the constraint can't be
-    honestly resolved to one asset and one of the three effect kinds --
-    never a partial guess. `affected_finding_ids` is empty in that case
-    too."""
+class ConstraintKind(str, Enum):
+    """The two shapes a constraint can honestly resolve to -- mirrors
+    ConstraintEffectKind's own reasoning: a fixed, bounded menu is what
+    makes the result mechanically usable downstream (which table it
+    belongs in, which re-ranking mechanism reads it) rather than more
+    prose a later stage has to re-interpret. `constraint_kind` is None
+    (not a third member here) when neither shape fits -- see
+    ConstraintInterpretation."""
 
+    ASSET = "asset"
+    CAPACITY = "capacity"
+
+
+class ConstraintInterpretation(BaseModel):
+    """This agent's structured output, one of three shapes selected by
+    `constraint_kind`:
+
+    - `constraint_kind="asset"` -- an asset-scoped operational constraint,
+      matching CLAUDE.md Section 7's worked example ("the payroll server
+      only reboots on Sundays"). `asset_id`, `effect_kind`, `effect_value`,
+      and `affected_finding_ids` are populated as before; `patch_limit` is
+      None.
+    - `constraint_kind="capacity"` -- a fleet-wide capacity statement
+      naming no single asset (CLAUDE.md Section 10's "only five patches
+      fit this window"). ONLY `patch_limit` is populated (the integer
+      limit extracted from the statement); `asset_id`, `effect_kind`,
+      `effect_value` are None and `affected_finding_ids` is empty. Which
+      finding_ids a capacity limit actually constrains is computed
+      deterministically elsewhere in this codebase, from every finding
+      currently in the `next_window` bucket -- a separate, already-planned
+      piece this agent does not build and must not attempt: it never
+      populates `affected_finding_ids` for a capacity constraint, even if
+      list_findings_for_asset was called for some other reason first.
+    - `constraint_kind=None` -- a refusal: the statement could not be
+      honestly resolved to EITHER an asset-scoped effect or a capacity
+      limit (e.g. it gestures at fleet-wide capacity but gives no
+      extractable number, or it names no asset and isn't a capacity
+      statement either, or it names an asset but no clear effect).
+      `asset_id`, `effect_kind`, `effect_value`, and `patch_limit` are all
+      None and `affected_finding_ids` is empty; only `rationale` explains
+      why.
+
+    In every case exactly one shape applies -- never a partial mix across
+    shapes."""
+
+    constraint_kind: str | None
     asset_id: str | None
     effect_kind: str | None
     effect_value: str | None
+    patch_limit: int | None
     affected_finding_ids: list[str]
     rationale: str
     sources: list[str]
@@ -280,11 +330,41 @@ def build_constraint_task(constraint_text: str, agent: Agent) -> Task:
     return Task(
         description=(
             f"A human has stated this operational constraint: {constraint_text!r}\n\n"
+            "FIRST, decide which of two shapes this statement has -- before doing "
+            "anything else. This is the constraint_kind decision, and it comes before "
+            "any asset lookup.\n\n"
+            "A CAPACITY statement is about how much CAN be done this cycle -- how many "
+            "patches, changes, or slots fit -- not about any single machine's "
+            "operational facts. Its identifying feature is that it constrains a COUNT "
+            "across the whole plan, not a fact about one named system. Examples of "
+            "what a capacity statement sounds like:\n"
+            "- \"only five patches fit this window\"\n"
+            "- \"we can only do three changes this cycle\"\n"
+            "- \"the team has capacity for two patches before the freeze\"\n"
+            "If (and only if) the statement is capacity-shaped, set constraint_kind to "
+            "\"capacity\" and extract the integer limit into patch_limit. Do NOT call "
+            "search_assets or list_findings_for_asset for a capacity statement -- it "
+            "names no asset to look up. Do NOT populate affected_finding_ids for a "
+            "capacity constraint, even though you have list_findings_for_asset "
+            "available: which finding_ids a capacity limit actually constrains (every "
+            "finding currently in the next_window bucket) is computed deterministically "
+            "elsewhere in this codebase, not by you. Leave asset_id, effect_kind, and "
+            "effect_value null; leave affected_finding_ids empty. If the statement "
+            "gestures at capacity but gives no extractable number, it does not resolve "
+            "cleanly -- fall through to the refusal case below rather than guessing a "
+            "number.\n\n"
+            "An ASSET statement's identifying pattern is the opposite: it names or "
+            "clearly implies one specific machine, server, or workstation, and states an "
+            "operational fact about that one system (e.g. \"the payroll server only "
+            "reboots on Sundays\", \"WKS-FIN12 now sits behind the new WAF rule\"). If "
+            "the statement is asset-shaped, set constraint_kind to \"asset\" and resolve "
+            "it as follows:\n\n"
             "Call search_assets with terms drawn from the constraint text to find "
             "candidate assets. If exactly one asset clearly matches, call "
             "list_findings_for_asset for it to see what it would affect. If zero "
             "assets match, or more than one plausible candidate exists with no way "
-            "to tell which one the human meant, do not guess -- leave asset_id null.\n\n"
+            "to tell which one the human meant, do not guess -- leave asset_id null "
+            "and treat this as a refusal instead (constraint_kind null).\n\n"
             "Once (and only if) you have resolved exactly one asset, classify the "
             "constraint into exactly one effect kind:\n"
             "- patch_window: establishes or replaces when this asset may be patched "
@@ -293,26 +373,43 @@ def build_constraint_task(constraint_text: str, agent: Agent) -> Task:
             "\"now sits behind the new WAF rule\")\n"
             "- patch_restriction: establishes or replaces an operational restriction "
             "on patching this asset (e.g. \"no reboots during business hours\")\n\n"
-            "If the constraint does not clearly describe one of these three -- for "
-            "example, a fleet-wide capacity statement like \"only five patches fit "
-            "this window\", which names no single asset -- leave effect_kind and "
-            "effect_value null too, and say why in rationale. effect_value must be "
-            "grounded in the human's own words -- do not invent scheduling details, "
-            "control names, or restrictions the constraint text doesn't state.\n\n"
-            "affected_finding_ids defaults to every finding list_findings_for_asset "
-            "returned for the resolved asset -- narrow it only if the constraint's "
-            "own words scope it further (e.g. to one specific CVE or product)."
+            "If an asset resolves but the constraint does not clearly describe one of "
+            "these three effects, leave effect_kind and effect_value null too, and "
+            "treat the whole thing as a refusal (constraint_kind null) -- say why in "
+            "rationale. effect_value must be grounded in the human's own words -- do "
+            "not invent scheduling details, control names, or restrictions the "
+            "constraint text doesn't state. patch_limit stays null for an asset "
+            "constraint.\n\n"
+            "affected_finding_ids (asset constraints only) defaults to every finding "
+            "list_findings_for_asset returned for the resolved asset -- narrow it only "
+            "if the constraint's own words scope it further (e.g. to one specific CVE "
+            "or product).\n\n"
+            "THIRD, if the statement is neither clearly capacity-shaped nor "
+            "clearly asset-shaped -- or is asset-shaped but fails to resolve to one "
+            "asset and one effect kind, or is capacity-shaped but gives no extractable "
+            "number -- this is a refusal. Set constraint_kind to null, and leave "
+            "asset_id, effect_kind, effect_value, and patch_limit all null and "
+            "affected_finding_ids empty. Never guess a partial answer across shapes: "
+            "constraint_kind, and only the fields that shape uses, are populated "
+            "together, or nothing is."
         ),
         expected_output=(
             "Return ONLY a single JSON object, with these keys directly at the top "
             "level -- not wrapped in any container key, and no markdown code fences "
-            "or prose before or after it: asset_id (string or null), effect_kind "
-            '(one of "patch_window", "compensating_control", "patch_restriction", or '
-            "null), effect_value (string or null), affected_finding_ids (a list of "
-            "strings, empty if asset_id is null), rationale (a short paragraph "
-            "explaining the resolution, or why it could not be resolved), and "
-            "sources (a list of strings citing which tool calls the resolution came "
-            "from)."
+            "or prose before or after it: constraint_kind (one of \"asset\", "
+            "\"capacity\", or null), asset_id (string or null; populated only when "
+            "constraint_kind is \"asset\"), effect_kind (one of \"patch_window\", "
+            "\"compensating_control\", \"patch_restriction\", or null; populated only "
+            "when constraint_kind is \"asset\"), effect_value (string or null; "
+            "populated only when constraint_kind is \"asset\"), patch_limit (integer "
+            "or null; populated only when constraint_kind is \"capacity\", and null in "
+            "every other case), affected_finding_ids (a list of strings; populated "
+            "only when constraint_kind is \"asset\", always empty when constraint_kind "
+            "is \"capacity\" or null -- never infer or list finding_ids for a capacity "
+            "constraint yourself), rationale (a short paragraph explaining the "
+            "resolution, or why it could not be resolved), and sources (a list of "
+            "strings citing which tool calls the resolution came from, empty for a "
+            "capacity constraint since none are called)."
         ),
         agent=agent,
     )

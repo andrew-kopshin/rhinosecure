@@ -4,6 +4,8 @@ import pytest
 from crewai import Task
 
 from rhinosecure.agents.constraint_intake import (
+    ConstraintInterpretation,
+    ConstraintKind,
     apply_constraints,
     build_constraint_agent,
     build_constraint_task,
@@ -221,3 +223,76 @@ def test_build_constraint_task_embeds_the_constraint_text_and_effect_menu():
     assert "do not guess" in task.description.lower()
     assert "not wrapped in any container key" in task.expected_output
     assert "affected_finding_ids" in task.expected_output
+
+
+def test_build_constraint_task_describes_the_capacity_shape_with_an_example():
+    tools, _ = _tools()
+    agent = build_constraint_agent(list(tools.values()), llm=_fake_llm())
+    task = build_constraint_task("only five patches fit this window", agent)
+
+    assert "capacity" in task.description.lower()
+    assert "only five patches fit this window" in task.description
+    assert "patch_limit" in task.description
+
+
+def test_build_constraint_task_expected_output_lists_the_new_capacity_fields():
+    tools, _ = _tools()
+    agent = build_constraint_agent(list(tools.values()), llm=_fake_llm())
+    task = build_constraint_task("only five patches fit this window", agent)
+
+    assert "constraint_kind" in task.expected_output
+    assert "patch_limit" in task.expected_output
+
+
+# --- ConstraintInterpretation schema (three-way shape) -----------------------
+
+
+def test_capacity_interpretation_validates_with_only_patch_limit_populated():
+    interpretation = ConstraintInterpretation(
+        constraint_kind=ConstraintKind.CAPACITY.value,
+        asset_id=None,
+        effect_kind=None,
+        effect_value=None,
+        patch_limit=5,
+        affected_finding_ids=[],
+        rationale="fleet-wide capacity statement: five patches fit this window",
+        sources=[],
+    )
+    assert interpretation.constraint_kind == "capacity"
+    assert interpretation.patch_limit == 5
+    assert interpretation.asset_id is None
+    assert interpretation.affected_finding_ids == []
+
+
+def test_asset_interpretation_still_validates_with_the_existing_fields_populated():
+    interpretation = ConstraintInterpretation(
+        constraint_kind=ConstraintKind.ASSET.value,
+        asset_id="A12",
+        effect_kind="patch_window",
+        effect_value="Sun 00:00-06:00",
+        patch_limit=None,
+        affected_finding_ids=["F15"],
+        rationale="matched A12 via business_function",
+        sources=["search_assets", "list_findings_for_asset"],
+    )
+    assert interpretation.constraint_kind == "asset"
+    assert interpretation.asset_id == "A12"
+    assert interpretation.effect_kind == "patch_window"
+    assert interpretation.patch_limit is None
+
+
+def test_refusal_interpretation_still_validates_with_everything_null_or_empty():
+    interpretation = ConstraintInterpretation(
+        constraint_kind=None,
+        asset_id=None,
+        effect_kind=None,
+        effect_value=None,
+        patch_limit=None,
+        affected_finding_ids=[],
+        rationale="statement is neither asset-scoped nor a recognizable capacity limit",
+        sources=[],
+    )
+    assert interpretation.constraint_kind is None
+    assert interpretation.asset_id is None
+    assert interpretation.patch_limit is None
+    assert interpretation.affected_finding_ids == []

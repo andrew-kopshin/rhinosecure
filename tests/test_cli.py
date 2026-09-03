@@ -431,11 +431,14 @@ def test_quiet_flag_without_agents_is_a_harmless_no_op():
 def _fake_interpretation(
     *, asset_id="A02", effect_kind="compensating_control", effect_value="WAF rule enabled",
     affected_finding_ids=None, rationale="matched A02 via business_function",
+    constraint_kind="asset", patch_limit=None,
 ):
     from rhinosecure.agents.constraint_intake import ConstraintInterpretation
 
     return ConstraintInterpretation(
+        constraint_kind=constraint_kind,
         asset_id=asset_id, effect_kind=effect_kind, effect_value=effect_value,
+        patch_limit=patch_limit,
         affected_finding_ids=affected_finding_ids if affected_finding_ids is not None else ["F02"],
         rationale=rationale, sources=["fake"],
     )
@@ -465,7 +468,8 @@ def _fake_submission_result(*, persisted=True, deltas=None, unresolved=()):
         return ConstraintSubmissionResult(
             interpretation=_fake_interpretation(
                 asset_id=None, effect_kind=None, effect_value=None, affected_finding_ids=[],
-                rationale="no single asset named; this is a fleet-wide capacity statement",
+                rationale="statement names no asset and no recognizable capacity limit",
+                constraint_kind=None,
             ),
             constraint_id=None, run_id=None, deltas=(), unresolved_finding_ids=unresolved,
         )
@@ -550,12 +554,12 @@ def test_constraint_add_reports_decline_and_exits_1(monkeypatch, capsys):
         "rhinosecure.cli.submit_constraint", lambda *a, **k: _fake_submission_result(persisted=False)
     )
 
-    exit_code = main(["constraint", "add", "only five patches fit this window"])
+    exit_code = main(["constraint", "add", "please make everything more secure"])
     captured = capsys.readouterr()
 
     assert exit_code == 1
     assert "could not resolve to a single asset" in captured.out
-    assert "fleet-wide capacity statement" in captured.out
+    assert "no recognizable capacity limit" in captured.out
     assert "Nothing persisted or re-planned." in captured.err
 
 
@@ -619,7 +623,10 @@ def test_constraint_add_maps_interpretation_error_to_exit_1(monkeypatch, capsys)
     assert "could not interpret constraint" in capsys.readouterr().err
 
 
-def test_constraint_add_with_quiet_suppresses_console_output(monkeypatch):
+def test_constraint_add_suppresses_console_output_by_default(monkeypatch):
+    """Inverted polarity from `rhino run --agents`: constraint add is a
+    single-decision command, so it suppresses CrewAI's own console
+    output by default rather than requiring an opt-in flag."""
     monkeypatch.setattr("rhinosecure.cli.submit_constraint", lambda *a, **k: _fake_submission_result())
     calls = []
     monkeypatch.setattr(
@@ -627,8 +634,153 @@ def test_constraint_add_with_quiet_suppresses_console_output(monkeypatch):
         lambda suppress: calls.append(suppress),
     )
 
-    assert main(["constraint", "add", "some constraint", "--quiet"]) == 0
+    assert main(["constraint", "add", "some constraint"]) == 0
     assert calls == [True]
+
+
+def test_constraint_add_verbose_flag_disables_suppression(monkeypatch):
+    monkeypatch.setattr("rhinosecure.cli.submit_constraint", lambda *a, **k: _fake_submission_result())
+    calls = []
+    monkeypatch.setattr(
+        "crewai.events.utils.console_formatter.set_suppress_console_output",
+        lambda suppress: calls.append(suppress),
+    )
+
+    assert main(["constraint", "add", "some constraint", "--verbose"]) == 0
+    assert calls == []
+
+
+# --- constraint add: fleet-wide capacity (CapacitySubmissionResult) ---------
+#
+# Same division of labor as the asset-scoped tests above: the allocation
+# itself (ranking, the deferred_capacity bucket, memory persistence) is
+# covered in test_coordinator.py's own capacity tests. These only check
+# that main() tells a CapacitySubmissionResult apart from a
+# ConstraintSubmissionResult and prints the "risk_score unchanged, lost a
+# rank-position race" framing rather than the asset-scoped diff format.
+
+
+def _fake_capacity_delta(
+    *, finding_id="F07", risk_score=21.2, original_bucket="next_window",
+    effective_bucket="deferred_capacity", rank=3, pool_size=4, limit=2,
+):
+    from rhinosecure.agents.coordinator import CapacityDelta
+
+    return CapacityDelta(
+        finding_id=finding_id, cve_id="CVE-2024-0007", asset_id="A07", hostname="H7",
+        risk_score=risk_score, original_bucket=original_bucket, effective_bucket=effective_bucket,
+        rank=rank, pool_size=pool_size, limit=limit,
+    )
+
+
+def _fake_capacity_result(*, persisted=True, deltas=None, patch_limit=2):
+    from rhinosecure.agents.coordinator import CapacitySubmissionResult
+
+    interpretation = _fake_interpretation(
+        asset_id=None, effect_kind=None, effect_value=None, affected_finding_ids=[],
+        rationale="fleet-wide capacity statement: two patches fit this window",
+        constraint_kind="capacity", patch_limit=patch_limit,
+    )
+    if not persisted:
+        return CapacitySubmissionResult(
+            interpretation=interpretation, capacity_constraint_id=None, run_id=None, deltas=()
+        )
+    return CapacitySubmissionResult(
+        interpretation=interpretation,
+        capacity_constraint_id=9,
+        run_id=4,
+        deltas=tuple(deltas) if deltas is not None else (
+            _fake_capacity_delta(finding_id="F01", risk_score=36.4, original_bucket="next_window",
+                                  effective_bucket="next_window", rank=1, pool_size=4, limit=2),
+            _fake_capacity_delta(finding_id="F06", risk_score=31.7, original_bucket="next_window",
+                                  effective_bucket="next_window", rank=2, pool_size=4, limit=2),
+            _fake_capacity_delta(finding_id="F07", risk_score=21.2, rank=3, pool_size=4, limit=2),
+            _fake_capacity_delta(finding_id="F04", risk_score=18.3, rank=4, pool_size=4, limit=2),
+        ),
+    )
+
+
+def test_constraint_add_routes_a_capacity_result_through_the_capacity_printer(monkeypatch, capsys):
+    monkeypatch.setattr("rhinosecure.cli.submit_constraint", lambda *a, **k: _fake_capacity_result())
+
+    exit_code = main(["constraint", "add", "only two patches fit this window"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "capacity constraint -- patch_limit=2" in out
+    assert "asset:" not in out  # never the asset-scoped interpretation printer
+    assert "Capacity constraint #9 persisted (limit=2)." in out
+
+
+def test_constraint_add_prints_capacity_diff_with_rank_framing_not_a_score_pair(monkeypatch, capsys):
+    monkeypatch.setattr("rhinosecure.cli.submit_constraint", lambda *a, **k: _fake_capacity_result())
+
+    exit_code = main(["constraint", "add", "only two patches fit this window"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "4 next_window finding(s) competing for 2 slot(s) this cycle:" in out
+    assert "#1 F01" in out and "-> fits" in out
+    assert "#3 F07" in out and "-> deferred_capacity" in out
+    assert "Diff (2/4 finding(s) deferred):" in out
+    assert "F07 (CVE-2024-0007 on H7): next_window -> deferred_capacity" in out
+    assert "risk_score unchanged at 21.2" in out
+    assert "lost a rank-position race, not a change in risk" in out
+    # The asset-scoped diff's before/after risk_score-pair framing
+    # ("bucket (score) -> bucket (score)") must never appear here.
+    assert "next_window (21.2)" not in out
+    assert "deferred_capacity (21.2)" not in out
+
+
+def test_constraint_add_capacity_reports_no_change_when_everything_fits(monkeypatch, capsys):
+    fits = tuple(
+        _fake_capacity_delta(finding_id=fid, effective_bucket="next_window", rank=r, pool_size=2, limit=5)
+        for r, fid in enumerate(("F01", "F06"), start=1)
+    )
+    monkeypatch.setattr(
+        "rhinosecure.cli.submit_constraint", lambda *a, **k: _fake_capacity_result(deltas=fits, patch_limit=5)
+    )
+
+    exit_code = main(["constraint", "add", "five patches fit this window"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "All findings fit within capacity -- no bucket changes." in out
+    assert "Diff (" not in out
+
+
+def test_constraint_add_capacity_persisted_with_an_empty_pool_reports_nothing_to_allocate(monkeypatch, capsys):
+    """persisted=True (patch_limit was extracted, the constraint row was
+    written) but deltas=() -- a real, reachable state: zero next_window
+    findings exist in the fleet right now, so apply_capacity_limit's pool
+    is empty even though the limit itself was recorded. Distinct from the
+    persisted=False decline case below, which hits a different guard."""
+    monkeypatch.setattr(
+        "rhinosecure.cli.submit_constraint",
+        lambda *a, **k: _fake_capacity_result(deltas=(), patch_limit=5),
+    )
+
+    exit_code = main(["constraint", "add", "five patches fit this window"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "Capacity constraint #9 persisted (limit=5)." in out
+    assert "No next_window finding(s) currently in the pool -- nothing to allocate." in out
+    assert "Diff (" not in out
+
+
+def test_constraint_add_capacity_decline_when_limit_not_extracted_exits_1(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "rhinosecure.cli.submit_constraint",
+        lambda *a, **k: _fake_capacity_result(persisted=False, patch_limit=None),
+    )
+
+    exit_code = main(["constraint", "add", "we don't have much bandwidth this week"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "capacity constraint -- patch_limit=None" in captured.out
+    assert "Nothing computed or persisted." in captured.err
 
 
 # --- _ensure_utf8_stdio ------------------------------------------------------

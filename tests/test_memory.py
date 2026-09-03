@@ -399,3 +399,101 @@ def test_list_feedback_returns_newest_first_and_respects_limit(db_path: Path):
 
         assert [f.raw_input for f in db.list_feedback()] == ["third", "second", "first"]
         assert [f.raw_input for f in db.list_feedback(limit=2)] == ["third", "second"]
+
+
+# --- capacity constraints -----------------------------------------------
+
+
+def test_record_capacity_constraint_returns_an_id_and_is_retrievable(db_path: Path):
+    with Memory(db_path) as db:
+        run_id = _record_demo_run(db)
+        constraint_id = db.record_capacity_constraint(
+            run_id, "only five patches fit this window", patch_limit=5, pool_size=9, deferred_count=4
+        )
+
+        [constraint] = db.capacity_constraints_for_run(run_id)
+        assert constraint.id == constraint_id
+        assert constraint.run_id == run_id
+        assert constraint.raw_text == "only five patches fit this window"
+        assert constraint.patch_limit == 5
+        assert constraint.pool_size == 9
+        assert constraint.deferred_count == 4
+        assert constraint.created_at  # non-empty timestamp
+
+
+def test_capacity_constraints_for_run_returns_empty_list_when_none_recorded(db_path: Path):
+    with Memory(db_path) as db:
+        run_id = _record_demo_run(db)
+        assert db.capacity_constraints_for_run(run_id) == []
+
+
+def test_record_capacity_constraint_with_unknown_run_id_raises_integrity_error(db_path: Path):
+    """Foreign-keyed to runs and enforced by SQLite (PRAGMA
+    foreign_keys=ON) -- not re-checked in Python, matching
+    record_decision/record_feedback's own FK behavior."""
+    with Memory(db_path) as db:
+        with pytest.raises(sqlite3.IntegrityError):
+            db.record_capacity_constraint(
+                999, "only five patches fit this window", patch_limit=5, pool_size=9, deferred_count=4
+            )
+
+
+def test_capacity_constraint_survives_a_new_session(db_path: Path):
+    """Same cross-session guarantee as
+    test_the_claude_md_worked_example_survives_a_new_session above, for
+    the newer capacity_constraints table -- record_capacity_constraint's
+    own `self._conn.commit()` is what makes this durable across a process
+    boundary (Memory.close() has no implicit commit); closing one Memory
+    and opening a fresh one against the same file is how a second `rhino
+    constraint add` invocation would actually see it."""
+    with Memory(db_path) as session_one:
+        run_id = _record_demo_run(session_one)
+        session_one.record_capacity_constraint(
+            run_id, "only five patches fit this window", patch_limit=5, pool_size=9, deferred_count=4
+        )
+
+    session_two = Memory(db_path)
+    try:
+        [constraint] = session_two.capacity_constraints_for_run(run_id)
+        assert constraint.raw_text == "only five patches fit this window"
+        assert constraint.patch_limit == 5
+        assert constraint.pool_size == 9
+        assert constraint.deferred_count == 4
+    finally:
+        session_two.close()
+
+
+def test_record_decision_capacity_fields_default_to_none_when_not_given(db_path: Path):
+    """Backward compatibility: every existing caller of record_decision
+    omits the capacity_* kwargs entirely and must keep working
+    unchanged, reading back as None -- modeled directly on
+    test_record_decision_tot_fields_default_to_none_for_a_non_contested_finding."""
+    with Memory(db_path) as db:
+        run_id = _record_demo_run(db)
+        db.record_decision(
+            run_id=run_id, finding_id="F19", cve_id="CVE-2018-8410", asset_id="A07",
+            hostname="SQL01", risk_score=8.6, bucket="accept",
+            rationale=["risk_score=8.6/100"], verdict_summary="Accepted.", narrative="...",
+        )
+
+        decision = db.decisions_for_run(run_id)[0]
+        assert decision.capacity_rank is None
+        assert decision.capacity_pool_size is None
+        assert decision.capacity_limit is None
+
+
+def test_record_decision_capacity_fields_round_trip_when_given(db_path: Path):
+    with Memory(db_path) as db:
+        run_id = _record_demo_run(db)
+        db.record_decision(
+            run_id=run_id, finding_id="F14", cve_id="CVE-2023-23397", asset_id="A09",
+            hostname="WKS-FIN12", risk_score=25.5, bucket="next_window",
+            rationale=["deferred by capacity reallocation"],
+            verdict_summary="Deferred: outside the 5-patch window capacity.", narrative="...",
+            capacity_rank=7, capacity_pool_size=9, capacity_limit=5,
+        )
+
+        decision = db.decisions_for_run(run_id)[0]
+        assert decision.capacity_rank == 7
+        assert decision.capacity_pool_size == 9
+        assert decision.capacity_limit == 5

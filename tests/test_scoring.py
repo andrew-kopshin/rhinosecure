@@ -8,7 +8,10 @@ from rhinosecure.scoring import (
     EPSS_MULTIPLIER_BASELINE,
     KEV_FLOOR_MULTIPLIER,
     Bucket,
+    CapacityAllocation,
+    RankableFinding,
     ThreatInputs,
+    apply_capacity_limit,
     bucket_for,
     contested_rate,
     score_threat,
@@ -83,8 +86,12 @@ def test_bucket_values_match_spec():
     scored = cli_run(DEMO_DIR, seed=42)
     # contested is not a remediation bucket -- see Bucket.CONTESTED's
     # docstring -- but it is a legitimate value bucket_for can return.
+    # deferred_capacity is a legitimate Bucket member too, but only
+    # apply_capacity_limit assigns it (see CapacityAllocation tests below)
+    # -- bucket_for/score_finding itself never produces it, so it is
+    # excluded from `allowed` here on purpose.
     allowed = {"patch_now", "next_window", "mitigate_monitor", "accept", "contested"}
-    assert allowed == {b.value for b in Bucket}
+    assert allowed | {"deferred_capacity"} == {b.value for b in Bucket}
     for s in scored:
         assert s.bucket.value in allowed
 
@@ -252,6 +259,99 @@ def test_f14_is_contested_on_the_demo_fixture():
     f14 = by_id["F14"]
     assert f14.bucket == Bucket.CONTESTED
     assert any("contested" in line for line in f14.rationale)
+
+
+# --- apply_capacity_limit ---------------------------------------------------
+
+
+def _rankable(finding_id, risk_score, bucket=Bucket.NEXT_WINDOW):
+    return RankableFinding(finding_id=finding_id, risk_score=risk_score, bucket=bucket)
+
+
+def test_capacity_limit_of_empty_pool_is_empty_not_an_error():
+    assert apply_capacity_limit([], limit=5) == []
+
+
+def test_capacity_limit_zero_defers_everyone():
+    findings = [_rankable("F01", 50.0), _rankable("F02", 40.0), _rankable("F03", 30.0)]
+    allocations = apply_capacity_limit(findings, limit=0)
+    assert len(allocations) == 3
+    assert all(a.effective_bucket == Bucket.DEFERRED_CAPACITY for a in allocations)
+    assert all(not a.fits for a in allocations)
+
+
+def test_capacity_limit_at_or_above_pool_size_defers_nobody():
+    findings = [_rankable("F01", 50.0), _rankable("F02", 40.0), _rankable("F03", 30.0)]
+    allocations = apply_capacity_limit(findings, limit=3)
+    assert all(a.effective_bucket == Bucket.NEXT_WINDOW for a in allocations)
+    assert all(a.fits for a in allocations)
+
+    allocations_over = apply_capacity_limit(findings, limit=10)
+    assert all(a.effective_bucket == Bucket.NEXT_WINDOW for a in allocations_over)
+    assert all(a.fits for a in allocations_over)
+
+
+def test_capacity_limit_boundary_between_fits_and_deferred():
+    """limit strictly between 1 and pool_size-1: the finding ranked exactly
+    at the limit still fits; the very next one is deferred. Pool of 5,
+    limit 2 -- rank 2 fits, rank 3 does not."""
+    findings = [
+        _rankable("F01", 90.0),
+        _rankable("F02", 80.0),
+        _rankable("F03", 70.0),
+        _rankable("F04", 60.0),
+        _rankable("F05", 50.0),
+    ]
+    allocations = apply_capacity_limit(findings, limit=2)
+    by_id = {a.finding_id: a for a in allocations}
+
+    assert by_id["F01"].rank == 1 and by_id["F01"].fits
+    assert by_id["F01"].effective_bucket == Bucket.NEXT_WINDOW
+
+    assert by_id["F02"].rank == 2 and by_id["F02"].fits
+    assert by_id["F02"].effective_bucket == Bucket.NEXT_WINDOW
+
+    assert by_id["F03"].rank == 3 and not by_id["F03"].fits
+    assert by_id["F03"].effective_bucket == Bucket.DEFERRED_CAPACITY
+
+    assert by_id["F04"].rank == 4 and not by_id["F04"].fits
+    assert by_id["F05"].rank == 5 and not by_id["F05"].fits
+
+    assert all(a.pool_size == 5 for a in allocations)
+    assert all(a.limit == 2 for a in allocations)
+    assert all(a.original_bucket == Bucket.NEXT_WINDOW for a in allocations)
+
+
+def test_capacity_limit_tie_breaks_by_ascending_finding_id():
+    """Same tie-break rank() already uses: equal risk_score, ascending
+    finding_id gets the better (lower) rank."""
+    findings = [_rankable("F02", 50.0), _rankable("F01", 50.0)]
+    allocations = apply_capacity_limit(findings, limit=1)
+    by_id = {a.finding_id: a for a in allocations}
+    assert by_id["F01"].rank == 1
+    assert by_id["F01"].fits
+    assert by_id["F01"].effective_bucket == Bucket.NEXT_WINDOW
+    assert by_id["F02"].rank == 2
+    assert not by_id["F02"].fits
+    assert by_id["F02"].effective_bucket == Bucket.DEFERRED_CAPACITY
+
+
+def test_capacity_limit_exempts_non_next_window_buckets_by_construction():
+    """The exemption is structural, not a special case: a patch_now finding
+    with a very high risk_score never competes for window capacity and
+    never appears in apply_capacity_limit's output at all, regardless of
+    how low the limit is."""
+    findings = [
+        _rankable("F01", 99.9, bucket=Bucket.PATCH_NOW),
+        _rankable("F02", 60.0, bucket=Bucket.MITIGATE_MONITOR),
+        _rankable("F03", 40.0, bucket=Bucket.ACCEPT),
+        _rankable("F04", 55.0, bucket=Bucket.CONTESTED),
+        _rankable("F05", 50.0, bucket=Bucket.NEXT_WINDOW),
+    ]
+    allocations = apply_capacity_limit(findings, limit=0)
+    ids = {a.finding_id for a in allocations}
+    assert ids == {"F05"}
+    assert len(allocations) == 1
 
 
 # --- contested_rate ------------------------------------------------------

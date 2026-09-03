@@ -123,6 +123,8 @@ from pydantic import BaseModel
 from rhinosecure.agents.constraint_intake import (
     ConstraintInterpretation,
     ConstraintInterpretationError,
+    ConstraintKind,
+    apply_constraints,
     build_constraint_agent,
     build_constraint_task,
     build_constraint_tools,
@@ -149,11 +151,21 @@ from rhinosecure.agents.risk import (
     merge_research_into_enriched,
     verify_scoring_matches_tool,
 )
+from rhinosecure.enrich.attack import load_index as load_attack_index
 from rhinosecure.enrich.cache import SnapshotCache
-from rhinosecure.ingest import load_asset_index
+from rhinosecure.enrich.kev import load_catalog as load_kev_catalog
+from rhinosecure.ingest import attach_threat_signals, load_asset_index
 from rhinosecure.memory import Memory
 from rhinosecure.schema import EnrichedFinding
-from rhinosecure.scoring import Bucket, ScoredFinding, score_finding
+from rhinosecure.scoring import (
+    Bucket,
+    CapacityAllocation,
+    RankableFinding,
+    ScoredFinding,
+    apply_capacity_limit,
+    contested_rate,
+    score_finding,
+)
 from rhinosecure.tot import (
     ToTDispatchError,
     ToTResult,
@@ -314,6 +326,93 @@ class ConstraintSubmissionResult:
         return tuple(d for d in self.deltas if d.changed)
 
 
+@dataclass(frozen=True)
+class CapacityDelta:
+    """One finding's outcome from a fleet-wide capacity reallocation
+    (`_submit_capacity_constraint`) -- deliberately NOT a `FindingDelta`.
+    Nothing about this finding's own risk_score or Research evidence
+    changed (`scoring.apply_capacity_limit`'s own docstring: the whole
+    point of "exempt by construction" is that the pool this operates
+    over was already final) -- only its rank position relative to a
+    fleet-wide limit did. Framing this as a risk_score before/after the
+    way `FindingDelta` does would misrepresent what actually happened,
+    which is why `risk_score` here is a single value, not a pair."""
+
+    finding_id: str
+    cve_id: str
+    asset_id: str
+    hostname: str
+    risk_score: float
+    original_bucket: str
+    effective_bucket: str
+    rank: int
+    pool_size: int
+    limit: int
+
+    @property
+    def fits(self) -> bool:
+        return self.rank <= self.limit
+
+    @property
+    def changed(self) -> bool:
+        return self.original_bucket != self.effective_bucket
+
+
+def _capacity_verdict_summary(d: CapacityDelta) -> str:
+    if d.fits:
+        return (
+            f"Fits within this cycle's capacity: ranked {d.rank} of {d.pool_size} "
+            f"next_window candidate(s), limit {d.limit}."
+        )
+    return (
+        f"Deferred to next cycle: ranked {d.rank} of {d.pool_size} next_window "
+        f"candidate(s), exceeding this cycle's capacity of {d.limit}. risk_score is "
+        "unchanged -- this finding lost a rank-position race, not a change in risk."
+    )
+
+
+def _capacity_rationale_line(d: CapacityDelta) -> str:
+    return (
+        f"capacity: ranked {d.rank} of {d.pool_size} next_window candidate(s) "
+        f"against a cycle limit of {d.limit} -> "
+        f"{'fits, stays next_window' if d.fits else 'deferred_capacity'}"
+    )
+
+
+def _summarize_capacity_deltas(capacity_constraint_id: int, deltas: tuple[CapacityDelta, ...]) -> str:
+    deferred = [d for d in deltas if d.changed]
+    if not deferred:
+        return (
+            f"capacity constraint #{capacity_constraint_id}: {len(deltas)} next_window "
+            "candidate(s) evaluated, all fit within capacity"
+        )
+    parts = [f"{d.finding_id}: rank {d.rank}/{d.pool_size} -> deferred_capacity" for d in deferred]
+    return f"capacity constraint #{capacity_constraint_id}: " + "; ".join(parts)
+
+
+@dataclass(frozen=True)
+class CapacitySubmissionResult:
+    """The end-to-end outcome of a fleet-wide capacity constraint
+    (`_submit_capacity_constraint`) -- CLAUDE.md Section 10's "only five
+    patches fit this window". `capacity_constraint_id` and `run_id` are
+    None together when the Interpreter recognized the statement as
+    capacity-shaped but could not extract a usable limit -- nothing was
+    computed or persisted in that case, and `deltas` is empty."""
+
+    interpretation: ConstraintInterpretation
+    capacity_constraint_id: int | None
+    run_id: int | None
+    deltas: tuple[CapacityDelta, ...]
+
+    @property
+    def persisted(self) -> bool:
+        return self.capacity_constraint_id is not None
+
+    @property
+    def changed_deltas(self) -> tuple[CapacityDelta, ...]:
+        return tuple(d for d in self.deltas if d.changed)
+
+
 class Coordinator:
     def __init__(
         self,
@@ -405,14 +504,17 @@ class Coordinator:
 
     def submit_constraint(
         self, text: str, findings: list[EnrichedFinding], *, seed: int = 42
-    ) -> ConstraintSubmissionResult:
+    ) -> ConstraintSubmissionResult | CapacitySubmissionResult:
         """The full "Human submits a constraint" flow (Section 5's Flow,
-        Section 7's worked example): interpret, persist, targeted
-        re-plan, diff. Requires `self.memory` -- construct
-        `Coordinator(..., memory=Memory(...))`. See the module docstring
-        for the full mechanics; `seed` is recorded on the resulting
-        `runs` row only (scoring has no sampling to seed -- same no-op
-        `cli.run` itself documents).
+        Section 7's worked example): interpret, then dispatch to one of
+        two entirely different mechanisms depending on
+        `interpretation.constraint_kind`. Requires `self.memory` --
+        construct `Coordinator(..., memory=Memory(...))`. See the module
+        docstring for the asset-scoped mechanics; `_submit_capacity_constraint`
+        below has the fleet-wide capacity mechanics
+        (CLAUDE.md Section 10's "only five patches fit this window").
+        `seed` is recorded on the resulting `runs` row only (scoring has
+        no sampling to seed -- same no-op `cli.run` itself documents).
         """
         if self.memory is None:
             raise CoordinatorError(
@@ -421,7 +523,14 @@ class Coordinator:
             )
 
         interpretation = self.interpret_constraint(text, findings)
-        if interpretation.asset_id is None:
+
+        if interpretation.constraint_kind == ConstraintKind.CAPACITY.value:
+            return self._submit_capacity_constraint(text, findings, interpretation, seed=seed)
+
+        if interpretation.constraint_kind != ConstraintKind.ASSET.value or interpretation.asset_id is None:
+            # A refusal (constraint_kind=None), or -- defensively -- any
+            # inconsistent shape the schema shouldn't produce but this
+            # doesn't trust blindly. Persists and re-plans nothing.
             return ConstraintSubmissionResult(
                 interpretation=interpretation, constraint_id=None, run_id=None, deltas=()
             )
@@ -502,6 +611,132 @@ class Coordinator:
             run_id=run_id,
             deltas=deltas,
             unresolved_finding_ids=unresolved,
+        )
+
+    def _submit_capacity_constraint(
+        self,
+        text: str,
+        findings: list[EnrichedFinding],
+        interpretation: ConstraintInterpretation,
+        *,
+        seed: int,
+    ) -> CapacitySubmissionResult:
+        """CLAUDE.md Section 10's "only five patches fit this window" --
+        fleet-wide, not asset-scoped, so there is no one asset's findings
+        to target the way the asset flow above does. The competing pool
+        is every finding currently in `Bucket.NEXT_WINDOW`, computed here,
+        deterministically, from the whole fleet -- never from the
+        Interpreter's own judgment (`interpretation.affected_finding_ids`
+        is not read here; `constraint_intake.py`'s task prompt already
+        instructs it to leave that empty for a capacity constraint).
+
+        Entirely LLM-free past the one `interpret_constraint` call that
+        already happened to extract `patch_limit` -- no Research/
+        Environment/Risk/ToT dispatch. The real, current bucket for every
+        finding comes from `ingest.attach_threat_signals` +
+        `scoring.score_finding`, the exact same deterministic pipeline
+        `cli.run()` uses, so "who's in next_window" reflects live KEV/
+        EPSS/NVD/ATT&CK data, not a guess -- but the reallocation itself
+        (`scoring.apply_capacity_limit`) stays a pure sort, matching
+        "Keep the allocation deterministic and in the scoring path, not
+        in an agent." `patch_now` and a contested finding whose ToT
+        recommended `emergency_change` are both excluded from the
+        competing pool by construction, not by an exemption list here --
+        neither is ever `Bucket.NEXT_WINDOW` in the first place; see
+        `apply_capacity_limit`'s own docstring.
+
+        Any active asset-scoped constraint on file is folded in before
+        scoring, the same way `agents/risk.py`'s `score_finding_tool`
+        does for a live agents run -- otherwise "the real, current
+        bucket" above would be a lie whenever an asset has a constraint
+        (e.g. a `compensating_control` just added via a prior `rhino
+        constraint add`) affecting `has_patch_window`/
+        `has_compensating_controls`: a finding could wrongly compete for
+        capacity (or wrongly be excluded, if a constraint moved it out of
+        `contested`) against the fleet's raw, un-overlaid CSV state
+        instead of what a person would actually see right now.
+        """
+        if interpretation.patch_limit is None:
+            return CapacitySubmissionResult(
+                interpretation=interpretation, capacity_constraint_id=None, run_id=None, deltas=()
+            )
+
+        kev_catalog = load_kev_catalog(self.cache)
+        attack_index = load_attack_index(self.cache)
+        scored = []
+        for e in findings:
+            active = self.memory.constraints_for_asset(e.asset.asset_id)
+            if active:
+                e = e.model_copy(update={"asset": apply_constraints(e.asset, active)})
+            scored.append(score_finding(attach_threat_signals(e, kev_catalog, attack_index, self.cache)))
+        scored_by_id = {s.finding_id: s for s in scored}
+        asset_id_by_finding_id = {e.finding.finding_id: e.asset.asset_id for e in findings}
+
+        rankable = [
+            RankableFinding(finding_id=s.finding_id, risk_score=s.risk_score, bucket=s.bucket)
+            for s in scored
+        ]
+        allocations = apply_capacity_limit(rankable, interpretation.patch_limit)
+
+        deltas = tuple(
+            CapacityDelta(
+                finding_id=a.finding_id,
+                cve_id=scored_by_id[a.finding_id].cve_id,
+                asset_id=asset_id_by_finding_id[a.finding_id],
+                hostname=scored_by_id[a.finding_id].hostname,
+                risk_score=scored_by_id[a.finding_id].risk_score,
+                original_bucket=a.original_bucket.value,
+                effective_bucket=a.effective_bucket.value,
+                rank=a.rank,
+                pool_size=a.pool_size,
+                limit=a.limit,
+            )
+            for a in allocations
+        )
+        deferred_count = sum(1 for d in deltas if d.changed)
+
+        rate = contested_rate(s.bucket.value for s in scored)
+        run_id = self.memory.record_run(
+            data_dir=str(self.data_dir),
+            seed=seed,
+            offline=self.cache.offline,
+            # agents=False: this run made no LLM calls beyond the one
+            # Interpreter call already dispatched by interpret_constraint
+            # -- the allocation itself is the deterministic pipeline, the
+            # same shape as `rhino run` without --agents.
+            agents=False,
+            total_findings=len(findings),
+            contested_count=rate.contested,
+            contested_total=rate.total,
+        )
+        capacity_constraint_id = self.memory.record_capacity_constraint(
+            run_id, text, interpretation.patch_limit, len(allocations), deferred_count
+        )
+        for d in deltas:
+            self.memory.record_decision(
+                run_id=run_id,
+                finding_id=d.finding_id,
+                cve_id=d.cve_id,
+                asset_id=d.asset_id,
+                hostname=d.hostname,
+                risk_score=d.risk_score,
+                bucket=d.effective_bucket,
+                rationale=[*scored_by_id[d.finding_id].rationale, _capacity_rationale_line(d)],
+                verdict_summary=_capacity_verdict_summary(d),
+                narrative=_capacity_verdict_summary(d),
+                capacity_rank=d.rank,
+                capacity_pool_size=d.pool_size,
+                capacity_limit=d.limit,
+            )
+        self.memory.record_feedback(
+            text, _summarize_capacity_deltas(capacity_constraint_id, deltas), run_id=run_id
+        )
+
+        return CapacitySubmissionResult(
+            interpretation=interpretation,
+            capacity_constraint_id=capacity_constraint_id,
+            run_id=run_id,
+            deltas=deltas,
         )
 
     def ranked(self) -> list[RiskRecommendation]:

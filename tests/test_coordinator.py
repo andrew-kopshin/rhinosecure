@@ -76,12 +76,16 @@ def _constraint_interpretation_json(
     effect_value: str | None = None,
     affected_finding_ids: list[str] | None = None,
     rationale: str = "fake rationale",
+    constraint_kind: str | None = "asset",
+    patch_limit: int | None = None,
 ) -> str:
     return json.dumps(
         {
+            "constraint_kind": constraint_kind,
             "asset_id": asset_id,
             "effect_kind": effect_kind,
             "effect_value": effect_value,
+            "patch_limit": patch_limit,
             "affected_finding_ids": affected_finding_ids or [],
             "rationale": rationale,
             "sources": ["fake"],
@@ -634,20 +638,24 @@ def test_submit_constraint_happy_path_persists_replans_and_diffs(data_dir, findi
 
 
 def test_submit_constraint_when_interpreter_declines_persists_nothing(data_dir, findings, tmp_path):
-    """A fleet-wide capacity statement like Section 10's "only five patches
-    fit this window" -- the Interpreter is instructed to refuse rather
-    than guess (constraint_intake.py's module docstring)."""
+    """A statement that is neither asset-scoped nor capacity-shaped (e.g.
+    ungrounded or unrelated to any asset/window) -- the Interpreter is
+    instructed to refuse rather than guess (constraint_intake.py's module
+    docstring). A genuine fleet-wide capacity statement like Section 10's
+    "only five patches fit this window" now resolves to constraint_kind=
+    "capacity" instead -- see the capacity tests below."""
     from rhinosecure.memory import Memory
 
     memory = Memory(tmp_path / "mem.db")
     _QueuedFakeCrew.queue = [
         _constraint_interpretation_json(
-            asset_id=None, rationale="no single asset named; this is a fleet-wide capacity statement",
+            asset_id=None, rationale="statement names no asset and no recognizable capacity limit",
+            constraint_kind=None,
         ),
     ]
 
     coordinator = Coordinator(data_dir, memory=memory)
-    result = coordinator.submit_constraint("only five patches fit this window", findings)
+    result = coordinator.submit_constraint("please prioritize things better", findings)
 
     assert result.persisted is False
     assert result.constraint_id is None
@@ -677,3 +685,275 @@ def test_submit_constraint_filters_out_a_hallucinated_finding_id(data_dir, findi
     assert result.persisted is True
     assert result.unresolved_finding_ids == ("F99",)
     assert [d.finding_id for d in result.deltas] == ["F02"]
+
+
+# --- fleet-wide capacity constraint (_submit_capacity_constraint) -----------
+#
+# CLAUDE.md Section 10's "only five patches fit this window". Unlike the
+# asset-scoped flow above, this path is entirely LLM-free past the one
+# interpret_constraint call -- it re-scores every finding through the exact
+# same deterministic pipeline cli.run() uses (ingest.attach_threat_signals +
+# scoring.score_finding), so these tests fake attach_threat_signals/
+# load_kev_catalog/load_attack_index to a pure identity (no network, no
+# snapshot files needed) rather than faking a Crew -- there is no second
+# Crew dispatch for this path to fake in the first place.
+
+CAPACITY_ASSETS_CSV = """asset_id,hostname,os,os_build,role,business_function,criticality,internet_exposed,environment,data_sensitivity,patch_window,patch_restrictions,compensating_controls,owner
+A00,DC01,Windows Server 2022,20348,dc,Domain controller,5,True,prod,regulated,,,,it-infra
+A01,H1,Windows 10,19045,workstation,Engineering workstation,5,True,prod,confidential,Sun 02:00-06:00,,,it-helpdesk
+A06,H6,Windows 10,19045,workstation,Engineering workstation,3,True,prod,confidential,Sun 02:00-06:00,,,it-helpdesk
+A07,H7,Windows 10,19045,workstation,Engineering workstation,4,True,prod,confidential,Sun 02:00-06:00,,,it-helpdesk
+A04,H4,Windows 10,19045,workstation,Engineering workstation,2,True,prod,confidential,Sun 02:00-06:00,,,it-helpdesk
+A02,H2,Windows 10,19045,workstation,Finance workstation,4,False,prod,confidential,Sun 02:00-06:00,,,it-helpdesk
+"""
+
+CAPACITY_FINDINGS_CSV = """finding_id,asset_id,cve_id,detected_date,scanner_severity,product,version,port,service,evidence
+F00,A00,CVE-2020-1472,2026-08-01,critical,Netlogon,x,445,smb,Zerologon
+F01,A01,CVE-2021-26855,2026-08-01,critical,Microsoft Exchange Server,2016 CU19,443,https,OWA SSRF chain
+F06,A06,CVE-2024-0006,2026-08-01,critical,Fake Product,1.0,0,x,fake
+F07,A07,CVE-2024-0007,2026-08-01,high,Fake Product,1.0,0,x,fake
+F04,A04,CVE-2024-0004,2026-08-01,high,Fake Product,1.0,0,x,fake
+F02,A02,CVE-2024-0002,2026-08-01,critical,Fake Product,1.0,0,x,fake
+"""
+
+# A separate, isolated fixture for the constraint-overlay regression test below --
+# deliberately NOT added to CAPACITY_ASSETS_CSV/CAPACITY_FINDINGS_CSV above, since
+# adding a finding there would change every other capacity test's pool_size/rank
+# assertions for no reason relevant to what they're each testing.
+CAPACITY_OVERLAY_ASSETS_CSV = """asset_id,hostname,os,os_build,role,business_function,criticality,internet_exposed,environment,data_sensitivity,patch_window,patch_restrictions,compensating_controls,owner
+A08,H8,Windows 10,19045,workstation,Engineering workstation,3,True,prod,confidential,,,,it-helpdesk
+"""
+
+CAPACITY_OVERLAY_FINDINGS_CSV = """finding_id,asset_id,cve_id,detected_date,scanner_severity,product,version,port,service,evidence
+F08,A08,CVE-2024-0008,2026-08-01,critical,Fake Product,1.0,0,x,fake
+"""
+
+
+@pytest.fixture
+def capacity_data_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "capacity"
+    d.mkdir()
+    (d / "assets.csv").write_text(CAPACITY_ASSETS_CSV, encoding="utf-8")
+    (d / "findings.csv").write_text(CAPACITY_FINDINGS_CSV, encoding="utf-8")
+    return d
+
+
+@pytest.fixture
+def capacity_findings(capacity_data_dir: Path):
+    """F00 -> patch_now (epss bumped so it clears the 70 threshold -- proves
+    patch_now is excluded from the pool by construction, not by an
+    exemption list). F01(36.4) > F06(31.7) > F07(21.2) > F04(18.3) all land
+    in next_window -- a real, distinct rank ordering to allocate against.
+    F02 lands in accept -- proves that bucket is excluded too."""
+    all_findings = list(join_findings(capacity_data_dir / "findings.csv", capacity_data_dir / "assets.csv"))
+    return [
+        e.model_copy(update={"epss": 0.9}) if e.finding.finding_id == "F00" else e
+        for e in all_findings
+    ]
+
+
+@pytest.fixture(autouse=True)
+def fake_capacity_enrichment(monkeypatch):
+    """Identity attach_threat_signals + inert bulk loaders -- the capacity
+    flow's real enrichment call, with no network/snapshot dependency. Only
+    the capacity tests below rely on this; every other test in this file
+    never reaches _submit_capacity_constraint at all."""
+    monkeypatch.setattr(coordinator_module, "attach_threat_signals", lambda e, kev, attack, cache: e)
+    monkeypatch.setattr(coordinator_module, "load_kev_catalog", lambda cache: None)
+    monkeypatch.setattr(coordinator_module, "load_attack_index", lambda cache: None)
+
+
+def _capacity_interpretation_json(patch_limit: int | None) -> str:
+    return _constraint_interpretation_json(
+        asset_id=None,
+        constraint_kind="capacity",
+        patch_limit=patch_limit,
+        rationale="fleet-wide capacity statement",
+    )
+
+
+def test_submit_constraint_routes_a_capacity_kind_to_the_capacity_flow_with_no_extra_crew(
+    capacity_data_dir, capacity_findings, tmp_path
+):
+    from rhinosecure.memory import Memory
+
+    memory = Memory(tmp_path / "mem.db")
+    _QueuedFakeCrew.queue = [_capacity_interpretation_json(2)]
+
+    coordinator = Coordinator(capacity_data_dir, memory=memory)
+    result = coordinator.submit_constraint("only two patches fit this window", capacity_findings)
+
+    from rhinosecure.agents.coordinator import CapacitySubmissionResult
+
+    assert isinstance(result, CapacitySubmissionResult)
+    # Interpretation only -- _submit_capacity_constraint dispatches no
+    # Research/Environment/Risk Crew at all.
+    assert _QueuedFakeCrew.instantiations == 1
+
+
+def test_submit_capacity_constraint_ranks_and_defers_by_limit(capacity_data_dir, capacity_findings, tmp_path):
+    from rhinosecure.memory import Memory
+
+    memory = Memory(tmp_path / "mem.db")
+    _QueuedFakeCrew.queue = [_capacity_interpretation_json(2)]
+
+    coordinator = Coordinator(capacity_data_dir, memory=memory)
+    result = coordinator.submit_constraint("only two patches fit this window", capacity_findings)
+
+    assert result.persisted is True
+    assert result.capacity_constraint_id is not None
+    assert result.run_id is not None
+
+    # Only the 4 next_window findings ever get a delta -- F00 (patch_now)
+    # and F02 (accept) are absent entirely, not present with fits=True.
+    assert {d.finding_id for d in result.deltas} == {"F01", "F06", "F07", "F04"}
+    by_id = {d.finding_id: d for d in result.deltas}
+    assert all(d.pool_size == 4 and d.limit == 2 for d in result.deltas)
+
+    # Rank order matches risk_score descending, tie-break irrelevant here
+    # since all 4 scores are distinct.
+    assert by_id["F01"].rank == 1 and by_id["F01"].fits and not by_id["F01"].changed
+    assert by_id["F06"].rank == 2 and by_id["F06"].fits and not by_id["F06"].changed
+    assert by_id["F07"].rank == 3 and not by_id["F07"].fits
+    assert by_id["F04"].rank == 4 and not by_id["F04"].fits
+
+    # The deferred pair actually changed bucket; risk_score is untouched --
+    # this is a rank-position loss, not a change in risk (CapacityDelta's
+    # own contract).
+    for fid in ("F07", "F04"):
+        d = by_id[fid]
+        assert d.original_bucket == "next_window"
+        assert d.effective_bucket == "deferred_capacity"
+        assert d.changed is True
+    for fid in ("F01", "F06"):
+        d = by_id[fid]
+        assert d.original_bucket == d.effective_bucket == "next_window"
+
+    assert result.changed_deltas and {d.finding_id for d in result.changed_deltas} == {"F07", "F04"}
+
+    # Memory: capacity_constraints, decisions (one per pool member, with the
+    # capacity_* columns populated), and feedback all written.
+    [stored] = memory.capacity_constraints_for_run(result.run_id)
+    assert stored.raw_text == "only two patches fit this window"
+    assert stored.patch_limit == 2
+    assert stored.pool_size == 4
+    assert stored.deferred_count == 2
+
+    decisions = memory.decisions_for_run(result.run_id)
+    assert {d.finding_id for d in decisions} == {"F01", "F06", "F07", "F04"}
+    decisions_by_id = {d.finding_id: d for d in decisions}
+    assert decisions_by_id["F07"].bucket == "deferred_capacity"
+    assert decisions_by_id["F07"].capacity_rank == 3
+    assert decisions_by_id["F07"].capacity_pool_size == 4
+    assert decisions_by_id["F07"].capacity_limit == 2
+    assert decisions_by_id["F01"].bucket == "next_window"
+    assert decisions_by_id["F01"].capacity_rank == 1
+
+    [feedback] = memory.list_feedback()
+    assert feedback.raw_input == "only two patches fit this window"
+    assert feedback.run_id == result.run_id
+    assert "F07" in feedback.change_description
+    assert "F04" in feedback.change_description
+    assert "F01" not in feedback.change_description  # only the deferred pair is called out
+
+
+def test_submit_capacity_constraint_limit_covers_the_full_pool_none_deferred(
+    capacity_data_dir, capacity_findings, tmp_path
+):
+    from rhinosecure.memory import Memory
+
+    memory = Memory(tmp_path / "mem.db")
+    _QueuedFakeCrew.queue = [_capacity_interpretation_json(10)]
+
+    coordinator = Coordinator(capacity_data_dir, memory=memory)
+    result = coordinator.submit_constraint("ten patches fit this window", capacity_findings)
+
+    assert len(result.deltas) == 4
+    assert all(d.fits and not d.changed for d in result.deltas)
+    assert result.changed_deltas == ()
+
+    [stored] = memory.capacity_constraints_for_run(result.run_id)
+    assert stored.deferred_count == 0
+
+    [feedback] = memory.list_feedback()
+    assert "all fit within capacity" in feedback.change_description
+
+
+def test_submit_capacity_constraint_when_patch_limit_is_missing_persists_nothing(
+    capacity_data_dir, capacity_findings, tmp_path
+):
+    """The Interpreter recognized a capacity-shaped statement but couldn't
+    extract a usable integer -- nothing computed, nothing persisted."""
+    from rhinosecure.memory import Memory
+
+    memory = Memory(tmp_path / "mem.db")
+    _QueuedFakeCrew.queue = [_capacity_interpretation_json(None)]
+
+    coordinator = Coordinator(capacity_data_dir, memory=memory)
+    result = coordinator.submit_constraint("we don't have much bandwidth this week", capacity_findings)
+
+    assert result.persisted is False
+    assert result.capacity_constraint_id is None
+    assert result.run_id is None
+    assert result.deltas == ()
+    assert memory.list_runs() == []
+
+
+def test_submit_capacity_constraint_applies_an_active_asset_constraint_before_ranking(tmp_path):
+    """A08/F08 has no declared patch_window and no compensating_controls in
+    assets.csv, so it lands in next_window by default (bucket_for's "no
+    control, no window" fallback). An active compensating_control
+    constraint on A08 -- persisted earlier via the asset-scoped flow, the
+    same way a real prior `rhino constraint add` would -- flips it to
+    mitigate_monitor (control + no window). The capacity pool must reflect
+    that overlaid state, not assets.csv's raw, un-overlaid facts: F08 must
+    be entirely absent from the pool, not present and merely deprioritized.
+    This is the regression test for the gap an adversarial review caught --
+    _submit_capacity_constraint originally re-scored straight from
+    ground-truth assets.csv, skipping the same constraint overlay
+    agents/risk.py's score_finding_tool already applies."""
+    from rhinosecure.memory import Memory
+
+    data_dir = tmp_path / "overlay"
+    data_dir.mkdir()
+    (data_dir / "assets.csv").write_text(CAPACITY_OVERLAY_ASSETS_CSV, encoding="utf-8")
+    (data_dir / "findings.csv").write_text(CAPACITY_OVERLAY_FINDINGS_CSV, encoding="utf-8")
+    findings = list(join_findings(data_dir / "findings.csv", data_dir / "assets.csv"))
+
+    memory = Memory(tmp_path / "mem.db")
+    memory.add_constraint("A08", "A08 now sits behind a new WAF rule", effect_kind="compensating_control",
+                           effect_value="WAF rule enabled")
+    _QueuedFakeCrew.queue = [_capacity_interpretation_json(5)]
+
+    coordinator = Coordinator(data_dir, memory=memory)
+    result = coordinator.submit_constraint("five patches fit this window", findings)
+
+    assert result.persisted is True
+    assert result.deltas == ()  # F08 is mitigate_monitor once overlaid -- never enters the pool
+
+
+def test_submit_capacity_constraint_limit_zero_is_a_real_limit_not_a_decline(
+    capacity_data_dir, capacity_findings, tmp_path
+):
+    """coordinator.py's own guard is `if interpretation.patch_limit is
+    None`, deliberately not a truthiness check -- 0 ("zero patches fit
+    this window") is a real, meaningful limit distinct from None ("the
+    Interpreter couldn't extract a number"). `0` is falsy in Python, so a
+    regression to `if not interpretation.patch_limit` would silently
+    misroute this into the decline branch; this test only passes if the
+    real `is None` check is what's actually running."""
+    from rhinosecure.memory import Memory
+
+    memory = Memory(tmp_path / "mem.db")
+    _QueuedFakeCrew.queue = [_capacity_interpretation_json(0)]
+
+    coordinator = Coordinator(capacity_data_dir, memory=memory)
+    result = coordinator.submit_constraint("zero patches fit this window", capacity_findings)
+
+    assert result.persisted is True
+    assert result.capacity_constraint_id is not None
+    assert len(result.deltas) == 4  # every next_window finding deferred, none fits
+    assert all(not d.fits and d.changed for d in result.deltas)
+    [stored] = memory.capacity_constraints_for_run(result.run_id)
+    assert stored.patch_limit == 0
+    assert stored.deferred_count == 4

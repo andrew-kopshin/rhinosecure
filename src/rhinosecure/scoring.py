@@ -158,6 +158,17 @@ class Bucket(str, Enum):
     # CLAUDE.md Section 6 -- this is the seed case for Slice 4's
     # Tree-of-Thought contested-finding gate.
     CONTESTED = "contested"
+    # Also a "no honest bucket exists" signal, not a remediation category --
+    # same shape as CONTESTED, different cause. CONTESTED means a single
+    # finding's own signals conflict (bucket_for can't honestly pick among
+    # the four real buckets for it in isolation). DEFERRED_CAPACITY means
+    # bucket_for's per-finding verdict of next_window was honest on its own,
+    # but the fleet does not have enough scheduled-window capacity to patch
+    # every next_window finding this cycle, and this one lost the
+    # rank-position race for a slot. Never assigned by bucket_for -- capacity
+    # is inherently a property of the whole ranked pool, not of one finding,
+    # so only apply_capacity_limit (below) assigns it, given that pool.
+    DEFERRED_CAPACITY = "deferred_capacity"
 
 
 @dataclass(frozen=True)
@@ -446,6 +457,97 @@ def score_finding(enriched: EnrichedFinding) -> ScoredFinding:
 
 def rank(scored: list[ScoredFinding]) -> list[ScoredFinding]:
     return sorted(scored, key=lambda s: (-s.risk_score, s.finding_id))
+
+
+@dataclass(frozen=True)
+class RankableFinding:
+    """The minimal shape apply_capacity_limit needs: enough to rank and
+    re-bucket, nothing else.
+
+    Deliberately narrower than ScoredFinding. apply_capacity_limit has two
+    callers with two different full record types -- ScoredFinding on the
+    deterministic path, agents/risk.py's RiskRecommendation (where `bucket`
+    is a plain str the caller converts with Bucket(...)) on the agents path
+    -- and neither should have to fabricate threat_score/impact_score/
+    cve_id/hostname/asset_id fields this function never reads just to call
+    it. A capacity reallocation only ever needs identity, rank key, and
+    current bucket.
+    """
+
+    finding_id: str
+    risk_score: float
+    bucket: Bucket
+
+
+@dataclass(frozen=True)
+class CapacityAllocation:
+    finding_id: str
+    original_bucket: Bucket
+    effective_bucket: Bucket
+    rank: int
+    pool_size: int
+    limit: int
+
+    @property
+    def fits(self) -> bool:
+        return self.rank <= self.limit
+
+
+def apply_capacity_limit(
+    findings: list[RankableFinding], limit: int
+) -> list[CapacityAllocation]:
+    """Reallocate next_window findings against a fleet-wide capacity limit
+    -- CLAUDE.md Section 10's "only five patches fit this window" example.
+
+    Deterministic and LLM-free, matching this module's Section 8 rule 2
+    discipline: pure re-ranking arithmetic over an already-scored,
+    already-bucketed pool. No agent, network, or LLM call belongs here or
+    ever will.
+
+    Only Bucket.NEXT_WINDOW findings compete for capacity. This is the
+    entire exemption mechanism -- there is no exempt_ids parameter and none
+    is needed, because the other buckets are excluded by construction, not
+    by an explicit exclusion list:
+
+    - patch_now already means "too urgent to wait for a window" (CLAUDE.md
+      Section 3). It was never competing for scheduled-window capacity in
+      the first place, so it cannot be squeezed out by this function.
+    - mitigate_monitor and accept aren't scheduled into a window at all.
+    - contested has no honest bucket yet, capacity or otherwise -- it is
+      still awaiting Tree-of-Thought/human resolution and is untouched here.
+    - A Tree-of-Thought emergency_change recommendation on a contested
+      finding is exempt by the identical structural reasoning: that
+      finding's bucket is "contested", never "next_window", so it was never
+      in this function's input pool to begin with.
+
+    This is a deliberate, load-bearing design point, not an oversight: the
+    exemption logic is "which bucket is this," which already lives in
+    bucket_for/tot.py, so apply_capacity_limit does not need -- and must
+    not duplicate -- a second copy of that decision.
+
+    Findings are ranked by the exact same (-risk_score, finding_id)
+    tie-break rank() uses, so a capacity allocation's ordering always
+    agrees with the ranked table a human reads it alongside. The first
+    `limit` findings by that ordering keep next_window; the rest become
+    deferred_capacity.
+    """
+    candidates = [f for f in findings if f.bucket is Bucket.NEXT_WINDOW]
+    ordered = sorted(candidates, key=lambda f: (-f.risk_score, f.finding_id))
+    pool_size = len(ordered)
+    allocations = []
+    for i, finding in enumerate(ordered, start=1):
+        effective = Bucket.NEXT_WINDOW if i <= limit else Bucket.DEFERRED_CAPACITY
+        allocations.append(
+            CapacityAllocation(
+                finding_id=finding.finding_id,
+                original_bucket=finding.bucket,
+                effective_bucket=effective,
+                rank=i,
+                pool_size=pool_size,
+                limit=limit,
+            )
+        )
+    return allocations
 
 
 @dataclass(frozen=True)
