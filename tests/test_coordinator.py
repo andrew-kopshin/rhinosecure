@@ -69,6 +69,26 @@ def _environment_json(fid: str, cve_id: str, asset_id: str, hostname: str, *, wr
     return json.dumps({"assessment": payload} if wrapped else payload)
 
 
+def _constraint_interpretation_json(
+    *,
+    asset_id: str | None,
+    effect_kind: str | None = None,
+    effect_value: str | None = None,
+    affected_finding_ids: list[str] | None = None,
+    rationale: str = "fake rationale",
+) -> str:
+    return json.dumps(
+        {
+            "asset_id": asset_id,
+            "effect_kind": effect_kind,
+            "effect_value": effect_value,
+            "affected_finding_ids": affected_finding_ids or [],
+            "rationale": rationale,
+            "sources": ["fake"],
+        }
+    )
+
+
 UNPARSEABLE = "this is not json and will never parse, no matter how many times you ask"
 
 
@@ -119,6 +139,7 @@ class _QueuedFakeCrew:
                         "risk_score": risk_score,
                         "bucket": tool_result["bucket"],
                         "scoring_rationale": tool_result["rationale"],
+                        "constraints_applied": tool_result["constraints_applied"],
                         "verdict_summary": "fake verdict summary.",
                         "narrative": "fake narrative",
                         "sources": ["fake"],
@@ -517,3 +538,142 @@ def test_replan_also_dispatches_tot_for_a_newly_contested_finding(data_dir, find
 
     assert research_called["count"] == 0  # confirms replan, not a fresh run, drove this
     assert "F02" in coordinator.state.tot_by_id
+
+
+# --- constraint intake (interpret_constraint / submit_constraint) -----------
+
+
+def test_interpret_constraint_resolves_asset_and_affected_findings(data_dir, findings):
+    _QueuedFakeCrew.queue = [
+        _constraint_interpretation_json(
+            asset_id="A02", effect_kind="compensating_control", effect_value="WAF rule enabled",
+            affected_finding_ids=["F02"], rationale="matched A02 via business_function",
+        ),
+    ]
+
+    coordinator = Coordinator(data_dir)
+    interpretation = coordinator.interpret_constraint(
+        "the finance workstation now sits behind a WAF", findings
+    )
+
+    assert interpretation.asset_id == "A02"
+    assert interpretation.effect_kind == "compensating_control"
+    assert interpretation.effect_value == "WAF rule enabled"
+    assert interpretation.affected_finding_ids == ["F02"]
+    assert interpretation.rationale == "matched A02 via business_function"
+    assert coordinator.state is None  # interpret_constraint alone never dispatches run()
+    assert _QueuedFakeCrew.instantiations == 1  # one batched (single-task) crew, no retries needed
+
+
+def test_interpret_constraint_raises_after_persistent_parse_failure(data_dir, findings):
+    max_attempts = 2
+    _QueuedFakeCrew.queue = [UNPARSEABLE, UNPARSEABLE]
+
+    coordinator = Coordinator(data_dir, max_parse_attempts=max_attempts)
+    with pytest.raises(coordinator_module.ConstraintInterpretationError, match="gave up after 2 attempt"):
+        coordinator.interpret_constraint("nonsense", findings)
+
+
+def test_submit_constraint_without_memory_raises(data_dir, findings):
+    coordinator = Coordinator(data_dir)  # no memory= given
+    with pytest.raises(CoordinatorError, match="requires a Memory instance"):
+        coordinator.submit_constraint("the finance workstation now sits behind a WAF", findings)
+
+
+def test_submit_constraint_happy_path_persists_replans_and_diffs(data_dir, findings, tmp_path):
+    from rhinosecure.memory import Memory
+
+    memory = Memory(tmp_path / "mem.db")
+    _QueuedFakeCrew.queue = [
+        _constraint_interpretation_json(
+            asset_id="A02", effect_kind="compensating_control", effect_value="WAF rule enabled",
+            affected_finding_ids=["F02"],
+        ),
+        _research_json("F02", "CVE-2018-8410"),
+        _environment_json("F02", "CVE-2018-8410", "A02", "WKS01"),
+        "F02",
+    ]
+
+    coordinator = Coordinator(data_dir, memory=memory)
+    result = coordinator.submit_constraint(
+        "the finance workstation now sits behind a WAF", findings
+    )
+
+    assert result.persisted is True
+    assert result.constraint_id is not None
+    assert result.run_id is not None
+    assert result.unresolved_finding_ids == ()
+
+    # Persisted via memory.py, asset-scoped, structured effect included.
+    [stored] = memory.constraints_for_asset("A02")
+    assert stored.constraint_text == "the finance workstation now sits behind a WAF"
+    assert stored.effect_kind == "compensating_control"
+    assert stored.effect_value == "WAF rule enabled"
+
+    # Diff: A02 had zero compensating controls before -- adding one must
+    # lower F02's risk_score (scoring.py's decay), a real, non-trivial delta.
+    assert len(result.deltas) == 1
+    delta = result.deltas[0]
+    assert delta.finding_id == "F02"
+    assert delta.after_risk_score < delta.before_risk_score
+    assert delta.risk_score_changed is True
+    assert delta.changed is True
+    assert delta.after_verdict_summary == "fake verdict summary."
+    assert delta.after_constraints_applied == ("the finance workstation now sits behind a WAF",)
+
+    # runs/decisions/feedback all populated -- all four Section 7 tables exercised.
+    run = memory.get_run(result.run_id)
+    assert run.data_dir == str(data_dir)
+    assert run.total_findings == 1
+    decisions = memory.decisions_for_run(result.run_id)
+    assert [d.finding_id for d in decisions] == ["F02"]
+    [feedback] = memory.list_feedback()
+    assert feedback.raw_input == "the finance workstation now sits behind a WAF"
+    assert feedback.run_id == result.run_id
+    assert "F02" in feedback.change_description
+
+
+def test_submit_constraint_when_interpreter_declines_persists_nothing(data_dir, findings, tmp_path):
+    """A fleet-wide capacity statement like Section 10's "only five patches
+    fit this window" -- the Interpreter is instructed to refuse rather
+    than guess (constraint_intake.py's module docstring)."""
+    from rhinosecure.memory import Memory
+
+    memory = Memory(tmp_path / "mem.db")
+    _QueuedFakeCrew.queue = [
+        _constraint_interpretation_json(
+            asset_id=None, rationale="no single asset named; this is a fleet-wide capacity statement",
+        ),
+    ]
+
+    coordinator = Coordinator(data_dir, memory=memory)
+    result = coordinator.submit_constraint("only five patches fit this window", findings)
+
+    assert result.persisted is False
+    assert result.constraint_id is None
+    assert result.run_id is None
+    assert result.deltas == ()
+    assert memory.all_active_constraints() == []
+    assert _QueuedFakeCrew.instantiations == 1  # interpretation only -- no replan was ever dispatched
+
+
+def test_submit_constraint_filters_out_a_hallucinated_finding_id(data_dir, findings, tmp_path):
+    from rhinosecure.memory import Memory
+
+    memory = Memory(tmp_path / "mem.db")
+    _QueuedFakeCrew.queue = [
+        _constraint_interpretation_json(
+            asset_id="A02", effect_kind="patch_restriction", effect_value="no reboots during business hours",
+            affected_finding_ids=["F02", "F99"],  # F99 does not exist
+        ),
+        _research_json("F02", "CVE-2018-8410"),
+        _environment_json("F02", "CVE-2018-8410", "A02", "WKS01"),
+        "F02",
+    ]
+
+    coordinator = Coordinator(data_dir, memory=memory)
+    result = coordinator.submit_constraint("no reboots during business hours on the finance box", findings)
+
+    assert result.persisted is True
+    assert result.unresolved_finding_ids == ("F99",)
+    assert [d.finding_id for d in result.deltas] == ["F02"]

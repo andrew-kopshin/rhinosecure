@@ -668,3 +668,108 @@ mirroring `scoring.ContestedRate.pct`, never stored) handles a zero-total run wi
 zero; an unknown `run_id` on `record_decision`/`record_feedback` raises `sqlite3.IntegrityError`
 from the foreign key constraint itself; `decisions_for_finding` correctly spans multiple runs for
 the same finding, oldest first, with `latest_decision_for_finding` picking the most recent.
+
+**Constraint intake and re-plan-with-diff built: the last piece of Slice 4.** `agents/
+constraint_intake.py` (new) is the Constraint Interpreter agent CLAUDE.md and every prior session
+named as the one unbuilt piece; `agents/coordinator.py`'s new `submit_constraint` wires interpret
+→ persist → targeted re-plan → diff end to end; `cli.py` exposes it as `rhino constraint add
+"<text>"`. Scoped deliberately to asset-scoped operational constraints — Section 7's worked
+example ("the payroll server only reboots on Sundays") — not Section 10's "only five patches fit
+this window," a fleet-wide capacity statement with no single asset to resolve to and no
+representation in `memory.py`'s `constraints` table (`asset_id NOT NULL`). CLAUDE.md Section 10
+now carries a "Decided" note saying so plainly rather than implying that example is handled.
+
+**Three effect kinds, chosen to match what Environment/scoring already read, not invented.**
+`patch_window`, `compensating_control`, `patch_restriction` — the same three `Asset` fields
+Environment Analysis already surfaces and `scoring.bucket_for`/`score_impact` already consume.
+The Interpreter is instructed to refuse (`asset_id`/`effect_kind`/`effect_value` all `None`)
+rather than force a constraint that doesn't clearly name one asset or describe one of the three —
+this is the concrete mechanism that keeps "only five patches fit this window" from being silently
+mishandled: it isn't caught by a special case, it just never matches any of the three, and the
+Interpreter says so in `rationale`.
+
+**Overlay, not mutation — `apply_constraints` (`agents/constraint_intake.py`), the actual
+mechanism the whole feature exists to build correctly.** Takes an `Asset` and active
+`memory.Constraint` rows, returns a *new* `Asset` via `model_copy` with their effects folded in;
+never mutates its input. `agents/risk.py`'s `score_finding` tool is where this reaches scoring:
+when given a `Memory`, it builds the overlaid asset fresh on every call from the ground-truth
+`Asset` plus whatever `constraints_for_asset` currently returns, scores *that*, and never writes
+the result back to `enriched_by_id` — every other finding on the same asset, and every future call
+without this constraint, sees `assets.csv`'s asset exactly as declared. Verified directly:
+`test_the_overlay_never_mutates_the_ground_truth_asset` re-reads `enriched_by_id["F01"].asset
+.compensating_controls` after a constrained `score_finding` call and confirms it's still `""`.
+
+**Provenance stays distinguishable by staying in separate fields, never by scoring.py learning a
+new concept.** `scoring.py` has no notion of "who declared this patch_window" and Section 8 rule 2
+(deterministic, LLM-free) argues against giving it one. Instead: `agents/environment.py`'s
+`lookup_asset_context` tool reports active constraints as a `human_constraints` list *alongside*
+`patch_window`/`compensating_controls`/`patch_restrictions`, which always report only what the
+asset record itself says regardless of any constraint on file — `EnvironmentAssessment` carries
+the same field, and the task prompt tells the agent to mention it distinctly in
+`applicability_summary`, never blended into the inventory's own facts. `agents/risk.py`'s
+`score_finding` tool reports which constraints it actually applied as `constraints_applied`, a
+field *separate from* `rationale`; `RiskRecommendation.constraints_applied` carries that into the
+agent's narrative, and `verify_scoring_matches_tool` now checks it verbatim the same way
+`risk_score`/`bucket`/`scoring_rationale` already are. This is how "human input stays
+distinguishable from scanner input for provenance" actually surfaces in what a person reads.
+
+**A real gap the test suite caught, not a hypothetical one: the fake Crew's risk-stage simulation
+didn't echo `constraints_applied`, which would have made `verify_scoring_matches_tool`'s new check
+spuriously fail the moment any test exercised an actual constraint.** `tests/test_coordinator.py`'s
+`_QueuedFakeCrew.kickoff()` calls the *real* `score_finding` tool (by design — deterministic,
+not an LLM call, so `verify_scoring_matches_tool` has a genuine call to check) and constructs a
+fake "LLM answer" JSON around the real tool's result. That construction listed `risk_score`/
+`bucket`/`scoring_rationale` but not `constraints_applied` — meaning the fake's simulated answer
+would silently disagree with the real tool's output the instant a constraint made
+`constraints_applied` non-empty, exactly the kind of drift `verify_scoring_matches_tool` exists to
+catch, except the "drift" here would have been the test double lying, not the agent. Caught before
+it caused a false failure (added the missing field to the fake's constructed JSON) because the
+constraint-overlay tests were written to actually exercise a real active constraint through the
+whole stack, not just call `apply_constraints` in isolation.
+
+**A real test-isolation bug, caught before it could pollute the actual repo: `run_agents`/
+`submit_constraint` construct a real `memory.Memory` — creating a real SQLite file — *before* the
+`Coordinator` they hand it to is even constructed, so monkeypatching `Coordinator` alone in
+`tests/test_cli.py` doesn't stop a real file from being created at `memory.DEFAULT_DB_PATH` (the
+actual repo-root `rhinosecure.db`).** First run of the updated `tests/test_cli.py` (before this was
+noticed) left a real `rhinosecure.db` sitting in the repo root, gitignored but still not something
+that belongs there. Fixed with a session-wide autouse fixture that monkeypatches `rhinosecure
+.memory.DEFAULT_DB_PATH` to a `tmp_path` location for the whole test file — both call sites import
+`DEFAULT_DB_PATH` lazily (inside the function, at call time), so the patch is picked up correctly
+rather than cached stale. The stray file was deleted; a version of it existing at all was the
+signal something needed fixing, not just a cleanup step.
+
+**Automatic pickup, not just at submission time.** `cli.py`'s `run_agents()` now always constructs
+a `Memory` (default `memory.DEFAULT_DB_PATH`, overridable with `--db`) and passes it to
+`Coordinator` — so a plain `rhino run --agents`, with no constraint just submitted in the same
+invocation, still applies whatever's on file. This is what actually satisfies CLAUDE.md Section
+7's worked-example phrase "applied automatically on the next run without being restated" — it was
+entirely possible to build `submit_constraint` without this and only apply a constraint within the
+same process that just created it, which would not have satisfied "next run."
+
+**`rhino constraint add` output: interpretation, persistence confirmation, and the diff with
+why.** Prints what the Interpreter resolved (asset, effect, affected findings, rationale) before
+anything is persisted; on decline (`asset_id=None`), prints the rationale and exits 1 without
+touching `memory.py` at all. On success, prints which findings actually changed bucket or risk
+score (not the full set re-planned, if some didn't move) with the rationale lines added/removed
+by the constraint and the agent's own `verdict_summary` as the "why" — satisfying CLAUDE.md's
+"the agent explains the delta" in the agent's own words, not a mechanically-generated sentence
+this module writes on its behalf. A finding_id the Interpreter named that doesn't actually belong
+to the resolved asset (hallucination or cross-asset mistake) is filtered out of the re-plan and
+reported to stderr as `unresolved_finding_ids`, without blocking the findings that did resolve.
+
+**Verification.** 44 new tests (268 total, up from 224): `tests/test_constraint_intake.py` (17 —
+`apply_constraints` against hand-built `Constraint` rows, including that it never mutates its
+input and that a later same-kind constraint wins over an earlier one; `search_assets`/
+`list_findings_for_asset` tool behavior; agent/task construction), `tests/test_environment_agent.py`
+(+4, `human_constraints` present/absent/excluded-when-retracted, and that it's never merged into
+the asset's own fields), `tests/test_risk_agent.py` (+4, the overlay changing a real risk_score,
+never mutating ground truth, `verify_scoring_matches_tool`'s new check), `tests/test_coordinator.py`
+(+6, `interpret_constraint`'s parse-retry-then-raise, and `submit_constraint`'s full happy path —
+persistence, targeted replan, a real risk_score delta, all four `memory.py` tables populated —
+plus the decline and hallucinated-finding-id cases), `tests/test_cli.py` (+11, argument wiring,
+output formatting, all four error-to-exit-code mappings, `--quiet`). All 268 pass; the
+deterministic path (`.venv`, Python 3.14) is unaffected and confirmed separately, since none of
+this touches it — `memory.py` stays crewai-free but this session's new code that *uses* it
+(`constraint_intake.py`, the `Coordinator`/`risk.py`/`environment.py` changes) is agents-only,
+same as everything built since Slice 3.

@@ -11,6 +11,20 @@ from rhinosecure.cli import main, run, run_agents
 DEMO_DIR = Path(__file__).resolve().parents[1] / "data" / "demo"
 
 
+@pytest.fixture(autouse=True)
+def _isolated_memory_db(tmp_path, monkeypatch):
+    """run_agents()/submit_constraint() always construct a real
+    memory.Memory (so a plain `rhino run --agents` picks up constraints
+    automatically -- cli.py's module docstring) *before* the Coordinator
+    they build gets handed to whatever's monkeypatched in for it, so
+    faking Coordinator alone doesn't stop a real SQLite file from being
+    created. Point DEFAULT_DB_PATH at this test's own tmp_path so that
+    file never touches the real repo-root rhinosecure.db. Both functions
+    import DEFAULT_DB_PATH locally (lazily) at call time, so patching the
+    module attribute here is picked up correctly, not cached stale."""
+    monkeypatch.setattr("rhinosecure.memory.DEFAULT_DB_PATH", tmp_path / "test-rhinosecure.db")
+
+
 def test_offline_flag_is_accepted_and_does_not_error():
     assert main(["run", "--data", "demo", "--seed", "42", "--offline"]) == 0
 
@@ -109,9 +123,11 @@ class _FakeCoordinator:
     tot_by_id: dict = {}
     last_init_args: tuple | None = None
     last_run_findings: list | None = None
+    last_memory = None
 
-    def __init__(self, data_dir, cache=None, *, verbose=False):
+    def __init__(self, data_dir, cache=None, *, memory=None, verbose=False):
         _FakeCoordinator.last_init_args = (data_dir, cache)
+        _FakeCoordinator.last_memory = memory
         self.state = SimpleNamespace(
             research_failures=_FakeCoordinator.failures.get("research", {}),
             environment_failures=_FakeCoordinator.failures.get("environment", {}),
@@ -135,6 +151,7 @@ def _reset_fake_coordinator():
     _FakeCoordinator.tot_by_id = {}
     _FakeCoordinator.last_init_args = None
     _FakeCoordinator.last_run_findings = None
+    _FakeCoordinator.last_memory = None
 
 
 def _fake_recommendation(finding_id="F01", risk_score=42.0, bucket="next_window"):
@@ -398,6 +415,220 @@ def test_quiet_flag_without_agents_is_a_harmless_no_op():
     """--quiet only means something on the --agents path; alone it must not
     error or change the deterministic path's behavior."""
     assert main(["run", "--data", "demo", "--seed", "42", "--quiet"]) == 0
+
+
+# --- constraint add ----------------------------------------------------------
+#
+# cli.submit_constraint() is a thin wrapper around
+# agents.coordinator.Coordinator.submit_constraint, already covered
+# thoroughly (interpretation, persistence, targeted replan, the diff
+# itself) in test_coordinator.py's own fake-Crew tests. These only check
+# this module's own concerns: argument wiring, print formatting, and
+# exit codes -- so cli.submit_constraint is mocked directly rather than
+# re-driving a fake Crew through the whole Coordinator stack again.
+
+
+def _fake_interpretation(
+    *, asset_id="A02", effect_kind="compensating_control", effect_value="WAF rule enabled",
+    affected_finding_ids=None, rationale="matched A02 via business_function",
+):
+    from rhinosecure.agents.constraint_intake import ConstraintInterpretation
+
+    return ConstraintInterpretation(
+        asset_id=asset_id, effect_kind=effect_kind, effect_value=effect_value,
+        affected_finding_ids=affected_finding_ids if affected_finding_ids is not None else ["F02"],
+        rationale=rationale, sources=["fake"],
+    )
+
+
+def _fake_delta(
+    *, finding_id="F02", before_bucket="accept", after_bucket="mitigate_monitor",
+    before_risk_score=10.0, after_risk_score=6.0,
+):
+    from rhinosecure.agents.coordinator import FindingDelta
+
+    return FindingDelta(
+        finding_id=finding_id, cve_id="CVE-2018-8410", hostname="WKS01",
+        before_bucket=before_bucket, after_bucket=after_bucket,
+        before_risk_score=before_risk_score, after_risk_score=after_risk_score,
+        rationale_added=("compensating_controls=['WAF rule enabled'] (x0.85 impact, applied after composite)",),
+        rationale_removed=(),
+        after_verdict_summary="Mitigate/monitor: a WAF rule now covers this finding.",
+        after_constraints_applied=("the finance workstation now sits behind a WAF",),
+    )
+
+
+def _fake_submission_result(*, persisted=True, deltas=None, unresolved=()):
+    from rhinosecure.agents.coordinator import ConstraintSubmissionResult
+
+    if not persisted:
+        return ConstraintSubmissionResult(
+            interpretation=_fake_interpretation(
+                asset_id=None, effect_kind=None, effect_value=None, affected_finding_ids=[],
+                rationale="no single asset named; this is a fleet-wide capacity statement",
+            ),
+            constraint_id=None, run_id=None, deltas=(), unresolved_finding_ids=unresolved,
+        )
+    return ConstraintSubmissionResult(
+        interpretation=_fake_interpretation(),
+        constraint_id=7, run_id=3,
+        deltas=tuple(deltas) if deltas is not None else (_fake_delta(),),
+        unresolved_finding_ids=unresolved,
+    )
+
+
+def test_constraint_add_wires_args_and_dispatches(monkeypatch):
+    calls = {}
+
+    def fake_submit(text, data_dir, seed, *, offline, db_path):
+        calls["args"] = (text, data_dir, seed, offline, db_path)
+        return _fake_submission_result()
+
+    monkeypatch.setattr("rhinosecure.cli.submit_constraint", fake_submit)
+
+    exit_code = main(
+        [
+            "constraint", "add", "the payroll server only reboots on Sundays",
+            "--data", "demo", "--seed", "7", "--offline", "--db", "custom.db",
+        ]
+    )
+
+    assert exit_code == 0
+    text, data_dir, seed, offline, db_path = calls["args"]
+    assert text == "the payroll server only reboots on Sundays"
+    assert data_dir == DEMO_DIR
+    assert seed == 7
+    assert offline is True
+    assert db_path == "custom.db"
+
+
+def test_constraint_add_db_flag_defaults_to_none_meaning_default_db_path(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(
+        "rhinosecure.cli.submit_constraint",
+        lambda text, data_dir, seed, *, offline, db_path: calls.__setitem__("db_path", db_path)
+        or _fake_submission_result(),
+    )
+
+    assert main(["constraint", "add", "some constraint"]) == 0
+    assert calls["db_path"] is None
+
+
+def test_constraint_add_prints_interpretation_and_diff(monkeypatch, capsys):
+    monkeypatch.setattr("rhinosecure.cli.submit_constraint", lambda *a, **k: _fake_submission_result())
+
+    exit_code = main(["constraint", "add", "the finance workstation now sits behind a WAF"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "asset: A02" in out
+    assert "compensating_control" in out
+    assert "affects: F02" in out
+    assert "Constraint #7 persisted" in out
+    assert "F02 (CVE-2018-8410 on WKS01)" in out
+    assert "accept (10.0) -> mitigate_monitor (6.0)" in out
+    assert "compensating_controls=['WAF rule enabled']" in out
+    assert "why: Mitigate/monitor: a WAF rule now covers this finding." in out
+
+
+def test_constraint_add_reports_no_change_when_nothing_in_the_diff_changed(monkeypatch, capsys):
+    unchanged = _fake_delta(before_bucket="accept", after_bucket="accept", before_risk_score=5.0, after_risk_score=5.02)
+    monkeypatch.setattr(
+        "rhinosecure.cli.submit_constraint", lambda *a, **k: _fake_submission_result(deltas=[unchanged])
+    )
+
+    exit_code = main(["constraint", "add", "a constraint that changes nothing material"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "Constraint #7 persisted" in out
+    assert "No findings changed bucket or risk score." in out
+
+
+def test_constraint_add_reports_decline_and_exits_1(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "rhinosecure.cli.submit_constraint", lambda *a, **k: _fake_submission_result(persisted=False)
+    )
+
+    exit_code = main(["constraint", "add", "only five patches fit this window"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "could not resolve to a single asset" in captured.out
+    assert "fleet-wide capacity statement" in captured.out
+    assert "Nothing persisted or re-planned." in captured.err
+
+
+def test_constraint_add_warns_about_unresolved_finding_ids_but_still_persists(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "rhinosecure.cli.submit_constraint",
+        lambda *a, **k: _fake_submission_result(unresolved=("F99",)),
+    )
+
+    exit_code = main(["constraint", "add", "no reboots during business hours on the finance box"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0  # still persisted -- F99 was just one bad id among the request
+    assert "F99" in captured.err
+    assert "Constraint #7 persisted" in captured.out
+
+
+def test_constraint_add_maps_ingest_error_to_exit_1(monkeypatch, capsys):
+    from rhinosecure.ingest import IngestError
+
+    def raiser(*a, **k):
+        raise IngestError("bad findings.csv")
+
+    monkeypatch.setattr("rhinosecure.cli.submit_constraint", raiser)
+
+    assert main(["constraint", "add", "some constraint"]) == 1
+    assert "ingest error" in capsys.readouterr().err
+
+
+def test_constraint_add_maps_offline_cache_miss_to_exit_1(monkeypatch, capsys):
+    def raiser(*a, **k):
+        raise OfflineCacheMissError("no snapshot for CVE-0000-0000")
+
+    monkeypatch.setattr("rhinosecure.cli.submit_constraint", raiser)
+
+    assert main(["constraint", "add", "some constraint", "--offline"]) == 1
+    assert "offline error" in capsys.readouterr().err
+
+
+def test_constraint_add_maps_llm_config_error_to_exit_1(monkeypatch, capsys):
+    from rhinosecure.llm import LLMConfigError
+
+    def raiser(*a, **k):
+        raise LLMConfigError("no API key")
+
+    monkeypatch.setattr("rhinosecure.cli.submit_constraint", raiser)
+
+    assert main(["constraint", "add", "some constraint"]) == 1
+    assert "LLM config error" in capsys.readouterr().err
+
+
+def test_constraint_add_maps_interpretation_error_to_exit_1(monkeypatch, capsys):
+    from rhinosecure.agents.coordinator import ConstraintInterpretationError
+
+    def raiser(*a, **k):
+        raise ConstraintInterpretationError("gave up after 3 attempt(s): no valid JSON object found")
+
+    monkeypatch.setattr("rhinosecure.cli.submit_constraint", raiser)
+
+    assert main(["constraint", "add", "some constraint"]) == 1
+    assert "could not interpret constraint" in capsys.readouterr().err
+
+
+def test_constraint_add_with_quiet_suppresses_console_output(monkeypatch):
+    monkeypatch.setattr("rhinosecure.cli.submit_constraint", lambda *a, **k: _fake_submission_result())
+    calls = []
+    monkeypatch.setattr(
+        "crewai.events.utils.console_formatter.set_suppress_console_output",
+        lambda suppress: calls.append(suppress),
+    )
+
+    assert main(["constraint", "add", "some constraint", "--quiet"]) == 0
+    assert calls == [True]
 
 
 # --- _ensure_utf8_stdio ------------------------------------------------------

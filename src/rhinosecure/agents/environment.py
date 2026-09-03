@@ -43,6 +43,22 @@ run (`agents/parsing.py`'s module docstring has the full trace). The task's
 final raw text is parsed into `EnvironmentAssessment` by
 `agents.parsing.parse_structured_output`, dispatched with a retry cap by
 `agents/coordinator.py`.
+
+**`human_constraints` is informational here, never merged into
+`patch_window`/`compensating_controls`/`patch_restrictions`.** When
+`build_environment_tools` is given a `memory.Memory`, `lookup_asset_context`
+also returns whatever active constraints exist for this asset
+(`agents/constraint_intake.py`'s overlay mechanism) as a *separate* field.
+This agent's job is to surface them distinctly in
+`applicability_summary` -- "declared patch_window: none; human
+constraint: Sundays only" -- not to fold a human statement into the same
+field a scanner-derived fact occupies, which is exactly what would make
+the two indistinguishable for provenance. The three asset fields
+(`patch_window`/`compensating_controls`/`patch_restrictions`) always
+report what the asset record itself says, regardless of any constraint
+on file; `agents/risk.py`'s `score_finding` tool is where a constraint's
+effect actually reaches scoring, applied separately and reported
+separately (`RiskRecommendation.constraints_applied`).
 """
 
 from __future__ import annotations
@@ -57,6 +73,7 @@ from pydantic import BaseModel
 
 from rhinosecure.agents.research import ResearchFinding
 from rhinosecure.llm import get_llm
+from rhinosecure.memory import Memory
 from rhinosecure.schema import Asset, EnrichedFinding
 
 ROLE = "Environment Analysis"
@@ -99,26 +116,37 @@ class EnvironmentAssessment(BaseModel):
     has_patch_window: bool
     patch_window: str
     patch_restrictions: str
+    # Active memory.Constraint text for this asset, if any -- informational
+    # only, never merged into the three fields above. See module docstring.
+    human_constraints: list[str] = []
     applicability_summary: str
     sources: list[str]
 
 
 def build_environment_tools(
-    asset_index: dict[str, Asset], call_log: list[dict[str, Any]]
+    asset_index: dict[str, Asset],
+    call_log: list[dict[str, Any]],
+    memory: Memory | None = None,
 ) -> list[BaseTool]:
     """Wrap a lookup against the already-ingested asset inventory as a
-    CrewAI tool, logging every call the same way research.py's tools do."""
+    CrewAI tool, logging every call the same way research.py's tools do.
+    `memory` is optional and defaults to None -- omitting it (as every
+    call site did before constraints existed) reproduces the exact prior
+    behavior, `human_constraints` always empty."""
 
     @tool("lookup_asset_context")
     def lookup_asset_context(asset_id: str) -> str:
         """The asset record a finding was detected on: hostname, OS and
         build, role, criticality, environment, exposure, compensating
         controls, and patch window/restrictions, as declared in the fleet
-        inventory."""
+        inventory -- plus, separately, any active human-supplied
+        constraint on file for this asset (see human_constraints in the
+        result), which is never merged into the asset's own fields."""
         asset = asset_index.get(asset_id)
         if asset is None:
             result: dict[str, Any] = {"asset_id": asset_id, "found": False}
         else:
+            human_constraints = memory.constraints_for_asset(asset_id) if memory is not None else []
             result = {
                 "asset_id": asset.asset_id,
                 "found": True,
@@ -135,6 +163,7 @@ def build_environment_tools(
                 "patch_restrictions": asset.patch_restrictions,
                 "compensating_controls": list(asset.compensating_control_list),
                 "owner": asset.owner,
+                "human_constraints": [c.constraint_text for c in human_constraints],
             }
         call_log.append(
             {"tool": "lookup_asset_context", "args": {"asset_id": asset_id}, "result": result}
@@ -194,7 +223,14 @@ def build_environment_task(
             "text against the asset's os/os_build, so leave "
             "os_build_consistent_provenance at its default value "
             "\"model_judgment\"; every other field must come from "
-            "lookup_asset_context or the finding text above."
+            "lookup_asset_context or the finding text above. If the tool's "
+            "human_constraints is non-empty, copy it verbatim into your own "
+            "human_constraints field and mention it explicitly in "
+            "applicability_summary as a fact distinct from the asset's own "
+            "declared patch_window/compensating_controls/patch_restrictions "
+            "-- never blend a human constraint into those three fields, "
+            "which must always report only what the asset record itself "
+            "declares."
         ),
         expected_output=(
             "Return ONLY a single JSON object, with these keys directly at "
@@ -205,9 +241,11 @@ def build_environment_task(
             'os_build_consistent_provenance (always the literal string '
             '"model_judgment"), role, environment, internet_exposed (bool), '
             "compensating_controls (a list of strings), has_patch_window "
-            "(bool), patch_window, patch_restrictions, "
-            "applicability_summary (a short prose summary), and sources (a "
-            "list of strings citing each source used)."
+            "(bool), patch_window, patch_restrictions, human_constraints "
+            "(a list of strings, copied verbatim from the tool result -- "
+            "empty list if the tool returned none), applicability_summary "
+            "(a short prose summary), and sources (a list of strings "
+            "citing each source used)."
         ),
         agent=agent,
     )

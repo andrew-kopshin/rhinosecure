@@ -453,28 +453,32 @@ persists and is applied automatically on the next run without being restated.
 
 Inspect with DB Browser for SQLite (sqlitebrowser.org).
 
-**Built: the persistence layer, not yet the two things that would make the worked example true
-end to end.** `memory.py`'s `Memory` class owns all four tables (local file, default
-`rhinosecure.db` at the repo root, gitignored). `constraints` is asset-scoped free text with a
-soft-delete `active` flag rather than update-in-place, so a retracted constraint stays in the
-record; `runs` stores seed, a JSON `snapshot_versions` map (keyed `"source"` or `"source:key"`,
-mirroring `enrich/cache.py`'s own `SnapshotEntry` fields), contested rate, and the four per-stage
-`UsageMetrics` blobs (nullable — the deterministic path and a `--agents` run with nothing
-contested leave some or all of them `NULL`); `decisions` is one row per finding per run, foreign-
-keyed to `runs`, with nullable ToT summary columns so a contested finding's record actually
-reflects what was decided; `feedback` is raw input plus what it changed, `run_id` nullable. Cross-
-session persistence (closing one `Memory` and opening a new one against the same file) is what
-the test suite exercises directly against Section 7's own worked example text.
+**Built: the persistence layer, and now the worked example end to end.** `memory.py`'s `Memory`
+class owns all four tables (local file, default `rhinosecure.db` at the repo root, gitignored).
+`constraints` is asset-scoped free text with a soft-delete `active` flag rather than
+update-in-place, so a retracted constraint stays in the record, plus a structured `effect_kind`/
+`effect_value` pair (nullable — a constraint can be recorded before, or without ever, being
+interpreted); `runs` stores seed, a JSON `snapshot_versions` map (keyed `"source"` or
+`"source:key"`, mirroring `enrich/cache.py`'s own `SnapshotEntry` fields), contested rate, and the
+four per-stage `UsageMetrics` blobs (nullable — the deterministic path and a `--agents` run with
+nothing contested leave some or all of them `NULL`); `decisions` is one row per finding per run,
+foreign-keyed to `runs`, with nullable ToT summary columns so a contested finding's record
+actually reflects what was decided; `feedback` is raw input plus what it changed, `run_id`
+nullable. Cross-session persistence (closing one `Memory` and opening a new one against the same
+file) is what the test suite exercises directly against Section 7's own worked example text.
 
-**Two things this module deliberately does not do, so the worked example is not yet true end to
-end.** Nothing turns free-form human text ("the payroll server only reboots on Sundays") into the
-`(asset_id, constraint_text)` pair `add_constraint` takes — that interpretation is "constraint
-intake," the same still-unbuilt LLM-shaped work `agents/coordinator.py`'s docstring names (deciding
-which `finding_ids` a stated constraint should drive `replan` for). And nothing reads a stored
-constraint back out during a run and folds it into Environment Analysis's `has_patch_window`/
-`compensating_controls` — `constraints_for_asset` exists and is correct, but no caller invokes it
-yet. Both remain open; this section stays accurate about that rather than implying the worked
-example already works.
+**Constraint intake is built** (`agents/constraint_intake.py`'s Constraint Interpreter agent,
+dispatched by `agents/coordinator.py`'s `submit_constraint` — Section 5's "Human submits a
+constraint" edge, `rhino constraint add "<text>"` on the CLI) **and a stored constraint is read
+back into a run** (`agents/environment.py`'s `lookup_asset_context` and `agents/risk.py`'s
+`score_finding` tools both query `constraints_for_asset` when given a `Memory`) — the two gaps
+this section previously named as open. See Section 6's ToT entry's own "Decided" convention: full
+mechanics are in `agents/constraint_intake.py`'s and `agents/coordinator.py`'s module docstrings,
+not repeated here. One scope boundary worth stating plainly: this handles asset-scoped
+constraints only, matching this section's own worked example exactly (`memory.py`'s `constraints`
+table is `asset_id NOT NULL` by construction) — not Section 10's "only five patches fit this
+window," a fleet-wide capacity constraint with no single asset to resolve to. See Section 10's own
+note on this.
 
 ---
 
@@ -688,6 +692,25 @@ with diff.
 **Exit criteria:** submitting "only five patches fit this window" changes the plan, and the
 agent explains the delta between the original and revised plan. Contested rate reported and
 under ~1%.
+
+**Decided.** This exit criteria's own example — "only five patches fit this window" — is a
+fleet-wide *capacity* constraint: no single asset to resolve to, nothing in it that maps onto one
+of `memory.py`'s asset-scoped `constraints` rows. What got built instead is exactly Section 7's
+worked example shape — "the payroll server only reboots on Sundays," an *operational* constraint
+about one asset's patch window, compensating controls, or patch restrictions — because that is
+the constraint `memory.py`'s schema (Section 7, `constraints.asset_id NOT NULL`) actually
+represents, and building a second, fleet-wide-capacity mechanism (a different table, a different
+re-ranking rule: which of the currently-scheduled findings actually fit, and what happens to the
+rest) was never asked for alongside it. `agents/constraint_intake.py`'s Constraint Interpreter is
+told explicitly to recognize this shape and refuse (`asset_id=None`) rather than force a capacity
+statement onto one asset — Section 10's own exit-criteria sentence is the worked example that
+instruction is written against. Re-plan with diff is real and exercised on the operational case:
+`agents/coordinator.py`'s `submit_constraint` re-plans exactly the resolved `affected_finding_ids`
+and returns a per-finding before/after (`FindingDelta`), and `cli.py`'s `rhino constraint add`
+prints it with the agent's own explanation of why. Contested rate has been reported since the ToT
+entry above landed (`scoring.contested_rate`, `Contested: 3/24 (12.5%)` on the demo fixture) —
+above the ~1% target for the reason already recorded there (fixture size). A fleet-wide capacity
+mechanism remains unbuilt and is not scoped into this build.
 
 ---
 

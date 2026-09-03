@@ -134,21 +134,99 @@ def test_score_finding_tool_matches_calling_scoring_directly_with_research_signa
     assert call_log[0]["tool"] == "score_finding"
     assert call_log[0]["args"] == {"finding_id": "F01"}
     assert call_log[0]["result"] == result
+    assert result["constraints_applied"] == []
+
+
+# --- constraint overlay (agents/constraint_intake.py's apply_constraints) ---
+
+
+def test_without_memory_scoring_is_unaffected_and_constraints_applied_is_empty(tmp_path):
+    """The default (memory=None) reproduces the exact prior behavior --
+    every call site before constraints existed."""
+    call_log: list[dict] = []
+    tools = {
+        t.name: t for t in build_risk_tools({"F01": ENRICHED}, {"F01": RESEARCH}, call_log)
+    }
+    result = json.loads(tools["score_finding"].run(finding_id="F01"))
+    assert result["constraints_applied"] == []
+
+
+def test_with_memory_but_no_active_constraints_scoring_is_unaffected(tmp_path):
+    from rhinosecure.memory import Memory
+
+    memory = Memory(tmp_path / "mem.db")
+    call_log: list[dict] = []
+    tools = {
+        t.name: t
+        for t in build_risk_tools({"F01": ENRICHED}, {"F01": RESEARCH}, call_log, memory)
+    }
+    result = json.loads(tools["score_finding"].run(finding_id="F01"))
+    assert result["constraints_applied"] == []
+
+
+def test_an_active_compensating_control_constraint_changes_the_score_and_is_reported(tmp_path):
+    """ASSET (module-level) has compensating_controls="" -- adding one via
+    a constraint must change score_finding's own risk_score/rationale
+    (scoring.py's compensating-control decay applies) and be reported
+    separately in constraints_applied, not silently folded into
+    rationale's existing text."""
+    from rhinosecure.memory import Memory
+
+    memory = Memory(tmp_path / "mem.db")
+    memory.add_constraint(
+        "A02", "now sits behind the new WAF rule",
+        effect_kind="compensating_control", effect_value="WAF rule enabled",
+    )
+    call_log: list[dict] = []
+    tools = {
+        t.name: t
+        for t in build_risk_tools({"F01": ENRICHED}, {"F01": RESEARCH}, call_log, memory)
+    }
+
+    without_constraint = json.loads(_tools()[0]["score_finding"].run(finding_id="F01"))
+    with_constraint = json.loads(tools["score_finding"].run(finding_id="F01"))
+
+    assert with_constraint["constraints_applied"] == ["now sits behind the new WAF rule"]
+    assert with_constraint["risk_score"] < without_constraint["risk_score"]
+    assert with_constraint["rationale"] != without_constraint["rationale"]
+
+
+def test_the_overlay_never_mutates_the_ground_truth_asset(tmp_path):
+    """ENRICHED.asset must be byte-identical after a scored call with an
+    active constraint -- the overlay is a fresh, throwaway Asset.model_copy,
+    never written back to enriched_by_id (module docstring)."""
+    from rhinosecure.memory import Memory
+
+    memory = Memory(tmp_path / "mem.db")
+    memory.add_constraint(
+        "A02", "now sits behind the new WAF rule",
+        effect_kind="compensating_control", effect_value="WAF rule enabled",
+    )
+    enriched_by_id = {"F01": ENRICHED}
+    tools = {
+        t.name: t
+        for t in build_risk_tools(enriched_by_id, {"F01": RESEARCH}, [], memory)
+    }
+    tools["score_finding"].run(finding_id="F01")
+
+    assert enriched_by_id["F01"] is ENRICHED
+    assert enriched_by_id["F01"].asset.compensating_controls == ""
 
 
 def test_score_finding_ignores_environment_analysis_asset_data_uses_ground_truth():
     """The tool must reconstruct scoring input from the ground-truth Asset
     (criticality=5, prod, confidential, exchange -- ENRICHED above), not
     from anything EnvironmentAssessment says, since Risk's tools are never
-    even given an EnvironmentAssessment object -- only research_by_id and
-    the ground-truth enriched_by_id. This test is really just documenting
-    that contract: build_risk_tools's signature has no environment
-    parameter at all.
+    even given an EnvironmentAssessment object -- only research_by_id,
+    the ground-truth enriched_by_id, and (optionally) memory for the
+    constraint overlay. This test is really just documenting that
+    contract: build_risk_tools's signature has no environment parameter
+    at all.
     """
     import inspect
 
     sig = inspect.signature(build_risk_tools)
-    assert list(sig.parameters) == ["enriched_by_id", "research_by_id", "call_log"]
+    assert list(sig.parameters) == ["enriched_by_id", "research_by_id", "call_log", "memory"]
 
 
 # --- agent/task construction (no network, no LLM call) ----------------------
@@ -189,6 +267,8 @@ def test_build_risk_task_embeds_finding_research_and_environment_context():
     assert "verdict_summary" in task.description
     assert "exactly two sentences" in task.description
     assert "verdict_summary" in task.expected_output
+    assert "constraints_applied" in task.description
+    assert "constraints_applied" in task.expected_output
 
 
 # --- verify_scoring_matches_tool ---------------------------------------------
@@ -235,6 +315,13 @@ def test_verify_raises_on_mismatched_bucket():
 def test_verify_raises_on_mismatched_rationale():
     recommendation, call_log = _matching_recommendation_and_log()
     bad = recommendation.model_copy(update={"scoring_rationale": ["a made-up rationale line"]})
+    with pytest.raises(ScoringMismatchError):
+        verify_scoring_matches_tool(bad, call_log)
+
+
+def test_verify_raises_on_mismatched_constraints_applied():
+    recommendation, call_log = _matching_recommendation_and_log()
+    bad = recommendation.model_copy(update={"constraints_applied": ["a constraint the tool never applied"]})
     with pytest.raises(ScoringMismatchError):
         verify_scoring_matches_tool(bad, call_log)
 

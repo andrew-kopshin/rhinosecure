@@ -48,6 +48,25 @@ final raw text is parsed into `RiskRecommendation` by
 below runs as part of the same retry-then-skip loop in
 `agents/coordinator.py` -- a mismatch is treated exactly like a parse
 failure, not a separate hard stop.
+
+**This is where a constraint's overlay actually reaches scoring.** When
+`build_risk_tools` is given a `memory.Memory`, `score_finding_tool` looks
+up active constraints for the finding's asset and, if any exist, scores
+a *copy* of the enriched finding with `agents/constraint_intake.py`'s
+`apply_constraints` applied -- the ground-truth `EnrichedFinding` in
+`enriched_by_id` (and the `Asset` it holds) is never mutated, so every
+other finding on the same asset within the same dispatch, and every
+future call that doesn't pass this constraint, sees the asset exactly as
+`assets.csv` declares it. `constraints_applied` is reported by the tool
+as a field *separate from* `rationale` -- `scoring.py` itself has no
+concept of "who declared this fact" (Section 8 rule 2 keeps it that way;
+see `constraint_intake.py`'s module docstring) -- and
+`RiskRecommendation.constraints_applied` carries that grounding into the
+agent's own narrative, verified verbatim by `verify_scoring_matches_tool`
+the same way `risk_score`/`bucket`/`scoring_rationale` already are. This
+is how "human input stays distinguishable from scanner input" actually
+surfaces in what a person reads, without `scoring.py` growing a new
+concept for it.
 """
 
 from __future__ import annotations
@@ -61,9 +80,11 @@ from crewai.llms.base_llm import BaseLLM
 from crewai.tools import BaseTool, tool
 from pydantic import BaseModel
 
+from rhinosecure.agents.constraint_intake import apply_constraints
 from rhinosecure.agents.environment import EnvironmentAssessment
 from rhinosecure.agents.research import ResearchFinding
 from rhinosecure.llm import get_llm
+from rhinosecure.memory import Memory
 from rhinosecure.schema import AttackTechniqueRef, EnrichedFinding
 from rhinosecure.scoring import score_finding
 
@@ -90,6 +111,11 @@ class RiskRecommendation(BaseModel):
     risk_score: float
     bucket: str
     scoring_rationale: list[str]
+    # Active constraint text applied to this finding's asset before
+    # scoring, copied verbatim from score_finding's result -- empty list
+    # when no memory was configured or none were active. See module
+    # docstring: this is separate from scoring_rationale on purpose.
+    constraints_applied: list[str] = []
     verdict_summary: str
     narrative: str
     sources: list[str]
@@ -102,14 +128,19 @@ class ScoringMismatchError(RuntimeError):
     describes: model output presented as sourced when it wasn't."""
 
 
-def _merge_research_into_enriched(
+def merge_research_into_enriched(
     enriched: EnrichedFinding, research: ResearchFinding
 ) -> EnrichedFinding:
     """The scoring input: ground-truth Finding/Asset, with Research's
     enrichment signals layered on -- the same shape cli.py's
     `_attach_threat_signals` produces, sourced from `research` instead of
     a live fetch. See the module docstring for why ground truth, not
-    EnvironmentAssessment, is what gets merged here."""
+    EnvironmentAssessment, is what gets merged here. Public (not
+    underscore-prefixed): `agents/coordinator.py`'s `submit_constraint`
+    reuses this directly to compute a "before" score for the constraint
+    diff, using the exact same Research-enriched inputs the "after"
+    score is computed from -- only the asset overlay differs between the
+    two, so the diff isolates the constraint's own effect."""
     confirmed_prevalence = [
         t.prevalence for t in research.attack_techniques if t.confidence == "confirmed"
     ]
@@ -132,20 +163,34 @@ def build_risk_tools(
     enriched_by_id: dict[str, EnrichedFinding],
     research_by_id: dict[str, ResearchFinding],
     call_log: list[dict[str, Any]],
+    memory: Memory | None = None,
 ) -> list[BaseTool]:
     """One tool: `score_finding`, wrapping `scoring.score_finding` -- the
-    only source of a risk score or bucket this agent may use."""
+    only source of a risk score or bucket this agent may use. `memory` is
+    optional and defaults to None -- omitting it (as every call site did
+    before constraints existed) reproduces the exact prior behavior,
+    constraints_applied always empty and scoring always against the
+    asset exactly as `assets.csv` declares it."""
 
     @tool("score_finding")
     def score_finding_tool(finding_id: str) -> str:
         """Compute this finding's deterministic risk score and remediation
         bucket. This is the ONLY way to get either -- never estimate them
-        yourself. Returns risk_score, bucket, and a fully cited rationale
+        yourself. Returns risk_score, bucket, a fully cited rationale
         (severity source, exposure, EPSS/KEV, ATT&CK, impact factors,
-        compensating controls, patch window) to use verbatim."""
-        enriched = _merge_research_into_enriched(
+        compensating controls, patch window), and constraints_applied
+        (any active human-supplied constraints that were folded into the
+        asset used for this computation, separate from rationale) to use
+        verbatim."""
+        enriched = merge_research_into_enriched(
             enriched_by_id[finding_id], research_by_id[finding_id]
         )
+        constraints_applied: list[str] = []
+        if memory is not None:
+            active = memory.constraints_for_asset(enriched.asset.asset_id)
+            if active:
+                enriched = enriched.model_copy(update={"asset": apply_constraints(enriched.asset, active)})
+                constraints_applied = [c.constraint_text for c in active]
         scored = score_finding(enriched)
         result = {
             "finding_id": scored.finding_id,
@@ -155,6 +200,7 @@ def build_risk_tools(
             "risk_score": scored.risk_score,
             "bucket": scored.bucket.value,
             "rationale": list(scored.rationale),
+            "constraints_applied": constraints_applied,
         }
         call_log.append(
             {"tool": "score_finding", "args": {"finding_id": finding_id}, "result": result}
@@ -212,8 +258,14 @@ def build_risk_task(
             f"{environment.has_patch_window} ({environment.patch_window!r}). "
             f"{environment.applicability_summary}\n\n"
             f"Call score_finding with finding_id={finding.finding_id!r} exactly once "
-            "and copy its risk_score, bucket, and rationale into your output "
-            "verbatim -- do not adjust, round, or reinterpret them. Then write "
+            "and copy its risk_score, bucket, rationale, and constraints_applied "
+            "into your output verbatim -- do not adjust, round, or reinterpret "
+            "them. If constraints_applied is non-empty, this score was computed "
+            "against an asset with one or more human-supplied constraints folded "
+            "in -- state this explicitly in narrative, naming the constraint text "
+            "and distinguishing it clearly from facts the asset inventory itself "
+            "declares (Environment's own patch_window/compensating_controls above "
+            "are the inventory's facts, unaffected by any constraint). Then write "
             "verdict_summary: exactly two sentences stating the bucket and the "
             "single biggest reason for it, written so it stands alone -- a "
             "reader skimming a plan with dozens of findings should get the gist "
@@ -230,7 +282,9 @@ def build_risk_task(
             "markdown code fences or prose before or after it: finding_id, "
             "cve_id, asset_id, hostname, risk_score and bucket (copied "
             "exactly from score_finding), scoring_rationale (its rationale "
-            "list, copied verbatim as an array of strings), verdict_summary "
+            "list, copied verbatim as an array of strings), constraints_applied "
+            "(its constraints_applied list, copied verbatim -- empty list if "
+            "the tool returned none), verdict_summary "
             "(exactly two sentences -- the verdict and its main driver, "
             "skimmable on its own), narrative (the full prose synthesis "
             "citing Research, Environment, and the scoring rationale), and "
@@ -274,4 +328,9 @@ def verify_scoring_matches_tool(
         raise ScoringMismatchError(
             f"{recommendation.finding_id}: scoring_rationale does not match the "
             "tool's rationale verbatim"
+        )
+    if list(recommendation.constraints_applied) != list(tool_result.get("constraints_applied", [])):
+        raise ScoringMismatchError(
+            f"{recommendation.finding_id}: constraints_applied does not match the "
+            "tool's constraints_applied verbatim"
         )

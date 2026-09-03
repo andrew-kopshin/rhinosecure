@@ -42,6 +42,25 @@ winner, or both near-tied candidates surfaced for a human, per finding)
 prints alongside its narrative; a ToT dispatch failure prints its reason
 instead, the same skip-and-report treatment agents/coordinator.py already
 gives a Research/Environment/Risk failure.
+
+`rhino constraint add "<text>"` is CLAUDE.md Section 5's "Human submits a
+constraint" edge and Section 7's memory worked example, made real:
+`agents/coordinator.py`'s `submit_constraint` interprets the text,
+persists it, re-plans only the findings it resolves to, and this module
+prints the resulting diff -- what changed between the finding(s)' prior
+score and the new one, and why (the agent's own narrative already
+explains a constraint's effect whenever one was applied; see
+`agents/risk.py`). `--agents` (this module's `run`/`run_agents`) always
+constructs a `memory.Memory` at `--db` (default `memory.DEFAULT_DB_PATH`)
+and passes it to `Coordinator`, so a plain `rhino run --agents` picks up
+whatever constraints are already on file automatically -- CLAUDE.md
+Section 7's worked example ("persists and is applied automatically on
+the next run without being restated") applies to every `--agents` run,
+not just the one that just submitted a constraint. The plain
+(non-`--agents`) deterministic path never touches `memory.py` -- `memory`
+requires a `Coordinator`, and this module's own docstring already
+explains why `agents.*` (and now `memory` alongside it, imported lazily
+in the same places) stays out of that path's import graph.
 """
 
 from __future__ import annotations
@@ -136,24 +155,58 @@ def run(data_dir: Path, seed: int, *, offline: bool = False) -> list[ScoredFindi
     return rank(scored)
 
 
-def run_agents(data_dir: Path, seed: int, *, offline: bool = False) -> Coordinator:
+def run_agents(
+    data_dir: Path, seed: int, *, offline: bool = False, db_path: Path | str | None = None
+) -> Coordinator:
     """Dispatches the Slice 3 crew over every finding in `data_dir`, the
     agent equivalent of `run`. Returns the `Coordinator` itself, not just
     the ranked list -- `coordinator.state.*_failures` is how a caller sees
     which findings (if any) were recorded and skipped rather than
     blocking the run (agents/coordinator.py's module docstring has the
-    full incident this exists to survive). Imports agents.* lazily -- see
-    this module's own docstring for why.
+    full incident this exists to survive). Imports agents.*/memory
+    lazily -- see this module's own docstring for why.
+
+    `db_path` defaults to `memory.DEFAULT_DB_PATH` -- a `Memory` is
+    always constructed and passed to `Coordinator`, so this always picks
+    up whatever constraints are already on file (CLAUDE.md Section 7's
+    worked example), not just when a constraint was just submitted in
+    the same invocation.
     """
     from rhinosecure.agents.coordinator import Coordinator
+    from rhinosecure.memory import DEFAULT_DB_PATH, Memory
 
     random.seed(seed)  # see run()'s comment -- still a no-op for now
     assets_path = data_dir / "assets.csv"
     findings_path = data_dir / "findings.csv"
     findings = list(join_findings(findings_path, assets_path))
-    coordinator = Coordinator(data_dir, cache=SnapshotCache(offline=offline))
+    memory = Memory(db_path if db_path is not None else DEFAULT_DB_PATH)
+    coordinator = Coordinator(data_dir, cache=SnapshotCache(offline=offline), memory=memory)
     coordinator.run(findings)
     return coordinator
+
+
+def submit_constraint(
+    text: str,
+    data_dir: Path,
+    seed: int,
+    *,
+    offline: bool = False,
+    db_path: Path | str | None = None,
+) -> ConstraintSubmissionResult:
+    """CLI entry point for `rhino constraint add` -- the agent equivalent
+    of `run`/`run_agents`, dispatching `agents/coordinator.py`'s
+    `submit_constraint` against every finding in `data_dir`. Imports
+    agents.*/memory lazily, same reason as `run_agents`."""
+    from rhinosecure.agents.coordinator import Coordinator
+    from rhinosecure.memory import DEFAULT_DB_PATH, Memory
+
+    random.seed(seed)
+    assets_path = data_dir / "assets.csv"
+    findings_path = data_dir / "findings.csv"
+    findings = list(join_findings(findings_path, assets_path))
+    memory = Memory(db_path if db_path is not None else DEFAULT_DB_PATH)
+    coordinator = Coordinator(data_dir, cache=SnapshotCache(offline=offline), memory=memory)
+    return coordinator.submit_constraint(text, findings, seed=seed)
 
 
 def _print_rows(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> None:
@@ -272,6 +325,53 @@ def _print_tot_result(finding_id: str, coordinator: Coordinator) -> None:
         print(_wrap(winner.proposal, indent="      "))
 
 
+def _print_constraint_interpretation(interpretation: ConstraintInterpretation) -> None:
+    print("Interpreting constraint...")
+    if interpretation.asset_id is None:
+        print(f"  could not resolve to a single asset -- {interpretation.rationale}")
+        return
+    print(f"  asset: {interpretation.asset_id}")
+    print(f"  effect: {interpretation.effect_kind} = {interpretation.effect_value!r}")
+    print(f"  affects: {', '.join(interpretation.affected_finding_ids) or '(none)'}")
+    print(_wrap(interpretation.rationale, indent="  rationale: ", continuation_indent="    "))
+
+
+def _print_constraint_result(result: ConstraintSubmissionResult) -> None:
+    """The diff CLAUDE.md Section 10's exit criteria asks for: what
+    changed between the finding(s)' prior score and the new one, and
+    why -- `FindingDelta.after_verdict_summary` already states the "why"
+    in plain language (agents/risk.py's task prompt requires it to,
+    whenever a constraint was actually applied)."""
+    if result.unresolved_finding_ids:
+        print(
+            f"\nWarning: the interpreter named finding_id(s) not found on "
+            f"{result.interpretation.asset_id}, ignored: {', '.join(result.unresolved_finding_ids)}",
+            file=sys.stderr,
+        )
+    if not result.persisted:
+        print("\nNothing persisted or re-planned.", file=sys.stderr)
+        return
+
+    print(f"\nConstraint #{result.constraint_id} persisted. Re-planned {len(result.deltas)} finding(s).")
+    changed = result.changed_deltas
+    if not changed:
+        print("\nNo findings changed bucket or risk score.")
+        return
+
+    print(f"\nDiff ({len(changed)}/{len(result.deltas)} finding(s) changed):")
+    for d in changed:
+        print(
+            f"\n  {d.finding_id} ({d.cve_id} on {d.hostname}): "
+            f"{d.before_bucket} ({d.before_risk_score:.1f}) -> "
+            f"{d.after_bucket} ({d.after_risk_score:.1f})"
+        )
+        for line in d.rationale_added:
+            print(_wrap(line, indent="    + ", continuation_indent="      "))
+        for line in d.rationale_removed:
+            print(_wrap(line, indent="    - ", continuation_indent="      "))
+        print(_wrap(f"why: {d.after_verdict_summary}", indent="    ", continuation_indent="    "))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="rhino")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -301,6 +401,36 @@ def main(argv: list[str] | None = None) -> int:
             "per-tool-call echo lines) so only the table and --explain's rationale print"
         ),
     )
+    run_parser.add_argument(
+        "--db",
+        default=None,
+        help=(
+            "with --agents, path to the memory.py SQLite file (default: "
+            "memory.DEFAULT_DB_PATH) -- constraints on file there are picked up automatically"
+        ),
+    )
+
+    constraint_parser = subparsers.add_parser(
+        "constraint", help="submit or manage operational constraints (memory.py's constraints table)"
+    )
+    constraint_subparsers = constraint_parser.add_subparsers(dest="constraint_command", required=True)
+    constraint_add_parser = constraint_subparsers.add_parser(
+        "add", help="submit a free-form operational constraint and re-plan the findings it affects"
+    )
+    constraint_add_parser.add_argument("text", help="the constraint, in plain English")
+    constraint_add_parser.add_argument("--data", default="demo", help="dataset name under data/, or a path")
+    constraint_add_parser.add_argument("--seed", type=int, default=42)
+    constraint_add_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="forbid network fetches; fail loudly on any snapshot cache miss instead of fetching",
+    )
+    constraint_add_parser.add_argument(
+        "--quiet", action="store_true", help="silence CrewAI's own console logging"
+    )
+    constraint_add_parser.add_argument(
+        "--db", default=None, help="path to the memory.py SQLite file (default: memory.DEFAULT_DB_PATH)"
+    )
 
     args = parser.parse_args(argv)
     _ensure_utf8_stdio()
@@ -321,7 +451,7 @@ def main(argv: list[str] | None = None) -> int:
             # Coordinator.run (see agents/coordinator.py), not raised --
             # neither exception can propagate out of run_agents.
             try:
-                coordinator = run_agents(data_dir, args.seed, offline=args.offline)
+                coordinator = run_agents(data_dir, args.seed, offline=args.offline, db_path=args.db)
             except IngestError as exc:
                 print(f"ingest error: {exc}", file=sys.stderr)
                 return 1
@@ -367,6 +497,35 @@ def main(argv: list[str] | None = None) -> int:
                     print(_wrap_bullet(line))
 
         return 0
+
+    if args.command == "constraint" and args.constraint_command == "add":
+        from rhinosecure.agents.coordinator import ConstraintInterpretationError
+        from rhinosecure.llm import LLMConfigError
+
+        data_dir = _resolve_data_dir(args.data)
+        if args.quiet:
+            from crewai.events.utils.console_formatter import set_suppress_console_output
+
+            set_suppress_console_output(True)
+
+        try:
+            result = submit_constraint(args.text, data_dir, args.seed, offline=args.offline, db_path=args.db)
+        except IngestError as exc:
+            print(f"ingest error: {exc}", file=sys.stderr)
+            return 1
+        except OfflineCacheMissError as exc:
+            print(f"offline error: {exc}", file=sys.stderr)
+            return 1
+        except LLMConfigError as exc:
+            print(f"LLM config error: {exc}", file=sys.stderr)
+            return 1
+        except ConstraintInterpretationError as exc:
+            print(f"could not interpret constraint: {exc}", file=sys.stderr)
+            return 1
+
+        _print_constraint_interpretation(result.interpretation)
+        _print_constraint_result(result)
+        return 0 if result.persisted else 1
 
     return 1
 

@@ -20,11 +20,45 @@ of its four responsibilities -- planning the run, dispatching work, owning
 shared state, owning the re-plan loop -- requires model reasoning at the
 scope currently built. The primary path's sequencing is fixed, not
 model-decided, and re-plan here (see `replan` below) is "re-run Environment
-and Risk for these finding_ids," a mechanical re-dispatch, not an
-interpretation of free-form human constraint text -- that interpretation
-step (constraint intake, still Slice 4, still not built) is genuinely
-LLM-shaped work. If and when it is built, it slots in ahead of `replan`'s
-`finding_ids` argument, not inside this class.
+and Risk for these finding_ids," a mechanical re-dispatch.
+
+**`submit_constraint` is constraint intake, now built -- the interpretation
+step every prior commit in this repo named as the one unbuilt piece of
+Slice 4's Coordinator-side wiring.** `interpret_constraint` dispatches
+`agents/constraint_intake.py`'s Constraint Interpreter once, against the
+fleet's current (deterministic, unenriched) scores for tool context, and
+raises `ConstraintInterpretationError` if its response never parses --
+unlike a single finding's Research/Environment/Risk/ToT failure (recorded
+and skipped, the rest of the run continues), a constraint that can't be
+interpreted at all has nothing to fall back to, so `submit_constraint`
+aborts entirely rather than persisting or re-planning anything from a
+response it can't trust. If the Interpreter itself resolves cleanly but
+declines -- no single asset named, or no effect kind it recognizes (e.g.
+Section 10's "only five patches fit this window", a fleet-wide capacity
+statement with no one asset to resolve to; see `constraint_intake.py`'s
+module docstring for why that's out of scope) -- `submit_constraint`
+returns a normal (non-exception) result with `constraint_id=None` and the
+Interpreter's own `rationale` explaining why, and persists and re-plans
+nothing.
+
+Once resolved, `submit_constraint`: persists via `self.memory.add_constraint`
+*before* re-planning (Environment's and Risk's tools only ever see an
+active constraint by querying `self.memory` themselves -- see
+`_dispatch_environment`/`_dispatch_risk` below -- so the constraint has to
+already be on file for the targeted `run()` that follows to pick it up);
+re-plans only the resolved `affected_finding_ids` (a fresh, scoped `run()`,
+not the whole fleet -- `rhino constraint add` stays cheap); computes a
+per-finding diff against a "before" score computed from the exact same
+Research-enriched inputs the targeted run itself produced, just without the
+constraint overlay (`agents/risk.py`'s `merge_research_into_enriched` +
+`scoring.score_finding` directly, no LLM call needed for "before" since
+it's the same deterministic function Risk's own tool already trusts) --
+so the diff isolates the constraint's own effect rather than conflating it
+with enrichment that would happen regardless; and records the run,
+each affected finding's new decision, and the constraint itself as
+feedback, via `memory.py`'s existing `record_run`/`record_decision`/
+`record_feedback` -- exercising all four Section 7 tables from this one
+flow.
 
 **`_dispatch_tot` is the gate CLAUDE.md Section 6 describes: every
 finding whose Risk stage lands on `bucket="contested"` gets routed into a
@@ -39,9 +73,7 @@ any other contested finding in the same batch -- but unlike a
 Research/Environment/Risk failure, it does NOT remove the finding from
 `risk_by_id`: Risk already succeeded (that's *why* the finding reached
 this gate at all), and a failed ToT elaboration doesn't retroactively
-make that scoring result untrustworthy. Constraint intake -- turning
-free-form human text into which finding_ids `replan` should re-dispatch
--- is still the only unbuilt piece of Slice 4's Coordinator-side wiring.
+make that scoring result untrustworthy.
 
 **A failed finding is recorded and skipped, never left to block the whole
 run.** Incident (PROGRESS.md, this date): a 24-finding run hung on the
@@ -78,6 +110,8 @@ module itself never constructs a provider client or calls `get_llm`.
 
 from __future__ import annotations
 
+import math
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, TypeVar
@@ -86,6 +120,13 @@ from crewai import Agent, Crew, Process, Task
 from crewai.types.usage_metrics import UsageMetrics
 from pydantic import BaseModel
 
+from rhinosecure.agents.constraint_intake import (
+    ConstraintInterpretation,
+    ConstraintInterpretationError,
+    build_constraint_agent,
+    build_constraint_task,
+    build_constraint_tools,
+)
 from rhinosecure.agents.environment import (
     EnvironmentAssessment,
     build_environment_agent,
@@ -105,12 +146,14 @@ from rhinosecure.agents.risk import (
     build_risk_agent,
     build_risk_task,
     build_risk_tools,
+    merge_research_into_enriched,
     verify_scoring_matches_tool,
 )
 from rhinosecure.enrich.cache import SnapshotCache
 from rhinosecure.ingest import load_asset_index
+from rhinosecure.memory import Memory
 from rhinosecure.schema import EnrichedFinding
-from rhinosecure.scoring import Bucket
+from rhinosecure.scoring import Bucket, ScoredFinding, score_finding
 from rhinosecure.tot import (
     ToTDispatchError,
     ToTResult,
@@ -166,17 +209,124 @@ class RunState:
     tot_failures: dict[str, str] = field(default_factory=dict)
 
 
+_RATIONALE_TIE_TOLERANCE = 0.05  # risk_score is printed to 0.1 -- ignore float noise below that
+
+
+@dataclass(frozen=True)
+class FindingDelta:
+    """One finding's before/after comparison from `submit_constraint`.
+    `before_*` comes from `scoring.score_finding` run directly (no
+    overlay); `after_*` from the targeted run's real `RiskRecommendation`
+    (overlay applied). Both are computed from the same Research-enriched
+    inputs -- see `submit_constraint`'s docstring -- so any difference
+    here is the constraint's own effect, not enrichment noise."""
+
+    finding_id: str
+    cve_id: str
+    hostname: str
+    before_bucket: str
+    after_bucket: str
+    before_risk_score: float
+    after_risk_score: float
+    rationale_added: tuple[str, ...]
+    rationale_removed: tuple[str, ...]
+    # The "why" a caller (cli.py's diff output) can show without needing
+    # separate access to Coordinator.state -- the agent's own narrative
+    # already explains the constraint's effect (agents/risk.py's task
+    # prompt tells it to, whenever constraints_applied is non-empty).
+    after_verdict_summary: str
+    after_constraints_applied: tuple[str, ...]
+
+    @property
+    def bucket_changed(self) -> bool:
+        return self.before_bucket != self.after_bucket
+
+    @property
+    def risk_score_changed(self) -> bool:
+        return not math.isclose(self.before_risk_score, self.after_risk_score, abs_tol=_RATIONALE_TIE_TOLERANCE)
+
+    @property
+    def changed(self) -> bool:
+        return self.bucket_changed or self.risk_score_changed
+
+
+def _build_finding_delta(before: ScoredFinding, after: RiskRecommendation) -> FindingDelta:
+    before_rationale = set(before.rationale)
+    after_rationale = set(after.scoring_rationale)
+    return FindingDelta(
+        finding_id=after.finding_id,
+        cve_id=after.cve_id,
+        hostname=after.hostname,
+        before_bucket=before.bucket.value,
+        after_bucket=after.bucket,
+        after_verdict_summary=after.verdict_summary,
+        after_constraints_applied=tuple(after.constraints_applied),
+        before_risk_score=before.risk_score,
+        after_risk_score=after.risk_score,
+        rationale_added=tuple(sorted(after_rationale - before_rationale)),
+        rationale_removed=tuple(sorted(before_rationale - after_rationale)),
+    )
+
+
+def _summarize_deltas(constraint_id: int, deltas: tuple[FindingDelta, ...]) -> str:
+    changed = [d for d in deltas if d.changed]
+    if not changed:
+        return (
+            f"constraint #{constraint_id}: re-evaluated {len(deltas)} finding(s), "
+            "none changed bucket or risk score"
+        )
+    parts = [
+        f"{d.finding_id}: {d.before_bucket}({d.before_risk_score:.1f}) -> "
+        f"{d.after_bucket}({d.after_risk_score:.1f})"
+        for d in changed
+    ]
+    return f"constraint #{constraint_id}: " + "; ".join(parts)
+
+
+def _usage_dict(usage: UsageMetrics | None) -> dict[str, Any] | None:
+    return None if usage is None else usage.model_dump()
+
+
+@dataclass(frozen=True)
+class ConstraintSubmissionResult:
+    """The end-to-end outcome of `submit_constraint`. `constraint_id` and
+    `run_id` are None together when the Interpreter couldn't resolve the
+    constraint to one asset and effect, or resolved one but none of its
+    `affected_finding_ids` actually matched a real finding on that asset
+    -- nothing was persisted or re-planned in either case, and `deltas`
+    is empty. `unresolved_finding_ids` names any finding_id the
+    Interpreter listed that didn't survive that cross-check (a
+    hallucinated or cross-asset id), even when others did and the
+    constraint still went through."""
+
+    interpretation: ConstraintInterpretation
+    constraint_id: int | None
+    run_id: int | None
+    deltas: tuple[FindingDelta, ...]
+    unresolved_finding_ids: tuple[str, ...] = ()
+
+    @property
+    def persisted(self) -> bool:
+        return self.constraint_id is not None
+
+    @property
+    def changed_deltas(self) -> tuple[FindingDelta, ...]:
+        return tuple(d for d in self.deltas if d.changed)
+
+
 class Coordinator:
     def __init__(
         self,
         data_dir: Path,
         cache: SnapshotCache | None = None,
         *,
+        memory: Memory | None = None,
         verbose: bool = False,
         max_parse_attempts: int = DEFAULT_MAX_PARSE_ATTEMPTS,
     ):
         self.data_dir = data_dir
         self.cache = cache or SnapshotCache()
+        self.memory = memory
         self.verbose = verbose
         self.max_parse_attempts = max_parse_attempts
         self._asset_index = load_asset_index(data_dir / "assets.csv")
@@ -211,6 +361,148 @@ class Coordinator:
         self._dispatch_risk(findings)
         self._dispatch_tot(findings)
         return self.ranked()
+
+    def interpret_constraint(
+        self, text: str, findings: list[EnrichedFinding]
+    ) -> ConstraintInterpretation:
+        """Dispatch the Constraint Interpreter once (agents/constraint_intake.py)
+        against `findings`' current, deterministic, unenriched scores --
+        context for the model's own reasoning, not an authoritative
+        verdict (see that module's docstring). Does not require a prior
+        `run` -- `findings` here is the ground-truth pool to search and
+        list against, independent of any state `run`/`replan` may hold.
+
+        Raises `ConstraintInterpretationError` if the response never
+        parses within `max_parse_attempts` -- there is no per-finding
+        skip-and-continue for a single constraint that can't be
+        interpreted at all; see the module docstring.
+        """
+        scored_by_asset: dict[str, list[ScoredFinding]] = defaultdict(list)
+        for e in findings:
+            scored_by_asset[e.asset.asset_id].append(score_finding(e))
+
+        call_log: list[dict[str, Any]] = []
+        tools = build_constraint_tools(self._asset_index, scored_by_asset, call_log)
+        agent = build_constraint_agent(tools)
+        task = build_constraint_task(text, agent)
+        Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=self.verbose).kickoff()
+
+        last_error: Exception | None = None
+        for attempt in range(1, self.max_parse_attempts + 1):
+            try:
+                return parse_structured_output(task.output.raw, ConstraintInterpretation)
+            except AgentOutputParseError as exc:
+                last_error = exc
+                if attempt == self.max_parse_attempts:
+                    break
+                task = build_constraint_task(text, agent)
+                Crew(
+                    agents=[agent], tasks=[task], process=Process.sequential, verbose=self.verbose
+                ).kickoff()
+        raise ConstraintInterpretationError(
+            f"gave up after {self.max_parse_attempts} attempt(s): {last_error}"
+        )
+
+    def submit_constraint(
+        self, text: str, findings: list[EnrichedFinding], *, seed: int = 42
+    ) -> ConstraintSubmissionResult:
+        """The full "Human submits a constraint" flow (Section 5's Flow,
+        Section 7's worked example): interpret, persist, targeted
+        re-plan, diff. Requires `self.memory` -- construct
+        `Coordinator(..., memory=Memory(...))`. See the module docstring
+        for the full mechanics; `seed` is recorded on the resulting
+        `runs` row only (scoring has no sampling to seed -- same no-op
+        `cli.run` itself documents).
+        """
+        if self.memory is None:
+            raise CoordinatorError(
+                "submit_constraint requires a Memory instance -- construct "
+                "Coordinator(..., memory=Memory(...))"
+            )
+
+        interpretation = self.interpret_constraint(text, findings)
+        if interpretation.asset_id is None:
+            return ConstraintSubmissionResult(
+                interpretation=interpretation, constraint_id=None, run_id=None, deltas=()
+            )
+
+        by_id = {e.finding.finding_id: e for e in findings}
+        requested = set(interpretation.affected_finding_ids)
+        affected = [
+            by_id[fid]
+            for fid in interpretation.affected_finding_ids
+            if fid in by_id and by_id[fid].asset.asset_id == interpretation.asset_id
+        ]
+        unresolved = tuple(sorted(requested - {e.finding.finding_id for e in affected}))
+        if not affected:
+            return ConstraintSubmissionResult(
+                interpretation=interpretation,
+                constraint_id=None,
+                run_id=None,
+                deltas=(),
+                unresolved_finding_ids=unresolved,
+            )
+
+        constraint_id = self.memory.add_constraint(
+            interpretation.asset_id,
+            text,
+            effect_kind=interpretation.effect_kind,
+            effect_value=interpretation.effect_value,
+        )
+
+        # Fresh, scoped run -- Risk's score_finding tool applies the
+        # constraint just persisted above by querying self.memory itself.
+        self.run(affected)
+
+        deltas = []
+        for e in affected:
+            fid = e.finding.finding_id
+            after = self.state.risk_by_id.get(fid)
+            if after is None:
+                continue  # this finding failed during the targeted run; already in risk_failures
+            research = self.state.research_by_id[fid]
+            before = score_finding(merge_research_into_enriched(e, research))
+            deltas.append(_build_finding_delta(before, after))
+        deltas = tuple(deltas)
+
+        run_id = self.memory.record_run(
+            data_dir=str(self.data_dir),
+            seed=seed,
+            offline=self.cache.offline,
+            agents=True,
+            total_findings=len(affected),
+            contested_count=sum(
+                1 for r in self.state.risk_by_id.values() if r.bucket == Bucket.CONTESTED.value
+            ),
+            contested_total=len(self.state.risk_by_id),
+            research_usage=_usage_dict(self.state.research_usage),
+            environment_usage=_usage_dict(self.state.environment_usage),
+            risk_usage=_usage_dict(self.state.risk_usage),
+            tot_usage=_usage_dict(self.state.tot_usage),
+        )
+        for delta in deltas:
+            recommendation = self.state.risk_by_id[delta.finding_id]
+            self.memory.record_decision(
+                run_id=run_id,
+                finding_id=delta.finding_id,
+                cve_id=delta.cve_id,
+                asset_id=interpretation.asset_id,
+                hostname=delta.hostname,
+                risk_score=recommendation.risk_score,
+                bucket=recommendation.bucket,
+                rationale=list(recommendation.scoring_rationale),
+                verdict_summary=recommendation.verdict_summary,
+                narrative=recommendation.narrative,
+            )
+        self.memory.record_feedback(text, _summarize_deltas(constraint_id, deltas), run_id=run_id)
+
+        return ConstraintSubmissionResult(
+            interpretation=interpretation,
+            constraint_id=constraint_id,
+            run_id=run_id,
+            deltas=deltas,
+            unresolved_finding_ids=unresolved,
+        )
 
     def ranked(self) -> list[RiskRecommendation]:
         """The current plan, sorted the same way `scoring.rank` sorts the
@@ -292,7 +584,7 @@ class Coordinator:
         if not survivors:
             return
 
-        tools = build_environment_tools(self._asset_index, self.state.environment_call_log)
+        tools = build_environment_tools(self._asset_index, self.state.environment_call_log, self.memory)
         agent = build_environment_agent(tools)
         tasks = [
             build_environment_task(e, self.state.research_by_id[e.finding.finding_id], agent)
@@ -333,7 +625,7 @@ class Coordinator:
             return
 
         tools = build_risk_tools(
-            self.state.enriched_by_id, self.state.research_by_id, self.state.risk_call_log
+            self.state.enriched_by_id, self.state.research_by_id, self.state.risk_call_log, self.memory
         )
         agent = build_risk_agent(tools)
         tasks = [

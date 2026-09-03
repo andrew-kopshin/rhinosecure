@@ -54,6 +54,23 @@ def test_add_constraint_returns_an_id_and_is_retrievable(db_path: Path):
         assert constraint.constraint_text == "payroll server only reboots on Sundays"
         assert constraint.active is True
         assert constraint.created_at  # non-empty timestamp
+        assert constraint.effect_kind is None  # not given -- not yet interpreted
+        assert constraint.effect_value is None
+
+
+def test_add_constraint_stores_the_structured_effect_when_given(db_path: Path):
+    """agents/constraint_intake.py's job is producing effect_kind/
+    effect_value; this module just stores whatever strings it's handed,
+    with no knowledge of ConstraintEffectKind's values."""
+    with Memory(db_path) as db:
+        db.add_constraint(
+            "A12", "payroll server only reboots on Sundays",
+            effect_kind="patch_window", effect_value="Sundays only",
+        )
+
+        [constraint] = db.constraints_for_asset("A12")
+        assert constraint.effect_kind == "patch_window"
+        assert constraint.effect_value == "Sundays only"
 
 
 def test_constraints_for_asset_does_not_leak_across_assets(db_path: Path):

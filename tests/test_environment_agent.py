@@ -12,6 +12,7 @@ from rhinosecure.agents.environment import (
 )
 from rhinosecure.agents.research import ResearchFinding
 from rhinosecure.llm import LLMConfig, get_llm
+from rhinosecure.memory import Memory
 from rhinosecure.schema import Asset, EnrichedFinding, Finding
 
 _ASSESSMENT_KWARGS = dict(
@@ -96,6 +97,55 @@ def test_lookup_asset_context_unknown_asset_id_reports_not_found():
     assert call_log[0]["result"] == {"asset_id": "A99", "found": False}
 
 
+# --- human_constraints: the overlay is visible, never merged ----------------
+
+
+def test_lookup_asset_context_without_memory_reports_no_human_constraints():
+    """Every call site before constraints existed omits memory -- must
+    reproduce the exact prior behavior, just with the new field present
+    and empty."""
+    tools, _ = _tools()
+    result = json.loads(tools["lookup_asset_context"].run(asset_id="A02"))
+    assert result["human_constraints"] == []
+
+
+def test_lookup_asset_context_with_memory_but_no_constraints_on_file(tmp_path):
+    memory = Memory(tmp_path / "mem.db")
+    call_log: list[dict] = []
+    tools = {t.name: t for t in build_environment_tools(_asset_index(), call_log, memory)}
+
+    result = json.loads(tools["lookup_asset_context"].run(asset_id="A02"))
+    assert result["human_constraints"] == []
+
+
+def test_lookup_asset_context_surfaces_active_constraints_separately_from_asset_fields(tmp_path):
+    memory = Memory(tmp_path / "mem.db")
+    memory.add_constraint(
+        "A02", "the mail server only reboots on Sundays",
+        effect_kind="patch_window", effect_value="Sun 00:00-06:00",
+    )
+    call_log: list[dict] = []
+    tools = {t.name: t for t in build_environment_tools(_asset_index(), call_log, memory)}
+
+    result = json.loads(tools["lookup_asset_context"].run(asset_id="A02"))
+
+    assert result["human_constraints"] == ["the mail server only reboots on Sundays"]
+    # The asset's own declared fields are untouched by the constraint --
+    # ASSET_A02's real patch_window, not the constraint's effect_value.
+    assert result["patch_window"] == "Sun 02:00-06:00"
+
+
+def test_lookup_asset_context_excludes_deactivated_constraints(tmp_path):
+    memory = Memory(tmp_path / "mem.db")
+    constraint_id = memory.add_constraint("A02", "retracted statement")
+    memory.deactivate_constraint(constraint_id)
+    call_log: list[dict] = []
+    tools = {t.name: t for t in build_environment_tools(_asset_index(), call_log, memory)}
+
+    result = json.loads(tools["lookup_asset_context"].run(asset_id="A02"))
+    assert result["human_constraints"] == []
+
+
 # --- os_build_consistent provenance marker -----------------------------------
 
 
@@ -170,3 +220,6 @@ def test_build_environment_task_embeds_finding_and_upstream_research_context():
     assert "os_build_consistent_provenance" in task.description
     assert "os_build_consistent_provenance" in task.expected_output
     assert "not wrapped in any container key" in task.expected_output
+    assert "human_constraints" in task.description
+    assert "human_constraints" in task.expected_output
+    assert "never blend a human constraint" in task.description

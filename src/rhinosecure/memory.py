@@ -87,6 +87,8 @@ CREATE TABLE IF NOT EXISTS constraints (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     asset_id TEXT NOT NULL,
     constraint_text TEXT NOT NULL,
+    effect_kind TEXT,
+    effect_value TEXT,
     created_at TEXT NOT NULL,
     active INTEGER NOT NULL DEFAULT 1
 );
@@ -151,6 +153,15 @@ class Constraint:
     constraint_text: str
     created_at: str
     active: bool
+    # Structured effect -- nullable: a constraint can be recorded before
+    # (or without) ever being interpreted into one of these. Populated by
+    # agents/constraint_intake.py's ConstraintInterpretation once that
+    # exists; this module doesn't know that type and only stores whatever
+    # strings it's given. See agents/constraint_intake.py's module
+    # docstring for what "effect_kind" values mean and how they're
+    # applied.
+    effect_kind: str | None = None
+    effect_value: str | None = None
 
 
 @dataclass(frozen=True)
@@ -224,6 +235,8 @@ def _constraint_from_row(row: sqlite3.Row) -> Constraint:
         constraint_text=row["constraint_text"],
         created_at=row["created_at"],
         active=bool(row["active"]),
+        effect_kind=row["effect_kind"],
+        effect_value=row["effect_value"],
     )
 
 
@@ -304,11 +317,23 @@ class Memory:
 
     # --- constraints ----------------------------------------------------
 
-    def add_constraint(self, asset_id: str, constraint_text: str) -> int:
+    def add_constraint(
+        self,
+        asset_id: str,
+        constraint_text: str,
+        *,
+        effect_kind: str | None = None,
+        effect_value: str | None = None,
+    ) -> int:
+        """`effect_kind`/`effect_value` are optional and independent of
+        each other's presence -- this module doesn't validate them
+        against anything (no dependency on agents/constraint_intake.py's
+        ConstraintEffectKind enum). Omit both to record a constraint
+        that hasn't been interpreted into a structured effect yet."""
         cur = self._conn.execute(
-            "INSERT INTO constraints (asset_id, constraint_text, created_at, active) "
-            "VALUES (?, ?, ?, 1)",
-            (asset_id, constraint_text, _now()),
+            "INSERT INTO constraints (asset_id, constraint_text, effect_kind, effect_value, "
+            "created_at, active) VALUES (?, ?, ?, ?, ?, 1)",
+            (asset_id, constraint_text, effect_kind, effect_value, _now()),
         )
         self._conn.commit()
         return cur.lastrowid
