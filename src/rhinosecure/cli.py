@@ -73,6 +73,30 @@ not just the one that just submitted a constraint. The plain
 requires a `Coordinator`, and this module's own docstring already
 explains why `agents.*` (and now `memory` alongside it, imported lazily
 in the same places) stays out of that path's import graph.
+
+`--format` (default `native`) picks the ingest adapter (`adapters/`) --
+CLAUDE.md Section 1's "swapping in a real scanner export should require a
+new ingest adapter and nothing else", made a CLI flag. `--format defender`
+reads Microsoft Defender Vulnerability Management exports (devices.csv +
+vulnerabilities.csv, adapters/defender.py) and scores them through the
+identical deterministic pipeline. After the table, `_print_ingest_report`
+prints a data-gap summary -- which schema fields the export had no
+concept of, on how many records -- and `--explain` adds a per-finding
+note, both driven by `Asset.not_collected`/`Finding.not_collected`
+(adapters/base.py); for the native fixture both are empty, so nothing
+extra prints and output stays byte-identical. `run()` keeps its
+list-of-ScoredFinding return (test_scoring.py and others call it that
+way); `run_with_report` is the same pipeline returning the assets and the
+report alongside, which is what `main` uses.
+
+`--format` is deterministic-path only for now: `--agents` (and `rhino
+constraint add`) construct `agents/coordinator.py`'s `Coordinator`, whose
+constructor builds its own asset index from `<data>/assets.csv` -- the
+native filename -- so a non-native format there is refused up front with a
+message saying so, rather than letting the Coordinator read a file that
+isn't there (or, worse, a stale native one that happens to be). Lifting
+that needs the Coordinator to accept an inventory instead of a path, an
+agents change this flag deliberately doesn't make.
 """
 
 from __future__ import annotations
@@ -81,12 +105,22 @@ import argparse
 import random
 import sys
 import textwrap
+from dataclasses import dataclass
 from pathlib import Path
 
+from rhinosecure.adapters import DEFAULT_FORMAT, FORMATS, get_adapter
 from rhinosecure.enrich.attack import load_index as load_attack_index
 from rhinosecure.enrich.cache import OfflineCacheMissError, SnapshotCache
 from rhinosecure.enrich.kev import load_catalog as load_kev_catalog
-from rhinosecure.ingest import IngestError, attach_threat_signals, join_findings
+from rhinosecure.ingest import (
+    GapTally,
+    IngestError,
+    IngestReport,
+    attach_threat_signals,
+    join_findings,
+    load_batch,
+)
+from rhinosecure.schema import Asset
 from rhinosecure.scoring import ContestedRate, ScoredFinding, contested_rate, rank, score_finding
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -114,24 +148,56 @@ def _resolve_data_dir(data_arg: str) -> Path:
     raise SystemExit(f"no such data set: {data_arg!r} (looked for {named} and {path})")
 
 
-def run(data_dir: Path, seed: int, *, offline: bool = False) -> list[ScoredFinding]:
+@dataclass(frozen=True)
+class RunResult:
+    """The deterministic path's output plus the inventory it was scored
+    against and the ingest report -- `main` needs the last two to print
+    data gaps (`_print_ingest_report`, `_print_gap_note`), which
+    `ScoredFinding` alone can't supply: it carries no Asset and no
+    `not_collected`. `not_collected_by_finding` only holds findings that
+    have any (empty for the native fixture)."""
+
+    scored: list[ScoredFinding]
+    assets: dict[str, Asset]
+    not_collected_by_finding: dict[str, frozenset[str]]
+    report: IngestReport
+
+
+def run(data_dir: Path, seed: int, *, offline: bool = False, fmt: str = DEFAULT_FORMAT) -> list[ScoredFinding]:
+    """Ingest (via the `fmt` adapter), enrich, score, rank. The
+    list-returning form every existing caller uses; see run_with_report."""
+    return run_with_report(data_dir, seed, offline=offline, fmt=fmt).scored
+
+
+def run_with_report(
+    data_dir: Path, seed: int, *, offline: bool = False, fmt: str = DEFAULT_FORMAT
+) -> RunResult:
     # Scoring is fully deterministic (no sampling); the seed is accepted
     # now so the CLI contract does not change once Slice 4's ToT beam
     # search introduces anything seed-sensitive.
     random.seed(seed)
 
-    assets_path = data_dir / "assets.csv"
-    findings_path = data_dir / "findings.csv"
+    adapter = get_adapter(fmt)
+    assets, enriched = load_batch(data_dir, adapter)
 
     cache = SnapshotCache(offline=offline)
     kev_catalog = load_kev_catalog(cache)  # one bulk feed, loaded once for the whole run
     attack_index = load_attack_index(cache)  # same shape: one filtered bundle, loaded once
 
-    scored = [
-        score_finding(attach_threat_signals(e, kev_catalog, attack_index, cache))
-        for e in join_findings(findings_path, assets_path)
-    ]
-    return rank(scored)
+    tally = GapTally()
+    scored: list[ScoredFinding] = []
+    not_collected_by_finding: dict[str, frozenset[str]] = {}
+    for e in enriched:  # still one lazy pass over the findings stream
+        tally.observe(e.finding)
+        if e.finding.not_collected:
+            not_collected_by_finding[e.finding.finding_id] = e.finding.not_collected
+        scored.append(score_finding(attach_threat_signals(e, kev_catalog, attack_index, cache)))
+    return RunResult(
+        scored=rank(scored),
+        assets=assets,
+        not_collected_by_finding=not_collected_by_finding,
+        report=tally.report(fmt, assets, adapter.stats),
+    )
 
 
 def run_agents(
@@ -405,6 +471,73 @@ def _print_capacity_result(result: CapacitySubmissionResult) -> None:
         )
 
 
+def _print_ingest_report(report: IngestReport) -> None:
+    """The data-gap summary for a non-native format: which schema fields
+    the export had no concept of (or left blank), on how many records,
+    and what the adapter collapsed on the way in. Prints nothing when
+    there is nothing to say -- the native fixture's output is unchanged.
+    The last paragraph exists because scoring.py's own rationale still
+    says "no patch_window declared" for these assets (scoring is
+    untouched by the adapter layer; see adapters/base.py): this is where
+    the reader learns that blank means "not collected" here."""
+    if not report.has_anything_to_report:
+        return
+    print()
+    if report.has_gaps:
+        print(f"Data gaps (--format {report.format}): fields this export has no concept of, or left blank.")
+        print(
+            _wrap(
+                "The values in effect for them are documented defaults (adapters/base.py, "
+                "NOT_COLLECTED_DEFAULTS), not facts from the export."
+            )
+        )
+        for kind, total, gaps in (
+            ("assets", report.assets_total, report.asset_gaps),
+            ("findings", report.findings_total, report.finding_gaps),
+        ):
+            by_count: dict[int, list[str]] = {}
+            for name, count in gaps.items():
+                by_count.setdefault(count, []).append(name)
+            for count in sorted(by_count, reverse=True):
+                label = f"  {kind:<8} {count}/{total}  "
+                print(_wrap(", ".join(sorted(by_count[count])), indent=label, continuation_indent=" " * len(label)))
+        if {"patch_window", "compensating_controls"} & set(report.asset_gaps):
+            print(
+                _wrap(
+                    'The bucket rules read a blank patch_window as "no declared restriction" and blank '
+                    'compensating_controls as "none"; for these assets both mean "not collected". '
+                    "Supply the real ones per asset with `rhino constraint add`."
+                )
+            )
+    if report.duplicate_findings_collapsed or report.duplicate_assets_collapsed:
+        print(
+            f"  Collapsed {report.duplicate_findings_collapsed} duplicate finding row(s) and "
+            f"{report.duplicate_assets_collapsed} repeated device row(s)."
+        )
+
+
+def _print_gap_note(asset: Asset, finding_gaps: frozenset[str]) -> None:
+    """--explain's per-finding companion to _print_ingest_report: sits
+    right after scoring.py's rationale bullets and names the fields on
+    this asset/finding whose values are defaults, with the value in effect
+    for any that isn't blank. Silent for a native record."""
+    parts = []
+    for name in sorted(asset.not_collected):
+        value = getattr(asset, name)
+        parts.append(name if value == "" else f"{name}={value}")
+    parts.extend(sorted(finding_gaps))
+    if not parts:
+        return
+    print(
+        _wrap(
+            "not collected: " + ", ".join(parts) + ' -- read the bullets above as "unknown" for these, '
+            'not "none declared"; the values shown are defaults',
+            indent="  ! ",
+            continuation_indent="    ",
+        )
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="rhino")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -442,6 +575,17 @@ def main(argv: list[str] | None = None) -> int:
             "memory.DEFAULT_DB_PATH) -- constraints on file there are picked up automatically"
         ),
     )
+    run_parser.add_argument(
+        "--format",
+        default=DEFAULT_FORMAT,
+        choices=sorted(FORMATS),
+        help=(
+            "ingest adapter for --data's files (adapters/): native reads assets.csv + findings.csv; "
+            "defender reads Microsoft Defender Vulnerability Management exports devices.csv "
+            "(DeviceInfo) + vulnerabilities.csv (DeviceTvmSoftwareVulnerabilities). Deterministic "
+            "path only -- not yet accepted with --agents"
+        ),
+    )
 
     constraint_parser = subparsers.add_parser(
         "constraint", help="submit or manage operational constraints (memory.py's constraints table)"
@@ -475,6 +619,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         data_dir = _resolve_data_dir(args.data)
+
+        if args.agents and args.format != DEFAULT_FORMAT:
+            print(
+                f"--format {args.format} is not supported with --agents yet: agents/coordinator.py's "
+                f"Coordinator builds its own asset index from {data_dir / 'assets.csv'} (the native "
+                "format's filename), so it cannot read this export. Run without --agents, or teach "
+                "Coordinator to take an inventory instead of a path.",
+                file=sys.stderr,
+            )
+            return 2
 
         if args.agents:
             from rhinosecure.llm import LLMConfigError
@@ -517,7 +671,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         try:
-            scored = run(data_dir, args.seed, offline=args.offline)
+            result = run_with_report(data_dir, args.seed, offline=args.offline, fmt=args.format)
         except IngestError as exc:
             print(f"ingest error: {exc}", file=sys.stderr)
             return 1
@@ -525,14 +679,20 @@ def main(argv: list[str] | None = None) -> int:
             print(f"offline error: {exc}", file=sys.stderr)
             return 1
 
+        scored = result.scored
         _print_table(scored)
         _print_contested_rate(contested_rate(s.bucket.value for s in scored))
+        _print_ingest_report(result.report)
 
         if args.explain:
             for s in scored:
                 print(f"\n{s.finding_id} ({s.cve_id} on {s.hostname}) -> {s.bucket.value}")
                 for line in s.rationale:
                     print(_wrap_bullet(line))
+                _print_gap_note(
+                    result.assets[s.asset_id],
+                    result.not_collected_by_finding.get(s.finding_id, frozenset()),
+                )
 
         return 0
 

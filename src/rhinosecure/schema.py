@@ -13,9 +13,9 @@ tiers) are schema-level domain categories, not fixture-specific values.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 AssetRole = Literal["dc", "exchange", "iis_web", "sql", "file", "workstation", "dev"]
 Environment = Literal["prod", "staging", "dev"]
@@ -23,8 +23,31 @@ DataSensitivity = Literal["none", "internal", "confidential", "regulated"]
 ScannerSeverity = Literal["critical", "high", "medium", "low", "informational"]
 
 
+def _validate_not_collected(model: type[BaseModel], value: frozenset[str]) -> frozenset[str]:
+    """`not_collected` may only name fields the model actually has, and
+    never its primary key -- a record without identity is not a record with
+    a gap, it is unmappable input (adapters/base.py rule 1)."""
+    allowed = set(model.model_fields) - {"not_collected"} - set(getattr(model, "_never_not_collected", ()))
+    unknown = sorted(value - allowed)
+    if unknown:
+        raise ValueError(f"not_collected names field(s) {model.__name__} cannot leave uncollected: {unknown}")
+    return value
+
+
 class Asset(BaseModel):
+    """One host in the inventory.
+
+    `not_collected` is the set of this model's field names the record's
+    source format had no concept of, or left blank on this row. The field's
+    *value* is then the documented default (adapters/base.py
+    NOT_COLLECTED_DEFAULTS; "" for the free-text fields), which scoring reads
+    exactly as it would a native record; only the *claim* differs -- a blank
+    patch_window with "patch_window" in not_collected means "unknown", the
+    same blank without it means "none declared". Native assets.csv rows leave
+    it empty. See adapters/base.py for the full reasoning."""
+
     model_config = ConfigDict(str_strip_whitespace=True, frozen=True)
+    _never_not_collected: ClassVar[frozenset[str]] = frozenset({"asset_id"})
 
     asset_id: str
     hostname: str
@@ -40,6 +63,12 @@ class Asset(BaseModel):
     patch_restrictions: str = ""
     compensating_controls: str = ""
     owner: str = ""
+    not_collected: frozenset[str] = frozenset()
+
+    @field_validator("not_collected")
+    @classmethod
+    def _not_collected_names_real_fields(cls, value: frozenset[str]) -> frozenset[str]:
+        return _validate_not_collected(cls, value)
 
     @property
     def compensating_control_list(self) -> tuple[str, ...]:
@@ -54,7 +83,12 @@ class Asset(BaseModel):
 
 
 class Finding(BaseModel):
+    """One scanner finding. `not_collected` has the same meaning as on
+    `Asset` -- e.g. an agent-based scanner that never observes a listening
+    port leaves port/service blank *and* names them here."""
+
     model_config = ConfigDict(str_strip_whitespace=True, frozen=True)
+    _never_not_collected: ClassVar[frozenset[str]] = frozenset({"finding_id", "asset_id", "cve_id"})
 
     finding_id: str
     asset_id: str
@@ -66,6 +100,12 @@ class Finding(BaseModel):
     port: str = ""
     service: str = ""
     evidence: str = ""
+    not_collected: frozenset[str] = frozenset()
+
+    @field_validator("not_collected")
+    @classmethod
+    def _not_collected_names_real_fields(cls, value: frozenset[str]) -> frozenset[str]:
+        return _validate_not_collected(cls, value)
 
 
 class AttackTechniqueRef(BaseModel):

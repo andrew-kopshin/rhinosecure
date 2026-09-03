@@ -9,6 +9,19 @@ it normalizes that export's native columns into assets.csv / findings.csv
 shape and hands rows to the same `Asset` / `Finding` models. Nothing below
 needs to change for that to work.
 
+That adapter layer now exists: `adapters/` (base.py for the contract and
+the `not_collected` representation of fields a source format lacks;
+defender.py for Microsoft Defender Vulnerability Management). `join` is the
+loader-agnostic half of the old `join_findings`: an adapter hands it an
+already-indexed inventory and a lazy finding stream in whatever way its
+source format requires, and it does the one thing every format needs
+identically -- attach each finding to its asset, refusing an orphan.
+`join_findings` (the native two-path form every existing caller uses) is
+unchanged in behavior and delegates to it; `load_batch` is what cli.py
+calls for any format. `IngestStats`/`IngestReport` live here rather than
+in `adapters/` because they describe a batch, not a format, and cli.py
+prints them for every format alike.
+
 `attach_threat_signals` was originally private to `cli.py`'s deterministic
 `run()`. Moved here (public, unchanged behavior) so `agents/coordinator.py`'s
 fleet-wide capacity constraint flow can reuse the exact same real,
@@ -32,8 +45,11 @@ deterministic or agents path.
 from __future__ import annotations
 
 import csv
-from collections.abc import Iterator
+from collections import Counter
+from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 
@@ -44,9 +60,73 @@ from rhinosecure.enrich.kev import KevCatalog
 from rhinosecure.enrich.nvd import lookup as nvd_lookup
 from rhinosecure.schema import Asset, AttackTechniqueRef, EnrichedFinding, Finding
 
+if TYPE_CHECKING:  # adapters/base.py imports this module; keep the runtime import graph one-directional
+    from rhinosecure.adapters.base import IngestAdapter
+
 
 class IngestError(Exception):
-    """A row failed schema validation."""
+    """A row failed schema validation, or an adapter refused its input
+    (adapters.AdapterError subclasses this)."""
+
+
+@dataclass
+class IngestStats:
+    """What an adapter collapsed on the way in. Mutable: a streaming
+    `load_findings` can only count as its iterator is consumed."""
+
+    duplicate_assets_collapsed: int = 0
+    duplicate_findings_collapsed: int = 0
+
+
+@dataclass(frozen=True)
+class IngestReport:
+    """One batch's data-gap summary -- how many records left each schema
+    field `not_collected` (adapters/base.py), plus what was collapsed.
+    Empty for a native run (no gaps, nothing collapsed), so cli.py prints
+    nothing and the demo fixture's output stays byte-identical."""
+
+    format: str
+    assets_total: int
+    findings_total: int
+    duplicate_assets_collapsed: int
+    duplicate_findings_collapsed: int
+    asset_gaps: dict[str, int] = field(default_factory=dict)  # field -> assets where not collected
+    finding_gaps: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def has_gaps(self) -> bool:
+        return bool(self.asset_gaps or self.finding_gaps)
+
+    @property
+    def has_anything_to_report(self) -> bool:
+        return self.has_gaps or bool(self.duplicate_assets_collapsed or self.duplicate_findings_collapsed)
+
+
+class GapTally:
+    """Accumulates `IngestReport` counts while a caller streams findings,
+    so the report costs no second pass over anything."""
+
+    def __init__(self) -> None:
+        self.findings_total = 0
+        self._finding_gaps: Counter[str] = Counter()
+
+    def observe(self, finding: Finding) -> None:
+        self.findings_total += 1
+        self._finding_gaps.update(finding.not_collected)
+
+    def report(self, fmt: str, assets: Mapping[str, Asset], stats: IngestStats) -> IngestReport:
+        asset_gaps: Counter[str] = Counter()
+        for asset in assets.values():
+            asset_gaps.update(asset.not_collected)
+        return IngestReport(
+            format=fmt,
+            assets_total=len(assets),
+            findings_total=self.findings_total,
+            duplicate_assets_collapsed=stats.duplicate_assets_collapsed,
+            duplicate_findings_collapsed=stats.duplicate_findings_collapsed,
+            asset_gaps=dict(sorted(asset_gaps.items())),
+            finding_gaps=dict(sorted(self._finding_gaps.items())),
+        )
 
 
 def _rows(path: Path) -> Iterator[dict[str, str]]:
@@ -83,18 +163,38 @@ def load_asset_index(path: Path) -> dict[str, Asset]:
     return index
 
 
-def join_findings(
-    findings_path: Path, assets_path: Path
+def join(
+    assets: Mapping[str, Asset], findings: Iterable[Finding], *, source: str = "findings"
 ) -> Iterator[EnrichedFinding]:
-    asset_index = load_asset_index(assets_path)
-    for finding in load_findings(findings_path):
-        asset = asset_index.get(finding.asset_id)
+    """Attach each finding to its asset, lazily. `source` only labels the
+    error. Raises on the first orphan -- an adapter that wants to report
+    every orphan at once checks membership itself before handing rows here
+    (adapters/defender.py does)."""
+    for finding in findings:
+        asset = assets.get(finding.asset_id)
         if asset is None:
             raise IngestError(
-                f"{findings_path}: finding {finding.finding_id!r} references "
+                f"{source}: finding {finding.finding_id!r} references "
                 f"unknown asset_id {finding.asset_id!r}"
             )
         yield EnrichedFinding(finding=finding, asset=asset)
+
+
+def join_findings(
+    findings_path: Path, assets_path: Path
+) -> Iterator[EnrichedFinding]:
+    yield from join(load_asset_index(assets_path), load_findings(findings_path), source=str(findings_path))
+
+
+def load_batch(data_dir: Path, adapter: IngestAdapter) -> tuple[dict[str, Asset], Iterator[EnrichedFinding]]:
+    """The format-agnostic entry point cli.py uses: the adapter's inventory,
+    indexed, and its findings joined to it, lazily. The inventory is
+    materialized here (it always was -- load_asset_index) and returned so
+    the caller can report per-asset data gaps without a second load."""
+    assets = {a.asset_id: a for a in adapter.load_assets(data_dir / adapter.assets_filename)}
+    findings_path = data_dir / adapter.findings_filename
+    findings = adapter.load_findings(findings_path, assets)
+    return assets, join(assets, findings, source=str(findings_path))
 
 
 def attach_threat_signals(

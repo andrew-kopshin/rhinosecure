@@ -1,0 +1,11 @@
+DeviceId,DeviceName,OSPlatform,OSVersion,OSArchitecture,SoftwareVendor,SoftwareName,SoftwareVersion,CveId,VulnerabilitySeverityLevel,RecommendedSecurityUpdate,RecommendedSecurityUpdateId,CveTags
+1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b,dc01.corp.example.com,WindowsServer2019,1809,x64,microsoft,windows_server_2019,10.0.17763.1339,CVE-2020-1472,Critical,August 2020 Security Updates,4565349,[]
+1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b,dc01.corp.example.com,WindowsServer2019,1809,x64,microsoft,windows_server_2019,10.0.17763.1339,CVE-2021-1656,Medium,January 2021 Security Updates,4598230,[]
+2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c,web01.corp.example.com,WindowsServer2022,21H2,x64,microsoft,windows_server_2022,10.0.20348.405,CVE-2022-21907,Critical,January 2022 Security Updates,5009555,[]
+2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c,web01.corp.example.com,WindowsServer2022,21H2,x64,microsoft,windows_server_2022,10.0.20348.405,CVE-2021-34527,High,July 2021 Security Updates,5004945,[]
+3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d,wks-fin12.corp.example.com,Windows10,22H2,x64,microsoft,office,16.0.15128.20224,CVE-2022-30190,High,June 2022 Security Updates,,[]
+3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d,wks-fin12.corp.example.com,Windows10,22H2,x64,microsoft,outlook,16.0.15128.20224,CVE-2023-23397,Critical,March 2023 Security Updates,5002254,[]
+3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d,wks-fin12.corp.example.com,Windows10,22H2,x64,microsoft,outlook,16.0.15128.20224,CVE-2023-23397,Critical,March 2023 Security Updates,5002254,[]
+4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e,wks-it05.corp.example.com,Windows11,23H2,x64,microsoft,windows_11,10.0.22631.2861,CVE-2021-1727,High,January 2021 Security Updates,4598242,[]
+5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f,sql02.corp.example.com,WindowsServer2012R2,6.3,x64,microsoft,sql_server_2014,12.0.6024.0,CVE-2019-1068,High,July 2019 Security Updates,4505419,[]
+5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f,sql02.corp.example.com,WindowsServer2012R2,6.3,x64,microsoft,sql_server_reporting_services,13.0.5426.0,CVE-2020-0618,High,February 2020 Security Updates,4532097,[]

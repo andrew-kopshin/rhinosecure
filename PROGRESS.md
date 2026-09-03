@@ -999,3 +999,117 @@ With the fix, all three pieces ran clean end to end:
 
 Scratch memory DBs used for this run were not the repo's `rhinosecure.db` and are not part of any
 commit.
+
+**Microsoft Defender Vulnerability Management adapter; `rhino run --format`.** CLAUDE.md
+Section 1's contract ("swapping in a real scanner export should require a new ingest adapter
+and nothing else") now has its first real adapter and the seam to plug it into. New
+`adapters/` package: `base.py` (the `IngestAdapter` contract, `AdapterError`, and the
+`not_collected` representation below), `native.py` (the existing assets.csv/findings.csv
+loaders, wrapped so "native" is a format like any other rather than the one everything
+silently assumes), `defender.py`. `ingest.py` gained the loader-agnostic `join` (the old
+`join_findings` delegates to it, behavior unchanged), `load_batch`, and `IngestStats`/
+`IngestReport`/`GapTally`; `cli.py` gained `--format {defender,native}` (default native),
+`run_with_report` (same pipeline as `run`, which keeps its list return -- test_scoring.py
+calls it), a data-gap summary after the table, and a per-finding `! not collected:` note under
+`--explain`. scoring.py, enrich/, and agents/ are untouched, as required. Confirmed the native
+demo output is byte-identical to HEAD (full `--explain` run diffed against a temporary
+worktree of the previous commit: 432 lines, no difference), not just "tests still pass".
+
+**Column vocabulary is Microsoft's, verified, not remembered.** The adapter reads two CSVs
+shaped like the advanced-hunting tables Microsoft documents: `devices.csv` <- `DeviceInfo`
+(DeviceId, DeviceName, OSPlatform, OSBuild, IsInternetFacing, AssetValue; Timestamp
+optional) and `vulnerabilities.csv` <- `DeviceTvmSoftwareVulnerabilities` (DeviceId, CveId,
+VulnerabilitySeverityLevel, SoftwareName, SoftwareVersion; SoftwareVendor,
+RecommendedSecurityUpdate(Id) optional). Checked both Learn pages today rather than trusting
+memory, which paid off twice: the hunting table has *no* timestamp column at all (so
+`detected_date` is not collected unless the file came from the per-device assessment API,
+whose `FirstSeenTimestamp` the adapter accepts as optional), and the API doc states the
+uniqueness key of a per-device vulnerability record is (DeviceId, SoftwareVendor,
+SoftwareName, SoftwareVersion, CveId) -- SoftwareVendor included, which the first draft of the
+dedup key had left out. `finding_id` is `MDVM-` plus 16 hex of a sha256 over exactly that key:
+Defender exports no stable per-finding id, and a content-addressed one gives the same finding
+the same id across exports, which memory.py's `decisions` table needs. The 64-bit prefix keeps
+accidental collisions negligible at fleet scale and the validation pass still checks for one.
+
+**The representation of fields the source has no concept of -- the decision this feature was
+gated on.** Defender exports no maintenance window, compensating controls, patch restrictions,
+environment tier, data-sensitivity classification, role, business function, or owner. Every
+Defender asset therefore arrives with a blank `patch_window`, and the schema already gives that
+blank a meaning -- "no declared scheduling restriction", read by `bucket_for` as "may be patched
+any time" -- when here it means "nobody asked". This was Section 3's open item, now bitten by the
+first real format. Decided: separate the *value* from the *claim*. The value stays the schema's
+own absent encoding ("" for free text), so `bucket_for`, `has_patch_window`,
+`compensating_control_list`, and the constraint overlay read it exactly as before and nothing
+downstream changes; the claim moves into a new machine-readable field on the record,
+`Asset.not_collected` / `Finding.not_collected` -- the set of schema field names the source
+had no concept of, or left blank on that row. A blank `patch_window` with `"patch_window" in
+not_collected` means "unknown"; without it, "none declared". A pydantic validator refuses
+names that aren't real fields and refuses the primary keys (a record without identity is
+unmappable input, not a record with a gap). Rejected alternatives, recorded so they don't come
+back: a sentinel value in the field (any non-blank `patch_window` flips `has_patch_window`
+and any non-blank `compensating_controls` manufactures a control, so it would change verdicts
+and force every consumer to learn to skip it); `None` vs `""` (a CSV cell can't tell them
+apart, so the native loader would have had to decide what a blank means, reintroducing the
+ambiguity one layer down). The enumerated Impact inputs (`role`, `environment`,
+`data_sensitivity`, `criticality`) have no absent encoding -- scoring indexes weight tables by
+them -- so `NOT_COLLECTED_DEFAULTS` (adapters/base.py) fixes one value per field for every
+adapter: the modal enterprise value (prod, internal, criticality 3), deliberately neither the
+worst case (every unknown server a DC in a regulated prod environment floods `patch_now`
+uniformly and teaches the reader to distrust the ranking) nor the best case (hides risk).
+Because the default is the same for every record of a format, it shifts every finding's
+Impact by a constant instead of reordering them. `role` is defaulted by OS class --
+`workstation` for a client OS (nearly a fact), `file` for a server OS (the most generic server
+role, mid-table blast radius) -- and marked not collected either way. A dedicated `server`
+role would be cleaner but needs a `ROLE_BLAST_RADIUS` entry, a scoring change, so it was not
+made. Values are still visible everywhere: `rhino run` prints per-field counts and, under
+`--explain`, each finding's defaulted fields with the value in effect.
+
+**Messy realities, each with one defined behavior (adapters/defender.py's docstring is the
+reference).** Missing column: refused at the header, listing missing and found (a portal-grid
+export with display names fails as "not a DeviceInfo export", not as forty rows of blank
+identity). Blank cell: fatal for identity columns; otherwise the field's default plus a
+per-row `not_collected` entry. Non-Windows OSPlatform: refused, every offender listed --
+Section 2 scopes the fleet to Windows, and dropping a macOS box silently would hide that part
+of the fleet went unscored. Orphaned findings (DeviceId not in the inventory): refused, every
+device listed with its finding count, because a plan that quietly omits findings is the thing
+this project refuses to produce. Repeated device rows (DeviceInfo is per-report): identical
+rows collapse; differing rows collapse to the latest `Timestamp` (Microsoft's own sample query
+is `arg_max(Timestamp, *) by DeviceId`); differing rows with no Timestamp are refused.
+Duplicate findings: same uniqueness key plus same severity and first-seen date collapse
+(evidence-only differences included, first row's evidence kept, count reported); a different
+severity or date is a conflict and refused. Non-CVE advisory ids: refused (enrichment is
+CVE-keyed). UTF-8 BOM: tolerated. `load_findings` reads the file twice -- a yield-nothing
+validation pass that collects every problem (bounded memory: one digest per distinct
+finding, never a row), then the yielding pass -- so the operator sees all problems in one
+message and no NVD/EPSS lookup is spent on a batch about to abort.
+
+**What the sample run shows.** `data/defender-sample/` (synthetic, 6 device rows / 10
+vulnerability rows, CVEs chosen from the committed snapshots so `--offline` works, one repeated
+device row and one exact-duplicate finding row on purpose): `rhino run --format defender
+--data defender-sample --offline` scores 9 findings on 5 devices, reports 5/5 assets missing
+the eight never-exported fields and 1/5 missing criticality (a blank AssetValue), 9/9 findings
+missing detected_date/port/service, and `Contested: 6/9 (66.7%)`. That last number is the
+representation decision showing its teeth, not a bug: every KEV-listed finding on a Defender
+asset is contested, because no window and no control are *known* for any asset, and
+`bucket_for` refuses to call such a finding "on schedule". It is the honest verdict on an
+export that carries no business context, and it is exactly why `rhino constraint add` --
+which persists a per-asset window or control and overlays it on the next agents run -- is the
+fill-in path the summary points to. The two non-KEV findings land where their risk puts them
+(next_window at 50.6, accept below 18).
+
+**Left open, stated rather than hidden.** (1) `--format` is deterministic-path only:
+`Coordinator.__init__` builds its own asset index from `<data>/assets.csv`, so `--agents` and
+`rhino constraint add` with a non-native format are refused up front with a message saying so
+(exit 2) rather than reading a file that isn't there. Lifting it means the Coordinator accepts
+an inventory instead of a path -- an agents change deliberately not made under this feature's
+"no changes to scoring, enrichment, or agents" rule. Until then the constraint fill-in path
+the gap summary recommends is usable only for native data. (2) scoring.py's rationale still
+prints "no patch_window declared -> no scheduling restriction" for a not-collected window,
+and `lookup_asset_context` still hands agents `patch_window: ""` with no marker; the CLI's
+gap note corrects the reading for a human, nothing corrects it for an agent. One line each in
+`scoring._rationale` and `agents/environment.py` would close that; both are outside this
+feature's remit. (3) Role, environment, and data sensitivity have no fill-in path at all --
+constraints cover only window/restriction/control. `DeviceInfo.DeviceRoles` (JSON, undocumented
+vocabulary) and `DeviceManualTags` are the natural Defender-side sources; a CMDB/context sidecar
+keyed by DeviceId is the general one. 347 tests total, up from 298; the fixture-coupling guard
+now scans `adapters/*.py` too.

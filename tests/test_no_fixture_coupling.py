@@ -1,15 +1,18 @@
 """Enforces the CLAUDE.md rule that no component may assume its input is
-synthetic: schema.py, ingest.py, and scoring.py must never reference a
-specific asset_id, cve_id, or finding_id literal. If this test needs to be
-touched to make a change pass, the change is almost certainly encoding
-fixture-specific behavior into logic that must stay general.
+synthetic: schema.py, ingest.py, scoring.py, and every ingest adapter under
+adapters/ must never reference a specific asset_id, cve_id, or finding_id
+literal. If this test needs to be touched to make a change pass, the change
+is almost certainly encoding fixture-specific behavior into logic that must
+stay general.
 """
 
 import re
 from pathlib import Path
 
 SRC_DIR = Path(__file__).resolve().parents[1] / "src" / "rhinosecure"
-GUARDED_FILES = ["schema.py", "ingest.py", "scoring.py"]
+GUARDED_FILES = ["schema.py", "ingest.py", "scoring.py"] + sorted(
+    str(p.relative_to(SRC_DIR)) for p in (SRC_DIR / "adapters").glob("*.py")
+)
 
 CVE_PATTERN = re.compile(r"CVE-\d{4}-\d+")
 ASSET_ID_PATTERN = re.compile(r"\bA\d{2}\b")

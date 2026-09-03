@@ -63,6 +63,38 @@ This has a binding design consequence: **no component may assume its input is sy
 
 Swapping in a real scanner export should require a new ingest adapter and nothing else.
 
+**Built.** The adapter seam exists: `src/rhinosecure/adapters/` — `base.py` (the `IngestAdapter`
+contract every format implements, `AdapterError`, and the representation of fields a source
+format has no concept of, below), `native.py` (the existing `assets.csv`/`findings.csv` loaders,
+wrapped so "native" is one format among several rather than the one everything silently
+assumes), and `defender.py`, the first real-export adapter: Microsoft Defender Vulnerability
+Management, reading `devices.csv` (the `DeviceInfo` advanced-hunting table) and
+`vulnerabilities.csv` (`DeviceTvmSoftwareVulnerabilities`) under their documented column names,
+verified against Microsoft Learn rather than remembered. `rhino run --format {native,defender}`
+selects the adapter; scoring, enrichment, and agents are untouched, and the demo fixture's
+output is byte-identical with or without the seam. A real export carries technical facts and
+almost none of the business context the Impact axis is built on — Defender exports no patch
+window, compensating controls, environment, data sensitivity, role, business function, or owner
+— so the adapter layer had to decide how to represent a field the source never collected
+without changing what a blank already means to `bucket_for`. Decided: the *value* stays the
+schema's absent encoding (or, for the enumerated Impact inputs that have none, a documented
+modal default — `adapters/base.py`'s `NOT_COLLECTED_DEFAULTS`: prod, internal, criticality 3,
+role by OS class), and the *claim* moves into a separate machine-readable field,
+`Asset.not_collected` / `Finding.not_collected`, the set of field names the source had no
+concept of. `rhino run` prints the gaps after the table and `--explain` names them per finding
+with the value in effect. Section 3's open item on blank `patch_window` is resolved that way —
+see there for what remains. Two things the adapter deliberately does: refuse rather than guess
+(a missing column, a non-Windows device, a non-CVE id, a finding whose host isn't in the
+inventory, or two conflicting rows for one finding all fail loudly, every offender listed in one
+message), and dedupe rather than double-count (exact duplicate rows collapse and are counted).
+`--format` is deterministic-path only: `agents/coordinator.py`'s `Coordinator` builds its own
+asset index from `<data>/assets.csv`, so `--agents` with a non-native format is refused up front
+— lifting that is an agents change, not an adapter one. Full mechanics, including the mapping
+table and each messy-reality rule: `adapters/base.py`'s and `adapters/defender.py`'s module
+docstrings. `data/defender-sample/` is a synthetic export (CVEs from the committed snapshots, so
+`--offline` works) that exercises the whole path; it is not the frozen fixture and not covered by
+Section 8 rule 1.
+
 **Guardrail.** This is a design constraint, not a feature list. The following remain out of
 scope for the capstone build: live scanner API connectors, credential handling, PII or
 regulated-data handling, and multi-tenant concerns. Design so they're possible later; do not
@@ -310,11 +342,35 @@ prohibits — see the note there. Fixture is now 12 assets / 15 findings.
 
 ### Open items
 
-- The schema has no way to distinguish "no patch window recorded" (a data gap — nobody has
-  documented one yet) from "patching is genuinely unconstrained" (a deliberate fact about the
-  asset). Both currently produce the same blank `patch_window` value and the same downstream
-  treatment. This matters more once real scanner data replaces the fixture, where blank
-  fields are far more likely to mean "not collected" than "not applicable."
+- **Resolved in representation, still open in two consumers.** The schema previously had no
+  way to distinguish "no patch window recorded" (a data gap — nobody has documented one yet)
+  from "patching is genuinely unconstrained" (a deliberate fact about the asset); both were the
+  same blank, and the first real format (Defender, Section 1's "Built" note) collects neither.
+  `Asset.not_collected` / `Finding.not_collected` (`adapters/base.py`) now carries the
+  distinction: the value stays blank, so this section's rule for a blank window is unchanged and
+  the fixture's output is byte-identical, and the field's name sits in `not_collected` whenever
+  the source never collected it. The native fixture leaves it empty; the Defender adapter fills
+  it for every field Defender lacks. Two consumers still don't read the marker, because neither
+  is adapter code: `scoring._rationale` prints "no patch_window declared → no scheduling
+  restriction" for a not-collected window (the CLI's per-finding gap note corrects the reading
+  alongside it, in `cli.py`, not inside the rationale — Section 8 rule 2 kept scoring untouched),
+  and `agents/environment.py`'s `lookup_asset_context` hands an agent `patch_window: ""` with
+  no marker. One line each would close both; both are outside the adapter's remit and
+  deliberately not made yet. Likewise `--format` is not accepted by `--agents` or `rhino
+  constraint add` until `Coordinator` takes an inventory instead of reading `assets.csv` itself.
+- **The not-collected Impact enums have no fill-in path.** `rhino constraint add` can supply a
+  patch window, restriction, or compensating control per asset — the operational fields — but
+  nothing can supply `role`, `environment`, or `data_sensitivity` for an asset whose source
+  lacked them, so a Defender-sourced asset scores on `NOT_COLLECTED_DEFAULTS` indefinitely.
+  Defender-side candidates: `DeviceInfo.DeviceRoles` (JSON, undocumented vocabulary) and
+  `DeviceManualTags`; the general answer is a CMDB/context sidecar keyed by device id. Related
+  consequence, visible on `data/defender-sample/`: every KEV finding on a Defender asset lands
+  `contested` (6/9 there), because no window and no control are *known* for any asset — the
+  honest verdict under this section's own rule, and exactly why the fill-in path matters.
+- **A `server` role.** An unclassified server currently defaults to `file`, the most generic
+  server role in the vocabulary (blast radius 0.55, mid-table), and is marked not collected. A
+  dedicated `server` value would be the honest encoding, but it needs a weight in
+  `scoring.ROLE_BLAST_RADIUS` — a scoring change, so not bundled into the adapter.
 
 ---
 
@@ -683,6 +739,9 @@ rhinosecure/
     demo/                    # 24-finding fixture — FROZEN
       assets.csv
       findings.csv
+    defender-sample/         # synthetic Defender export for --format defender (not a fixture)
+      devices.csv            #   DeviceInfo shape
+      vulnerabilities.csv    #   DeviceTvmSoftwareVulnerabilities shape
     full/                    # generated, seed 42
       assets.csv
       findings.csv
@@ -694,6 +753,8 @@ rhinosecure/
   src/rhinosecure/
     schema.py                # dataclasses + CSV validation
     ingest.py
+    adapters/                # ingest adapters -- the format seam (Section 1)
+      base.py  native.py  defender.py
     scoring.py               # deterministic, no LLM
     tot.py
     memory.py                # sqlite
