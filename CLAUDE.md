@@ -98,6 +98,38 @@ accept it. Full mechanics, including the mapping table and each messy-reality ru
 synthetic export (CVEs from the committed snapshots, so `--offline` works) that exercises the
 whole path; it is not the frozen fixture and not covered by Section 8 rule 1.
 
+**Bug fixed: a `--format`/`--data` mismatch used to crash instead of erroring.** Every one of the
+three CLI paths (`run`, `run --agents`, `constraint add`) shared `ingest.load_batch` without that
+function ever checking that `--data`'s resolved directory actually had the files the chosen
+`--format` expects — `rhino constraint add --format defender` with `--data` left at its default
+(`demo`, the native fixture) raised a raw, unhandled `FileNotFoundError` from deep inside the
+adapter's own `csv.DictReader` construction, naming neither the directory nor the reason.
+`ingest._require_adapter_files`, called first thing inside `load_batch`, now checks before either
+file is opened and raises `IngestError` — already caught by name in all three CLI paths — naming
+the resolved path, what was expected versus what's missing, what the directory actually contains,
+and a stated likely cause. One check in the one function every path already shares is what makes
+`--data`/`--format` handling identical across `run` and `constraint add`, rather than two
+parallel implementations to keep in sync. An adversarial review of the first version of this fix
+(three independent reviewers, each finding adversarially re-verified by two more) found and this
+version fixes four real defects in `_require_adapter_files` itself: `Path.iterdir()`, unlike
+`.is_file()`/`.is_dir()`/`.exists()`, does not swallow a genuine `OSError`, so a directory the
+process could stat but not list (a locked-down deployment share) crashed the precheck with the
+exact unhandled exception it exists to prevent — now wrapped; a same-named directory shadowing an
+expected filename was silently excluded from the "contains" listing while still being called
+missing, a visible contradiction — directories are now listed too, marked `(not a file)`; the
+missing-file list wasn't deduplicated, which would garble the message for a hypothetical future
+adapter reusing one filename for both roles — now deduplicated; and the "likely cause" was stated
+as a `--format`/`--data` mismatch even when only one of the two expected files was missing, which
+is exactly the case where an incomplete or corrupted export — not the wrong format entirely — is
+the likelier story, and the old wording would have pointed the user at the wrong fix. Left
+untouched, and flagged rather than silently fixed: `agents/coordinator.py`'s `Coordinator.__init__`
+has its own, separate native-only fallback file load (`ingest.load_asset_index`, used only when a
+caller omits `assets=`) that still raises a bare `FileNotFoundError` — confirmed unreachable from
+any of the three CLI commands today (they always pass `assets=` from `load_batch`'s own result),
+and pinned as intentional by an existing test (`test_without_an_inventory_and_without_assets_csv_it_fails_loudly`,
+`tests/test_coordinator.py`). Same defect class, different code path and a different, separate
+decision about whether that constructor's own contract should change.
+
 **The fill-in loop, demonstrated end to end** (real LLM calls, `data/defender-sample`, scratch DB).
 `CVE-2020-1472` on `dc01.corp.example.com` scores 35.5 and lands `contested` — KEV-listed, and
 neither a control nor a window is *known*, which is the honest verdict on an export that collects

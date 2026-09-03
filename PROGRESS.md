@@ -1182,3 +1182,64 @@ string being edited for the not-collected wording, so it was corrected rather th
 the full `rhino run --data demo --seed 42 --offline --explain` against the prior commit through a
 temporary worktree: 18 changed lines, all of them that one phrase on the three contested findings,
 with every score and bucket identical. 374 tests, up from 348.
+
+**Fixed: `--format`/`--data` mismatch crashed instead of erroring.** Reported: `rhino constraint
+add --format defender` with `--data` left at its default (`demo`, the native fixture) raised a raw
+`FileNotFoundError` traceback -- `devices.csv` doesn't exist under `data/demo`. Same crash on
+`rhino run --format defender` with no `--data`. Root cause: all three CLI paths (`run`,
+`run --agents`, `constraint add`) share `ingest.load_batch`, which never checked that `--data`'s
+resolved directory had the files the chosen `--format` expects before an adapter tried to open
+them -- `native.py`'s `_rows` and `defender.py`'s `_open_csv` both call `path.open()` unguarded.
+`ingest._require_adapter_files`, called first inside `load_batch`, now checks with `Path.is_file()`
+before either file is opened and raises `IngestError` -- already caught by name in every "ingest
+error: ..." / exit 1 handler in `cli.py` for all three commands, so no `cli.py` change was needed.
+One check in the one function all three paths already call is what makes them behave identically:
+the second half of the ask ("make --data and --format consistent between run and constraint add")
+turned out to be the *same* fix as the first half ("catch missing input files"), not a separate
+change.
+
+**An adversarial review of the first version found four real bugs in the fix itself.** Given the
+diff was small and already manually verified against every scenario tested by hand, a 3-reviewer
+workflow (completeness, edge-cases, test-and-requirements lenses) was run before committing, each
+finding adversarially re-verified by two more independent agents. All five findings the reviewers
+raised survived unanimous re-verification. Four were fixed:
+
+1. `_require_adapter_files`'s own "list what's present" branch called `Path.iterdir()`, which --
+   unlike `.is_file()`/`.is_dir()`/`.exists()` -- does not swallow a genuine `OSError`. A directory
+   the process can stat but not list (a realistic locked-down deployment share) crashed the
+   precheck with an unhandled `PermissionError` -- reintroducing, in the fix's own new code, the
+   exact bug class it exists to close. Now every filesystem check in the function is wrapped in one
+   `try/except OSError`, converted to a clean `IngestError` naming what couldn't be checked and why.
+2. The "contains:" listing filtered to `is_file()` only, so a same-named directory (e.g. a stray
+   `mkdir devices.csv`) was silently excluded while `_require_adapter_files` still called that name
+   "missing" -- a visible contradiction a user could see was false just by running `ls`/`dir`
+   themselves. Directories are now listed too, suffixed `(not a file)`.
+3. The missing-file list wasn't deduplicated: a hypothetical future adapter reusing one filename
+   for both `assets_filename` and `findings_filename` would have produced a message repeating that
+   name on both sides ("needs data.csv, data.csv, but data.csv, data.csv are missing"). Not
+   exploitable by either currently-registered adapter, but cheap to close now via
+   `dict.fromkeys` -- fixed on both the "needs" and "missing" clauses, not just one.
+4. The "likely cause" was unconditionally "this is almost always a --format/--data mismatch," even
+   when only ONE of the two expected files was missing -- exactly the case where a format swap is
+   the *least* likely explanation (the correct-format file is right there) and an incomplete or
+   corrupted export is the more likely story. The test added for this exact scenario in the first
+   version of the fix even said so in its own docstring ("a genuinely broken export, not
+   necessarily a format swap") without the production message matching it. The explanation now
+   branches: format/data mismatch only when every expected file is absent; "incomplete or
+   corrupted export" language when some are present.
+
+One finding was surfaced but deliberately not fixed here: `agents/coordinator.py`'s
+`Coordinator.__init__` has its own separate native-only fallback file load
+(`ingest.load_asset_index`, used only when a caller omits `assets=`) that still raises a bare
+`FileNotFoundError` with no path or cause named -- the same defect class, a different code path.
+Confirmed unreachable from any of the three CLI commands today (`run_agents`/`submit_constraint`
+always pass `assets=` from `load_batch`'s own result before constructing `Coordinator`), and
+pinned as intentional behavior by an existing test
+(`test_without_an_inventory_and_without_assets_csv_it_fails_loudly`,
+`tests/test_coordinator.py:1004`). Fixing it means deliberately reversing a pinned test's contract
+in a code path the reported bug never touched -- a separate decision, flagged rather than made
+unilaterally.
+
+All four fixes verified by hand (a monkeypatched `Path.iterdir` raising `PermissionError` for the
+exact directory under test; a real same-named directory; a stub adapter reusing one filename; a
+real partial-file directory) before writing the covering tests. 389 tests, up from 374.

@@ -147,3 +147,65 @@ def test_format_flag_lists_every_registered_adapter(capsys):
         main(["run", "--help"])
     out = capsys.readouterr().out
     assert "--format {defender,native}" in out
+
+
+# --- reported bug: --format defender with --data left at its default ------
+#
+# `rhino constraint add --format defender` (no --data, so it defaults to
+# "demo", the native fixture) crashed with an unhandled FileNotFoundError
+# traceback -- devices.csv doesn't exist under data/demo. Same crash on
+# `rhino run --format defender` with no --data. ingest.load_batch now
+# raises a clear IngestError before either file is opened; cli.py already
+# maps IngestError to "ingest error: ..." / exit 1 on every command, so
+# no cli.py change was needed to fix this once the check moved down there.
+
+
+def test_constraint_add_format_defender_without_data_fails_cleanly_not_a_traceback(capsys):
+    """The exact bug report: --format defender, --data omitted (defaults
+    to demo, the native fixture) -- must not raise past main()."""
+    exit_code = main(["constraint", "add", "some constraint", "--format", "defender", "--offline"])
+    err = capsys.readouterr().err
+
+    assert exit_code == 1
+    assert "ingest error" in err
+    assert "devices.csv" in err and "vulnerabilities.csv" in err  # what defender needed
+    assert "assets.csv" in err and "findings.csv" in err  # what demo actually has
+    assert "--format/--data mismatch" in err
+    assert "Traceback" not in err
+    assert "FileNotFoundError" not in err
+
+
+def test_run_format_defender_without_data_fails_cleanly_not_a_traceback(capsys):
+    exit_code = main(["run", "--format", "defender", "--offline"])
+    err = capsys.readouterr().err
+
+    assert exit_code == 1
+    assert "ingest error" in err
+    assert "devices.csv" in err and "assets.csv" in err
+    assert "Traceback" not in err
+
+
+def test_run_agents_format_defender_without_data_fails_cleanly(capsys, monkeypatch):
+    """Fails during ingest, before Coordinator is ever constructed --
+    confirm run_agents is never reached to be extra sure this isn't
+    accidentally caught somewhere deeper and re-raised differently."""
+    monkeypatch.setattr(
+        "rhinosecure.agents.coordinator.Coordinator",
+        lambda *a, **k: pytest.fail("Coordinator must not be constructed -- ingest should fail first"),
+    )
+    exit_code = main(["run", "--agents", "--format", "defender", "--offline"])
+    err = capsys.readouterr().err
+
+    assert exit_code == 1
+    assert "ingest error" in err
+
+
+def test_run_format_native_default_against_defender_sample_fails_cleanly(capsys):
+    """The reverse mismatch: --data points at a defender export but
+    --format is left at its native default."""
+    exit_code = main(["run", "--data", "defender-sample", "--offline"])
+    err = capsys.readouterr().err
+
+    assert exit_code == 1
+    assert "devices.csv" in err and "assets.csv" in err
+    assert "Traceback" not in err

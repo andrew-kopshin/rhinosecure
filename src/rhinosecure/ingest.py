@@ -186,11 +186,103 @@ def join_findings(
     yield from join(load_asset_index(assets_path), load_findings(findings_path), source=str(findings_path))
 
 
+def _describe_directory_contents(data_dir: Path) -> str:
+    """Human-readable summary of what's actually in `data_dir`, for
+    `_require_adapter_files`'s message below.
+
+    Directories are listed too, marked "(not a file)", rather than
+    silently filtered out -- otherwise a stray same-named directory
+    (someone ran `mkdir devices.csv` by mistake, say) would be called
+    "missing" by `_require_adapter_files` while this listing claimed the
+    directory had nothing in it: a contradiction visible to anyone who
+    runs `ls`/`dir` on the same path themselves.
+    """
+    if not data_dir.exists():
+        return "(directory does not exist)"
+    if not data_dir.is_dir():
+        return "(not a directory)"
+    entries = sorted(data_dir.iterdir(), key=lambda p: p.name)
+    if not entries:
+        return "(no files)"
+    return ", ".join(p.name if p.is_file() else f"{p.name}/ (not a file)" for p in entries)
+
+
+def _require_adapter_files(data_dir: Path, adapter: IngestAdapter) -> None:
+    """Refuse up front, before either file is opened, if `data_dir` lacks
+    the files `adapter` expects.
+
+    The overwhelmingly common cause is a `--format`/`--data` mismatch --
+    e.g. `--format defender` against a directory that only has the
+    native `assets.csv`/`findings.csv` (or the reverse, `--data` left at
+    its default and `--format` changed). Without this check, that
+    mismatch surfaces as a bare `FileNotFoundError` raised from deep
+    inside an adapter's own `csv.DictReader` construction -- naming
+    neither the directory nor the reason, and different in shape for
+    every adapter that opens its file differently (`native.py`'s vs.
+    `defender.py`'s `_open_csv`). One check here, in the function every
+    `load_batch` caller (`run`, `run --agents`, `constraint add`) already
+    goes through, means all three report the mismatch identically, and
+    `IngestError` is already caught by name in all three (`cli.py`) --
+    no new except clause needed anywhere.
+
+    Two things an adversarial review caught in the first pass of this
+    function, both fixed here: `Path.iterdir()` -- unlike
+    `.is_file()`/`.is_dir()`/`.exists()` -- does NOT swallow a genuine
+    OS-level failure, so a directory the process can stat but not list
+    (a realistic locked-down deployment share) would otherwise crash
+    this very function with the unhandled exception it exists to
+    prevent; every filesystem check below is wrapped in one
+    `except OSError`. And the "likely cause" is only stated as a
+    format/data mismatch when EVERY expected file is missing -- when
+    only some are, an incomplete or corrupted export is the more likely
+    story, and naming a mismatch there would send the user toward the
+    wrong fix.
+    """
+    # dict.fromkeys: order-preserving de-dup, in case a future adapter
+    # ever reuses one filename for both roles -- otherwise both the
+    # "needs" and "missing" clauses below would repeat that name.
+    expected = list(dict.fromkeys((adapter.assets_filename, adapter.findings_filename)))
+    try:
+        missing = [name for name in expected if not (data_dir / name).is_file()]
+        if not missing:
+            return
+        contents = _describe_directory_contents(data_dir)
+    except OSError as exc:
+        raise IngestError(
+            f"{data_dir}: could not check whether the files --format {adapter.format!r} needs "
+            f"({', '.join(expected)}) are present -- {exc}."
+        ) from exc
+
+    if len(missing) == len(expected):
+        explanation = (
+            "This is almost always a --format/--data mismatch -- pass --format matching what "
+            "--data actually contains, or point --data at a directory that has the files this "
+            "format expects."
+        )
+    else:
+        explanation = (
+            "Only part of this format's file set is missing, which usually means an incomplete "
+            "or corrupted export rather than a --format/--data mismatch -- restore or re-export "
+            "the missing file(s), or double check --data points at the right directory."
+        )
+
+    raise IngestError(
+        f"{data_dir}: --format {adapter.format!r} needs {', '.join(expected)}, but "
+        f"{', '.join(missing)} {'is' if len(missing) == 1 else 'are'} missing. "
+        f"{data_dir} contains: {contents}. {explanation}"
+    )
+
+
 def load_batch(data_dir: Path, adapter: IngestAdapter) -> tuple[dict[str, Asset], Iterator[EnrichedFinding]]:
     """The format-agnostic entry point cli.py uses: the adapter's inventory,
     indexed, and its findings joined to it, lazily. The inventory is
     materialized here (it always was -- load_asset_index) and returned so
-    the caller can report per-asset data gaps without a second load."""
+    the caller can report per-asset data gaps without a second load.
+
+    Raises `IngestError` (via `_require_adapter_files`, above) before
+    either file is opened if `data_dir` doesn't have what `adapter`
+    expects -- see that function's docstring."""
+    _require_adapter_files(data_dir, adapter)
     assets = {a.asset_id: a for a in adapter.load_assets(data_dir / adapter.assets_filename)}
     findings_path = data_dir / adapter.findings_filename
     findings = adapter.load_findings(findings_path, assets)
