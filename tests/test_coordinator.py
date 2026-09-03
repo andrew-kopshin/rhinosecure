@@ -117,6 +117,7 @@ class _QueuedFakeCrew:
                         "risk_score": risk_score,
                         "bucket": tool_result["bucket"],
                         "scoring_rationale": tool_result["rationale"],
+                        "verdict_summary": "fake verdict summary.",
                         "narrative": "fake narrative",
                         "sources": ["fake"],
                     }

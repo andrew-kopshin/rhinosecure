@@ -186,6 +186,9 @@ def test_build_risk_task_embeds_finding_research_and_environment_context():
     assert "Confirmed KEV-listed, near-maximal EPSS" in task.description
     assert "Exchange 2016 CU19 is consistent with Windows Server 2019." in task.description
     assert "score_finding" in task.description
+    assert "verdict_summary" in task.description
+    assert "exactly two sentences" in task.description
+    assert "verdict_summary" in task.expected_output
 
 
 # --- verify_scoring_matches_tool ---------------------------------------------
@@ -202,6 +205,7 @@ def _matching_recommendation_and_log():
         risk_score=tool_result["risk_score"],
         bucket=tool_result["bucket"],
         scoring_rationale=tool_result["rationale"],
+        verdict_summary="Patch now: confirmed KEV on an exposed Exchange server.",
         narrative="Patch now: confirmed KEV, exposed Exchange server.",
         sources=["Vulnerability Research", "Environment Analysis", "score_finding"],
     )

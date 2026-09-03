@@ -74,10 +74,14 @@ class RiskRecommendation(BaseModel):
     """This agent's structured output for one finding. `risk_score`,
     `bucket`, and `scoring_rationale` must be copied verbatim from the
     score_finding tool's result -- `verify_scoring_matches_tool` checks
-    that after the fact. `narrative` is the only field this agent
-    actually authors: a synthesis of Research's threat evidence,
+    that after the fact. `verdict_summary` and `narrative` are the only
+    fields this agent actually authors -- a two-sentence skimmable
+    verdict and a full synthesis of Research's threat evidence,
     Environment's asset-context evidence, and the deterministic
-    rationale, in plain language, citing sources."""
+    rationale, in plain language, citing sources. `verdict_summary`
+    exists for a plan with dozens of findings: reading the header plus
+    two sentences should be enough to know whether a given finding needs
+    the full explanation at all."""
 
     finding_id: str
     cve_id: str
@@ -86,6 +90,7 @@ class RiskRecommendation(BaseModel):
     risk_score: float
     bucket: str
     scoring_rationale: list[str]
+    verdict_summary: str
     narrative: str
     sources: list[str]
 
@@ -208,11 +213,15 @@ def build_risk_task(
             f"{environment.applicability_summary}\n\n"
             f"Call score_finding with finding_id={finding.finding_id!r} exactly once "
             "and copy its risk_score, bucket, and rationale into your output "
-            "verbatim -- do not adjust, round, or reinterpret them. Then write a "
-            "short narrative in plain language explaining the verdict, drawing on "
-            "the Research and Environment evidence above plus the tool's "
-            "rationale. Do not introduce any fact not present in the evidence "
-            "given or returned by the tool."
+            "verbatim -- do not adjust, round, or reinterpret them. Then write "
+            "verdict_summary: exactly two sentences stating the bucket and the "
+            "single biggest reason for it, written so it stands alone -- a "
+            "reader skimming a plan with dozens of findings should get the gist "
+            "from this alone, before reading anything else. Then write "
+            "narrative: the full explanation in plain language, drawing on the "
+            "Research and Environment evidence above plus the tool's rationale. "
+            "Do not introduce any fact not present in the evidence given or "
+            "returned by the tool, in either field."
         ),
         expected_output=(
             "Return ONLY a single JSON object, with these keys directly at "
@@ -221,9 +230,11 @@ def build_risk_task(
             "markdown code fences or prose before or after it: finding_id, "
             "cve_id, asset_id, hostname, risk_score and bucket (copied "
             "exactly from score_finding), scoring_rationale (its rationale "
-            "list, copied verbatim as an array of strings), narrative (a "
-            "prose synthesis citing Research, Environment, and the scoring "
-            "rationale), and sources (a list of strings)."
+            "list, copied verbatim as an array of strings), verdict_summary "
+            "(exactly two sentences -- the verdict and its main driver, "
+            "skimmable on its own), narrative (the full prose synthesis "
+            "citing Research, Environment, and the scoring rationale), and "
+            "sources (a list of strings)."
         ),
         agent=agent,
     )

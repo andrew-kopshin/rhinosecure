@@ -46,6 +46,18 @@ def test_offline_flag_fails_loudly_on_a_genuinely_new_cve(tmp_path: Path):
         run(tmp_path, seed=42, offline=True)
 
 
+def test_deterministic_explain_wraps_long_rationale_bullets_on_the_real_fixture(capsys):
+    """F14 (CVE-2023-23397, contested) has a scoring_rationale bullet that
+    runs to 319 characters unwrapped -- confirms the fix against real
+    fixture data, not just a synthetic long string."""
+    assert main(["run", "--data", "demo", "--seed", "42", "--offline", "--explain"]) == 0
+    out = capsys.readouterr().out
+    assert "F14" in out
+    assert "bucket=contested" in out  # content survived the wrap, just reflowed
+    for line in out.splitlines():
+        assert len(line) <= 100, f"line exceeds 100 chars: {line!r}"
+
+
 # --- --agents ------------------------------------------------------------
 #
 # Never dispatch a real Coordinator/Crew here -- that makes real LLM calls
@@ -124,6 +136,7 @@ def _fake_recommendation(finding_id="F01", risk_score=42.0, bucket="next_window"
         risk_score=risk_score,
         bucket=bucket,
         scoring_rationale=["fake rationale line"],
+        verdict_summary="fake verdict summary.",
         narrative="fake narrative",
         sources=["fake"],
     )
@@ -158,6 +171,56 @@ def test_main_with_agents_flag_and_explain_prints_narrative(monkeypatch, capsys)
     out = capsys.readouterr().out
     assert "fake narrative" in out
     assert "fake rationale line" in out
+    assert "fake verdict summary." in out
+    # verdict_summary is skimmable up top: before the rationale bullets,
+    # which come before the full narrative.
+    assert out.index("fake verdict summary.") < out.index("- fake rationale line")
+    assert out.index("- fake rationale line") < out.index("fake narrative")
+
+
+def test_main_with_agents_flag_and_explain_wraps_long_narrative_and_bullet_text(monkeypatch, capsys):
+    """verdict_summary/narrative/scoring_rationale bullets all currently
+    ran off-screen unwrapped -- confirm every printed line stays within
+    NARRATIVE_WRAP_WIDTH, on all three."""
+    monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
+    long_text = " ".join(f"word{i}" for i in range(60))  # far longer than 100 chars unwrapped
+    _FakeCoordinator.result = [
+        _fake_recommendation().model_copy(
+            update={
+                "verdict_summary": long_text,
+                "narrative": long_text,
+                "scoring_rationale": ["fake rationale line", long_text],
+            }
+        )
+    ]
+
+    assert main(["run", "--data", "demo", "--agents", "--explain"]) == 0
+    out = capsys.readouterr().out
+    for line in out.splitlines():
+        assert len(line) <= 100, f"line exceeds 100 chars: {line!r}"
+
+
+def test_wrap_indents_every_line_and_respects_the_width():
+    from rhinosecure.cli import _wrap
+
+    text = " ".join(f"word{i}" for i in range(60))
+    wrapped = _wrap(text)
+    lines = wrapped.splitlines()
+    assert len(lines) > 1  # actually wrapped, not left as one long line
+    assert all(line.startswith("  ") for line in lines)
+    assert all(len(line) <= 100 for line in lines)
+
+
+def test_wrap_bullet_aligns_continuation_under_text_not_the_dash():
+    from rhinosecure.cli import _wrap_bullet
+
+    text = " ".join(f"word{i}" for i in range(60))
+    wrapped = _wrap_bullet(text)
+    lines = wrapped.splitlines()
+    assert len(lines) > 1  # actually wrapped
+    assert lines[0].startswith("  - ")
+    assert all(line.startswith("    ") for line in lines[1:])  # aligned under the text, not "-"
+    assert all(len(line) <= 100 for line in lines)
 
 
 def test_main_with_agents_flag_prints_recorded_failures(monkeypatch, capsys):

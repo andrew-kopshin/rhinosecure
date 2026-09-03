@@ -25,6 +25,13 @@ codec can't encode character..." lines on every agent run even though
 nothing was actually failing -- reconfiguring stdout/stderr to UTF-8
 fixes that regardless of --quiet, and regardless of the console's own
 codepage.
+
+`--explain` output -- verdict_summary/narrative and every
+rationale/scoring_rationale bullet, on both the deterministic and agents
+paths -- is wrapped to NARRATIVE_WRAP_WIDTH (`_wrap`/`_wrap_bullet`) so
+none of it runs off-screen; a scoring_rationale bullet listing several
+ATT&CK candidates, or a contested bucket's explanation, can otherwise run
+well past 300 characters on one line.
 """
 
 from __future__ import annotations
@@ -32,6 +39,7 @@ from __future__ import annotations
 import argparse
 import random
 import sys
+import textwrap
 from pathlib import Path
 
 from rhinosecure.enrich.attack import TechniqueIndex, load_index as load_attack_index
@@ -147,6 +155,32 @@ def _print_rows(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> None:
         print("  ".join(c.ljust(w) for c, w in zip(row, widths)))
 
 
+NARRATIVE_WRAP_WIDTH = 100
+
+
+def _wrap(text: str, indent: str = "  ", *, continuation_indent: str | None = None) -> str:
+    """Wrap free-form text to NARRATIVE_WRAP_WIDTH so it doesn't run
+    off-screen. `continuation_indent` (default: same as `indent`) lets a
+    bullet's wrapped lines align under its text instead of repeating the
+    "- " marker -- see `_wrap_bullet`."""
+    return textwrap.fill(
+        text,
+        width=NARRATIVE_WRAP_WIDTH,
+        initial_indent=indent,
+        subsequent_indent=continuation_indent if continuation_indent is not None else indent,
+    )
+
+
+def _wrap_bullet(text: str) -> str:
+    """A rationale bullet (deterministic ScoredFinding.rationale or its
+    verbatim copy, RiskRecommendation.scoring_rationale) can run well past
+    100 characters -- e.g. a long ATT&CK candidate list, or a contested-
+    bucket's explanation. Same NARRATIVE_WRAP_WIDTH treatment as
+    verdict_summary/narrative, just with the continuation lines aligned
+    under the bullet's text rather than its "-" marker."""
+    return _wrap(text, indent="  - ", continuation_indent="    ")
+
+
 def _print_table(scored: list[ScoredFinding]) -> None:
     headers = ("finding_id", "cve_id", "hostname", "bucket", "risk_score")
     rows = [
@@ -249,9 +283,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.explain:
                 for r in recommendations:
                     print(f"\n{r.finding_id} ({r.cve_id} on {r.hostname}) -> {r.bucket}")
+                    print(f"\n{_wrap(r.verdict_summary)}")
                     for line in r.scoring_rationale:
-                        print(f"  - {line}")
-                    print(f"\n  {r.narrative}")
+                        print(_wrap_bullet(line))
+                    print(f"\n{_wrap(r.narrative)}")
 
             return 0
 
@@ -270,7 +305,7 @@ def main(argv: list[str] | None = None) -> int:
             for s in scored:
                 print(f"\n{s.finding_id} ({s.cve_id} on {s.hostname}) -> {s.bucket.value}")
                 for line in s.rationale:
-                    print(f"  - {line}")
+                    print(_wrap_bullet(line))
 
         return 0
 
