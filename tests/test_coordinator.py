@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from rhinosecure import tot as tot_module
 from rhinosecure.agents import coordinator as coordinator_module
 from rhinosecure.agents.coordinator import Coordinator, CoordinatorError
 from rhinosecure.ingest import join_findings
@@ -32,12 +33,12 @@ def findings(data_dir: Path):
     return list(join_findings(data_dir / "findings.csv", data_dir / "assets.csv"))
 
 
-def _research_json(fid: str, cve_id: str, *, wrapped: bool = False) -> str:
+def _research_json(fid: str, cve_id: str, *, wrapped: bool = False, is_kev: bool = False) -> str:
     payload = {
         "finding_id": fid,
         "cve_id": cve_id,
         "scanner_severity": "high",
-        "is_kev": False,
+        "is_kev": is_kev,
         "exploitation_summary": "fake research summary",
         "sources": ["fake"],
     }
@@ -346,3 +347,159 @@ def test_ranked_before_any_run_raises(data_dir):
     coordinator = Coordinator(data_dir)
     with pytest.raises(CoordinatorError):
         coordinator.ranked()
+
+
+# --- ToT gate (_dispatch_tot) -------------------------------------------------
+#
+# The beam-search mechanics (branches, critic scoring, termination, near-tie
+# surfacing) are covered in test_tot.py; these only check that Coordinator
+# routes a contested finding into it, records a failure without blocking the
+# run, and leaves everything else untouched.
+
+
+class _QueuedFakeTotCrew:
+    """Stands in for tot.py's own Crew reference -- separate from
+    coordinator_module.Crew above, since run_tree_of_thought (tot.py)
+    never goes through Coordinator's Crew binding. Same pop-one-per-task
+    contract."""
+
+    queue: list = []
+    instantiations: int = 0
+
+    def __init__(self, agents, tasks, process=None, verbose=False):
+        self.tasks = tasks
+        type(self).instantiations += 1
+
+    def kickoff(self):
+        for task in self.tasks:
+            task.output = SimpleNamespace(raw=_QueuedFakeTotCrew.queue.pop(0))
+        return None
+
+
+@pytest.fixture(autouse=True)
+def fake_tot_crew(monkeypatch):
+    _QueuedFakeTotCrew.queue = []
+    _QueuedFakeTotCrew.instantiations = 0
+    monkeypatch.setattr(tot_module, "Crew", _QueuedFakeTotCrew)
+    return _QueuedFakeTotCrew
+
+
+def _tot_proposal(strategy: str, text: str) -> str:
+    return json.dumps({"strategy": strategy, "proposal": text})
+
+
+def _tot_critique(strategy: str, **scores) -> str:
+    return json.dumps({"strategy": strategy, "justification": "fake", **scores})
+
+
+def _tot_clear_winner_queue() -> list:
+    """A minimal, complete ToT response sequence -- 3 proposals then 3
+    critiques, emergency_change scored high enough to terminate at depth
+    1. Only exists to give _dispatch_tot something real to parse; the
+    beam-search behavior itself is test_tot.py's job."""
+    return [
+        _tot_proposal("emergency_change", "Patch now."),
+        _tot_proposal("establish_window", "Schedule a window."),
+        _tot_proposal("build_control", "Add a control."),
+        _tot_critique("emergency_change", risk_reduction=9, operational_cost=3,
+                      constraint_compliance=8, evidence_strength=8, contradicting_evidence=1),
+        _tot_critique("establish_window", risk_reduction=3, operational_cost=5,
+                      constraint_compliance=4, evidence_strength=3, contradicting_evidence=6),
+        _tot_critique("build_control", risk_reduction=2, operational_cost=6,
+                      constraint_compliance=3, evidence_strength=2, contradicting_evidence=7),
+    ]
+
+
+def test_a_contested_finding_is_routed_into_tot_and_recorded(data_dir, findings):
+    """F02 sits on A02, which has neither a compensating control nor a
+    patch window (ASSETS_CSV above) -- is_kev=True is enough on its own
+    to make bucket_for return contested for it (scoring.py). F01 (A01,
+    which DOES have a patch window) stays out of contested and must never
+    reach ToT at all."""
+    _QueuedFakeCrew.queue = [
+        _research_json("F01", "CVE-2021-26855"),
+        _research_json("F02", "CVE-2018-8410", is_kev=True),
+        _environment_json("F01", "CVE-2021-26855", "A01", "EXCH01"),
+        _environment_json("F02", "CVE-2018-8410", "A02", "WKS01"),
+        "F01",
+        "F02",
+    ]
+    _QueuedFakeTotCrew.queue = _tot_clear_winner_queue()
+
+    coordinator = Coordinator(data_dir)
+    coordinator.run(findings)
+
+    assert coordinator.state.risk_by_id["F02"].bucket == "contested"
+    assert "F02" in coordinator.state.tot_by_id
+    result = coordinator.state.tot_by_id["F02"]
+    assert result.finding_id == "F02"
+    assert result.winner.strategy.value == "emergency_change"
+    assert "F01" not in coordinator.state.tot_by_id
+    assert coordinator.state.tot_failures == {}
+
+
+def test_a_run_with_no_contested_findings_never_touches_tot_crew(data_dir, findings):
+    _queue_happy_path(["F01", "F02"])
+
+    coordinator = Coordinator(data_dir)
+    coordinator.run(findings)
+
+    assert coordinator.state.tot_by_id == {}
+    assert _QueuedFakeTotCrew.instantiations == 0
+
+
+def test_tot_failure_is_recorded_and_does_not_remove_the_finding_from_risk_by_id(data_dir, findings):
+    """A finding that reaches the gate but whose strategist responses
+    never parse must be recorded in tot_failures, never raised -- and,
+    unlike a Research/Environment/Risk failure, must NOT be removed from
+    risk_by_id: Risk already succeeded for it (that's why it reached this
+    gate at all) -- see agents/coordinator.py's _dispatch_tot docstring."""
+    _QueuedFakeCrew.queue = [
+        _research_json("F01", "CVE-2021-26855"),
+        _research_json("F02", "CVE-2018-8410", is_kev=True),
+        _environment_json("F01", "CVE-2021-26855", "A01", "EXCH01"),
+        _environment_json("F02", "CVE-2018-8410", "A02", "WKS01"),
+        "F01",
+        "F02",
+    ]
+    _QueuedFakeTotCrew.queue = [UNPARSEABLE, UNPARSEABLE, UNPARSEABLE]  # F02's 3 initial proposals
+
+    coordinator = Coordinator(data_dir, max_parse_attempts=1)
+    ranked = coordinator.run(findings)
+
+    assert "F02" in coordinator.state.tot_failures
+    assert "gave up after 1 attempt(s)" in coordinator.state.tot_failures["F02"]
+    assert "F02" not in coordinator.state.tot_by_id
+    assert coordinator.state.risk_by_id["F02"].bucket == "contested"  # untouched
+    assert {r.finding_id for r in ranked} == {"F01", "F02"}  # both still in the plan
+
+
+def test_replan_also_dispatches_tot_for_a_newly_contested_finding(data_dir, findings, monkeypatch):
+    _queue_happy_path(["F01", "F02"])
+    coordinator = Coordinator(data_dir)
+    coordinator.run(findings)
+    assert coordinator.state.tot_by_id == {}  # nothing contested on the first run
+
+    research_called = {"count": 0}
+    monkeypatch.setattr(
+        coordinator,
+        "_dispatch_research",
+        lambda *a, **k: research_called.__setitem__("count", research_called["count"] + 1),
+    )
+    # Simulates F02's research turning up is_kev=True on re-enrichment --
+    # constraint-driven re-enrichment itself isn't built yet (Slice 4's
+    # remaining piece); this only confirms replan's _dispatch_tot wiring.
+    coordinator.state.research_by_id["F02"] = coordinator.state.research_by_id["F02"].model_copy(
+        update={"is_kev": True}
+    )
+
+    _QueuedFakeCrew.queue = [
+        _environment_json("F02", "CVE-2018-8410", "A02", "WKS01"),
+        "F02",
+    ]
+    _QueuedFakeTotCrew.queue = _tot_clear_winner_queue()
+
+    coordinator.replan(["F02"])
+
+    assert research_called["count"] == 0  # confirms replan, not a fresh run, drove this
+    assert "F02" in coordinator.state.tot_by_id

@@ -32,6 +32,16 @@ paths -- is wrapped to NARRATIVE_WRAP_WIDTH (`_wrap`/`_wrap_bullet`) so
 none of it runs off-screen; a scoring_rationale bullet listing several
 ATT&CK candidates, or a contested bucket's explanation, can otherwise run
 well past 300 characters on one line.
+
+Both paths print a "Contested: n/total" line after the table --
+scoring.contested_rate, CLAUDE.md Section 6's quantitative gate ("keep
+contested findings under roughly 1% of the corpus") checked against a
+real run instead of only asserted. On `--agents --explain`, a contested
+finding's Tree-of-Thought outcome (tot.py, Section 6's beam search --
+winner, or both near-tied candidates surfaced for a human, per finding)
+prints alongside its narrative; a ToT dispatch failure prints its reason
+instead, the same skip-and-report treatment agents/coordinator.py already
+gives a Research/Environment/Risk failure.
 """
 
 from __future__ import annotations
@@ -49,7 +59,7 @@ from rhinosecure.enrich.kev import KevCatalog, load_catalog as load_kev_catalog
 from rhinosecure.enrich.nvd import lookup as nvd_lookup
 from rhinosecure.ingest import IngestError, join_findings
 from rhinosecure.schema import AttackTechniqueRef, EnrichedFinding
-from rhinosecure.scoring import ScoredFinding, rank, score_finding
+from rhinosecure.scoring import ContestedRate, ScoredFinding, contested_rate, rank, score_finding
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -201,11 +211,15 @@ def _print_agent_table(recommendations: list) -> None:
 
 def _print_failures(coordinator: Coordinator) -> None:
     """Findings recorded and skipped (rather than left blocking the run)
-    at any stage -- see agents/coordinator.py's module docstring."""
+    at any stage -- see agents/coordinator.py's module docstring. A ToT
+    failure is reported the same way but never removes the finding from
+    the table above -- Risk already succeeded for it (see
+    agents/coordinator.py's _dispatch_tot docstring)."""
     stages = (
         ("research", coordinator.state.research_failures),
         ("environment", coordinator.state.environment_failures),
         ("risk", coordinator.state.risk_failures),
+        ("tot", coordinator.state.tot_failures),
     )
     total = sum(len(failures) for _stage, failures in stages)
     if total == 0:
@@ -214,6 +228,48 @@ def _print_failures(coordinator: Coordinator) -> None:
     for stage, failures in stages:
         for finding_id, reason in failures.items():
             print(f"  {finding_id} ({stage}): {reason}", file=sys.stderr)
+
+
+def _print_contested_rate(rate: ContestedRate) -> None:
+    print(f"\nContested: {rate.contested}/{rate.total} ({rate.pct:.1f}%) of scored findings")
+
+
+_TERMINATION_LABELS = {
+    "clear_winner": "clear winner",
+    "depth_limit": "depth limit",
+    "exhausted_evidence": "exhausted evidence",
+}
+
+
+def _print_tot_result(finding_id: str, coordinator: Coordinator) -> None:
+    """Prints a contested finding's Tree-of-Thought outcome right after
+    its narrative, if it has one -- either a single winning strategy, or
+    (Section 6: "Near-tie -> surface both branches to the human") every
+    candidate in a near-tied final beam, with no branch picked for the
+    reader. Silently does nothing for a finding with neither a result nor
+    a recorded failure -- i.e. every finding that was never contested."""
+    if finding_id in coordinator.state.tot_failures:
+        print(f"\n  Tree-of-Thought: failed -- {coordinator.state.tot_failures[finding_id]}")
+        return
+    result = coordinator.state.tot_by_id.get(finding_id)
+    if result is None:
+        return
+    reason = _TERMINATION_LABELS.get(result.termination_reason, result.termination_reason)
+    if result.near_tie:
+        print(
+            f"\n  Tree-of-Thought: near-tie after {result.depth_reached} round(s) ({reason}) "
+            "-- surfaced to human, no single winner:"
+        )
+        for t in result.candidates:
+            print(f"    [{t.strategy.value}] score={t.score:.1f}/10")
+            print(_wrap(t.proposal, indent="      "))
+    else:
+        winner = result.winner
+        print(
+            f"\n  Tree-of-Thought: winner = {winner.strategy.value} "
+            f"(score={winner.score:.1f}/10) after {result.depth_reached} round(s) ({reason})"
+        )
+        print(_wrap(winner.proposal, indent="      "))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -279,6 +335,7 @@ def main(argv: list[str] | None = None) -> int:
             recommendations = coordinator.ranked()
             _print_agent_table(recommendations)
             _print_failures(coordinator)
+            _print_contested_rate(contested_rate(r.bucket for r in recommendations))
 
             if args.explain:
                 for r in recommendations:
@@ -287,6 +344,7 @@ def main(argv: list[str] | None = None) -> int:
                     for line in r.scoring_rationale:
                         print(_wrap_bullet(line))
                     print(f"\n{_wrap(r.narrative)}")
+                    _print_tot_result(r.finding_id, coordinator)
 
             return 0
 
@@ -300,6 +358,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         _print_table(scored)
+        _print_contested_rate(contested_rate(s.bucket.value for s in scored))
 
         if args.explain:
             for s in scored:

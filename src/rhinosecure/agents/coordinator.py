@@ -22,9 +22,26 @@ scope currently built. The primary path's sequencing is fixed, not
 model-decided, and re-plan here (see `replan` below) is "re-run Environment
 and Risk for these finding_ids," a mechanical re-dispatch, not an
 interpretation of free-form human constraint text -- that interpretation
-step (Slice 4: constraint intake, ToT, `tot.py`) is genuinely LLM-shaped
-work and is not built yet. If and when it is, it slots in ahead of
-`replan`'s `finding_ids` argument, not inside this class.
+step (constraint intake, still Slice 4, still not built) is genuinely
+LLM-shaped work. If and when it is built, it slots in ahead of `replan`'s
+`finding_ids` argument, not inside this class.
+
+**`_dispatch_tot` is the gate CLAUDE.md Section 6 describes: every
+finding whose Risk stage lands on `bucket="contested"` gets routed into a
+`tot.run_tree_of_thought` root.** Called after `_dispatch_risk` in both
+`run` and `replan` -- a replanned finding can end up contested (or stop
+being contested) the same way any other finding can, so the gate has to
+re-check every time Risk produces a fresh bucket, not just on the first
+run. Like the three stages above it, one finding's ToT failure (raised
+as `tot.ToTDispatchError` after `tot.py`'s own retry cap) is caught here,
+recorded into `RunState.tot_failures`, and never allowed to block ToT for
+any other contested finding in the same batch -- but unlike a
+Research/Environment/Risk failure, it does NOT remove the finding from
+`risk_by_id`: Risk already succeeded (that's *why* the finding reached
+this gate at all), and a failed ToT elaboration doesn't retroactively
+make that scoring result untrustworthy. Constraint intake -- turning
+free-form human text into which finding_ids `replan` should re-dispatch
+-- is still the only unbuilt piece of Slice 4's Coordinator-side wiring.
 
 **A failed finding is recorded and skipped, never left to block the whole
 run.** Incident (PROGRESS.md, this date): a 24-finding run hung on the
@@ -92,6 +109,15 @@ from rhinosecure.agents.risk import (
 from rhinosecure.enrich.cache import SnapshotCache
 from rhinosecure.ingest import load_asset_index
 from rhinosecure.schema import EnrichedFinding
+from rhinosecure.scoring import Bucket
+from rhinosecure.tot import (
+    ToTDispatchError,
+    ToTResult,
+    ToTRoot,
+    build_critic_agent,
+    build_strategist_agent,
+    run_tree_of_thought,
+)
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -114,6 +140,10 @@ class RunState:
     research_by_id: dict[str, ResearchFinding] = field(default_factory=dict)
     environment_by_id: dict[str, EnvironmentAssessment] = field(default_factory=dict)
     risk_by_id: dict[str, RiskRecommendation] = field(default_factory=dict)
+    # Only populated for findings whose RiskRecommendation.bucket is
+    # "contested" -- see _dispatch_tot. Never used to compute risk_score
+    # or bucket for anything; scoring.py stays the sole owner of both.
+    tot_by_id: dict[str, ToTResult] = field(default_factory=dict)
     research_call_log: list[dict[str, Any]] = field(default_factory=list)
     environment_call_log: list[dict[str, Any]] = field(default_factory=list)
     risk_call_log: list[dict[str, Any]] = field(default_factory=list)
@@ -127,6 +157,7 @@ class RunState:
     research_failures: dict[str, str] = field(default_factory=dict)
     environment_failures: dict[str, str] = field(default_factory=dict)
     risk_failures: dict[str, str] = field(default_factory=dict)
+    tot_failures: dict[str, str] = field(default_factory=dict)
 
 
 class Coordinator:
@@ -153,6 +184,7 @@ class Coordinator:
         self._dispatch_research(findings)
         self._dispatch_environment(findings)
         self._dispatch_risk(findings)
+        self._dispatch_tot(findings)
         return self.ranked()
 
     def replan(self, finding_ids: list[str]) -> list[RiskRecommendation]:
@@ -171,6 +203,7 @@ class Coordinator:
         findings = [self.state.enriched_by_id[fid] for fid in finding_ids]
         self._dispatch_environment(findings)
         self._dispatch_risk(findings)
+        self._dispatch_tot(findings)
         return self.ranked()
 
     def ranked(self) -> list[RiskRecommendation]:
@@ -324,3 +357,40 @@ class Coordinator:
             )
             if result is not None:
                 self.state.risk_by_id[fid] = result
+
+    def _dispatch_tot(self, findings: list[EnrichedFinding]) -> None:
+        """CLAUDE.md Section 6's gate: any finding in `findings` whose
+        just-dispatched RiskRecommendation is bucket="contested" gets a
+        tot.ToTRoot built from this run's own Research/Environment/Risk
+        state and routed into run_tree_of_thought. Findings that never
+        reached Risk (upstream failure) or landed in a real bucket are
+        silently skipped -- this only ever fires on contested findings."""
+        contested = [
+            e
+            for e in findings
+            if self.state.risk_by_id.get(e.finding.finding_id) is not None
+            and self.state.risk_by_id[e.finding.finding_id].bucket == Bucket.CONTESTED.value
+        ]
+        if not contested:
+            return
+
+        strategist = build_strategist_agent()
+        critic = build_critic_agent()
+        for e in contested:
+            fid = e.finding.finding_id
+            root = ToTRoot(
+                enriched=e,
+                research=self.state.research_by_id[fid],
+                environment=self.state.environment_by_id[fid],
+                risk=self.state.risk_by_id[fid],
+            )
+            try:
+                self.state.tot_by_id[fid] = run_tree_of_thought(
+                    root,
+                    strategist,
+                    critic,
+                    verbose=self.verbose,
+                    max_parse_attempts=self.max_parse_attempts,
+                )
+            except ToTDispatchError as exc:
+                self.state.tot_failures[fid] = str(exc)

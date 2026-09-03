@@ -420,3 +420,99 @@ gap worth closing later but not done here. Extrapolating from the 3-finding run'
 (≈$0.41 for 9 finding-stage units, i.e. ≈$0.046/finding-stage) rather than re-running the job a
 second time just to meter it: **≈$3.3** for the full 24-finding, 3-stage, 72-task run — in line
 with the "$3-4" estimate the earlier entry projected before this run existed to confirm it.
+
+**`tot.py` built: Slice 4's beam search over remediation strategies, wired to the `contested`
+gate.** `Bucket.CONTESTED` findings (Section 6's "First concrete gate," Section 3) now route into
+`tot.run_tree_of_thought` via a new `Coordinator._dispatch_tot`, called after `_dispatch_risk` in
+both `run` and `replan`. `tot.py` lives at the repository-layout-specified top level (CLAUDE.md
+Section 9), not under `agents/`, though it imports crewai and the other agents' output types the
+same way they import each other.
+
+**The canonical three branches don't apply to the only gate that exists — replaced, not
+patched.** Section 6 already flagged this as unresolved: "accept and monitor" is invalid for a
+KEV-disqualified finding, and "compensating control + defer" presupposes a control that, for this
+gate, by construction doesn't exist (that absence is *why* the finding is contested). Rather than
+bolt a fourth branch onto the old three, `tot.py` uses a different fixed three, each viable
+regardless of whether a control or window currently exists: `emergency_change` (patch now,
+outside any window, via an expedited change process), `establish_window` (formally schedule one
+going forward), `build_control` (implement a real control before the next cycle). CLAUDE.md
+Section 6 records the full reasoning inline (a "Decided" note, matching the file's own
+convention) rather than only here, since it changes what the spec itself commits to.
+
+**Depth is refinement, not new branches — a design decision CLAUDE.md didn't fully specify.**
+Section 6 says "beam width 2, max depth 3" and "~3 initial branches" but doesn't say what depth
+*means* for a strategy space this small. Read literally as breadth-first branching, three fixed
+branches have nowhere to branch to past depth 1. Implemented instead as refinement-in-place: the
+beam's survivors (top 2 of the initial 3, by critic score) get the SAME strategy strengthened
+round over round against the critic's own prior feedback, never swapped for a different one. This
+is also what makes "exhausted evidence" (Section 6's third termination condition, alongside clear
+winner and depth limit) a coherent thing for the strategist to report — a strategy can run out of
+runway to improve; a branch identity can't.
+
+**A real bug the test suite caught, not just a spec gap: an exhausted strategy was being
+re-dispatched for refinement anyway.** First implementation tracked "did every active beam member
+just report exhausted" only within the current round, so a thought that went exhausted at depth 2
+was still handed a fresh refine task at depth 3 — wasted LLM calls, and a strategist re-asked a
+question it already answered. `tests/test_tot.py`'s
+`test_partial_exhaustion_only_recritiques_the_still_active_thought` was written to exercise
+exactly the "one exhausted, one not" case and failed against a hand-queued fake `Crew` with an
+`IndexError: pop from empty list` — the depth-3 round tried to dispatch a refine task for BOTH
+beam members when only one should have been re-queued, one queue item short by construction (the
+test deliberately queues nothing past the point where a correct implementation would stop
+needing input). Fixed by tracking each beam member's `exhausted` flag as sticky: once set, that
+member is skipped in `active_idx` for every subsequent round and carried forward unchanged (same
+`Thought`, same score, zero new dispatches) rather than re-refined. Confirms the value of writing
+the queue-exhaustion test tight enough to fail loudly on an under-consumption bug, not just a
+parse-shape one.
+
+**Critic scoring is a deterministic aggregation over LLM-assessed axes, never an LLM-computed
+number.** `CritiqueOutput` (the parsed schema) has no total/aggregate field at all — the model is
+asked for five 0–10 scores (risk_reduction, operational_cost, constraint_compliance,
+evidence_strength, contradicting_evidence) and nothing else; `CriticScores.aggregate`, ordinary
+Python arithmetic against a documented fixed weight table (`AGGREGATE_WEIGHTS`), is the only
+thing that ever combines them. Same shape as why `RiskRecommendation.risk_score` can only ever be
+a verbatim copy of `score_finding`'s answer (`agents/risk.py`) — there's structurally nothing for
+the model to mis-add, because it's never asked to add. Weights: risk_reduction highest (0.35 —
+the reason a strategy exists at all is reducing risk on a confirmed-exploited finding),
+contradicting_evidence second and as a penalty (0.25 — evidence against a strategy should be able
+to overrule an appealing one, the same argument behind the KEV floor in `scoring.py`, applied to
+a strategy instead of a CVE), constraint_compliance (0.20), evidence_strength (0.15),
+operational_cost lowest and deliberately capped (0.05 — cost is real, it's why branches besides
+"always emergency patch" exist, but must not be able to outweigh confirmed exploitation on its
+own, the same reason `is_kev` disqualifies `accept` regardless of convenience).
+
+**Contested-rate reporting lives in `scoring.py`, not `tot.py` — an import-boundary constraint,
+not a style choice.** `cli.py`'s deterministic path has a hard, tested requirement (this
+PROGRESS.md, 2026-09-02, above; `test_cli_module_does_not_import_crewai_at_module_level`) to stay
+import-clean of crewai so `rhino run` (no `--agents`) keeps working on Python 3.14. `tot.py`
+imports `crewai.Agent`/`Task`/`Crew` at module level, same as `agents/research.py` etc. — so
+`contested_rate` (a pure count of `Bucket.CONTESTED` occurrences, nothing about beam search)
+could not live in `tot.py` without dragging crewai into the deterministic path the moment either
+CLI branch imported it. Added to `scoring.py` instead (already crewai-free, already the sole
+owner of `Bucket`), with a docstring explaining why it isn't with the rest of ToT. Both CLI paths
+now print `Contested: n/total (pct%) of scored findings`; confirmed against the real fixture
+(`rhino run --data demo --seed 42 --offline`, both `.venv` (3.14) and `.venv312`): `3/24 (12.5%)`,
+matching `F07`/`F11`/`F14`.
+
+**`--agents --explain` prints each contested finding's ToT outcome** — the winning strategy and
+its score, or every near-tied final-beam candidate with neither picked (Section 6: "surface both
+branches to the human. Do not force a single answer") — right after its narrative, or a `Tree-of-
+Thought: failed` line with the reason if `tot.ToTDispatchError` was raised for it. `_print_failures`
+grew a fourth stage (`"tot"`) alongside research/environment/risk, listing the same reason to
+stderr. A ToT failure does not remove the finding from the ranked table: unlike a
+Research/Environment/Risk failure, Risk already succeeded for a contested finding (that's *why*
+it reached the ToT gate at all) — `_dispatch_tot` catches `ToTDispatchError` per finding, records
+it into `RunState.tot_failures`, and leaves `risk_by_id` untouched.
+
+**Verification.** 34 new tests (198 total, up from 164): `tests/test_tot.py` (21 — critic
+aggregation arithmetic against hand-computed examples, the substituted `Strategy` enum, task/agent
+construction, and the full beam search via a hand-queued fake `Crew` covering clear-winner,
+depth-limit-near-tie, all-exhausted, partial-exhausted, a persistently unparseable response, and a
+wrong-echoed-strategy retry), `tests/test_scoring.py` (+3, `contested_rate`, including the real
+fixture's 3/24), `tests/test_coordinator.py` (+4, the gate itself: a contested finding routes into
+ToT while a non-contested one never touches its `Crew`; a ToT failure is recorded without
+disturbing `risk_by_id`; `replan` dispatches ToT too), `tests/test_cli.py` (+6, contested-rate
+printing on both paths, winner/near-tie/failure explain output, and that none of it prints without
+`--explain`). Constraint intake — turning free-form human text into which `finding_ids` `replan`
+should re-dispatch — and `memory.py` (SQLite persistence) remain the two unbuilt pieces of Slice 4;
+neither was touched here.

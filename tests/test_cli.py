@@ -46,6 +46,14 @@ def test_offline_flag_fails_loudly_on_a_genuinely_new_cve(tmp_path: Path):
         run(tmp_path, seed=42, offline=True)
 
 
+def test_deterministic_path_prints_contested_rate_on_the_real_fixture(capsys):
+    """F07, F11, F14 are the demo fixture's three contested findings
+    (PROGRESS.md, test_scoring.py) -- 3/24."""
+    assert main(["run", "--data", "demo", "--seed", "42", "--offline"]) == 0
+    out = capsys.readouterr().out
+    assert "Contested: 3/24 (12.5%) of scored findings" in out
+
+
 def test_deterministic_explain_wraps_long_rationale_bullets_on_the_real_fixture(capsys):
     """F14 (CVE-2023-23397, contested) has a scoring_rationale bullet that
     runs to 319 characters unwrapped -- confirms the fix against real
@@ -91,13 +99,14 @@ class _FakeCoordinator:
     """Stands in for agents.coordinator.Coordinator so these tests never
     construct a real one (which would load KEV/ATT&CK snapshots) or call a
     real Crew (which would make real LLM calls). Mirrors the real
-    Coordinator's public surface -- run(), ranked(), .state.*_failures --
-    since cli.py now reads all three (a failed finding is recorded and
-    skipped inside Coordinator.run, never raised; see
+    Coordinator's public surface -- run(), ranked(), .state.*_failures,
+    .state.tot_by_id -- since cli.py reads all of it (a failed finding is
+    recorded and skipped inside Coordinator.run, never raised; see
     agents/coordinator.py)."""
 
     result: list = []
     failures: dict = {}
+    tot_by_id: dict = {}
     last_init_args: tuple | None = None
     last_run_findings: list | None = None
 
@@ -107,6 +116,8 @@ class _FakeCoordinator:
             research_failures=_FakeCoordinator.failures.get("research", {}),
             environment_failures=_FakeCoordinator.failures.get("environment", {}),
             risk_failures=_FakeCoordinator.failures.get("risk", {}),
+            tot_failures=_FakeCoordinator.failures.get("tot", {}),
+            tot_by_id=_FakeCoordinator.tot_by_id,
         )
 
     def run(self, findings):
@@ -121,6 +132,7 @@ class _FakeCoordinator:
 def _reset_fake_coordinator():
     _FakeCoordinator.result = []
     _FakeCoordinator.failures = {}
+    _FakeCoordinator.tot_by_id = {}
     _FakeCoordinator.last_init_args = None
     _FakeCoordinator.last_run_findings = None
 
@@ -253,6 +265,102 @@ def test_main_without_agents_flag_still_uses_the_deterministic_path(monkeypatch)
 
     assert main(["run", "--data", "demo", "--seed", "42"]) == 0
     assert _FakeCoordinator.last_init_args is None
+
+
+# --- contested rate and Tree-of-Thought explain output -----------------------
+
+
+def _fake_tot_result(finding_id="F01", *, near_tie=False):
+    from rhinosecure.tot import CriticScores, Strategy, Thought, ToTResult
+
+    winner = Thought(
+        strategy=Strategy.EMERGENCY_CHANGE,
+        depth=1,
+        proposal=f"Patch {finding_id} tonight via emergency change.",
+        critic=CriticScores(
+            risk_reduction=9, operational_cost=3, constraint_compliance=8,
+            evidence_strength=8, contradicting_evidence=1, justification="fake",
+        ),
+    )
+    if not near_tie:
+        return ToTResult(
+            finding_id=finding_id, winner=winner, near_tie=False, candidates=(winner,),
+            termination_reason="clear_winner", depth_reached=1,
+        )
+    runner_up = Thought(
+        strategy=Strategy.ESTABLISH_WINDOW,
+        depth=3,
+        proposal=f"Establish a Sunday window for {finding_id}.",
+        critic=CriticScores(
+            risk_reduction=7, operational_cost=3, constraint_compliance=9,
+            evidence_strength=7, contradicting_evidence=2, justification="fake",
+        ),
+    )
+    return ToTResult(
+        finding_id=finding_id, winner=None, near_tie=True, candidates=(winner, runner_up),
+        termination_reason="depth_limit", depth_reached=3,
+    )
+
+
+def test_agents_path_prints_contested_rate(monkeypatch, capsys):
+    monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
+    _FakeCoordinator.result = [
+        _fake_recommendation(finding_id="F01", bucket="contested"),
+        _fake_recommendation(finding_id="F02", bucket="next_window"),
+    ]
+
+    assert main(["run", "--data", "demo", "--agents"]) == 0
+    out = capsys.readouterr().out
+    assert "Contested: 1/2 (50.0%) of scored findings" in out
+
+
+def test_agents_explain_prints_the_tot_winner_for_a_contested_finding(monkeypatch, capsys):
+    monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
+    _FakeCoordinator.result = [_fake_recommendation(finding_id="F01", bucket="contested")]
+    _FakeCoordinator.tot_by_id = {"F01": _fake_tot_result("F01")}
+
+    assert main(["run", "--data", "demo", "--agents", "--explain"]) == 0
+    out = capsys.readouterr().out
+    assert "Tree-of-Thought: winner = emergency_change" in out
+    assert "Patch F01 tonight via emergency change." in out
+
+
+def test_agents_explain_surfaces_both_candidates_on_a_near_tie_not_a_forced_winner(monkeypatch, capsys):
+    monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
+    _FakeCoordinator.result = [_fake_recommendation(finding_id="F01", bucket="contested")]
+    _FakeCoordinator.tot_by_id = {"F01": _fake_tot_result("F01", near_tie=True)}
+
+    assert main(["run", "--data", "demo", "--agents", "--explain"]) == 0
+    out = capsys.readouterr().out
+    assert "near-tie" in out
+    assert "no single winner" in out
+    assert "[emergency_change]" in out
+    assert "[establish_window]" in out
+
+
+def test_agents_explain_prints_a_tot_dispatch_failure_reason(monkeypatch, capsys):
+    monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
+    _FakeCoordinator.result = [_fake_recommendation(finding_id="F01", bucket="contested")]
+    _FakeCoordinator.failures = {"tot": {"F01": "gave up after 3 attempt(s): no valid JSON object found"}}
+
+    assert main(["run", "--data", "demo", "--agents", "--explain"]) == 0
+    out = capsys.readouterr().out
+    assert "Tree-of-Thought: failed" in out
+    assert "gave up after 3 attempt(s)" in out
+
+
+def test_agents_without_explain_prints_no_tot_detail(monkeypatch, capsys):
+    """Only the contested-rate summary should show without --explain --
+    per-finding ToT winner/near-tie detail is --explain-gated, the same
+    as verdict_summary/narrative."""
+    monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
+    _FakeCoordinator.result = [_fake_recommendation(finding_id="F01", bucket="contested")]
+    _FakeCoordinator.tot_by_id = {"F01": _fake_tot_result("F01")}
+
+    assert main(["run", "--data", "demo", "--agents"]) == 0
+    out = capsys.readouterr().out
+    assert "Tree-of-Thought" not in out
+    assert "Contested: 1/1 (100.0%) of scored findings" in out
 
 
 # --- --quiet ---------------------------------------------------------------

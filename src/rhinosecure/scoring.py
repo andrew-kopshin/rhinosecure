@@ -26,6 +26,7 @@ record.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -445,3 +446,35 @@ def score_finding(enriched: EnrichedFinding) -> ScoredFinding:
 
 def rank(scored: list[ScoredFinding]) -> list[ScoredFinding]:
     return sorted(scored, key=lambda s: (-s.risk_score, s.finding_id))
+
+
+@dataclass(frozen=True)
+class ContestedRate:
+    contested: int
+    total: int
+
+    @property
+    def pct(self) -> float:
+        return 100.0 * self.contested / self.total if self.total else 0.0
+
+
+def contested_rate(buckets: Iterable[str]) -> ContestedRate:
+    """How often bucket_for's contested escape hatch actually fires --
+    CLAUDE.md Section 6's quantitative gate ("keep contested findings
+    under roughly 1% of the corpus"), reported so that claim is checked
+    against real runs instead of only asserted. Takes bucket *values*
+    (not ScoredFinding/RiskRecommendation objects) so cli.py can feed it
+    either the deterministic path's `Bucket` enums (via `.value`) or the
+    agents path's plain-string `RiskRecommendation.bucket` uniformly.
+
+    Lives here, not in tot.py, on purpose: this is pure counting over
+    scoring.py's own Bucket output, nothing about beam search, and
+    tot.py imports crewai at module level -- cli.py's deterministic path
+    must stay import-clean of that (see cli.py's module docstring) to
+    keep working on Python 3.14, so the one thing both CLI paths need to
+    print this rate can't live in the module that also has to build
+    Agent/Task/Crew objects.
+    """
+    values = list(buckets)
+    contested = sum(1 for b in values if b == Bucket.CONTESTED.value)
+    return ContestedRate(contested=contested, total=len(values))

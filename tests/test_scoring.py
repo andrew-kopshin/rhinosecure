@@ -10,6 +10,7 @@ from rhinosecure.scoring import (
     Bucket,
     ThreatInputs,
     bucket_for,
+    contested_rate,
     score_threat,
 )
 
@@ -251,3 +252,31 @@ def test_f14_is_contested_on_the_demo_fixture():
     f14 = by_id["F14"]
     assert f14.bucket == Bucket.CONTESTED
     assert any("contested" in line for line in f14.rationale)
+
+
+# --- contested_rate ------------------------------------------------------
+
+
+def test_contested_rate_counts_only_the_contested_bucket():
+    rate = contested_rate(["patch_now", "contested", "accept", "contested", "next_window"])
+    assert rate.contested == 2
+    assert rate.total == 5
+    assert rate.pct == pytest.approx(40.0)
+
+
+def test_contested_rate_of_empty_input_is_zero_not_a_division_error():
+    rate = contested_rate([])
+    assert rate.contested == 0
+    assert rate.total == 0
+    assert rate.pct == 0.0
+
+
+def test_contested_rate_on_the_demo_fixture_matches_the_known_three():
+    """F07, F11, and F14 are the demo fixture's three contested findings
+    (PROGRESS.md) -- 3/24, matching the bucket distribution logged after
+    every deterministic-pipeline change so far."""
+    by_id = _scored_by_finding_id()
+    rate = contested_rate(s.bucket.value for s in by_id.values())
+    assert rate.contested == 3
+    assert rate.total == 24
+    assert rate.pct == pytest.approx(12.5)

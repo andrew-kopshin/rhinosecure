@@ -375,27 +375,64 @@ is blocked, or high CVSS with strong compensating controls. The gate should keep
 findings under roughly 1% of the corpus; this is the quantitative answer to CP4's
 branch-explosion risk.
 
-**First concrete gate.** `bucket_for` (Section 3) already detects one structural instance of
-this deterministically, ahead of Slice 4 existing: a KEV-listed finding with neither a
-compensating control nor a declared patch window has no honest bucket among the four real
-ones, and `score_finding` returns `Bucket.CONTESTED` for it rather than guessing. The demo
-fixture's `F14` is this case today. Until `tot.py` exists, `contested` is a terminal CLI output
-— a flag for human judgment, not yet a routed beam search. When Slice 4 is built, `Bucket.CONTESTED`
-is the trigger condition that should drive findings into the ToT root, and this specific case
-is the first one to validate against. Note it also complicates the canonical branch set below:
-"accept and monitor" is not a valid branch for it — a KEV finding is disqualified from `accept`
-by definition — so the three initial branches will need a fourth option (or a substitute for
-that one) for findings that reach ToT this way. Other contested paths (e.g. EPSS/KEV disagreement
-on a blocked patch window) are qualitative, not yet formalized as a `bucket_for` rule, and remain
-future work.
+**Measured, not just targeted.** `rhino run --data demo --seed 42 --offline` reports 3/24
+(12.5%) via `scoring.contested_rate` — well above the ~1% target. Expected at this fixture's
+size, not a sign the rule is wrong: `F14` was added specifically to exercise this path (Section
+3), and `F07`/`F11` were discovered as fallout applying the same rule, not engineered in. Three
+findings out of a 24-row fixture can't demonstrate a sub-1% rate regardless of how the underlying
+rule behaves on a realistic-sized corpus — the target is a claim about fleet-scale data, and
+stays open to verify once that's available.
+
+**First concrete gate, now wired.** `bucket_for` (Section 3) already detects one structural
+instance of this deterministically: a KEV-listed finding with neither a compensating control nor
+a declared patch window has no honest bucket among the four real ones, and `score_finding`
+returns `Bucket.CONTESTED` for it rather than guessing. The demo fixture's `F14`, `F07`, and
+`F11` are this case today. `agents/coordinator.py`'s `_dispatch_tot` is the routing: any finding
+whose Risk stage lands on `bucket="contested"` gets built into a `tot.ToTRoot` (the finding plus
+its Research/Environment/Risk evidence) and run through `tot.run_tree_of_thought`. Other
+contested paths (e.g. EPSS/KEV disagreement on a blocked patch window) are qualitative, not yet
+formalized as a `bucket_for` rule, and remain future work.
 
 - **A thought is a remediation strategy**, not an explanation
 - Root: the contested finding plus all gathered evidence
-- ~3 initial branches: patch immediately / compensating control + defer / accept and monitor
+- 3 initial branches — see "Decided" below for why these replace the canonical three this
+  section originally named
 - Beam width 2, max depth 3
 - Critic scores each branch on: risk reduction, operational cost, constraint compliance, evidence strength, contradicting evidence
 - Terminate on clear winner, depth limit, or exhausted evidence
 - **Near-tie → surface both branches to the human.** Do not force a single answer.
+
+**Decided.** The canonical three branches this section originally named — patch immediately /
+compensating control + defer / accept and monitor — don't apply to the only gate that exists.
+`bucket_for`'s contested case is, by construction, a KEV finding (accept is disqualified — the
+scoring rule's own point) with no compensating control to defer behind (that absence is *why*
+it's contested, not incidental). Branches that presuppose either one aren't weaker for this case,
+they're incoherent for it. `tot.py` uses a different, fixed three instead, each viable regardless
+of whether a control or window currently exists:
+
+- **emergency_change** — patch now, outside any declared window, through an expedited change
+  process
+- **establish_window** — formally schedule a maintenance window for the asset going forward,
+  and patch within it
+- **build_control** — implement a real compensating control before the next patch cycle
+
+If a future contested case reaches ToT through a different `bucket_for` rule where an existing
+control or accept genuinely is on the table, that case may need its own branch set — this one is
+scoped to the gate that actually exists.
+
+Two more implementation decisions not fully specified above, recorded so they don't drift.
+**Depth is refinement, not new branches:** each beam survivor is the SAME strategy, strengthened
+round over round against the critic's own feedback, never replaced by a different strategy — a
+three-branch space doesn't have enough room to explore breadth-first past depth 1, and refinement
+is what makes "exhausted evidence" a coherent termination condition (a strategy can run out of
+runway to improve; a branch identity can't). Once a strategy reports exhausted, it's frozen (same
+score, no further LLM calls) for every remaining round rather than re-asked to say so again.
+**The critic's five axes combine by a fixed, documented, deterministic weighted formula**
+(`tot.AGGREGATE_WEIGHTS`; risk_reduction weighted highest, operational_cost lowest — see
+`tot.py`'s own comment for the full reasoning), never an LLM-computed total: `CritiqueOutput` has
+no aggregate/total field at all, the same "the model never computes the number" property
+`score_finding` gives `risk_score` (Section 8 rule 2's spirit, applied to a computation
+`scoring.py` itself has nothing to do with).
 
 ---
 
@@ -537,7 +574,14 @@ not mark any of these done until there's a specific module and test to point to.
    rationale cites the specific evidence strings it was actually given (e.g. nothing yet checks
    that Research's `nvd_base_score` field matches what `lookup_nvd` returned, or that
    Environment's `has_patch_window` matches `lookup_asset_context`'s result). Do not mark this
-   item done — a general citation-vs-evidence checker across all three agents is still unbuilt.
+   item done — a general citation-vs-evidence checker across all three agents, and now `tot.py`'s
+   Strategist/Critic (a fourth LLM surface with the same unchecked-prose-vs-evidence gap: nothing
+   confirms a proposal or a critic's justification only cites facts actually present in
+   `ToTRoot`), is still unbuilt. `tot.py`'s critic score itself is a *stronger* case than
+   `risk_score`'s: `CriticScores.aggregate` isn't just checked against the model's output after
+   the fact (`verify_scoring_matches_tool`'s pattern) — `CritiqueOutput` has no aggregate field at
+   all, so there is nothing for the model to get wrong in the first place. That closes the
+   number; it says nothing about the prose.
 3. **Tool-call retry cap.** No bound yet on how many times an agent may retry a failed tool call
    (an NVD timeout, a malformed EPSS response) before it must stop and escalate instead of
    looping.
