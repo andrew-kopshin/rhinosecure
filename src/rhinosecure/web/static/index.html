@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RhinoSecure &mdash; Plan Viewer</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">&#128058;</span>
+        <span class="brand-name">RhinoSecure</span>
+        <span class="brand-sub">read-only plan viewer</span>
+      </div>
+      <div id="run-meta" class="run-meta"></div>
+    </header>
+
+    <div class="layout">
+      <aside class="sidebar">
+        <h2 class="sidebar-title">Pipeline</h2>
+        <ol id="pipeline-stages" class="stage-list"></ol>
+      </aside>
+
+      <main class="main">
+        <nav class="tabs" id="tabs">
+          <button class="tab-btn active" data-tab="overview" type="button">Overview</button>
+          <button class="tab-btn" data-tab="findings" type="button">Findings</button>
+          <button class="tab-btn" data-tab="contested" type="button">Contested</button>
+          <button class="tab-btn" data-tab="constraints" type="button">Constraints</button>
+        </nav>
+
+        <section id="tab-overview" class="tab-panel active"></section>
+        <section id="tab-findings" class="tab-panel"></section>
+        <section id="tab-contested" class="tab-panel"></section>
+        <section id="tab-constraints" class="tab-panel"></section>
+      </main>
+    </div>
+  </div>
+
+  <div id="error-banner" class="error-banner" hidden></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

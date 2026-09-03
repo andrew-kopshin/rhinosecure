@@ -100,6 +100,16 @@ export that carries no patch window, no compensating control, and no
 role is exactly the input a human has to fill in by hand, so the
 constraint path is the one that has to work for it, not the one that
 refuses it.
+
+`rhino web --export PATH [--port PORT]` launches the read-only FastAPI
+viewer (`web/server.py`) over one `--export` JSON file (export.py) --
+additive, its own subcommand, touching nothing above. It imports
+`fastapi`/`uvicorn` lazily, same pattern as `crewai`/`memory` above, so
+`rhino run`/`rhino constraint add` never need the `web` extra installed;
+a missing extra is reported as a normal CLI error, not an ImportError
+traceback. `web/server.py`'s own module docstring has the read-only
+contract: that module reads the export file off disk and nothing else --
+no pipeline run, no agent/LLM call, no memory.py write, ever.
 """
 
 from __future__ import annotations
@@ -608,6 +618,11 @@ def main(argv: list[str] | None = None) -> int:
             "(DeviceInfo) + vulnerabilities.csv (DeviceTvmSoftwareVulnerabilities)"
         ),
     )
+    run_parser.add_argument(
+        "--export",
+        default=None,
+        help="write the full run report as JSON to this path, in addition to the console output",
+    )
 
     constraint_parser = subparsers.add_parser(
         "constraint", help="submit or manage operational constraints (memory.py's constraints table)"
@@ -645,6 +660,20 @@ def main(argv: list[str] | None = None) -> int:
             "command that supplies them"
         ),
     )
+
+    web_parser = subparsers.add_parser(
+        "web", help="serve a read-only web viewer for one `rhino run --export` JSON file"
+    )
+    web_parser.add_argument(
+        "--export",
+        default=None,
+        help=(
+            "path to a JSON file written by `rhino run --export` (default: "
+            "out/export_demo.json under the repo root, or $RHINOSECURE_EXPORT_PATH)"
+        ),
+    )
+    web_parser.add_argument("--port", type=int, default=8420)
+    web_parser.add_argument("--host", default="127.0.0.1", help="bind address (default: localhost only)")
 
     args = parser.parse_args(argv)
     _ensure_utf8_stdio()
@@ -692,6 +721,24 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"\n{_wrap(r.narrative)}")
                     _print_tot_result(r.finding_id, coordinator)
 
+            if args.export:
+                from rhinosecure.export import write_run_export
+
+                try:
+                    write_run_export(
+                        Path(args.export),
+                        fmt=args.format,
+                        data_dir=data_dir,
+                        seed=args.seed,
+                        offline=args.offline,
+                        agents=True,
+                        coordinator=coordinator,
+                        memory=coordinator.memory,
+                    )
+                except OSError as exc:
+                    print(f"export error: {exc}", file=sys.stderr)
+                    return 1
+
             return 0
 
         try:
@@ -717,6 +764,26 @@ def main(argv: list[str] | None = None) -> int:
                     result.assets[s.asset_id],
                     result.not_collected_by_finding.get(s.finding_id, frozenset()),
                 )
+
+        if args.export:
+            from rhinosecure.export import write_run_export
+            from rhinosecure.memory import Memory
+
+            export_memory = Memory(args.db) if args.db else Memory()
+            try:
+                write_run_export(
+                    Path(args.export),
+                    fmt=args.format,
+                    data_dir=data_dir,
+                    seed=args.seed,
+                    offline=args.offline,
+                    agents=False,
+                    result=result,
+                    memory=export_memory,
+                )
+            except OSError as exc:
+                print(f"export error: {exc}", file=sys.stderr)
+                return 1
 
         return 0
 
@@ -753,6 +820,27 @@ def main(argv: list[str] | None = None) -> int:
         else:
             _print_constraint_result(result)
         return 0 if result.persisted else 1
+
+    if args.command == "web":
+        try:
+            import uvicorn
+
+            from rhinosecure.web.server import create_app
+        except ImportError as exc:
+            print(
+                f"the web viewer needs the 'web' extra -- pip install -e '.[web]' ({exc})",
+                file=sys.stderr,
+            )
+            return 1
+
+        app = create_app(args.export)
+        resolved = app.state.export_path
+        if not resolved.exists():
+            print(f"warning: export file does not exist yet: {resolved}", file=sys.stderr)
+        print(f"RhinoSecure web viewer -- serving {resolved}")
+        print(f"  http://{args.host}:{args.port}/")
+        uvicorn.run(app, host=args.host, port=args.port)
+        return 0
 
     return 1
 
