@@ -83,6 +83,7 @@ from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from crewai import Agent, Crew, Process, Task
+from crewai.types.usage_metrics import UsageMetrics
 from pydantic import BaseModel
 
 from rhinosecure.agents.environment import (
@@ -149,9 +150,14 @@ class RunState:
     risk_call_log: list[dict[str, Any]] = field(default_factory=list)
     # Each stage's crewai UsageMetrics from its most recent dispatch --
     # token accounting for cost visibility, not anything scoring reads.
+    # tot_usage is the sum across every contested finding _dispatch_tot
+    # processed in that call (unlike the other three, one dispatch can
+    # mean many Crews -- see tot.py's module docstring), including
+    # whatever partial usage a finding accrued before its search failed.
     research_usage: Any = None
     environment_usage: Any = None
     risk_usage: Any = None
+    tot_usage: UsageMetrics | None = None
     # finding_id -> why it has no result for that stage, whether it failed
     # there directly or was skipped because an earlier stage failed for it.
     research_failures: dict[str, str] = field(default_factory=dict)
@@ -364,7 +370,15 @@ class Coordinator:
         tot.ToTRoot built from this run's own Research/Environment/Risk
         state and routed into run_tree_of_thought. Findings that never
         reached Risk (upstream failure) or landed in a real bucket are
-        silently skipped -- this only ever fires on contested findings."""
+        silently skipped -- this only ever fires on contested findings.
+
+        `self.state.tot_usage` is set to the sum of every contested
+        finding's usage in THIS call (overwritten, not accumulated across
+        calls -- same shape as research_usage/environment_usage/
+        risk_usage, which likewise reflect their most recent dispatch,
+        not a running session total). A finding that fails still
+        contributes whatever it spent before giving up
+        (ToTDispatchError.usage) -- real API calls happened either way."""
         contested = [
             e
             for e in findings
@@ -376,6 +390,7 @@ class Coordinator:
 
         strategist = build_strategist_agent()
         critic = build_critic_agent()
+        total_usage = UsageMetrics()
         for e in contested:
             fid = e.finding.finding_id
             root = ToTRoot(
@@ -385,12 +400,16 @@ class Coordinator:
                 risk=self.state.risk_by_id[fid],
             )
             try:
-                self.state.tot_by_id[fid] = run_tree_of_thought(
+                result = run_tree_of_thought(
                     root,
                     strategist,
                     critic,
                     verbose=self.verbose,
                     max_parse_attempts=self.max_parse_attempts,
                 )
+                self.state.tot_by_id[fid] = result
+                total_usage.add_usage_metrics(result.usage)
             except ToTDispatchError as exc:
                 self.state.tot_failures[fid] = str(exc)
+                total_usage.add_usage_metrics(exc.usage)
+        self.state.tot_usage = total_usage

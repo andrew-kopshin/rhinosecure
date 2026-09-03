@@ -516,3 +516,95 @@ printing on both paths, winner/near-tie/failure explain output, and that none of
 `--explain`). Constraint intake — turning free-form human text into which `finding_ids` `replan`
 should re-dispatch — and `memory.py` (SQLite persistence) remain the two unbuilt pieces of Slice 4;
 neither was touched here.
+
+## 2026-09-03
+
+**First real (non-fake) ToT run: `F07`/`F11`/`F14`, the demo fixture's three contested findings,
+scoped past the CLI (no `--findings` flag exists) by constructing a filtered `EnrichedFinding`
+list and calling `Coordinator.run` directly.** `offline=True` — every CVE the three needed
+(`CVE-2022-30190`, `CVE-2020-0796`, `CVE-2023-23397`) already had committed NVD/EPSS/KEV/ATT&CK
+snapshots, so the only live network calls were the LLM requests themselves, which `--offline`
+doesn't and can't gate. Zero failures at any of the four stages, all three.
+
+**`establish_window` was pruned after the first round in all three findings, unprompted.** Every
+run's depth-1 critique scored `establish_window` below both `emergency_change` and `build_control`
+— nothing in the fixture, the prompts, or `tot.py`'s code favors two of the three branches over
+the third; this fell out of the critic's own scoring given each finding's actual evidence, not
+anything engineered. Only `emergency_change` and `build_control` ever reached depth 2 in any of
+the three searches.
+
+**The critic caught two KEV due dates that had already passed — a fact `scoring.py` never
+encodes.** `F11`'s `CVE-2020-0796` (SMBGhost) has a KEV due date of 2022-08-10; `F14`'s
+`CVE-2023-23397` has one of 2023-04-04. Both are years in the past relative to the fixture's
+`detected_date`s. `scoring.py`'s `ThreatInputs`/`_likelihood_multiplier` use `is_kev` as a
+boolean floor (Section 3) and never read `kev_date_added`/a due date at all — that field exists on
+`ResearchFinding` (`kev_date_added`) but the deterministic score has no notion of "overdue."
+Both critics used the overdue date directly in `risk_reduction`'s justification (`F11`: "the KEV
+entry's own remediation due date of 2022-08-10 has already passed... this fix is not merely
+urgent but already delinquent"), and the winning `F14` proposal built the entire remediation
+timeline around it. This is exactly the kind of business-context reasoning the deterministic
+model structurally can't do — not a gap to fix in `scoring.py` (Section 8 rule 2: no LLM calls in
+the scoring path, and "overdue by how much" is not a clean multiplicative factor the way
+KEV-membership-as-floor is) but a concrete demonstration of why Section 6 routes contested
+findings to an LLM at all instead of forcing a deterministic guess.
+
+**All three proposals addressed `internet_exposed=False` head-on instead of leaning on it.**
+Every one of the six critiqued branches across the three findings is on an asset with
+`internet_exposed=False` — the fact that drove each finding's `x0.7` threat discount and kept
+`risk_score` in the 18–26 range despite KEV+near-maximal EPSS. Every proposal (not just the
+winners) explained specifically why that discount doesn't reduce *this* CVE's real exploitability:
+Follina's CVSS vector is `AV:L`/`UI:R` (local, phishing-delivered, not network-reachable) so
+"not internet-exposed" doesn't block the actual delivery path; SMBGhost is "network-adjacent/
+LAN-based... not one whose primary risk stems from direct internet exposure"; the Outlook NTLM
+leak is client-initiated outbound, so the host's own inbound exposure is irrelevant. None of the
+three treated the lower deterministic score as license to relax — each explicitly argued the
+discount doesn't apply to its finding's actual attack mechanism, using the CVSS vector string
+and the CVE's own description already sitting in the evidence, not new facts.
+
+**Two near-ties surfaced rather than forced; one resolved to a clear winner, but only by using
+the full depth budget.** `F07` (Follina, risk 18.7): `emergency_change` 8.60 vs `build_control`
+8.15 — gap 0.45, near-tie, `emergency_change` exhausted at depth 2 while `build_control` kept
+refining to depth 3. `F11` (SMBGhost, risk 25.9): `emergency_change` 8.50 vs `build_control` 7.75
+— gap 0.75, near-tie, neither exhausted, both went the full 3 rounds. `F14` (Outlook NTLM leak,
+risk 25.5): `emergency_change` 8.75, `build_control` 6.25 — gap 2.50, clear winner, but the gap
+only cleared `CLEAR_WINNER_MARGIN` (2.0) at the depth-3 critique; at depth 1 and depth 2 it was
+still ambiguous. All three needed `depth_reached=3` — none resolved at depth 1 the way the
+synthetic clear-winner test does — consistent with real critiqued strategies converging more
+slowly than hand-picked test numbers, not a sign the margin or the search is miscalibrated.
+
+**ToT usage tracking added — the cost-visibility gap CLAUDE.md's open item 4 named, extended to
+the one stage that didn't have it.** `research_usage`/`environment_usage`/`risk_usage` existed
+since Slice 3 (each stage dispatches exactly one `Crew` per run, so `crew.usage_metrics` is the
+whole stage's cost); ToT never had an equivalent, because one finding's search can dispatch
+anywhere from 2 Crews (clear winner at depth 1) to many more, and nothing summed them. Fixed by
+threading a single `UsageMetrics` accumulator (crewai's own `add_usage_metrics`) through
+`tot.py`'s `_dispatch_batch`/`_resolve` — every Crew this module ever constructs, initial batches
+and per-task retries alike, adds itself to it — and returning it on `ToTResult.usage`.
+`agents/coordinator.py`'s `_dispatch_tot` sums every contested finding's usage in one dispatch
+into the new `RunState.tot_usage`, mirroring the other three fields' shape (most-recent-dispatch,
+not a running session total).
+
+**Partial spend on a failed search is not dropped.** A finding whose strategist/critic responses
+never parse still made real, billed API calls before `tot.py` gave up — silently excluding that
+from `tot_usage` would make "cost visibility" undercount actual spend exactly in the failure case
+someone auditing cost would most want to see. `ToTDispatchError` now takes an optional `usage`
+parameter and `_resolve`'s final raise passes the same live accumulator it had been mutating all
+along; `_dispatch_tot`'s `except` clause adds `exc.usage` into the running total the same way it
+adds a successful result's. No CLI printing was added for any of this (`rhino run --agents`
+still prints nothing about cost, matching all three of the older usage fields) — that remains
+CLAUDE.md's still-open item 4, a separate, larger piece (pricing table, dollar computation) than
+"does the number exist to print."
+
+**Verification.** 200 tests (+2 net over the prior entry's 198 — several existing tests gained
+inline usage assertions rather than becoming new tests). `tests/test_tot.py`'s fake `Crew` now
+reports `usage_metrics` scaled to task count (1 "request" per task), so accumulation across
+multiple Crew instantiations is asserted on exact numbers, not just "is non-null": the clear-winner
+test checks `successful_requests == 6` (3 propose + 3 critique tasks); the depth-limit test checks
+`== 14` across all three rounds; a new pair of direct tests confirms `ToTDispatchError()` defaults
+to an empty `UsageMetrics()` (not `None`) and preserves whatever instance it's given.
+`tests/test_coordinator.py` gained the same fake-crew usage scaling plus two assertions:
+`tot_usage.successful_requests == 6` on the happy path, and `== 3` on the failure path (the
+batched 3-task propose crew's spend, with `max_parse_attempts=1` so no retry crew runs) —
+confirming a failed contested finding's real spend still lands in `RunState.tot_usage`.
+`tests/test_cli.py`'s `_fake_tot_result` helper needed a `usage=UsageMetrics()` argument added
+now that the field is required on `ToTResult`; no behavior there changed.

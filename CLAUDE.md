@@ -588,8 +588,10 @@ not mark any of these done until there's a specific module and test to point to.
 4. **Cost/usage visibility.** "Trust boundary and provider independence" (above) accepts
    per-run cost as an operational property of the LLM dependency, but `rhino run --agents`
    prints nothing about it — a run's actual token usage and dollar cost are currently invisible
-   from the CLI. `Coordinator`'s `RunState` already collects `research_usage`/
-   `environment_usage`/`risk_usage` (one `crewai` `UsageMetrics` per stage) — nothing reads them
+   from the CLI. `Coordinator`'s `RunState` collects `research_usage`/`environment_usage`/
+   `risk_usage` (one `crewai` `UsageMetrics` per stage) and, as of the ToT gate, `tot_usage`
+   (summed across every contested finding's search, partial spend included if the search failed
+   — `tot.py`'s module docstring has the accumulation mechanics) — nothing reads any of the four
    back out. The 24-finding run PROGRESS.md logged as confirming Slice 3's exit criteria could
    only report an *extrapolated* cost (≈$3.3, from an earlier smaller run's measured rate) for
    exactly this reason. `rhino run --agents` should print total tokens and an estimated dollar

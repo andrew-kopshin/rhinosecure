@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from crewai.types.usage_metrics import UsageMetrics
 
 from rhinosecure import tot as tot_module
 from rhinosecure.agents import coordinator as coordinator_module
@@ -361,7 +362,9 @@ class _QueuedFakeTotCrew:
     """Stands in for tot.py's own Crew reference -- separate from
     coordinator_module.Crew above, since run_tree_of_thought (tot.py)
     never goes through Coordinator's Crew binding. Same pop-one-per-task
-    contract."""
+    contract. usage_metrics scales with task count (1 "request" per
+    task), same convention as test_tot.py's fake, so accumulation into
+    RunState.tot_usage is predictable to assert on."""
 
     queue: list = []
     instantiations: int = 0
@@ -369,6 +372,10 @@ class _QueuedFakeTotCrew:
     def __init__(self, agents, tasks, process=None, verbose=False):
         self.tasks = tasks
         type(self).instantiations += 1
+        self.usage_metrics = UsageMetrics(
+            total_tokens=100 * len(tasks),
+            successful_requests=len(tasks),
+        )
 
     def kickoff(self):
         for task in self.tasks:
@@ -436,6 +443,8 @@ def test_a_contested_finding_is_routed_into_tot_and_recorded(data_dir, findings)
     assert result.winner.strategy.value == "emergency_change"
     assert "F01" not in coordinator.state.tot_by_id
     assert coordinator.state.tot_failures == {}
+    # 3 propose + 3 critique tasks, each "costing" 1 request in the fake.
+    assert coordinator.state.tot_usage.successful_requests == 6
 
 
 def test_a_run_with_no_contested_findings_never_touches_tot_crew(data_dir, findings):
@@ -446,6 +455,7 @@ def test_a_run_with_no_contested_findings_never_touches_tot_crew(data_dir, findi
 
     assert coordinator.state.tot_by_id == {}
     assert _QueuedFakeTotCrew.instantiations == 0
+    assert coordinator.state.tot_usage is None  # never set -- _dispatch_tot returned before touching it
 
 
 def test_tot_failure_is_recorded_and_does_not_remove_the_finding_from_risk_by_id(data_dir, findings):
@@ -472,6 +482,10 @@ def test_tot_failure_is_recorded_and_does_not_remove_the_finding_from_risk_by_id
     assert "F02" not in coordinator.state.tot_by_id
     assert coordinator.state.risk_by_id["F02"].bucket == "contested"  # untouched
     assert {r.finding_id for r in ranked} == {"F01", "F02"}  # both still in the plan
+    # Real requests happened on the way to giving up (max_parse_attempts=1,
+    # so no retry -- just the batched 3-task propose crew) -- that spend
+    # must still land in tot_usage, not be dropped because the search failed.
+    assert coordinator.state.tot_usage.successful_requests == 3
 
 
 def test_replan_also_dispatches_tot_for_a_newly_contested_finding(data_dir, findings, monkeypatch):

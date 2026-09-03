@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from crewai.types.usage_metrics import UsageMetrics
 
 from rhinosecure.agents.environment import EnvironmentAssessment
 from rhinosecure.agents.parsing import AgentOutputParseError
@@ -242,6 +243,20 @@ def test_parse_and_check_strategy_raises_when_echoed_strategy_is_wrong():
         _parse_and_check_strategy(task, ProposalOutput, Strategy.EMERGENCY_CHANGE)
 
 
+# --- ToTDispatchError.usage ---------------------------------------------
+
+
+def test_tot_dispatch_error_defaults_to_empty_usage_not_none():
+    exc = ToTDispatchError("gave up")
+    assert exc.usage == UsageMetrics()
+
+
+def test_tot_dispatch_error_carries_the_usage_it_was_given():
+    usage = UsageMetrics(total_tokens=42, successful_requests=3)
+    exc = ToTDispatchError("gave up", usage=usage)
+    assert exc.usage is usage
+
+
 # --- agent/task construction (no network, no LLM call) -----------------------
 
 
@@ -312,7 +327,9 @@ class _QueuedFakeCrew:
     """Stands in for crewai.Crew -- pops one raw JSON text string per task
     off a shared queue, in dispatch order, exactly like
     test_coordinator.py's _QueuedFakeCrew (no tools here, so no
-    score_finding special-casing is needed)."""
+    score_finding special-casing is needed). usage_metrics scales with
+    task count (1 "request" per task) so accumulation across multiple
+    Crew instantiations is predictable to assert on."""
 
     queue: list = []
     instantiations: int = 0
@@ -320,6 +337,12 @@ class _QueuedFakeCrew:
     def __init__(self, agents, tasks, process=None, verbose=False):
         self.tasks = tasks
         type(self).instantiations += 1
+        self.usage_metrics = UsageMetrics(
+            total_tokens=100 * len(tasks),
+            prompt_tokens=80 * len(tasks),
+            completion_tokens=20 * len(tasks),
+            successful_requests=len(tasks),
+        )
 
     def kickoff(self):
         for task in self.tasks:
@@ -388,6 +411,9 @@ def test_clear_winner_terminates_at_depth_one_without_any_refinement():
     assert result.winner.score == pytest.approx(8.55)
     assert len(result.candidates) == 2  # beam_width, even though a winner was picked
     assert _QueuedFakeCrew.instantiations == 2  # one propose batch, one critique batch -- no refinement
+    # usage sums both Crews' fake metrics: propose (3 tasks) + critique (3 tasks) = 6 "requests".
+    assert result.usage.successful_requests == 6
+    assert result.usage.total_tokens == 600
 
 
 def test_depth_limit_with_close_scores_produces_a_near_tie_not_a_forced_winner():
@@ -431,6 +457,9 @@ def test_depth_limit_with_close_scores_produces_a_near_tie_not_a_forced_winner()
     assert result.candidates[0].score == pytest.approx(8.15)
     assert result.candidates[1].score == pytest.approx(7.65)
     assert _QueuedFakeCrew.instantiations == 6  # 3 propose/critique pairs
+    # propose(3) + critique(3) + refine_d2(2) + critique_d2(2) + refine_d3(2) + critique_d3(2) = 14 tasks.
+    assert result.usage.successful_requests == 14
+    assert result.usage.total_tokens == 1400
 
 
 def test_all_beam_members_exhausted_stops_early_and_carries_forward_the_score():
@@ -513,10 +542,15 @@ def test_persistently_unparseable_response_raises_tot_dispatch_error():
         UNPARSEABLE,  # build_control's one retry (max_parse_attempts=2)
     ]
 
-    with pytest.raises(ToTDispatchError, match="gave up after 2 attempt"):
+    with pytest.raises(ToTDispatchError, match="gave up after 2 attempt") as exc_info:
         run_tree_of_thought(ROOT, STRATEGIST, CRITIC, max_parse_attempts=2)
 
     assert _QueuedFakeCrew.instantiations == 2  # batched propose crew + one single-task retry crew
+    # Real API calls happened on the way to giving up -- the exception
+    # must carry that spend rather than silently dropping it (module
+    # docstring). Batched propose (3 tasks) + one retry (1 task) = 4.
+    assert exc_info.value.usage.successful_requests == 4
+    assert exc_info.value.usage.total_tokens == 400
 
 
 def test_a_wrong_echoed_strategy_is_retried_and_recovers():

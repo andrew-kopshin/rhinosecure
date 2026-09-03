@@ -271,6 +271,8 @@ def test_main_without_agents_flag_still_uses_the_deterministic_path(monkeypatch)
 
 
 def _fake_tot_result(finding_id="F01", *, near_tie=False):
+    from crewai.types.usage_metrics import UsageMetrics
+
     from rhinosecure.tot import CriticScores, Strategy, Thought, ToTResult
 
     winner = Thought(
@@ -285,7 +287,7 @@ def _fake_tot_result(finding_id="F01", *, near_tie=False):
     if not near_tie:
         return ToTResult(
             finding_id=finding_id, winner=winner, near_tie=False, candidates=(winner,),
-            termination_reason="clear_winner", depth_reached=1,
+            termination_reason="clear_winner", depth_reached=1, usage=UsageMetrics(),
         )
     runner_up = Thought(
         strategy=Strategy.ESTABLISH_WINDOW,
@@ -298,7 +300,7 @@ def _fake_tot_result(finding_id="F01", *, near_tie=False):
     )
     return ToTResult(
         finding_id=finding_id, winner=None, near_tie=True, candidates=(winner, runner_up),
-        termination_reason="depth_limit", depth_reached=3,
+        termination_reason="depth_limit", depth_reached=3, usage=UsageMetrics(),
     )
 
 

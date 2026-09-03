@@ -77,6 +77,21 @@ Section 9), not under `agents/`, even though it imports crewai and the
 other agents' output types the same way they import each other --
 CLAUDE.md's layout treats this as a distinct reasoning mechanism (beam
 search over thoughts), not one more agent role.
+
+**Usage is tracked per search, not left invisible.** Unlike Research/
+Environment/Risk, which each dispatch exactly one Crew per run (so
+`crew.usage_metrics` is the whole stage's cost), one finding's ToT search
+can dispatch anywhere from 2 Crews (a clear winner at depth 1) to many
+more (deeper rounds, retries). `run_tree_of_thought` sums every Crew's
+`usage_metrics` it triggers into one running `UsageMetrics` (crewai's own
+`add_usage_metrics`) and returns it on `ToTResult.usage` -- and, since
+real API calls still cost real money even when a search ultimately gives
+up, `ToTDispatchError` carries the same running total up to the point of
+failure rather than discarding it. `agents/coordinator.py`'s
+`_dispatch_tot` sums across every contested finding in a batch into
+`RunState.tot_usage`, closing the gap CLAUDE.md's "Cost/usage visibility"
+open item named: `research_usage`/`environment_usage`/`risk_usage`
+already existed, `tot_usage` did not.
 """
 
 from __future__ import annotations
@@ -87,6 +102,7 @@ from typing import Callable, TypeVar
 
 from crewai import Agent, Crew, Process, Task
 from crewai.llms.base_llm import BaseLLM
+from crewai.types.usage_metrics import UsageMetrics
 from pydantic import BaseModel, Field
 
 from rhinosecure.agents.environment import EnvironmentAssessment
@@ -240,7 +256,9 @@ class ToTResult:
     """One finding's beam search outcome. `winner` is set only when
     `near_tie` is False -- Section 6: "Near-tie -> surface both branches
     to the human. Do not force a single answer." `candidates` is always
-    the final beam, ranked best-first (length == beam_width)."""
+    the final beam, ranked best-first (length == beam_width). `usage` is
+    the sum of every Crew this one finding's search dispatched (initial
+    batches and retries alike) -- see module docstring."""
 
     finding_id: str
     winner: Thought | None
@@ -248,6 +266,7 @@ class ToTResult:
     candidates: tuple[Thought, ...]
     termination_reason: str  # "clear_winner" | "depth_limit" | "exhausted_evidence"
     depth_reached: int
+    usage: UsageMetrics
 
 
 class ProposalOutput(BaseModel):
@@ -276,7 +295,19 @@ class ToTDispatchError(RuntimeError):
     """Raised when a strategist/critic response for one thought never
     parses, or echoes the wrong strategy, within max_parse_attempts --
     see module docstring for why this aborts the whole tree rather than
-    dropping the one thought."""
+    dropping the one thought.
+
+    Carries `usage`: whatever Crew usage this finding's search had
+    already accumulated before the failure. Real API calls happened and
+    cost real money on the way to giving up -- dropping that on the
+    floor would silently undercount actual spend, defeating the point of
+    tracking usage at all. `agents/coordinator.py`'s `_dispatch_tot`
+    folds this into `RunState.tot_usage` in its except clause, the same
+    as a successful search's usage."""
+
+    def __init__(self, message: str, usage: UsageMetrics | None = None):
+        super().__init__(message)
+        self.usage = usage if usage is not None else UsageMetrics()
 
 
 def build_strategist_agent(llm: BaseLLM | None = None) -> Agent:
@@ -476,14 +507,21 @@ def _dispatch_batch(
     *,
     max_parse_attempts: int,
     verbose: bool,
+    usage: UsageMetrics,
 ) -> list[ModelT]:
     """Batch `count` tasks onto one Crew, then resolve each independently
     -- a stuck task gets its own single-task retry Crew, the same shape
     as agents/coordinator.py's `_resolve_output`, without sharing code
     with it: failure here means abort the whole tree, not skip one of
-    many findings (see module docstring)."""
+    many findings (see module docstring). `usage` accumulates every
+    Crew's `usage_metrics` this call dispatches, initial batch and any
+    retries alike -- mutated in place, shared across the whole search by
+    the caller, so it stays accurate even if a later task in this same
+    batch fails after this one already succeeded."""
     tasks = [build_task(i) for i in range(count)]
-    Crew(agents=[agent], tasks=tasks, process=Process.sequential, verbose=verbose).kickoff()
+    crew = Crew(agents=[agent], tasks=tasks, process=Process.sequential, verbose=verbose)
+    crew.kickoff()
+    usage.add_usage_metrics(crew.usage_metrics)
     return [
         _resolve(
             agent,
@@ -492,6 +530,7 @@ def _dispatch_batch(
             lambda t, i=i: parse_one(t, i),
             max_parse_attempts,
             verbose,
+            usage,
         )
         for i, task in enumerate(tasks)
     ]
@@ -504,6 +543,7 @@ def _resolve(
     parse_task: Callable[[Task], ModelT],
     max_parse_attempts: int,
     verbose: bool,
+    usage: UsageMetrics,
 ) -> ModelT:
     last_error: Exception | None = None
     for attempt in range(1, max_parse_attempts + 1):
@@ -514,12 +554,16 @@ def _resolve(
             if attempt == max_parse_attempts:
                 break
             task = rebuild()
-            Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=verbose).kickoff()
-    raise ToTDispatchError(f"gave up after {max_parse_attempts} attempt(s): {last_error}")
+            crew = Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=verbose)
+            crew.kickoff()
+            usage.add_usage_metrics(crew.usage_metrics)
+    raise ToTDispatchError(
+        f"gave up after {max_parse_attempts} attempt(s): {last_error}", usage=usage
+    )
 
 
 def _propose_initial(
-    root: ToTRoot, agent: Agent, *, max_parse_attempts: int, verbose: bool
+    root: ToTRoot, agent: Agent, *, max_parse_attempts: int, verbose: bool, usage: UsageMetrics
 ) -> list[_RawThought]:
     strategies = list(Strategy)
     outputs = _dispatch_batch(
@@ -529,6 +573,7 @@ def _propose_initial(
         lambda task, i: _parse_and_check_strategy(task, ProposalOutput, strategies[i]),
         max_parse_attempts=max_parse_attempts,
         verbose=verbose,
+        usage=usage,
     )
     return [
         _RawThought(strategy=s, depth=1, proposal=o.proposal) for s, o in zip(strategies, outputs)
@@ -542,6 +587,7 @@ def _critique(
     *,
     max_parse_attempts: int,
     verbose: bool,
+    usage: UsageMetrics,
 ) -> list[Thought]:
     outputs = _dispatch_batch(
         agent,
@@ -550,6 +596,7 @@ def _critique(
         lambda task, i: _parse_and_check_strategy(task, CritiqueOutput, raw_thoughts[i].strategy),
         max_parse_attempts=max_parse_attempts,
         verbose=verbose,
+        usage=usage,
     )
     return [
         Thought(
@@ -579,6 +626,7 @@ def _refine(
     *,
     max_parse_attempts: int,
     verbose: bool,
+    usage: UsageMetrics,
 ) -> list[_RawThought]:
     outputs = _dispatch_batch(
         agent,
@@ -587,6 +635,7 @@ def _refine(
         lambda task, i: _parse_and_check_strategy(task, RefinementOutput, beam[i].strategy),
         max_parse_attempts=max_parse_attempts,
         verbose=verbose,
+        usage=usage,
     )
     return [
         _RawThought(
@@ -645,11 +694,16 @@ def run_tree_of_thought(
     full depth. The final beam's top two are always what
     `near_tie`/`winner`/`candidates` are computed from, regardless of
     which of the three reasons stopped the loop -- see ToTResult and the
-    module docstring.
+    module docstring. `usage` on the result is the sum of every Crew
+    dispatched along the way (see `_dispatch_batch`); on a `ToTDispatchError`
+    (retries exhausted), the same running total up to that point is
+    attached to the exception instead, so a failed search's real spend
+    is never silently dropped.
     """
-    raw = _propose_initial(root, strategist, max_parse_attempts=max_parse_attempts, verbose=verbose)
+    usage = UsageMetrics()
+    raw = _propose_initial(root, strategist, max_parse_attempts=max_parse_attempts, verbose=verbose, usage=usage)
     beam = _prune(
-        _critique(raw, root, critic, max_parse_attempts=max_parse_attempts, verbose=verbose),
+        _critique(raw, root, critic, max_parse_attempts=max_parse_attempts, verbose=verbose, usage=usage),
         beam_width,
     )
 
@@ -670,12 +724,14 @@ def run_tree_of_thought(
         depth += 1
         refined = _refine(
             [beam[i] for i in active_idx],
-            root, strategist, depth, max_parse_attempts=max_parse_attempts, verbose=verbose,
+            root, strategist, depth, max_parse_attempts=max_parse_attempts, verbose=verbose, usage=usage,
         )
         refined_by_idx = dict(zip(active_idx, refined))
         still_active_raw = [r for r in refined if not r.exhausted]
         scored = (
-            iter(_critique(still_active_raw, root, critic, max_parse_attempts=max_parse_attempts, verbose=verbose))
+            iter(_critique(
+                still_active_raw, root, critic, max_parse_attempts=max_parse_attempts, verbose=verbose, usage=usage
+            ))
             if still_active_raw
             else iter(())
         )
@@ -694,4 +750,5 @@ def run_tree_of_thought(
         candidates=tuple(ranked),
         termination_reason=termination_reason,
         depth_reached=depth,
+        usage=usage,
     )
