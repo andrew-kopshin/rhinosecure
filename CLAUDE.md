@@ -220,6 +220,65 @@ are real, declared facts, just declared on different rows) and only strengthens
 adapter against data it had never seen; both are recorded in `adapters/bluepeak.py`'s own module
 docstring, not just here.
 
+**A real usability gap, then a real posture change: whole-batch refusal on a scope boundary was
+too blunt.** Running the real 50-row file above hit it directly: 23 rows have an `Asset_Type`
+with no honest role, and refusing the *whole file* over that meant `rhino run --format bluepeak
+--data bluepeak` produced no plan at all -- exactly the same all-or-nothing shape
+`defender.py`'s own non-Windows-`OSPlatform` refusal already had. Investigated before touching
+anything: this "refuse loudly" rule was never one behavior. Native fails on the *first* bad row
+(no accumulation at all); Defender and BluePeak accumulate every problem across a full pass and
+then refuse the *whole* batch if any exist. All three agreed on the outcome (refuse everything)
+but not the mechanism, and neither shape distinguished a genuine data-quality problem (a blank
+identity column, a malformed value, an unresolvable conflict -- the "never guess" rule is
+squarely about these) from a scope-boundary one (the row is well-formed, it just describes
+something outside this project's declared Windows-fleet scope). `defender.py`'s own docstring
+for the non-Windows case already said the intent was that the device "went **unscored**" --
+language that assumed a partial result, which the all-or-nothing implementation never actually
+delivered.
+
+**Decided** (asked, not assumed; the alternative of leaving every row-level problem, data
+quality included, as skip-and-report was rejected -- that would start silently absorbing real
+export corruption, which is precisely what "never guess" exists to prevent): split by reason,
+layer-wide. A scope-boundary refusal is now excluded -- skipped and reported, never fatal to the
+batch; a data-quality refusal still refuses the whole batch, unchanged, in every adapter. Built:
+`adapters/base.py`'s `ProblemCollector` (promoted out of `defender.py`'s and `bluepeak.py`'s
+previously-separate, identically-shaped private collectors) carries both `.add` (fatal) and
+`.exclude(identity, reason)` (scope-boundary) for one pass; `.raise_if_fatal` only ever looks at
+the fatal list, so a batch that's going to be refused anyway never bothers reporting exclusions
+that are now moot. Only two call sites actually changed classification -- Defender's non-Windows
+`OSPlatform` check and BluePeak's role-boundary check -- every other refusal (blank identity, a
+malformed boolean/date/number, an unresolvable Timestamp/Last_Observed conflict, a missing
+required column) is untouched, in both adapters. Cascading exclusion: a finding whose asset was
+excluded is excluded too (`self.stats.excluded_assets`, populated by `load_assets`, read by the
+same instance's later `load_findings` call), reported as "its asset was excluded: ..." rather
+than a second, confusing "orphan" message for the same root cause -- a *true* orphan (an
+asset_id that never appeared as an asset row at all, a real data-integrity problem) still stays
+fatal, unchanged.
+
+`IngestStats`/`IngestReport` (ingest.py) gained `excluded_assets`/`excluded_findings`
+(id -> reason), the same shape as the existing `duplicate_*_collapsed` counters, threaded through
+`GapTally.report`. `cli.py`'s new `_print_exclusions` prints them **before** the ranked table,
+deliberately not alongside the `not_collected` gap report that already prints after it: a plan
+silently missing part of a fleet must never look complete, so it cannot be a footnote under
+numbers a reader has already formed an impression from. `export.py`'s `_ingest_report_dict`/
+`_ingest_detail` mirror the two new fields so `rhino web` shows the same thing a terminal run
+does. `run_agents`/`submit_constraint` don't build a full `IngestReport` (no `GapTally` pass), so
+they get a smaller, stderr-only `_warn_of_exclusions` instead of the full grouped-by-reason
+breakdown -- enough that a shrunk agents-path batch is never silent either, pointing back at
+plain `rhino run` for the details.
+
+**Confirmed against the real file.** `rhino run --format bluepeak --data bluepeak --seed 42` now
+prints `Excluded: 23/47 asset(s), 23/50 finding(s)`, each one named with its reason and (for
+findings) which excluded asset it cascaded from, followed by the identical 27-finding table,
+`Contested: 0/27 (0.0%)`, and the data-gap report the manually-filtered subset produced earlier
+in this section -- no more manual pre-filtering needed to see the pipeline run on this dataset.
+The native fixture's output is unchanged (`Contested: 3/24 (12.5%)`, byte-identical rows) --
+confirmed by re-running it, not just by the fact that native never populates `excluded_*`. 3 of
+the 38 existing adapter-refusal tests changed (Defender's and BluePeak's own scope-boundary
+tests, rewritten to assert exclusion instead of refusal, plus two new cascading-exclusion tests);
+every other refusal test -- blank identity, malformed values, conflicts, missing columns, true
+orphans -- is untouched, in both adapters, exactly as the reason-based split predicts.
+
 **Guardrail.** This is a design constraint, not a feature list. The following remain out of
 scope for the capstone build: live scanner API connectors, credential handling, PII or
 regulated-data handling, and multi-tenant concerns. Design so they're possible later; do not

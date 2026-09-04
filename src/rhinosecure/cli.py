@@ -143,6 +143,7 @@ from rhinosecure.ingest import (
     GapTally,
     IngestError,
     IngestReport,
+    IngestStats,
     attach_source_enrichment,
     attach_threat_signals,
     load_batch,
@@ -266,8 +267,10 @@ def run_agents(
     from rhinosecure.memory import DEFAULT_DB_PATH, Memory
 
     random.seed(seed)  # see run()'s comment -- still a no-op for now
-    assets, enriched = load_batch(data_dir, get_adapter(fmt))
+    adapter = get_adapter(fmt)
+    assets, enriched = load_batch(data_dir, adapter)
     findings = list(enriched)
+    _warn_of_exclusions(adapter.stats, fmt)
     memory = Memory(db_path if db_path is not None else DEFAULT_DB_PATH)
     coordinator = Coordinator(
         data_dir,
@@ -302,8 +305,10 @@ def submit_constraint(
     from rhinosecure.memory import DEFAULT_DB_PATH, Memory
 
     random.seed(seed)
-    assets, enriched = load_batch(data_dir, get_adapter(fmt))
+    adapter = get_adapter(fmt)
+    assets, enriched = load_batch(data_dir, adapter)
     findings = list(enriched)
+    _warn_of_exclusions(adapter.stats, fmt)
     memory = Memory(db_path if db_path is not None else DEFAULT_DB_PATH)
     coordinator = Coordinator(
         data_dir,
@@ -552,6 +557,55 @@ def _print_capacity_result(result: CapacitySubmissionResult) -> None:
                 continuation_indent="    ",
             )
         )
+
+
+def _print_exclusions(report: IngestReport) -> None:
+    """Scope-boundary exclusions (adapters/base.py's `ProblemCollector
+    .exclude` -- e.g. Defender's non-Windows `OSPlatform`, BluePeak's
+    unmapped `Asset_Type`), printed BEFORE the table, unlike the gap
+    report below: a plan that's silently missing part of a fleet must
+    never look complete, so this cannot be a footnote after the numbers
+    a reader has already formed an impression from. Prints nothing when
+    there is nothing to report -- native, and any run with nothing
+    excluded, stays exactly as before."""
+    if not report.has_exclusions:
+        return
+    original_assets = report.assets_total + len(report.excluded_assets)
+    original_findings = report.findings_total + len(report.excluded_findings)
+    print(
+        f"Excluded (--format {report.format}): {len(report.excluded_assets)}/{original_assets} asset(s), "
+        f"{len(report.excluded_findings)}/{original_findings} finding(s) -- outside this project's declared "
+        "scope, not a data-quality problem. The rest of the batch is scored below."
+    )
+    by_reason: dict[str, list[str]] = {}
+    for asset_id, reason in report.excluded_assets.items():
+        by_reason.setdefault(reason, []).append(asset_id)
+    for reason, ids in sorted(by_reason.items()):
+        label = "  asset(s)  "
+        print(_wrap(f"{', '.join(sorted(ids))}: {reason}", indent=label, continuation_indent=" " * len(label)))
+    for finding_id, reason in sorted(report.excluded_findings.items()):
+        label = "  finding   "
+        print(_wrap(f"{finding_id}: {reason}", indent=label, continuation_indent=" " * len(label)))
+    print()
+
+
+def _warn_of_exclusions(stats: IngestStats, fmt: str) -> None:
+    """The `--agents`/`constraint add` paths' counterpart to
+    `_print_exclusions` -- they don't build a full `IngestReport` (no
+    `GapTally` pass over the enriched findings), so this is a shorter,
+    stderr-only notice rather than the full grouped-by-reason breakdown,
+    just enough that a shrunk batch is never silent on these paths either.
+    `rhino run` (without --agents) is where the full breakdown lives."""
+    total = len(stats.excluded_assets) + len(stats.excluded_findings)
+    if total == 0:
+        return
+    print(
+        f"Note: --format {fmt} excluded {len(stats.excluded_assets)} asset(s) and "
+        f"{len(stats.excluded_findings)} finding(s) outside this project's declared scope "
+        "(not a data-quality problem) -- run `rhino run` (without --agents) for the full "
+        "breakdown of what and why.",
+        file=sys.stderr,
+    )
 
 
 def _print_ingest_report(report: IngestReport) -> None:
@@ -811,6 +865,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         scored = result.scored
+        _print_exclusions(result.report)
         _print_table(scored)
         _print_contested_rate(contested_rate(s.bucket.value for s in scored))
         _print_ingest_report(result.report)

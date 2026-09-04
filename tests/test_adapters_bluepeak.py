@@ -211,16 +211,40 @@ def test_every_documented_role_mapping_is_accepted(tmp_path):
     assert {a.role for a in assets.values()} == set(ROLE_BY_ASSET_TYPE.values())
 
 
-def test_unmapped_asset_type_refuses_the_whole_batch(tmp_path):
-    """No per-row skip-and-continue anywhere in this adapter layer (same
-    as defender.py's own OSPlatform refusal) -- one bad Asset_Type fails
-    the whole file, every offender listed, so the operator fixes the
-    export in one pass rather than one rerun at a time."""
+def test_unmapped_asset_type_is_excluded_not_fatal(tmp_path):
+    """Scope boundary, not data quality (adapters/base.py's "Two kinds of
+    refusal"): the mappable row still scores; the Firewall row is
+    excluded and reported, not fatal to the batch."""
     data_dir = _sample_dir(
         tmp_path,
-        [_row(record_id="VULN-0001", asset_id="A1"), _row(record_id="VULN-0002", asset_id="A2", asset_type="Firewall")],
+        [_row(record_id="VULN-0001", asset_id="A1"), _row(record_id="VULN-0002", asset_id="A2", cve="CVE-2099-10002", asset_type="Firewall")],
     )
-    with pytest.raises(AdapterError, match="Firewall.*has no honest equivalent"):
+    adapter = get_adapter("bluepeak")
+    assets, enriched = load_batch(data_dir, adapter)
+    findings = list(enriched)
+
+    assert set(assets) == {"A1"}
+    assert [f.finding.finding_id for f in findings] == ["VULN-0001"]
+    assert set(adapter.stats.excluded_assets) == {"A2"}
+    assert "Firewall" in adapter.stats.excluded_assets["A2"]
+    assert "has no honest equivalent" in adapter.stats.excluded_assets["A2"]
+    assert adapter.stats.excluded_findings == {
+        "VULN-0002": "its asset (A2) was excluded: " + adapter.stats.excluded_assets["A2"]
+    }
+
+
+def test_unmapped_asset_type_alongside_a_fatal_problem_still_refuses_everything(tmp_path):
+    """A real data-quality problem elsewhere in the batch still blocks
+    everything, exclusions included -- raise_if_fatal only looks at
+    .fatal, and a fatal batch never gets far enough to report .excluded."""
+    data_dir = _sample_dir(
+        tmp_path,
+        [
+            _row(record_id="VULN-0001", asset_id="A1", asset_type="Firewall"),
+            _row(record_id="VULN-0002", asset_id="A2", cve="CVE-2099-10002", criticality="not-a-tier"),
+        ],
+    )
+    with pytest.raises(AdapterError, match="Asset_Criticality"):
         load_batch(data_dir, get_adapter("bluepeak"))
 
 

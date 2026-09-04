@@ -71,19 +71,40 @@ class IngestError(Exception):
 
 @dataclass
 class IngestStats:
-    """What an adapter collapsed on the way in. Mutable: a streaming
-    `load_findings` can only count as its iterator is consumed."""
+    """What an adapter collapsed or excluded on the way in. Mutable: a
+    streaming `load_findings` can only count as its iterator is consumed.
+
+    `excluded_assets`/`excluded_findings` (identity -> reason) are scope-
+    boundary exclusions -- adapters/base.py's `ProblemCollector.exclude`,
+    e.g. Defender's non-Windows `OSPlatform` or BluePeak's unmapped
+    `Asset_Type`: the record is well-formed, it just describes something
+    outside this project's declared Windows-fleet scope, so it is skipped
+    and reported rather than blocking the whole batch the way a genuine
+    data-quality problem (a blank identity column, a malformed value, an
+    unresolvable conflict) still does via `ProblemCollector.add`/
+    `raise_if_fatal`. An excluded finding's reason may itself be cascading
+    ("its asset was excluded: ...") when the finding's own row was fine
+    but its asset's wasn't -- see each adapter's `load_findings`."""
 
     duplicate_assets_collapsed: int = 0
     duplicate_findings_collapsed: int = 0
+    excluded_assets: dict[str, str] = field(default_factory=dict)
+    excluded_findings: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class IngestReport:
     """One batch's data-gap summary -- how many records left each schema
-    field `not_collected` (adapters/base.py), plus what was collapsed.
-    Empty for a native run (no gaps, nothing collapsed), so cli.py prints
-    nothing and the demo fixture's output stays byte-identical."""
+    field `not_collected` (adapters/base.py), plus what was collapsed and
+    what was excluded. Empty for a native run (no gaps, nothing collapsed
+    or excluded), so cli.py prints nothing and the demo fixture's output
+    stays byte-identical.
+
+    `assets_total`/`findings_total` count only what was actually loaded
+    (excluded records are not in that count) -- the original, pre-
+    exclusion total is `assets_total + len(excluded_assets)` /
+    `findings_total + len(excluded_findings)`, computed by whoever prints
+    it (cli.py's `_print_exclusions`), not stored again here."""
 
     format: str
     assets_total: int
@@ -92,14 +113,24 @@ class IngestReport:
     duplicate_findings_collapsed: int
     asset_gaps: dict[str, int] = field(default_factory=dict)  # field -> assets where not collected
     finding_gaps: dict[str, int] = field(default_factory=dict)
+    excluded_assets: dict[str, str] = field(default_factory=dict)  # asset_id -> reason
+    excluded_findings: dict[str, str] = field(default_factory=dict)  # finding_id -> reason
 
     @property
     def has_gaps(self) -> bool:
         return bool(self.asset_gaps or self.finding_gaps)
 
     @property
+    def has_exclusions(self) -> bool:
+        return bool(self.excluded_assets or self.excluded_findings)
+
+    @property
     def has_anything_to_report(self) -> bool:
-        return self.has_gaps or bool(self.duplicate_assets_collapsed or self.duplicate_findings_collapsed)
+        return (
+            self.has_gaps
+            or self.has_exclusions
+            or bool(self.duplicate_assets_collapsed or self.duplicate_findings_collapsed)
+        )
 
 
 class GapTally:
@@ -126,6 +157,8 @@ class GapTally:
             duplicate_findings_collapsed=stats.duplicate_findings_collapsed,
             asset_gaps=dict(sorted(asset_gaps.items())),
             finding_gaps=dict(sorted(self._finding_gaps.items())),
+            excluded_assets=dict(sorted(stats.excluded_assets.items())),
+            excluded_findings=dict(sorted(stats.excluded_findings.items())),
         )
 
 

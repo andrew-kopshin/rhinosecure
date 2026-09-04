@@ -133,14 +133,24 @@ def _ingest_report_dict(report: IngestReport) -> dict[str, Any]:
         "duplicate_findings_collapsed": report.duplicate_findings_collapsed,
         "asset_gaps": dict(report.asset_gaps),
         "finding_gaps": dict(report.finding_gaps),
+        # Scope-boundary exclusions (adapters/base.py's ProblemCollector
+        # .exclude), not data-quality problems -- id -> reason, mirroring
+        # cli.py's _print_exclusions so the web viewer can show the same
+        # "excluded, and why" a terminal run already does, rather than
+        # silently reporting a smaller-than-expected fleet with no
+        # explanation.
+        "excluded_assets": dict(report.excluded_assets),
+        "excluded_findings": dict(report.excluded_findings),
     }
 
 
 def _ingest_detail(report: IngestReport, fmt: str) -> str:
     total_dupes = report.duplicate_assets_collapsed + report.duplicate_findings_collapsed
+    total_excluded = len(report.excluded_assets) + len(report.excluded_findings)
+    excluded_note = f"; {total_excluded} record(s) excluded (scope boundary)" if total_excluded else ""
     return (
         f"{report.assets_total} asset(s), {report.findings_total} finding(s) loaded via "
-        f"--format {fmt}; {total_dupes} duplicate row(s) collapsed"
+        f"--format {fmt}; {total_dupes} duplicate row(s) collapsed{excluded_note}"
     )
 
 

@@ -15,12 +15,33 @@ guardrail (real vulnerability data is a map of where an organization is
 weak, so silently mis-mapping it is worse than refusing it):
 
 1. **Fail loudly on unmappable input; never guess.** A column the mapping
-   needs but the file lacks, a platform value the adapter has no entry for,
-   a severity outside the source's own vocabulary, a finding whose host is
-   absent from the inventory -- each raises `AdapterError` naming the file,
-   the row, and the reason, ideally all of them at once so the operator can
-   fix the export in one pass. Nothing is coerced into a plausible value,
-   and nothing is dropped on the floor.
+   needs but the file lacks, a value outside the source's own vocabulary
+   (a severity string, a boolean cell), a finding whose host is absent
+   from the inventory, two rows making irreconcilable claims about the
+   same record -- each is a genuine data-quality problem, and `raise_if_fatal`
+   (`ProblemCollector`, below) refuses the *whole* batch over it, naming the
+   file, the row, and the reason, ideally all of them at once so the
+   operator can fix the export in one pass. Nothing is coerced into a
+   plausible value.
+
+   Two kinds of refusal, not one. The rule above is about *data quality* --
+   a row that is simply wrong or unreadable. A *scope-boundary* refusal is
+   different in kind: the row is perfectly well-formed, it just describes
+   something outside this project's declared Windows-fleet scope (Defender's
+   `OSPlatform` not in `OS_PLATFORMS`; BluePeak's `Asset_Type` not in
+   `ROLE_BY_ASSET_TYPE`). Blocking the *whole* batch over that conflates "this
+   export is broken" with "this export correctly describes a fleet wider than
+   what this project scores" -- the latter should be visible (never silently
+   dropped) but must not prevent scoring everything that *is* in scope.
+   `ProblemCollector.exclude` is that: the one record (and anything that
+   depends on it -- a finding whose asset was excluded) is skipped and
+   recorded, not raised; the caller (`ingest.load_batch`'s consumers, via
+   `IngestStats`/`IngestReport`) reports every exclusion prominently rather
+   than burying it in the same footer as a `not_collected` gap. Which
+   category a given problem falls into is each adapter's own call, made at
+   the specific check that detects it -- most checks (blank identity, a
+   malformed value, an unresolvable conflict) call `.add`; only a genuine
+   scope-boundary check calls `.exclude`.
 
 2. **Represent what the source has no concept of explicitly.** This is the
    `not_collected` mechanism below.
@@ -111,6 +132,57 @@ class AdapterError(IngestError):
     the file and, where a row is at fault, the row number and reason."""
 
 
+MAX_PROBLEMS_SHOWN = 25
+
+
+class ProblemCollector:
+    """Collects both kinds of refusal (module docstring's "Two kinds of
+    refusal") for one pass over a file: `.add` for a data-quality problem
+    that blocks the whole batch, `.exclude` for a scope-boundary one that
+    doesn't. Shared by every adapter so the two refusal shapes -- and their
+    wording -- stay identical across formats rather than each adapter
+    reinventing its own collector (defender.py and bluepeak.py both did,
+    before this was promoted here).
+
+    `.exclude(identity, reason)` keys by the excluded record's own id
+    (asset_id or finding_id) so a caller can look a specific one up later
+    -- e.g. `load_findings` checking whether a finding's `asset_id` is a
+    key here to report cascading exclusion ("its asset was excluded: ...")
+    instead of a separate, confusing "orphan" message for the same root
+    cause. Last write for a given identity wins, which only matters when
+    the same record is visited more than once (e.g. BluePeak's repeated
+    Asset_ID rows) and is always harmless -- the reason describing why a
+    record doesn't belong is the same reason on every row that names it.
+
+    `.raise_if_fatal` only looks at `.fatal` -- if the batch is going to be
+    refused outright over a real data-quality problem, nothing was scored
+    from it anyway, so `.excluded` (which would otherwise need reporting)
+    is simply moot; a caller only reads `.excluded` after a pass that did
+    *not* raise."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.fatal: list[str] = []
+        self.excluded: dict[str, str] = {}
+
+    def add(self, message: str) -> None:
+        self.fatal.append(message)
+
+    def exclude(self, identity: str, reason: str) -> None:
+        self.excluded[identity] = reason
+
+    def raise_if_fatal(self, what: str) -> None:
+        if not self.fatal:
+            return
+        shown = self.fatal[:MAX_PROBLEMS_SHOWN]
+        hidden = len(self.fatal) - len(shown)
+        lines = [f"{self.path}: {len(self.fatal)} problem(s) in {what}; refusing to guess:"]
+        lines += [f"  - {item}" for item in shown]
+        if hidden:
+            lines.append(f"  ... and {hidden} more")
+        raise AdapterError("\n".join(lines))
+
+
 # Value a field takes when the source format has no concept of it (or left
 # the cell blank). Free-text fields use the schema's own absent encoding;
 # enumerated Impact inputs use the modal enterprise value -- see the module
@@ -184,6 +256,13 @@ class IngestAdapter(ABC):
 
     @abstractmethod
     def load_findings(self, path: Path, asset_ids: Collection[str]) -> Iterator[Finding]:
-        """Findings, lazily. `asset_ids` is the inventory just loaded, so an
+        """Findings, lazily. `asset_ids` is the inventory just loaded (only
+        the assets that survived -- excluded ones are not in it), so an
         adapter that wants to report every orphaned finding at once (rather
-        than let ingest.join raise on the first) can check membership."""
+        than let ingest.join raise on the first) can check membership. A
+        finding whose asset_id is missing from `asset_ids` because that
+        asset was scope-excluded (`self.stats.excluded_assets`, populated
+        by the preceding `load_assets` call on this same instance) should
+        itself be excluded, not treated as a true orphan -- see the module
+        docstring's "Two kinds of refusal" and each adapter's own
+        `load_findings`."""

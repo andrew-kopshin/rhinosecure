@@ -68,6 +68,7 @@ def test_deterministic_export_matches_schema_shape(tmp_path):
         "format": "native", "assets_total": 12, "findings_total": 24,
         "duplicate_assets_collapsed": 0, "duplicate_findings_collapsed": 0,
         "asset_gaps": {}, "finding_gaps": {},
+        "excluded_assets": {}, "excluded_findings": {},
     }
 
     assert len(data["findings"]) == 24

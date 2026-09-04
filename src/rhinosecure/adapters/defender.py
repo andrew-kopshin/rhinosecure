@@ -73,11 +73,16 @@ Messy realities, and what each one does
   differing rows collapse to the latest `Timestamp` when the column is
   present; differing rows with no Timestamp to order them are a conflict
   and refused.
-- Non-Windows or unrecognized OSPlatform: refused, with every offending
-  device listed. CLAUDE.md Section 2 scopes the fleet to Windows; a macOS
-  or Linux device is not a messy reality to smooth over but out of scope,
-  and silently dropping it would hide from the operator that part of the
-  fleet went unscored. Filter the export to Windows platforms instead.
+- Non-Windows or unrecognized OSPlatform: excluded, not fatal -- a scope-
+  boundary problem, not a data-quality one (adapters/base.py's "Two kinds
+  of refusal"). CLAUDE.md Section 2 scopes the fleet to Windows; a macOS or
+  Linux device is not a messy reality to smooth over but out of scope, and
+  silently dropping it would hide from the operator that part of the fleet
+  went unscored -- so it isn't silent: every excluded device, and every
+  finding that referenced one, is reported (IngestReport.excluded_assets/
+  excluded_findings, cli.py's `_print_exclusions`), and the rest of the
+  batch still scores. Filter the export to Windows platforms first if the
+  goal is a clean report with nothing excluded.
 - Findings whose DeviceId is not in devices.csv: refused, every orphaned
   device listed with its finding count. A finding cannot be scored without
   its asset context, and a plan that quietly omits findings is exactly the
@@ -117,10 +122,12 @@ from typing import IO
 from pydantic import ValidationError
 
 from rhinosecure.adapters.base import (
+    MAX_PROBLEMS_SHOWN,
     NOT_COLLECTED_DEFAULTS,
     ROLE_DEFAULT_BY_OS_CLASS,
     AdapterError,
     IngestAdapter,
+    ProblemCollector,
 )
 from rhinosecure.schema import Asset, Finding
 
@@ -179,32 +186,8 @@ _CVE_ID = re.compile(r"^CVE-\d{4}-\d{4,}$")
 _ISO_DATE_PREFIX = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 _FRACTIONAL_SECONDS = re.compile(r"(\.\d{1,6})\d*")
 
-MAX_PROBLEMS_SHOWN = 25
 FINDING_ID_PREFIX = "MDVM-"
 FINDING_ID_HEX_LEN = 16
-
-
-class _Problems:
-    """Collects every problem in a file so one AdapterError can list them
-    all (bounded to MAX_PROBLEMS_SHOWN in the message, full count kept)."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.items: list[str] = []
-
-    def add(self, message: str) -> None:
-        self.items.append(message)
-
-    def raise_if_any(self, what: str) -> None:
-        if not self.items:
-            return
-        shown = self.items[:MAX_PROBLEMS_SHOWN]
-        hidden = len(self.items) - len(shown)
-        lines = [f"{self.path}: {len(self.items)} problem(s) in {what}; refusing to guess:"]
-        lines += [f"  - {item}" for item in shown]
-        if hidden:
-            lines.append(f"  ... and {hidden} more")
-        raise AdapterError("\n".join(lines))
 
 
 def _open_csv(path: Path) -> tuple[IO[str], csv.DictReader]:
@@ -276,7 +259,7 @@ class DefenderAdapter(IngestAdapter):
         rule for repeated DeviceIds can't be applied on a stream, and the
         inventory is the small, indexed side anyway (see IngestAdapter)."""
         self.stats.duplicate_assets_collapsed = 0
-        problems = _Problems(path)
+        problems = ProblemCollector(path)
         latest: dict[str, tuple[datetime | None, Asset, int]] = {}
         order: list[str] = []
 
@@ -307,12 +290,13 @@ class DefenderAdapter(IngestAdapter):
                         f"{prior_row} with different values and no later Timestamp to prefer -- "
                         "summarize the export to one row per device (arg_max(Timestamp, *) by DeviceId)"
                     )
-        problems.raise_if_any("DeviceInfo export")
+        problems.raise_if_fatal("DeviceInfo export")
+        self.stats.excluded_assets = dict(problems.excluded)
         for device_id in order:
             yield latest[device_id][1]
 
     def _map_device(
-        self, row: dict[str, str], row_no: int, problems: _Problems, has_timestamp: bool
+        self, row: dict[str, str], row_no: int, problems: ProblemCollector, has_timestamp: bool
     ) -> tuple[Asset, datetime | None] | None:
         device_id = (row.get("DeviceId") or "").strip()
         hostname = (row.get("DeviceName") or "").strip()
@@ -324,9 +308,14 @@ class DefenderAdapter(IngestAdapter):
             problems.add(f"row {row_no}: blank identity column(s) {blank_identity} -- nothing to key this device on")
             return None
         if platform not in OS_PLATFORMS:
-            problems.add(
-                f"row {row_no} ({hostname}): OSPlatform {platform!r} is not a Windows platform this adapter "
-                f"maps (known: {sorted(OS_PLATFORMS)}); filter the export to Windows devices or extend OS_PLATFORMS"
+            # Scope boundary, not a data-quality problem -- the row is
+            # well-formed, it just describes a device outside CLAUDE.md
+            # Section 2's Windows-only fleet. Excluded, not fatal: see
+            # adapters/base.py's "Two kinds of refusal".
+            problems.exclude(
+                device_id,
+                f"OSPlatform {platform!r} is not a Windows platform this adapter maps "
+                f"(known: {sorted(OS_PLATFORMS)})",
             )
             return None
         os_name, os_class = OS_PLATFORMS[platform]
@@ -400,13 +389,16 @@ class DefenderAdapter(IngestAdapter):
         self._validate_findings(path, asset_ids)
 
         yielded: set[str] = set()
+        excluded = self.stats.excluded_findings
         f, reader = _open_csv(path)
         with f:
             has_first_seen = "FirstSeenTimestamp" in (reader.fieldnames or [])
             for row_no, row in enumerate(reader, start=2):
-                mapped = self._map_vulnerability(row, row_no, _Problems(path), has_first_seen)
+                mapped = self._map_vulnerability(row, row_no, ProblemCollector(path), has_first_seen)
                 assert mapped is not None  # the validation pass already refused anything unmappable
                 digest, _content, finding = mapped
+                if finding.finding_id in excluded:
+                    continue  # its asset was excluded -- see _validate_findings
                 if digest in yielded:
                     self.stats.duplicate_findings_collapsed += 1
                     continue
@@ -416,8 +408,15 @@ class DefenderAdapter(IngestAdapter):
     def _validate_findings(self, path: Path, asset_ids: Collection[str]) -> None:
         """The yield-nothing pass -- see the module docstring. Memory is one
         (digest -> content, row) entry per distinct finding plus one
-        (finding_id -> digest) entry, never a Finding object."""
-        problems = _Problems(path)
+        (finding_id -> digest) entry, never a Finding object.
+
+        A finding whose `asset_id` is missing from `asset_ids` is either a
+        true orphan (its device was never in devices.csv at all -- stays
+        fatal, a real data-integrity problem) or cascading from a scope-
+        excluded asset (`self.stats.excluded_assets`, populated by the
+        preceding `load_assets` call on this same instance -- excluded,
+        not fatal, reason inherited from the asset's own)."""
+        problems = ProblemCollector(path)
         orphans: Counter[str] = Counter()
         seen: dict[str, tuple[tuple[str, str], int]] = {}
         ids: dict[str, str] = {}
@@ -432,7 +431,11 @@ class DefenderAdapter(IngestAdapter):
                     continue
                 digest, content, finding = mapped
                 if finding.asset_id not in asset_ids:
-                    orphans[finding.asset_id] += 1
+                    excluded_reason = self.stats.excluded_assets.get(finding.asset_id)
+                    if excluded_reason is not None:
+                        problems.exclude(finding.finding_id, f"its asset ({finding.asset_id}) was excluded: {excluded_reason}")
+                    else:
+                        orphans[finding.asset_id] += 1
                     continue
                 prior = seen.get(digest)
                 if prior is None:
@@ -457,10 +460,11 @@ class DefenderAdapter(IngestAdapter):
                 "cannot be scored without its asset context; re-export DeviceInfo to cover these devices "
                 "or filter the vulnerabilities export to the inventory"
             )
-        problems.raise_if_any("DeviceTvmSoftwareVulnerabilities export")
+        problems.raise_if_fatal("DeviceTvmSoftwareVulnerabilities export")
+        self.stats.excluded_findings = dict(problems.excluded)
 
     def _map_vulnerability(
-        self, row: dict[str, str], row_no: int, problems: _Problems, has_first_seen: bool
+        self, row: dict[str, str], row_no: int, problems: ProblemCollector, has_first_seen: bool
     ) -> tuple[str, tuple[str, str], Finding] | None:
         device_id = (row.get("DeviceId") or "").strip()
         cve_id = (row.get("CveId") or "").strip().upper()

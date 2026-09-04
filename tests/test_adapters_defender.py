@@ -199,18 +199,20 @@ def test_missing_required_column_is_refused_at_the_header_listing_found_columns(
     assert "'Device name'" in message  # what was found instead
 
 
-def test_non_windows_platforms_are_refused_with_every_offender_listed(tmp_path):
-    with pytest.raises(AdapterError) as excinfo:
-        _assets(tmp_path, [
-            _device(),
-            _device(device_id=WEB, name="mac01.corp.example.com", platform="macOS"),
-            _device(device_id=WKS, name="lnx01.corp.example.com", platform="Linux"),
-        ])
-    message = str(excinfo.value)
-    assert "2 problem(s)" in message
-    assert "mac01.corp.example.com" in message and "'macOS'" in message
-    assert "lnx01.corp.example.com" in message and "'Linux'" in message
-    assert "filter the export to Windows devices" in message
+def test_non_windows_platforms_are_excluded_not_fatal(tmp_path):
+    """Scope boundary, not data quality (adapters/base.py's "Two kinds of
+    refusal"): the Windows device still loads and scores; the two
+    non-Windows ones are skipped and recorded, not fatal to the batch."""
+    assets, adapter = _assets(tmp_path, [
+        _device(),
+        _device(device_id=WEB, name="mac01.corp.example.com", platform="macOS"),
+        _device(device_id=WKS, name="lnx01.corp.example.com", platform="Linux"),
+    ])
+    assert [a.asset_id for a in assets] == [DC]
+    assert set(adapter.stats.excluded_assets) == {WEB, WKS}
+    assert "'macOS'" in adapter.stats.excluded_assets[WEB]
+    assert "'Linux'" in adapter.stats.excluded_assets[WKS]
+    assert "is not a Windows platform this adapter maps" in adapter.stats.excluded_assets[WEB]
 
 
 def test_blank_identity_cell_is_fatal_not_a_gap(tmp_path):
@@ -472,6 +474,26 @@ def test_load_batch_joins_and_scores_a_defender_export_offline(tmp_path):
     assert not any("no patch_window declared" in line for line in rationale)
     contested = [line for line in rationale if line.startswith("bucket=contested")]
     assert contested and "no patch window collected" in contested[0]
+
+
+def test_load_batch_excludes_a_non_windows_devices_findings_not_orphans_them(tmp_path):
+    """A finding whose device was scope-excluded (not Windows) is
+    excluded too, cascading -- distinct from a true orphan (GHOST below,
+    which was never a device row at all and stays fatal)."""
+    data_dir = _sample_dir(
+        tmp_path,
+        [_device(), _device(device_id=WEB, name="mac01.corp.example.com", platform="macOS")],
+        [_vuln(), _vuln(device_id=WEB, cve="CVE-2021-1656")],
+    )
+    adapter = get_adapter("defender")
+    assets, enriched = load_batch(data_dir, adapter)
+    findings = list(enriched)
+
+    assert set(assets) == {DC}
+    assert [f.finding.asset_id for f in findings] == [DC]
+    assert set(adapter.stats.excluded_assets) == {WEB}
+    (excluded_finding_id,) = adapter.stats.excluded_findings  # exactly one -- CVE-2021-1656 on WEB
+    assert f"its asset ({WEB}) was excluded" in adapter.stats.excluded_findings[excluded_finding_id]
 
 
 def test_load_batch_refuses_before_any_enrichment_when_the_export_is_bad(tmp_path):

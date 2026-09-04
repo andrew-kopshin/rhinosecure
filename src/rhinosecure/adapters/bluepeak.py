@@ -99,18 +99,22 @@ honest equivalent (Domain Controller -> dc, Database Server -> sql,
 Workstation/Laptop/Privileged Workstation -> workstation, and a handful of
 generic-server types -> file, the same "most generic server role"
 fallback `defender.py`'s own docstring uses for an unclassified Windows
-server). Every other Asset_Type is refused, every offending row listed --
-the same posture `defender.py` already takes for a non-Windows
+server). Every other Asset_Type is excluded -- not fatal, a scope-boundary
+problem rather than a data-quality one (adapters/base.py's "Two kinds of
+refusal"), the same posture `defender.py` already takes for a non-Windows
 `OSPlatform`: forcing e.g. a Kubernetes cluster or a perimeter firewall
 into `iis_web` or `file` would assert something false about it and
 produce a confident-looking but fabricated blast-radius weight
 (scoring.ROLE_BLAST_RADIUS), which is the exact "produce a wrong-but-
 plausible number" failure the whole not_collected/refuse-rather-than-guess
-discipline exists to prevent. This is a deliberate scope boundary
-(CLAUDE.md Section 2's Windows-only fleet decision), not a gap to widen
-inside an adapter -- extending the role vocabulary is a scoring-model
-decision (see adapters/base.py's own docstring on the same point for
-`role`'s OS-class default), out of an adapter's remit.
+discipline exists to prevent. Every excluded asset, and every finding that
+referenced one, is still reported (IngestReport.excluded_assets/
+excluded_findings, cli.py's `_print_exclusions`) -- the rest of the batch
+scores normally. This is a deliberate scope boundary (CLAUDE.md Section
+2's Windows-only fleet decision), not a gap to widen inside an adapter --
+extending the role vocabulary is a scoring-model decision (see
+adapters/base.py's own docstring on the same point for `role`'s OS-class
+default), out of an adapter's remit.
 
 The compensating-control union
 -------------------------------
@@ -146,8 +150,10 @@ Messy realities, and what each one does
 - Missing columns: AdapterError at the header, listing missing and found.
 - Blank identity columns (Record_ID, Asset_ID, Asset_Hostname, CVE_ID):
   fatal, nothing to key the record on.
-- Asset_Type with no entry in ROLE_BY_ASSET_TYPE: refused, every offending
-  row listed with its Asset_Type -- see "The role boundary" above.
+- Asset_Type with no entry in ROLE_BY_ASSET_TYPE: excluded, not fatal --
+  see "The role boundary" above. Its findings are excluded too, cascading,
+  reported as "its asset was excluded: ..." rather than a separate orphan
+  message for the same root cause.
 - Repeated Asset_ID rows (the same asset has more than one finding):
   compensating controls union (see above); every other asset field must
   agree across rows or collapse to the later Last_Observed date (this
@@ -176,7 +182,13 @@ from typing import IO
 
 from pydantic import ValidationError
 
-from rhinosecure.adapters.base import NOT_COLLECTED_DEFAULTS, AdapterError, IngestAdapter
+from rhinosecure.adapters.base import (
+    MAX_PROBLEMS_SHOWN,
+    NOT_COLLECTED_DEFAULTS,
+    AdapterError,
+    IngestAdapter,
+    ProblemCollector,
+)
 from rhinosecure.schema import Asset, Finding, SourceEnrichment
 
 REQUIRED_COLUMNS = (
@@ -243,33 +255,6 @@ _ATTACK_TECHNIQUE = re.compile(r"^(T\d{4}(?:\.\d{3})?)\s*-\s*(.+)$")
 # real columns) but has no asset-level OS fact -- see the module docstring.
 ASSET_FIELDS_NEVER_EXPORTED = frozenset({"os", "os_build", "data_sensitivity", "patch_restrictions", "owner"})
 FINDING_FIELDS_NEVER_EXPORTED = frozenset({"port", "service"})
-
-MAX_PROBLEMS_SHOWN = 25
-
-
-class _Problems:
-    """Collects every problem in a pass so one AdapterError can list them
-    all (bounded to MAX_PROBLEMS_SHOWN in the message, full count kept).
-    Same shape as defender.py's own collector -- not shared with it, to
-    avoid coupling two independent adapters' refusal wording together."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.items: list[str] = []
-
-    def add(self, message: str) -> None:
-        self.items.append(message)
-
-    def raise_if_any(self, what: str) -> None:
-        if not self.items:
-            return
-        shown = self.items[:MAX_PROBLEMS_SHOWN]
-        hidden = len(self.items) - len(shown)
-        lines = [f"{self.path}: {len(self.items)} problem(s) in {what}; refusing to guess:"]
-        lines += [f"  - {item}" for item in shown]
-        if hidden:
-            lines.append(f"  ... and {hidden} more")
-        raise AdapterError("\n".join(lines))
 
 
 def _open_csv(path: Path) -> tuple[IO[str], csv.DictReader]:
@@ -350,7 +335,7 @@ class BluePeakAdapter(IngestAdapter):
         Consumes the whole file before yielding, same reason as
         defender.py's load_assets."""
         self.stats.duplicate_assets_collapsed = 0
-        problems = _Problems(path)
+        problems = ProblemCollector(path)
         # asset_id -> (core fields excluding compensating_controls, Last_Observed, row_no)
         resolved: dict[str, tuple[dict[str, object], date | None, int]] = {}
         controls_seen: dict[str, set[str]] = {}
@@ -387,7 +372,8 @@ class BluePeakAdapter(IngestAdapter):
                         f"{prior_row} with different values and no later Last_Observed to prefer -- "
                         "reconcile the export to one consistent set of asset facts per Asset_ID"
                     )
-        problems.raise_if_any("synthetic_cve_inventory export (assets)")
+        problems.raise_if_fatal("synthetic_cve_inventory export (assets)")
+        self.stats.excluded_assets = dict(problems.excluded)
         for asset_id in order:
             fields, _observed, row_no = resolved[asset_id]
             controls = ", ".join(sorted(controls_seen.get(asset_id, ())))
@@ -401,7 +387,7 @@ class BluePeakAdapter(IngestAdapter):
                 raise AdapterError(f"{path}: row {row_no} (Asset_ID {asset_id!r}): {exc}") from exc
 
     def _map_asset(
-        self, row: dict[str, str], row_no: int, problems: _Problems
+        self, row: dict[str, str], row_no: int, problems: ProblemCollector
     ) -> tuple[dict[str, object], str, date | None] | None:
         """Returns (core fields excluding compensating_controls, this
         row's Compensating_Control value, Last_Observed) -- Asset
@@ -418,11 +404,15 @@ class BluePeakAdapter(IngestAdapter):
 
         role = ROLE_BY_ASSET_TYPE.get(asset_type)
         if role is None:
-            problems.add(
-                f"row {row_no} ({hostname}): Asset_Type {asset_type!r} has no honest equivalent in this "
-                f"project's Windows-fleet role vocabulary (known: {sorted(ROLE_BY_ASSET_TYPE)}); refusing "
-                "rather than guessing a blast-radius weight for it -- see the module docstring's "
-                '"The role boundary"'
+            # Scope boundary, not a data-quality problem -- the row is
+            # well-formed, it just describes an asset outside CLAUDE.md
+            # Section 2's Windows-only fleet. Excluded, not fatal: see
+            # adapters/base.py's "Two kinds of refusal".
+            problems.exclude(
+                asset_id,
+                f"Asset_Type {asset_type!r} has no honest equivalent in this project's Windows-fleet role "
+                f"vocabulary (known: {sorted(ROLE_BY_ASSET_TYPE)}) -- not guessing a blast-radius weight "
+                'for it; see the module docstring\'s "The role boundary"',
             )
             return None
 
@@ -476,8 +466,17 @@ class BluePeakAdapter(IngestAdapter):
     # --- findings -----------------------------------------------------------
 
     def load_findings(self, path: Path, asset_ids: Collection[str]) -> Iterator[Finding]:
+        """A finding whose Asset_ID isn't in `asset_ids` is, in practice,
+        always a cascading exclusion here (never a true orphan): every
+        finding row is also an asset row in this single-file format, so
+        the only way `_map_asset` didn't yield that Asset_ID is either a
+        scope-boundary exclusion (self.stats.excluded_assets -- the
+        expected case) or a fatal data-quality problem on the asset's own
+        row, which would already have raised out of load_assets before
+        load_findings ever ran. The true-orphan branch below is kept only
+        as a defensive fallback, mirroring defender.py's shape."""
         self.stats.duplicate_findings_collapsed = 0
-        problems = _Problems(path)
+        problems = ProblemCollector(path)
         seen: dict[str, tuple[str, int]] = {}  # finding_id -> (content digest, row_no)
         orphans: list[str] = []
 
@@ -490,7 +489,11 @@ class BluePeakAdapter(IngestAdapter):
                     continue
                 finding, content = mapped
                 if finding.asset_id not in asset_ids:
-                    orphans.append(f"{finding.finding_id} (asset {finding.asset_id})")
+                    excluded_reason = self.stats.excluded_assets.get(finding.asset_id)
+                    if excluded_reason is not None:
+                        problems.exclude(finding.finding_id, f"its asset ({finding.asset_id}) was excluded: {excluded_reason}")
+                    else:
+                        orphans.append(f"{finding.finding_id} (asset {finding.asset_id})")
                     continue
                 prior = seen.get(finding.finding_id)
                 if prior is None:
@@ -510,13 +513,14 @@ class BluePeakAdapter(IngestAdapter):
             listed = ", ".join(sorted(orphans)[:MAX_PROBLEMS_SHOWN])
             more = len(orphans) - min(len(orphans), MAX_PROBLEMS_SHOWN)
             problems.add(
-                f"{len(orphans)} finding(s) reference an Asset_ID this adapter refused or never saw as an "
-                f"asset row: {listed}{f', ... and {more} more' if more else ''} -- a finding cannot be "
-                "scored without its asset context"
+                f"{len(orphans)} finding(s) reference an Asset_ID this adapter never saw as an asset row "
+                f"and cannot explain: {listed}{f', ... and {more} more' if more else ''} -- a finding "
+                "cannot be scored without its asset context"
             )
-        problems.raise_if_any("synthetic_cve_inventory export (findings)")
+        problems.raise_if_fatal("synthetic_cve_inventory export (findings)")
+        self.stats.excluded_findings = dict(problems.excluded)
 
-    def _map_finding(self, row: dict[str, str], row_no: int, problems: _Problems) -> tuple[Finding, str] | None:
+    def _map_finding(self, row: dict[str, str], row_no: int, problems: ProblemCollector) -> tuple[Finding, str] | None:
         finding_id = (row.get("Record_ID") or "").strip()
         asset_id = (row.get("Asset_ID") or "").strip()
         cve_id = (row.get("CVE_ID") or "").strip().upper()
