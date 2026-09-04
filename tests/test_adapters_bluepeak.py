@@ -386,6 +386,30 @@ def test_compensating_controls_union_across_an_assets_findings(tmp_path):
     assert set(controls) == {"SMB access segmented by department", "Archive extraction limited to authenticated file services"}
 
 
+@pytest.mark.parametrize("bad_control", ["Segmented, monitored, and alerted", "WAF; rate limiting also applied"])
+def test_a_control_containing_a_comma_or_semicolon_is_refused(tmp_path, bad_control):
+    """The bug this guards: compensating_control_list splits on comma AND
+    semicolon to recover a UNIONED value's individual controls, so a single
+    control whose own English-language description contains one of those
+    characters would be silently split into multiple fake controls on the
+    very next read -- deepening score_impact's decay for a fact the file
+    never declared. Refused rather than joined into the union unremarked."""
+    rows = [_row(compensating_control=bad_control)]
+    data_dir = _sample_dir(tmp_path, rows)
+    with pytest.raises(IngestError, match="contains a ',' or ';'"):
+        load_batch(data_dir, get_adapter("bluepeak"))
+
+
+def test_a_control_free_of_the_forbidden_characters_is_unaffected(tmp_path):
+    """The guard must not false-positive on ordinary text with no comma or
+    semicolon, however long or descriptive."""
+    rows = [_row(compensating_control="Traffic filtered and alerted at the WAF")]
+    data_dir = _sample_dir(tmp_path, rows)
+    assets, enriched = load_batch(data_dir, get_adapter("bluepeak"))
+    list(enriched)
+    assert assets["SRV-01"].compensating_control_list == ("Traffic filtered and alerted at the WAF",)
+
+
 def test_assigned_team_differing_per_finding_does_not_conflict(tmp_path):
     """The other real fixture case: Assigned_Team is per-finding
     remediation ownership, not asset ownership -- it must never block the

@@ -121,13 +121,25 @@ services" on another). `Asset.compensating_controls` is a single
 asset-level field, though, so `load_assets` resolves this by union rather
 than requiring every row's `Compensating_Control` to agree the way it
 requires role/criticality/environment/etc. to: every distinct non-blank
-value seen across an Asset_ID's rows is collected and joined
-(`compensating_control_list` already splits on comma/semicolon, so a
-joined string is exactly what every other consumer already expects). This
-is not a guess -- both controls are real, declared facts about the asset,
-just declared on different rows -- and only makes `score_impact`'s decay
-stronger (each additional distinct control counts, capped at
+value seen across an Asset_ID's rows is collected and joined with ", ".
+This is not a guess -- both controls are real, declared facts about the
+asset, just declared on different rows -- and only makes `score_impact`'s
+decay stronger (each additional distinct control counts, capped at
 MAX_CONTROLS_COUNTED), never weaker.
+
+`compensating_control_list` (schema.py) splits its field on comma AND
+semicolon to recover the individual controls a joined string encodes --
+correct for the native format's own convention, where one CSV cell is
+already meant to hold a delimited list. It is not automatically correct
+here: a BluePeak `Compensating_Control` cell is one atomic, free-text
+control description, and English prose routinely contains a comma
+("segmented, monitored, and alerted"). Joining such a value into the
+union verbatim would silently manufacture extra distinct controls on
+re-split -- a real control counted as two or three, deepening the impact
+decay for a fact the file never declared, with nothing to show it
+happened. `_map_asset` refuses a row whose `Compensating_Control` cell
+contains a comma or semicolon rather than let that ambiguity through
+unremarked; none of the real file's 15 distinct values does.
 
 Assigned_Team is not an owner
 -------------------------------
@@ -478,6 +490,21 @@ class BluePeakAdapter(IngestAdapter):
             "owner": str(NOT_COLLECTED_DEFAULTS["owner"]),
         }
         control = (row.get("Compensating_Control") or "").strip()
+        if "," in control or ";" in control:
+            # See the module docstring's "The compensating-control union".
+            # compensating_control_list splits on both characters to recover
+            # a UNIONED value's individual controls -- joining this cell
+            # verbatim would let its own internal punctuation be mistaken
+            # for that separator on the next read, silently inflating the
+            # count of distinct controls score_impact sees.
+            problems.add(
+                f"row {row_no} ({hostname}): Compensating_Control {control!r} contains a ',' or ';' -- "
+                "asset.compensating_control_list treats both as separators between independent controls, "
+                "so joining this value into the fleet-wide union would silently manufacture extra distinct "
+                "controls on the next read and deepen the impact decay for a fact this file never declared. "
+                "Rephrase the control text to remove the comma/semicolon."
+            )
+            return None
         return fields, control, observed
 
     # --- findings -----------------------------------------------------------
