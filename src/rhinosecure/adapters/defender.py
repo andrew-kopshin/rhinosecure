@@ -95,7 +95,11 @@ Messy realities, and what each one does
   guessing.
 - Non-CVE advisory ids: refused. Enrichment (NVD/KEV/EPSS) is keyed by CVE,
   so a row without one cannot be scored; filter it out of the export.
-- UTF-8 BOM (Excel and PowerShell both write one): tolerated.
+- Encoding: read from the file's own byte-order mark by `ingest.open_csv`,
+  so an Excel export (UTF-8 BOM) and a Windows PowerShell `Export-Csv` one
+  (UTF-16LE BOM, the default there) both load. A file with no BOM is read as
+  UTF-8 and refused as an `IngestError` if it isn't -- never decoded as
+  something merely plausible.
 
 Two passes over vulnerabilities.csv
 -----------------------------------
@@ -121,6 +125,7 @@ from typing import IO
 
 from pydantic import ValidationError
 
+from rhinosecure import ingest
 from rhinosecure.adapters.base import (
     MAX_PROBLEMS_SHOWN,
     NOT_COLLECTED_DEFAULTS,
@@ -191,8 +196,10 @@ FINDING_ID_HEX_LEN = 16
 
 
 def _open_csv(path: Path) -> tuple[IO[str], csv.DictReader]:
-    f = path.open(newline="", encoding="utf-8-sig")  # -sig: strip a BOM if Excel/PowerShell wrote one
-    return f, csv.DictReader(f)
+    # ingest.open_csv reads the BOM to pick the codec, so an Excel (UTF-8 BOM)
+    # or PowerShell (UTF-16LE BOM) export is read correctly rather than
+    # crashing, and a wrong codec is refused as an IngestError.
+    return ingest.open_csv(path)
 
 
 def _require_columns(path: Path, reader: csv.DictReader, required: tuple[str, ...], what: str) -> None:
@@ -267,7 +274,7 @@ class DefenderAdapter(IngestAdapter):
         with f:
             _require_columns(path, reader, DEVICE_COLUMNS_REQUIRED, "DeviceInfo")
             has_timestamp = "Timestamp" in (reader.fieldnames or [])
-            for row_no, row in enumerate(reader, start=2):
+            for row_no, row in ingest.iter_csv_rows(path, reader):
                 mapped = self._map_device(row, row_no, problems, has_timestamp)
                 if mapped is None:
                     continue
@@ -393,7 +400,7 @@ class DefenderAdapter(IngestAdapter):
         f, reader = _open_csv(path)
         with f:
             has_first_seen = "FirstSeenTimestamp" in (reader.fieldnames or [])
-            for row_no, row in enumerate(reader, start=2):
+            for row_no, row in ingest.iter_csv_rows(path, reader):
                 mapped = self._map_vulnerability(row, row_no, ProblemCollector(path), has_first_seen)
                 assert mapped is not None  # the validation pass already refused anything unmappable
                 digest, _content, finding = mapped
@@ -425,7 +432,7 @@ class DefenderAdapter(IngestAdapter):
         with f:
             _require_columns(path, reader, VULNERABILITY_COLUMNS_REQUIRED, "DeviceTvmSoftwareVulnerabilities")
             has_first_seen = "FirstSeenTimestamp" in (reader.fieldnames or [])
-            for row_no, row in enumerate(reader, start=2):
+            for row_no, row in ingest.iter_csv_rows(path, reader):
                 mapped = self._map_vulnerability(row, row_no, problems, has_first_seen)
                 if mapped is None:
                     continue

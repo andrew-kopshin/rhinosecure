@@ -44,12 +44,13 @@ deterministic or agents path.
 
 from __future__ import annotations
 
+import codecs
 import csv
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import IO, TYPE_CHECKING
 
 from pydantic import ValidationError
 
@@ -162,9 +163,93 @@ class GapTally:
         )
 
 
+# Byte-order marks, longest first: UTF-32-LE's BOM begins with UTF-16-LE's, so
+# checking UTF-16 first would decode a UTF-32 file as UTF-16 and produce
+# garbage rather than a refusal. The "utf-16"/"utf-32" codecs (no -le/-be
+# suffix) read the BOM to pick endianness and strip it, so one entry covers
+# both byte orders.
+_BOM_ENCODINGS: tuple[tuple[bytes, str], ...] = (
+    (codecs.BOM_UTF32_LE, "utf-32"),
+    (codecs.BOM_UTF32_BE, "utf-32"),
+    (codecs.BOM_UTF16_LE, "utf-16"),
+    (codecs.BOM_UTF16_BE, "utf-16"),
+    (codecs.BOM_UTF8, "utf-8-sig"),
+)
+
+
+def detect_encoding(path: Path) -> str:
+    """The codec `path` declares through its byte-order mark, or utf-8.
+
+    Windows PowerShell 5.1's `Export-Csv` writes UTF-16LE with a BOM by
+    default, and Excel writes UTF-8 with one -- so a real export is very
+    often not the bare UTF-8 every loader here used to assume. Sniffing the
+    BOM is not guessing: a BOM is the file stating its own encoding. A file
+    with no BOM is read as UTF-8 and refused by `open_csv` if it isn't.
+    """
+    # A missing or unreadable file raises OSError from here, exactly as the
+    # `path.open(...)` this replaced did. Deliberately not wrapped in
+    # IngestError: `Coordinator.__init__`'s native-only fallback load depends
+    # on the bare FileNotFoundError (pinned by test_coordinator.py), and
+    # whether that constructor's error contract should change is its own
+    # decision, not something an encoding fix gets to make on the way past.
+    with path.open("rb") as f:
+        prefix = f.read(4)
+    for bom, encoding in _BOM_ENCODINGS:
+        if prefix.startswith(bom):
+            return encoding
+    return "utf-8"
+
+
+def open_csv(path: Path) -> tuple[IO[str], csv.DictReader]:
+    """Open a source CSV in the encoding it declares, header already read.
+
+    Every adapter reads its files through here so encoding handling, and the
+    refusal when it fails, are identical across formats. The header is forced
+    now rather than on first iteration so a wrong codec is reported by this
+    function -- which knows the path and the encoding -- instead of surfacing
+    later as a bare `UnicodeDecodeError` from inside whatever code happens to
+    touch `fieldnames` first. That error is a `ValueError`, not an
+    `IngestError`, so before this it escaped every `except IngestError` in
+    cli.py and reached the user as a traceback.
+    """
+    encoding = detect_encoding(path)
+    f = path.open(newline="", encoding=encoding)
+    reader = csv.DictReader(f)
+    try:
+        reader.fieldnames  # noqa: B018 -- forces the header read; a bad codec fails here
+    except UnicodeDecodeError as exc:
+        f.close()
+        raise IngestError(_decode_error_message(path, encoding, exc)) from exc
+    return f, reader
+
+
+def _decode_error_message(path: Path, encoding: str, exc: UnicodeDecodeError) -> str:
+    return (
+        f"{path}: could not be decoded as {encoding} (byte {exc.object[exc.start:exc.end]!r} "
+        f"at position {exc.start}: {exc.reason}). The file declares no byte-order mark, so it "
+        "was read as UTF-8. Re-export it as UTF-8, or as UTF-8/UTF-16 with a BOM."
+    )
+
+
+def iter_csv_rows(path: Path, reader: csv.DictReader) -> Iterator[tuple[int, dict[str, str]]]:
+    """`(row number, row)` for every data row, refusing loudly on a decode
+    error mid-file rather than part-way through a batch.
+
+    The single place every adapter's row loop goes through, so a rule about
+    what a readable row *is* is stated once instead of per format.
+    """
+    try:
+        for row_no, row in enumerate(reader, start=2):
+            yield row_no, row
+    except UnicodeDecodeError as exc:
+        raise IngestError(_decode_error_message(path, exc.encoding, exc)) from exc
+
+
 def _rows(path: Path) -> Iterator[dict[str, str]]:
-    with path.open(newline="", encoding="utf-8") as f:
-        yield from csv.DictReader(f)
+    f, reader = open_csv(path)
+    with f:
+        for _row_no, row in iter_csv_rows(path, reader):
+            yield row
 
 
 def load_assets(path: Path) -> Iterator[Asset]:

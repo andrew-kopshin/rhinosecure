@@ -179,6 +179,7 @@ from typing import IO
 
 from pydantic import ValidationError
 
+from rhinosecure import ingest
 from rhinosecure.adapters.base import (
     MAX_PROBLEMS_SHOWN,
     NOT_COLLECTED_DEFAULTS,
@@ -274,8 +275,8 @@ FINDING_FIELDS_NEVER_EXPORTED = frozenset({"port", "service"})
 
 
 def _open_csv(path: Path) -> tuple[IO[str], csv.DictReader]:
-    f = path.open(newline="", encoding="utf-8-sig")  # -sig: strip a BOM if Excel/PowerShell wrote one
-    return f, csv.DictReader(f)
+    # See adapters/defender.py's _open_csv -- one shared reader for every format.
+    return ingest.open_csv(path)
 
 
 def _require_columns(path: Path, reader: csv.DictReader, required: tuple[str, ...]) -> None:
@@ -360,7 +361,7 @@ class BluePeakAdapter(IngestAdapter):
         f, reader = _open_csv(path)
         with f:
             _require_columns(path, reader, REQUIRED_COLUMNS)
-            for row_no, row in enumerate(reader, start=2):
+            for row_no, row in ingest.iter_csv_rows(path, reader):
                 mapped = self._map_asset(row, row_no, problems)
                 if mapped is None:
                     continue
@@ -499,7 +500,7 @@ class BluePeakAdapter(IngestAdapter):
         f, reader = _open_csv(path)
         with f:
             _require_columns(path, reader, REQUIRED_COLUMNS)
-            for row_no, row in enumerate(reader, start=2):
+            for row_no, row in ingest.iter_csv_rows(path, reader):
                 mapped = self._map_finding(row, row_no, problems)
                 if mapped is None:
                     continue
