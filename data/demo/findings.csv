@@ -15,11 +15,11 @@ F13,A03,CVE-2021-31207,2026-08-05,medium,Microsoft Exchange Server,2016 CU19,443
 F14,A09,CVE-2023-23397,2026-08-06,low,Microsoft Outlook,365,n/a,outlook,Reminder task triggers NTLM hash leak via crafted appointment
 F15,A12,CVE-2019-1068,2026-08-07,critical,Microsoft SQL Server Analysis Services,2014,2383,ssas,Malformed OLE DB provider request to Analysis Services enables remote code execution; vendor ERP module is certified only against this build
 F16,A01,CVE-2021-1656,2026-08-08,medium,Windows DHCP Server,n/a,67,dhcp,Malformed DHCP request triggers disclosure of uninitialized server memory
-F17,A03,CVE-2020-1015,2026-08-08,high,Windows Language Pack Installer,n/a,n/a,n/a,Installer fails to enforce file permissions during language pack setup, allowing local privilege escalation
-F18,A04,CVE-2020-0983,2026-08-08,high,Windows Error Reporting Manager,n/a,n/a,WerSvc,WER manager mishandles a file operation, letting a local user overwrite arbitrary files with SYSTEM privileges
+F17,A03,CVE-2020-1015,2026-08-08,high,Windows Language Pack Installer,n/a,n/a,n/a,"Installer fails to enforce file permissions during language pack setup, allowing local privilege escalation"
+F18,A04,CVE-2020-0983,2026-08-08,high,Windows Error Reporting Manager,n/a,n/a,WerSvc,"WER manager mishandles a file operation, letting a local user overwrite arbitrary files with SYSTEM privileges"
 F19,A06,CVE-2018-8410,2026-08-08,high,Microsoft OLE DB Driver for SQL Server,18.2,1433,mssql,Outdated OLE DB provider discloses memory contents via malformed connection string on linked-server queries
 F20,A07,CVE-2020-0788,2026-08-08,high,Windows Print Spooler,n/a,445,spoolsv,Spooler improperly discloses privileged file contents via crafted print job
 F21,A08,CVE-2020-0666,2026-08-08,high,Windows Common Log File System Driver (clfs.sys),n/a,n/a,n/a,Improper handling of objects in memory lets a locally logged-on user run code in kernel mode
 F22,A09,CVE-2020-1030,2026-08-08,high,Windows PDF viewer (built-in),n/a,n/a,n/a,Crafted PDF discloses process memory contents when opened in the built-in viewer; superseded by the Edge PDF engine on current builds
 F23,A10,CVE-2021-1727,2026-08-08,high,Windows Installer,n/a,n/a,msiserver,Local user can win a race during a repair operation to gain SYSTEM privileges
-F24,A11,CVE-2020-16938,2026-08-08,medium,Windows Kernel,n/a,n/a,n/a,Kernel improperly initializes an object in memory, letting a logged-on user read heap contents
+F24,A11,CVE-2020-16938,2026-08-08,medium,Windows Kernel,n/a,n/a,n/a,"Kernel improperly initializes an object in memory, letting a logged-on user read heap contents"
