@@ -237,9 +237,41 @@ def iter_csv_rows(path: Path, reader: csv.DictReader) -> Iterator[tuple[int, dic
 
     The single place every adapter's row loop goes through, so a rule about
     what a readable row *is* is stated once instead of per format.
+
+    A row whose field count disagrees with the header is refused here. That
+    matters most in the short-row direction: `csv.DictReader` fills a missing
+    trailing column with `None`, every adapter reads cells as
+    `(row.get(col) or "").strip()`, and a blank cell is exactly what the
+    `not_collected` machinery turns into a documented default plus a recorded
+    gap -- so without this check a truncated row is laundered into an
+    honest-looking "this source didn't collect that", in the code path built
+    to prevent precisely that. A long row is worse in a quieter way: the
+    overflow lands under the `None` key and is discarded with no trace.
+
+    Unlike a bad *value* in a well-formed row, this is a structural problem
+    with the file, so it refuses immediately rather than accumulating through
+    a `ProblemCollector` the way per-row value problems do -- a CSV whose
+    field counts do not line up is not a file to report forty separate
+    findings about.
     """
+    columns = list(reader.fieldnames or [])
     try:
         for row_no, row in enumerate(reader, start=2):
+            overflow = row.get(None)
+            if overflow is not None:
+                raise IngestError(
+                    f"{path}: row {row_no} has {len(columns) + len(overflow)} fields but the header "
+                    f"declares {len(columns)}; the {len(overflow)} extra value(s) {overflow!r} belong "
+                    "to no column and would be discarded silently. Re-export the file."
+                )
+            missing = [column for column in columns if row.get(column) is None]
+            if missing:
+                raise IngestError(
+                    f"{path}: row {row_no} has {len(columns) - len(missing)} fields but the header "
+                    f"declares {len(columns)}; column(s) {missing} are absent from the row entirely. "
+                    "A truncated row is not a row with blank cells -- treating it as one would record "
+                    "a data-quality problem as a collected-but-empty field. Re-export the file."
+                )
             yield row_no, row
     except UnicodeDecodeError as exc:
         raise IngestError(_decode_error_message(path, exc.encoding, exc)) from exc

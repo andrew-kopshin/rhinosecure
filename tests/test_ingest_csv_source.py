@@ -160,3 +160,68 @@ def test_the_reencoded_export_produces_the_same_records_as_the_utf8_one(tmp_path
 
     assert utf8[0] == utf16[0]
     assert utf8[1] == utf16[1]
+
+
+# --- ragged rows are refused, never reinterpreted ------------------------
+
+
+def test_a_short_row_is_refused_not_read_as_blank_cells(tmp_path):
+    """The dangerous direction. DictReader fills a missing trailing column
+    with None, adapters read `(row.get(c) or "").strip()`, and a blank is what
+    becomes a documented default plus a not_collected marker -- so a truncated
+    row would be recorded as "the source didn't collect that"."""
+    path = tmp_path / "x.csv"
+    path.write_bytes(b"CveId,Severity,Product\nCVE-2020-1472,High,Netlogon\nCVE-2021-34527,High\n")
+    f, reader = ingest.open_csv(path)
+    with f, pytest.raises(IngestError) as excinfo:
+        list(ingest.iter_csv_rows(path, reader))
+    message = str(excinfo.value)
+    assert "row 3" in message
+    assert "'Product'" in message
+    assert "2 fields" in message and "declares 3" in message
+
+
+def test_a_long_row_is_refused_not_silently_truncated(tmp_path):
+    path = tmp_path / "x.csv"
+    path.write_bytes(b"CveId,Severity\nCVE-2020-1472,High\nCVE-2021-34527,High,extra,more\n")
+    f, reader = ingest.open_csv(path)
+    with f, pytest.raises(IngestError) as excinfo:
+        list(ingest.iter_csv_rows(path, reader))
+    message = str(excinfo.value)
+    assert "row 3" in message
+    assert "4 fields" in message and "declares 2" in message
+    assert "extra" in message
+
+
+def test_a_genuinely_blank_cell_is_still_a_blank_cell(tmp_path):
+    """The check must not catch the case it exists to distinguish from: a row
+    with the right field count and an empty value is well-formed data."""
+    path = tmp_path / "x.csv"
+    path.write_bytes(b"CveId,Severity,Product\nCVE-2020-1472,,Netlogon\n")
+    f, reader = ingest.open_csv(path)
+    with f:
+        rows = [row for _n, row in ingest.iter_csv_rows(path, reader)]
+    assert rows == [{"CveId": "CVE-2020-1472", "Severity": "", "Product": "Netlogon"}]
+
+
+def test_a_trailing_newline_is_not_a_ragged_row(tmp_path):
+    """csv.reader yields [] for a blank line and DictReader skips it -- worth
+    pinning, since every well-formed CSV ends with one."""
+    path = tmp_path / "x.csv"
+    path.write_bytes(b"CveId,Severity\nCVE-2020-1472,High\n\n")
+    f, reader = ingest.open_csv(path)
+    with f:
+        rows = [row for _n, row in ingest.iter_csv_rows(path, reader)]
+    assert rows == [{"CveId": "CVE-2020-1472", "Severity": "High"}]
+
+
+def test_a_ragged_row_refuses_through_a_real_adapter(tmp_path):
+    """End to end: the refusal must reach the CLI as an IngestError, which is
+    what every `except IngestError` in cli.py already catches."""
+    data_dir = _reencode(DEFENDER_SAMPLE, tmp_path / "ragged", "utf-8")
+    devices = data_dir / "devices.csv"
+    devices.write_text(devices.read_text(encoding="utf-8") + "2026-08-30T02:10:44Z,truncated\n", encoding="utf-8")
+    with pytest.raises(IngestError) as excinfo:
+        assets, findings = load_batch(data_dir, get_adapter("defender"))
+        list(findings)
+    assert "fields but the header" in str(excinfo.value)
