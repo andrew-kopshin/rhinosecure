@@ -303,11 +303,18 @@ class ToTDispatchError(RuntimeError):
     floor would silently undercount actual spend, defeating the point of
     tracking usage at all. `agents/coordinator.py`'s `_dispatch_tot`
     folds this into `RunState.tot_usage` in its except clause, the same
-    as a successful search's usage."""
+    as a successful search's usage.
 
-    def __init__(self, message: str, usage: UsageMetrics | None = None):
+    Also carries `raw`: the last attempt's unparsed model output (from
+    the `AgentOutputParseError` that triggered the give-up), kept
+    separate from `str(self)` for the same reason `AgentOutputParseError`
+    itself separates it -- see that class's docstring. `None` only if
+    this is constructed directly without going through `_resolve`."""
+
+    def __init__(self, message: str, usage: UsageMetrics | None = None, raw: str | None = None):
         super().__init__(message)
         self.usage = usage if usage is not None else UsageMetrics()
+        self.raw = raw
 
 
 def build_strategist_agent(llm: BaseLLM | None = None) -> Agent:
@@ -494,7 +501,8 @@ def _parse_and_check_strategy(task: Task, model: type[ModelT], expected: Strateg
     echoed = getattr(result, "strategy")
     if echoed != expected.value:
         raise AgentOutputParseError(
-            f"expected strategy={expected.value!r}, agent echoed {echoed!r}"
+            f"expected strategy={expected.value!r}, agent echoed {echoed!r}",
+            raw=task.output.raw,
         )
     return result
 
@@ -558,7 +566,9 @@ def _resolve(
             crew.kickoff()
             usage.add_usage_metrics(crew.usage_metrics)
     raise ToTDispatchError(
-        f"gave up after {max_parse_attempts} attempt(s): {last_error}", usage=usage
+        f"gave up after {max_parse_attempts} attempt(s): {last_error}",
+        usage=usage,
+        raw=getattr(last_error, "raw", None),
     )
 
 

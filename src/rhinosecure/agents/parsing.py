@@ -43,7 +43,20 @@ _JSON_BLOB = re.compile(r"\{.*\}", re.DOTALL)
 
 class AgentOutputParseError(RuntimeError):
     """Raised when an agent's raw final-answer text can't be coerced into
-    the expected schema, even after tolerating a single-key wrapper."""
+    the expected schema, even after tolerating a single-key wrapper.
+
+    `str(self)` is a short, terminal-safe summary -- it never embeds the
+    agent's raw output, which can be arbitrarily long and, worse, is
+    untrusted model-generated text (CLAUDE.md's Safety and guardrails
+    section names prompt-injection resistance in agent-reachable text as
+    an open item; printing it unbounded to every terminal that sees a
+    failure message is the opposite of containing it). The raw text is
+    still available, deliberately separated out, as `.raw` -- a caller
+    decides whether and how to show it (e.g. only under --verbose)."""
+
+    def __init__(self, message: str, *, raw: str):
+        super().__init__(message)
+        self.raw = raw
 
 
 def parse_structured_output(raw: str, model: type[ModelT]) -> ModelT:
@@ -62,7 +75,7 @@ def parse_structured_output(raw: str, model: type[ModelT]) -> ModelT:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise AgentOutputParseError(f"no valid JSON object found in agent output: {raw!r}") from exc
+        raise AgentOutputParseError("no valid JSON object found in agent output", raw=raw) from exc
 
     try:
         return model.model_validate(parsed)
@@ -76,5 +89,6 @@ def parse_structured_output(raw: str, model: type[ModelT]) -> ModelT:
                     pass  # fall through to the error below -- unwrapping didn't fix it either
         raise AgentOutputParseError(
             f"agent output did not match {model.__name__}, even after tolerating a "
-            f"single-key wrapper: {direct_error}"
+            f"single-key wrapper: {direct_error}",
+            raw=raw,
         ) from direct_error

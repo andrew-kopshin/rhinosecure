@@ -54,3 +54,25 @@ def test_non_json_text_raises():
 def test_wrapper_around_a_scalar_is_not_unwrapped():
     with pytest.raises(AgentOutputParseError):
         parse_structured_output('{"finding": "not an object"}', Widget)
+
+
+# --- raw output is carried separately from the short message -----------------
+
+
+def test_non_json_text_carries_raw_but_not_in_the_short_message():
+    """The failure text itself must stay short and terminal-safe -- the
+    agent's full, untrusted raw output belongs on .raw, not baked into
+    str(exc), so a caller can withhold it unless --verbose is passed."""
+    raw = "not json at all, and quite a bit longer than a summary should ever be"
+    with pytest.raises(AgentOutputParseError) as exc_info:
+        parse_structured_output(raw, Widget)
+    assert exc_info.value.raw == raw
+    assert raw not in str(exc_info.value)
+
+
+def test_schema_violation_also_carries_raw():
+    raw = '{"finding": {"name": "bolt"}}'  # missing count
+    with pytest.raises(AgentOutputParseError) as exc_info:
+        parse_structured_output(raw, Widget)
+    assert exc_info.value.raw == raw
+    assert "count" in str(exc_info.value)  # the short message still names what's wrong

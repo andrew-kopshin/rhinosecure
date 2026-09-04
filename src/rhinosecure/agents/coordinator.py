@@ -220,6 +220,18 @@ class RunState:
     environment_failures: dict[str, str] = field(default_factory=dict)
     risk_failures: dict[str, str] = field(default_factory=dict)
     tot_failures: dict[str, str] = field(default_factory=dict)
+    # finding_id -> the last attempt's raw, unparsed model output, for any
+    # finding recorded in one of the four *_failures dicts above whose
+    # failure came from a parse/grounding mismatch (as opposed to a
+    # skip-because-an-earlier-stage-failed entry, which has none). Kept
+    # separate from the short *_failures message on purpose -- see
+    # agents/parsing.py's AgentOutputParseError docstring -- so a caller
+    # (cli.py) can choose to show it only under --verbose. A finding_id
+    # appears in at most one *_failures dict per run (Research/
+    # Environment/Risk failure is terminal for that finding's later
+    # stages; ToT only runs for a finding Risk already succeeded on), so
+    # one flat dict keyed by finding_id is unambiguous.
+    last_raw_output: dict[str, str] = field(default_factory=dict)
 
 
 _RATIONALE_TIE_TOLERANCE = 0.05  # risk_score is printed to 0.1 -- ignore float noise below that
@@ -519,7 +531,7 @@ class Coordinator:
                 ).kickoff()
         raise ConstraintInterpretationError(
             f"gave up after {self.max_parse_attempts} attempt(s): {last_error}"
-        )
+        ) from last_error
 
     def submit_constraint(
         self, text: str, findings: list[EnrichedFinding], *, seed: int = 42
@@ -805,6 +817,7 @@ class Coordinator:
         failures[finding_id] = (
             f"gave up after {self.max_parse_attempts} attempt(s): {last_error}"
         )
+        self.state.last_raw_output[finding_id] = task.output.raw
         return None
 
     def _dispatch_research(self, findings: list[EnrichedFinding]) -> None:
@@ -959,5 +972,7 @@ class Coordinator:
                 total_usage.add_usage_metrics(result.usage)
             except ToTDispatchError as exc:
                 self.state.tot_failures[fid] = str(exc)
+                if exc.raw is not None:
+                    self.state.last_raw_output[fid] = exc.raw
                 total_usage.add_usage_metrics(exc.usage)
         self.state.tot_usage = total_usage

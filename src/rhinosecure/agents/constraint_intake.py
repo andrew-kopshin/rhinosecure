@@ -227,7 +227,13 @@ def apply_constraints(asset: Asset, constraints: list[Constraint]) -> Asset:
 class ConstraintInterpretationError(RuntimeError):
     """Raised when the Interpreter's response never parses within
     max_parse_attempts -- see module docstring for why this aborts the
-    whole submit_constraint call rather than being recorded and skipped."""
+    whole submit_constraint call rather than being recorded and skipped.
+
+    Chained (`raise ... from last_error`) onto the `AgentOutputParseError`
+    of the final failed attempt, so `self.__cause__.raw` carries that
+    attempt's raw, unparsed model output -- kept out of `str(self)` on
+    purpose (see AgentOutputParseError's docstring); a caller shows it
+    only under --verbose."""
 
 
 SEARCHABLE_ASSET_FIELDS = ("asset_id", "hostname", "business_function", "role", "owner")

@@ -340,12 +340,24 @@ def _print_agent_table(recommendations: list) -> None:
     _print_rows(headers, rows)
 
 
-def _print_failures(coordinator: Coordinator) -> None:
+def _print_raw_output(raw: str, *, indent: str, file) -> None:
+    """--verbose only. The exact, untrusted, unparsed model text behind a
+    short failure summary -- withheld from the summary itself on purpose,
+    see agents/parsing.py's AgentOutputParseError docstring."""
+    print(f"{indent}raw model output:", file=file)
+    for line in raw.splitlines() or [""]:
+        print(f"{indent}  {line}", file=file)
+
+
+def _print_failures(coordinator: Coordinator, *, verbose: bool = False) -> None:
     """Findings recorded and skipped (rather than left blocking the run)
     at any stage -- see agents/coordinator.py's module docstring. A ToT
     failure is reported the same way but never removes the finding from
     the table above -- Risk already succeeded for it (see
-    agents/coordinator.py's _dispatch_tot docstring)."""
+    agents/coordinator.py's _dispatch_tot docstring). `reason` is always
+    a short summary (never the agent's raw output, which can be
+    arbitrary-length untrusted model text) -- pass verbose=True (--verbose)
+    to also print the failing attempt's raw output, when one was recorded."""
     stages = (
         ("research", coordinator.state.research_failures),
         ("environment", coordinator.state.environment_failures),
@@ -359,6 +371,10 @@ def _print_failures(coordinator: Coordinator) -> None:
     for stage, failures in stages:
         for finding_id, reason in failures.items():
             print(f"  {finding_id} ({stage}): {reason}", file=sys.stderr)
+            if verbose:
+                raw = coordinator.state.last_raw_output.get(finding_id)
+                if raw is not None:
+                    _print_raw_output(raw, indent="    ", file=sys.stderr)
 
 
 def _print_contested_rate(rate: ContestedRate) -> None:
@@ -372,15 +388,21 @@ _TERMINATION_LABELS = {
 }
 
 
-def _print_tot_result(finding_id: str, coordinator: Coordinator) -> None:
+def _print_tot_result(finding_id: str, coordinator: Coordinator, *, verbose: bool = False) -> None:
     """Prints a contested finding's Tree-of-Thought outcome right after
     its narrative, if it has one -- either a single winning strategy, or
     (Section 6: "Near-tie -> surface both branches to the human") every
     candidate in a near-tied final beam, with no branch picked for the
     reader. Silently does nothing for a finding with neither a result nor
-    a recorded failure -- i.e. every finding that was never contested."""
+    a recorded failure -- i.e. every finding that was never contested.
+    verbose=True (--verbose) also prints a failed search's last raw
+    model output, when one was recorded -- see _print_failures."""
     if finding_id in coordinator.state.tot_failures:
         print(f"\n  Tree-of-Thought: failed -- {coordinator.state.tot_failures[finding_id]}")
+        if verbose:
+            raw = coordinator.state.last_raw_output.get(finding_id)
+            if raw is not None:
+                _print_raw_output(raw, indent="    ", file=sys.stdout)
         return
     result = coordinator.state.tot_by_id.get(finding_id)
     if result is None:
@@ -601,6 +623,14 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     run_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "with --agents, also print the raw model output behind any finding/ToT search "
+            "that failed after exhausting retries -- omitted by default (debugging only)"
+        ),
+    )
+    run_parser.add_argument(
         "--db",
         default=None,
         help=(
@@ -709,7 +739,7 @@ def main(argv: list[str] | None = None) -> int:
 
             recommendations = coordinator.ranked()
             _print_agent_table(recommendations)
-            _print_failures(coordinator)
+            _print_failures(coordinator, verbose=args.verbose)
             _print_contested_rate(contested_rate(r.bucket for r in recommendations))
 
             if args.explain:
@@ -719,7 +749,7 @@ def main(argv: list[str] | None = None) -> int:
                     for line in r.scoring_rationale:
                         print(_wrap_bullet(line))
                     print(f"\n{_wrap(r.narrative)}")
-                    _print_tot_result(r.finding_id, coordinator)
+                    _print_tot_result(r.finding_id, coordinator, verbose=args.verbose)
 
             if args.export:
                 from rhinosecure.export import write_run_export
@@ -811,7 +841,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"LLM config error: {exc}", file=sys.stderr)
             return 1
         except ConstraintInterpretationError as exc:
-            print(f"could not interpret constraint: {exc}", file=sys.stderr)
+            print(f"could not interpret constraint: {exc}. Nothing was persisted.", file=sys.stderr)
+            if args.verbose:
+                raw = getattr(exc.__cause__, "raw", None)
+                if raw is not None:
+                    _print_raw_output(raw, indent="  ", file=sys.stderr)
             return 1
 
         _print_constraint_interpretation(result.interpretation)

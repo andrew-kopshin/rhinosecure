@@ -250,12 +250,20 @@ def test_persistently_unparseable_finding_is_recorded_and_skipped_not_blocking(d
     assert "F01" not in coordinator.state.research_by_id
     assert "F01" in coordinator.state.research_failures
     assert f"gave up after {max_attempts} attempt(s)" in coordinator.state.research_failures["F01"]
+    # The raw output is kept out of the short failure message (never a
+    # multi-line UNPARSEABLE dump in research_failures itself)...
+    assert UNPARSEABLE not in coordinator.state.research_failures["F01"]
+    # ...but is still recorded, separately, for a caller to show under --verbose.
+    assert coordinator.state.last_raw_output["F01"] == UNPARSEABLE
 
     # F01 is skipped downstream too, recorded at each stage it never reached.
     assert "F01" in coordinator.state.environment_failures
     assert "Research failed" in coordinator.state.environment_failures["F01"]
     assert "F01" in coordinator.state.risk_failures
     assert "Research failed" in coordinator.state.risk_failures["F01"]
+    # Neither downstream skip ever attempted a dispatch, so neither wrote
+    # its own entry -- last_raw_output holds only the real failure above.
+    assert coordinator.state.last_raw_output == {"F01": UNPARSEABLE}
 
     # F02 is unaffected -- the run completed instead of blocking on F01.
     assert coordinator.state.risk_by_id["F02"].cve_id == "CVE-2018-8410"
@@ -504,6 +512,8 @@ def test_tot_failure_is_recorded_and_does_not_remove_the_finding_from_risk_by_id
 
     assert "F02" in coordinator.state.tot_failures
     assert "gave up after 1 attempt(s)" in coordinator.state.tot_failures["F02"]
+    assert UNPARSEABLE not in coordinator.state.tot_failures["F02"]  # short message only
+    assert coordinator.state.last_raw_output["F02"] == UNPARSEABLE  # available for --verbose
     assert "F02" not in coordinator.state.tot_by_id
     assert coordinator.state.risk_by_id["F02"].bucket == "contested"  # untouched
     assert {r.finding_id for r in ranked} == {"F01", "F02"}  # both still in the plan
@@ -574,8 +584,17 @@ def test_interpret_constraint_raises_after_persistent_parse_failure(data_dir, fi
     _QueuedFakeCrew.queue = [UNPARSEABLE, UNPARSEABLE]
 
     coordinator = Coordinator(data_dir, max_parse_attempts=max_attempts)
-    with pytest.raises(coordinator_module.ConstraintInterpretationError, match="gave up after 2 attempt"):
+    with pytest.raises(coordinator_module.ConstraintInterpretationError, match="gave up after 2 attempt") as exc_info:
         coordinator.interpret_constraint("nonsense", findings)
+
+    # The short message never embeds the raw output (untrusted, unbounded
+    # model text) -- it survives only as __cause__.raw, chained on
+    # purpose so a caller (cli.py, --verbose) can still reach it.
+    assert UNPARSEABLE not in str(exc_info.value)
+    from rhinosecure.agents.parsing import AgentOutputParseError
+
+    assert isinstance(exc_info.value.__cause__, AgentOutputParseError)
+    assert exc_info.value.__cause__.raw == UNPARSEABLE
 
 
 def test_submit_constraint_without_memory_raises(data_dir, findings):

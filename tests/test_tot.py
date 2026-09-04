@@ -238,12 +238,14 @@ def test_parse_and_check_strategy_succeeds_when_echoed_strategy_matches():
 
 
 def test_parse_and_check_strategy_raises_when_echoed_strategy_is_wrong():
-    task = SimpleNamespace(output=SimpleNamespace(raw=json.dumps({"strategy": "build_control", "proposal": "x"})))
-    with pytest.raises(AgentOutputParseError):
+    raw = json.dumps({"strategy": "build_control", "proposal": "x"})
+    task = SimpleNamespace(output=SimpleNamespace(raw=raw))
+    with pytest.raises(AgentOutputParseError) as exc_info:
         _parse_and_check_strategy(task, ProposalOutput, Strategy.EMERGENCY_CHANGE)
+    assert exc_info.value.raw == raw  # available for --verbose even on a grounding mismatch
 
 
-# --- ToTDispatchError.usage ---------------------------------------------
+# --- ToTDispatchError.usage / .raw ---------------------------------------------
 
 
 def test_tot_dispatch_error_defaults_to_empty_usage_not_none():
@@ -255,6 +257,16 @@ def test_tot_dispatch_error_carries_the_usage_it_was_given():
     usage = UsageMetrics(total_tokens=42, successful_requests=3)
     exc = ToTDispatchError("gave up", usage=usage)
     assert exc.usage is usage
+
+
+def test_tot_dispatch_error_defaults_raw_to_none():
+    exc = ToTDispatchError("gave up")
+    assert exc.raw is None
+
+
+def test_tot_dispatch_error_carries_the_raw_output_it_was_given():
+    exc = ToTDispatchError("gave up", raw="not json at all")
+    assert exc.raw == "not json at all"
 
 
 # --- agent/task construction (no network, no LLM call) -----------------------
@@ -551,6 +563,10 @@ def test_persistently_unparseable_response_raises_tot_dispatch_error():
     # docstring). Batched propose (3 tasks) + one retry (1 task) = 4.
     assert exc_info.value.usage.successful_requests == 4
     assert exc_info.value.usage.total_tokens == 400
+    # The last attempt's raw output survives onto the exception too --
+    # available for --verbose, never baked into the short message above.
+    assert exc_info.value.raw == UNPARSEABLE
+    assert UNPARSEABLE not in str(exc_info.value)
 
 
 def test_a_wrong_echoed_strategy_is_retried_and_recovers():

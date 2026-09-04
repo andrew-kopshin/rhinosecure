@@ -121,6 +121,7 @@ class _FakeCoordinator:
     result: list = []
     failures: dict = {}
     tot_by_id: dict = {}
+    last_raw_output: dict = {}
     last_init_args: tuple | None = None
     last_run_findings: list | None = None
     last_memory = None
@@ -140,6 +141,7 @@ class _FakeCoordinator:
             risk_failures=_FakeCoordinator.failures.get("risk", {}),
             tot_failures=_FakeCoordinator.failures.get("tot", {}),
             tot_by_id=_FakeCoordinator.tot_by_id,
+            last_raw_output=_FakeCoordinator.last_raw_output,
         )
 
     def run(self, findings):
@@ -155,6 +157,7 @@ def _reset_fake_coordinator():
     _FakeCoordinator.result = []
     _FakeCoordinator.failures = {}
     _FakeCoordinator.tot_by_id = {}
+    _FakeCoordinator.last_raw_output = {}
     _FakeCoordinator.last_init_args = None
     _FakeCoordinator.last_run_findings = None
     _FakeCoordinator.last_memory = None
@@ -275,6 +278,32 @@ def test_main_with_agents_flag_prints_recorded_failures(monkeypatch, capsys):
     assert "research" in err
 
 
+def test_main_with_agents_flag_withholds_raw_output_without_verbose(monkeypatch, capsys):
+    """The agent's raw output is untrusted, unbounded model text -- must
+    not reach the terminal by default, only under --verbose."""
+    monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
+    _FakeCoordinator.result = [_fake_recommendation()]
+    _FakeCoordinator.failures = {"research": {"F07": "gave up after 3 attempt(s): no valid JSON object found"}}
+    _FakeCoordinator.last_raw_output = {"F07": "this is not json and will never parse"}
+
+    assert main(["run", "--data", "demo", "--agents"]) == 0
+    err = capsys.readouterr().err
+    assert "F07" in err
+    assert "this is not json and will never parse" not in err
+
+
+def test_main_with_agents_flag_and_verbose_prints_raw_output(monkeypatch, capsys):
+    monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
+    _FakeCoordinator.result = [_fake_recommendation()]
+    _FakeCoordinator.failures = {"research": {"F07": "gave up after 3 attempt(s): no valid JSON object found"}}
+    _FakeCoordinator.last_raw_output = {"F07": "this is not json and will never parse"}
+
+    assert main(["run", "--data", "demo", "--agents", "--verbose"]) == 0
+    err = capsys.readouterr().err
+    assert "F07" in err
+    assert "this is not json and will never parse" in err
+
+
 def test_main_with_agents_flag_prints_nothing_extra_when_no_failures(monkeypatch, capsys):
     monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
     _FakeCoordinator.result = [_fake_recommendation()]
@@ -374,6 +403,30 @@ def test_agents_explain_prints_a_tot_dispatch_failure_reason(monkeypatch, capsys
     out = capsys.readouterr().out
     assert "Tree-of-Thought: failed" in out
     assert "gave up after 3 attempt(s)" in out
+
+
+def test_agents_explain_withholds_tot_raw_output_without_verbose(monkeypatch, capsys):
+    monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
+    _FakeCoordinator.result = [_fake_recommendation(finding_id="F01", bucket="contested")]
+    _FakeCoordinator.failures = {"tot": {"F01": "gave up after 3 attempt(s): no valid JSON object found"}}
+    _FakeCoordinator.last_raw_output = {"F01": "the strategist's garbled reply"}
+
+    assert main(["run", "--data", "demo", "--agents", "--explain"]) == 0
+    out = capsys.readouterr().out
+    assert "Tree-of-Thought: failed" in out
+    assert "the strategist's garbled reply" not in out
+
+
+def test_agents_explain_and_verbose_prints_tot_raw_output(monkeypatch, capsys):
+    monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
+    _FakeCoordinator.result = [_fake_recommendation(finding_id="F01", bucket="contested")]
+    _FakeCoordinator.failures = {"tot": {"F01": "gave up after 3 attempt(s): no valid JSON object found"}}
+    _FakeCoordinator.last_raw_output = {"F01": "the strategist's garbled reply"}
+
+    assert main(["run", "--data", "demo", "--agents", "--explain", "--verbose"]) == 0
+    out = capsys.readouterr().out
+    assert "Tree-of-Thought: failed" in out
+    assert "the strategist's garbled reply" in out
 
 
 def test_agents_without_explain_prints_no_tot_detail(monkeypatch, capsys):
@@ -628,7 +681,47 @@ def test_constraint_add_maps_interpretation_error_to_exit_1(monkeypatch, capsys)
     monkeypatch.setattr("rhinosecure.cli.submit_constraint", raiser)
 
     assert main(["constraint", "add", "some constraint"]) == 1
-    assert "could not interpret constraint" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "could not interpret constraint" in err
+    assert "Nothing was persisted" in err  # no memory.add_constraint ever ran on this path
+
+
+def test_constraint_add_withholds_raw_output_without_verbose(monkeypatch, capsys):
+    """The exact bug report this fixes: a failed constraint interpretation
+    must not dump the agent's raw output to the terminal by default."""
+    from rhinosecure.agents.coordinator import ConstraintInterpretationError
+    from rhinosecure.agents.parsing import AgentOutputParseError
+
+    def raiser(*a, **k):
+        try:
+            raise AgentOutputParseError("no valid JSON object found in agent output", raw="garbled agent text")
+        except AgentOutputParseError as inner:
+            raise ConstraintInterpretationError("gave up after 3 attempt(s): no valid JSON object found") from inner
+
+    monkeypatch.setattr("rhinosecure.cli.submit_constraint", raiser)
+
+    assert main(["constraint", "add", "some constraint"]) == 1
+    err = capsys.readouterr().err
+    assert "could not interpret constraint" in err
+    assert "Nothing was persisted" in err
+    assert "garbled agent text" not in err
+
+
+def test_constraint_add_verbose_prints_the_raw_output(monkeypatch, capsys):
+    from rhinosecure.agents.coordinator import ConstraintInterpretationError
+    from rhinosecure.agents.parsing import AgentOutputParseError
+
+    def raiser(*a, **k):
+        try:
+            raise AgentOutputParseError("no valid JSON object found in agent output", raw="garbled agent text")
+        except AgentOutputParseError as inner:
+            raise ConstraintInterpretationError("gave up after 3 attempt(s): no valid JSON object found") from inner
+
+    monkeypatch.setattr("rhinosecure.cli.submit_constraint", raiser)
+
+    assert main(["constraint", "add", "some constraint", "--verbose"]) == 1
+    err = capsys.readouterr().err
+    assert "garbled agent text" in err
 
 
 def test_constraint_add_suppresses_console_output_by_default(monkeypatch):
