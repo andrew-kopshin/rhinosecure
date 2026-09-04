@@ -115,7 +115,12 @@ def bluepeak_gen_dict() -> dict:
                     "Server": "the most generic server weight",
                 },
             },
-            "business_function": {"kind": "column", "column": "Department", "case": "exact", "blank": "gap"},
+            # bluepeak.py's real Department mapping is a plain pass-through
+            # with no not_collected marking at all for a blank cell (its
+            # not_collected is the fixed ASSET_FIELDS_NEVER_EXPORTED set,
+            # never per-row) -- absent_fact matches that exactly; gap would
+            # add a per-row marker the hand-written adapter never adds.
+            "business_function": {"kind": "column", "column": "Department", "case": "exact", "blank": "absent_fact"},
             "criticality": {
                 "kind": "vocabulary", "column": "Asset_Criticality", "case": "lower", "blank": "fatal",
                 "table": {"critical": 5, "high": 4, "medium": 3, "low": 2},
@@ -150,7 +155,9 @@ def bluepeak_gen_dict() -> dict:
                 "table_notes": {"informational": "added by the reviewer; not witnessed in this file"},
             },
             "product": {"kind": "column", "column": "Affected_Product", "case": "exact", "blank": "absent_fact"},
-            "version": {"kind": "column", "column": "Affected_Version", "case": "exact", "blank": "gap"},
+            # Same reasoning as business_function above -- bluepeak.py's real
+            # Affected_Version mapping never marks a blank cell not_collected.
+            "version": {"kind": "column", "column": "Affected_Version", "case": "exact", "blank": "absent_fact"},
             "port": {"kind": "not_collected"},
             "service": {"kind": "not_collected"},
             "evidence": {
@@ -217,8 +224,15 @@ def bluepeak_gen_dict() -> dict:
         "not_collected": {
             "always_asset": ["data_sensitivity", "os", "os_build", "owner", "patch_restrictions"],
             "always_finding": ["port", "service"],
-            "per_row_eligible_asset": ["business_function"],
-            "per_row_eligible_finding": ["version"],
+            # Empty on both: bluepeak.py's own not_collected is entirely
+            # format-level (ASSET_FIELDS_NEVER_EXPORTED / FINDING_FIELDS_
+            # NEVER_EXPORTED, both fixed sets) -- it has no per-row gap
+            # tracking at all, unlike defender.py's (which genuinely does,
+            # for os_build/internet_exposed/criticality/version). business_
+            # function and version are absent_fact here for exactly that
+            # reason -- see their mapping entries above.
+            "per_row_eligible_asset": [],
+            "per_row_eligible_finding": [],
         },
         "validator_overrides": [],
         "observed": None,
@@ -303,7 +317,13 @@ def mdvm_gen_dict() -> dict:
             "finding_id": {
                 "kind": "content_address", "algorithm": "sha256",
                 "columns": ["DeviceId", "SoftwareVendor", "SoftwareName", "SoftwareVersion", "CveId"],
-                "join": "", "prefix": "MDVMC-", "hex_len": 16, "case": "upper", "recipe_version": 1,
+                # "\x1f" (unit separator), matching adapters/defender.py's own
+                # recipe byte-for-byte -- this contract's own divergences
+                # entry states the digest recipe is otherwise identical to
+                # the hand-written adapter's and differs only by the
+                # MDVMC-/MDVM- prefix, so the join character must actually
+                # match for that claim to be true.
+                "join": "", "prefix": "MDVMC-", "hex_len": 16, "case": "upper", "recipe_version": 1,
             },
             "asset_id": {"kind": "column", "column": "DeviceId", "case": "exact", "blank": "fatal"},
             "cve_id": {"kind": "parsed", "column": "CveId", "case": "upper", "blank": "fatal", "parser": "cve_id"},

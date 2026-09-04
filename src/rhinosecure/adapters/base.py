@@ -248,6 +248,20 @@ class IngestAdapter(ABC):
     def __init__(self) -> None:
         self.stats = IngestStats()
 
+    @property
+    def run_label(self) -> str:
+        """What a run driven by this adapter is recorded as
+        (`memory.runs.ingest_format`, a bare TEXT column). Defaults to the
+        plain format name for native/defender/bluepeak, where one format
+        name always means the same fixed mapping. `ConfiguredAdapter`
+        (adapters/configured.py) overrides this to include the contract's
+        own revision (`f"{format}@v{version}"`), because two runs against
+        different revisions of the same config-driven mapping are NOT the
+        same mapping -- comparing their `decisions` rows without knowing
+        which revision produced each one would compare two different
+        things silently."""
+        return self.format
+
     @abstractmethod
     def load_assets(self, path: Path) -> Iterator[Asset]:
         """Every asset in the inventory file. May consume the whole file

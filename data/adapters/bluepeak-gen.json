@@ -1,0 +1,465 @@
+{
+  "asset": {
+    "asset_id": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "Asset_ID",
+      "kind": "column"
+    },
+    "business_function": {
+      "blank": "absent_fact",
+      "case": "exact",
+      "column": "Department",
+      "kind": "column"
+    },
+    "compensating_controls": {
+      "blank": "absent_fact",
+      "case": "exact",
+      "column": "Compensating_Control",
+      "kind": "column"
+    },
+    "criticality": {
+      "blank": "fatal",
+      "case": "lower",
+      "column": "Asset_Criticality",
+      "kind": "vocabulary",
+      "table": {
+        "critical": 5,
+        "high": 4,
+        "low": 2,
+        "medium": 3
+      },
+      "table_notes": {
+        "low": "2, not 1 -- this source's four tiers do not reach the schema's floor"
+      }
+    },
+    "data_sensitivity": {
+      "kind": "not_collected"
+    },
+    "environment": {
+      "blank": "fatal",
+      "case": "lower",
+      "column": "Environment",
+      "kind": "vocabulary",
+      "table": {
+        "development": "dev",
+        "production": "prod",
+        "staging": "staging"
+      },
+      "table_notes": {
+        "staging": "added by the reviewer -- not witnessed in this file"
+      }
+    },
+    "hostname": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "Asset_Hostname",
+      "kind": "column"
+    },
+    "internet_exposed": {
+      "blank": "fatal",
+      "case": "lower",
+      "column": "Internet_Exposed",
+      "kind": "parsed",
+      "params": {
+        "false": [
+          "no",
+          "false",
+          "0"
+        ],
+        "true": [
+          "yes",
+          "true",
+          "1"
+        ]
+      },
+      "parser": "bool"
+    },
+    "os": {
+      "kind": "not_collected"
+    },
+    "os_build": {
+      "kind": "not_collected"
+    },
+    "owner": {
+      "kind": "not_collected"
+    },
+    "patch_restrictions": {
+      "kind": "not_collected"
+    },
+    "patch_window": {
+      "blank": "absent_fact",
+      "case": "exact",
+      "column": "Patch_Window",
+      "kind": "column"
+    },
+    "role": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "Asset_Type",
+      "kind": "vocabulary",
+      "table": {
+        "Application Gateway": "network_appliance",
+        "Application Server": "file",
+        "Cloud Management Portal": "identity_gateway",
+        "Container Host": "container_host",
+        "DNS Server": "file",
+        "Database Server": "sql",
+        "Development Server": "file",
+        "Domain Controller": "dc",
+        "Email Security Gateway": "email_gateway",
+        "Firewall": "firewall",
+        "Identity Gateway": "identity_gateway",
+        "Kubernetes Cluster": "container_orchestrator",
+        "Laptop": "workstation",
+        "Mobile Sync Gateway": "network_appliance",
+        "Monitoring Server": "file",
+        "Network Appliance": "network_appliance",
+        "Network Management Server": "file",
+        "Printer": "printer",
+        "Privileged Workstation": "workstation",
+        "Reporting Server": "file",
+        "Reverse Proxy": "network_appliance",
+        "Server": "file",
+        "Storage Appliance": "file",
+        "Web API": "web_app",
+        "Web Application": "web_app",
+        "Web Server": "web_app",
+        "Wireless Controller": "network_appliance",
+        "Workstation": "workstation"
+      },
+      "table_notes": {
+        "Cloud Management Portal": "identity_gateway, not container_orchestrator",
+        "Development Server": "file, not dev",
+        "Server": "the most generic server weight"
+      }
+    }
+  },
+  "asset_grouping": {
+    "key": "Asset_ID",
+    "order_by": {
+      "column": "Last_Observed",
+      "params": {
+        "format": "iso"
+      },
+      "parser": "date",
+      "required": true
+    },
+    "resolution": "agree_or_recency",
+    "union_fields": [
+      "compensating_controls"
+    ],
+    "union_justification": {
+      "compensating_controls": "FILE-SRV-01 declares two different, both-real controls on two rows with the same Last_Observed; the union asserts nothing new."
+    }
+  },
+  "attestations": [
+    {
+      "at": "2026-09-04T18:31:02Z",
+      "item": "enrichment",
+      "text": "Every CVE_ID in this export matches CVE-2099-NNNNN; trusting the export's own CVSS/exploitation/technique fields instead of a live lookup."
+    },
+    {
+      "at": "2026-09-04T18:31:02Z",
+      "item": "union",
+      "text": "Compensating_Control is declared per finding; FILE-SRV-01 declares two different real controls on two rows with the same Last_Observed. No control string in this file contains a comma or semicolon."
+    }
+  ],
+  "config_schema_version": "1.0.0",
+  "derived": {},
+  "description": "BluePeak Technologies (fictional) pre-enriched single-file CVE inventory",
+  "divergences": [
+    {
+      "rows_affected": 0,
+      "what": "A blank Asset_Type is fatal here, where adapters/bluepeak.py excludes it."
+    }
+  ],
+  "enrichment": {
+    "attack_technique": {
+      "blank": "absent_fact",
+      "column": "MITRE_ATTACK_Technique",
+      "on_no_match": "degrade",
+      "optional": true,
+      "outputs": [
+        "attack_technique_id",
+        "attack_technique_name"
+      ],
+      "pattern": "attack_technique"
+    },
+    "known_exploited": {
+      "blank": "fatal",
+      "case": "lower",
+      "column": "Known_Exploited",
+      "kind": "parsed",
+      "params": {
+        "false": [
+          "no",
+          "false",
+          "0"
+        ],
+        "true": [
+          "yes",
+          "true",
+          "1"
+        ]
+      },
+      "parser": "bool"
+    },
+    "severity_score": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "CVSS_Base_Score",
+      "kind": "parsed",
+      "params": {
+        "max": 10.0,
+        "min": 0.0
+      },
+      "parser": "float"
+    }
+  },
+  "finding": {
+    "asset_id": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "Asset_ID",
+      "kind": "column"
+    },
+    "cve_id": {
+      "blank": "fatal",
+      "case": "upper",
+      "column": "CVE_ID",
+      "kind": "parsed",
+      "parser": "cve_id"
+    },
+    "detected_date": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "First_Detected",
+      "kind": "parsed",
+      "params": {
+        "format": "iso"
+      },
+      "parser": "date"
+    },
+    "evidence": {
+      "join": "; ",
+      "kind": "composed",
+      "max_chars": 4096,
+      "parts": [
+        {
+          "fallback_template": "[{Asset_Type}] {Vulnerability_Description}",
+          "required_non_blank": [
+            "Detection_Source"
+          ],
+          "template": "[{Asset_Type}] {Detection_Source}: {Vulnerability_Description}"
+        },
+        {
+          "required_non_blank": [
+            "Exploit_Maturity"
+          ],
+          "template": "exploit maturity (source-reported): {Exploit_Maturity}"
+        },
+        {
+          "required_non_blank": [
+            "Business_Impact"
+          ],
+          "template": "business impact (source-reported): {Business_Impact}"
+        },
+        {
+          "required_non_blank": [
+            "Assigned_Team"
+          ],
+          "template": "assigned team (source-reported): {Assigned_Team}"
+        }
+      ]
+    },
+    "finding_id": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "Record_ID",
+      "kind": "column"
+    },
+    "port": {
+      "kind": "not_collected"
+    },
+    "product": {
+      "blank": "absent_fact",
+      "case": "exact",
+      "column": "Affected_Product",
+      "kind": "column"
+    },
+    "scanner_severity": {
+      "blank": "fatal",
+      "case": "lower",
+      "column": "Severity",
+      "kind": "vocabulary",
+      "table": {
+        "critical": "critical",
+        "high": "high",
+        "informational": "informational",
+        "low": "low",
+        "medium": "medium"
+      },
+      "table_notes": {
+        "informational": "added by the reviewer; not witnessed in this file"
+      }
+    },
+    "service": {
+      "kind": "not_collected"
+    },
+    "version": {
+      "blank": "absent_fact",
+      "case": "exact",
+      "column": "Affected_Version",
+      "kind": "column"
+    }
+  },
+  "finding_dedup": {
+    "content_targets": [
+      "scanner_severity",
+      "detected_date",
+      "product",
+      "version",
+      "source_enrichment.severity_score",
+      "source_enrichment.known_exploited"
+    ],
+    "on_conflict": "fatal",
+    "on_identical": "collapse_and_count"
+  },
+  "format": "bluepeak-gen",
+  "generated_at": "2026-09-04T18:22:41Z",
+  "generator": {
+    "attempts": 1,
+    "call_log_digest": "sha256:6d1f0c93a77b41e2c0f5b8a9d2e34f7011ab5c6d7e8f90a1b2c3d4e5f6a7b8c9",
+    "completion_tokens": 3117,
+    "estimated_cost_usd": 0.089,
+    "model": "claude-sonnet-5",
+    "prompt_tokens": 14208,
+    "tool": "rhino adapt propose"
+  },
+  "header": {
+    "assets": {
+      "columns": [
+        "Company",
+        "Record_ID",
+        "CVE_ID",
+        "Is_Synthetic",
+        "Vulnerability_Title",
+        "Vulnerability_Description",
+        "CWE_ID",
+        "MITRE_ATTACK_Technique",
+        "Affected_Product",
+        "Affected_Version",
+        "Asset_ID",
+        "Asset_Hostname",
+        "Asset_Type",
+        "Department",
+        "Environment",
+        "Asset_Criticality",
+        "Internet_Exposed",
+        "Detection_Source",
+        "First_Detected",
+        "Last_Observed",
+        "CVSS_Base_Score",
+        "Severity",
+        "Exploit_Maturity",
+        "Known_Exploited",
+        "Patch_Available",
+        "Compensating_Control",
+        "Patch_Window",
+        "Remediation_Status",
+        "Assigned_Team",
+        "SLA_Days",
+        "Target_Remediation_Date",
+        "Business_Impact",
+        "Recommended_Action",
+        "Data_Source"
+      ],
+      "sha256": "sha256:094187d066e180adb184ed7120b2e45e6255c1b5ec1908476ee5402e224c92db"
+    },
+    "mode": "declared"
+  },
+  "not_collected": {
+    "always_asset": [
+      "data_sensitivity",
+      "os",
+      "os_build",
+      "owner",
+      "patch_restrictions"
+    ],
+    "always_finding": [
+      "port",
+      "service"
+    ],
+    "per_row_eligible_asset": [],
+    "per_row_eligible_finding": []
+  },
+  "observed": null,
+  "review": {
+    "confirmed_at": "2026-09-04T20:00:00Z",
+    "confirmed_by": "andy.kopshin@gmail.com",
+    "confirmed_version": 2,
+    "content_digest": "sha256:7fd6130285d60c3072b54f56ae79f141d3ef6dcd75599af31425a039ad958c0d",
+    "decision_digest": "sha256:525f02a99a11229aebe14e6aa3c426e3de18e3a08ad68c9af75eff2a43739e90",
+    "state": "confirmed"
+  },
+  "source": {
+    "assets_filename": "synthetic_cve_inventory_50.csv",
+    "delimiter": ",",
+    "encoding": "auto",
+    "findings_filename": "synthetic_cve_inventory_50.csv",
+    "first_data_row": 2,
+    "layout": "single_file",
+    "quotechar": "\""
+  },
+  "unmapped_columns": {
+    "synthetic_cve_inventory_50.csv": {
+      "Assigned_Team": {
+        "disposition": "evidence_only",
+        "reason": "per-finding remediation owner, not asset owner"
+      },
+      "CWE_ID": {
+        "disposition": "ignored",
+        "reason": "weakness taxonomy; no schema field"
+      },
+      "Company": {
+        "disposition": "ignored",
+        "reason": "one constant value on all 50 rows"
+      },
+      "Data_Source": {
+        "disposition": "ignored",
+        "reason": "a constant disclaimer sentence"
+      },
+      "Is_Synthetic": {
+        "disposition": "ignored",
+        "reason": "constant TRUE"
+      },
+      "Patch_Available": {
+        "disposition": "ignored",
+        "reason": "remediation-workflow state"
+      },
+      "Recommended_Action": {
+        "disposition": "deliberately_dropped",
+        "reason": "the source's own remediation verdict"
+      },
+      "Remediation_Status": {
+        "disposition": "ignored",
+        "reason": "the source's own workflow state"
+      },
+      "SLA_Days": {
+        "disposition": "deliberately_dropped",
+        "reason": "the source's own prioritisation output"
+      },
+      "Target_Remediation_Date": {
+        "disposition": "ignored",
+        "reason": "derived from SLA_Days"
+      },
+      "Vulnerability_Title": {
+        "disposition": "ignored",
+        "reason": "a restatement of Vulnerability_Description"
+      }
+    }
+  },
+  "validator_overrides": [],
+  "version": 2
+}

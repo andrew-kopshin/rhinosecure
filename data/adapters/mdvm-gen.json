@@ -1,0 +1,440 @@
+{
+  "asset": {
+    "asset_id": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "DeviceId",
+      "kind": "column"
+    },
+    "business_function": {
+      "kind": "not_collected"
+    },
+    "compensating_controls": {
+      "kind": "not_collected"
+    },
+    "criticality": {
+      "blank": "gap",
+      "case": "lower",
+      "column": "AssetValue",
+      "kind": "vocabulary",
+      "table": {
+        "high": 5,
+        "low": 1,
+        "normal": 3
+      },
+      "table_notes": {
+        "normal": "Defender's own documented default tier"
+      }
+    },
+    "data_sensitivity": {
+      "kind": "not_collected"
+    },
+    "environment": {
+      "kind": "not_collected"
+    },
+    "hostname": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "DeviceName",
+      "kind": "column"
+    },
+    "internet_exposed": {
+      "blank": "gap",
+      "case": "lower",
+      "column": "IsInternetFacing",
+      "kind": "parsed",
+      "params": {
+        "false": [
+          "false",
+          "no",
+          "0"
+        ],
+        "true": [
+          "true",
+          "yes",
+          "1"
+        ]
+      },
+      "parser": "bool"
+    },
+    "os": {
+      "from": "os_platform",
+      "kind": "derived",
+      "output": "os"
+    },
+    "os_build": {
+      "blank": "gap",
+      "case": "exact",
+      "column": "OSBuild",
+      "kind": "column"
+    },
+    "owner": {
+      "kind": "not_collected"
+    },
+    "patch_restrictions": {
+      "kind": "not_collected"
+    },
+    "patch_window": {
+      "kind": "not_collected"
+    },
+    "role": {
+      "keyed_by": {
+        "from": "os_platform",
+        "output": "os_class"
+      },
+      "kind": "default_by",
+      "table": "ROLE_DEFAULT_BY_OS_CLASS"
+    }
+  },
+  "asset_grouping": {
+    "key": "DeviceId",
+    "order_by": {
+      "column": "Timestamp",
+      "parser": "timestamp",
+      "required": false
+    },
+    "resolution": "agree_or_recency",
+    "union_fields": [],
+    "union_justification": {}
+  },
+  "attestations": [
+    {
+      "at": "2026-09-04T19:09:44Z",
+      "item": "finding_id.synthesized",
+      "text": "Defender exports no stable per-finding id; the id is a sha256 over DeviceId/SoftwareVendor/SoftwareName/SoftwareVersion/CveId, frozen on confirmation. SoftwareVendor is an OPTIONAL column inside that tuple."
+    }
+  ],
+  "config_schema_version": "1.0.0",
+  "derived": {
+    "os_platform": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "OSPlatform",
+      "outputs": [
+        "os",
+        "os_class"
+      ],
+      "table": {
+        "Windows10": [
+          "Windows 10",
+          "client"
+        ],
+        "Windows11": [
+          "Windows 11",
+          "client"
+        ],
+        "Windows7": [
+          "Windows 7",
+          "client"
+        ],
+        "Windows8.1": [
+          "Windows 8.1",
+          "client"
+        ],
+        "WindowsServer2008R2": [
+          "Windows Server 2008 R2",
+          "server"
+        ],
+        "WindowsServer2012": [
+          "Windows Server 2012",
+          "server"
+        ],
+        "WindowsServer2012R2": [
+          "Windows Server 2012 R2",
+          "server"
+        ],
+        "WindowsServer2016": [
+          "Windows Server 2016",
+          "server"
+        ],
+        "WindowsServer2019": [
+          "Windows Server 2019",
+          "server"
+        ],
+        "WindowsServer2022": [
+          "Windows Server 2022",
+          "server"
+        ],
+        "WindowsServer2025": [
+          "Windows Server 2025",
+          "server"
+        ]
+      },
+      "table_notes": {
+        "Windows10": "case:'exact' on purpose -- Microsoft's exact tokens"
+      }
+    }
+  },
+  "description": "Microsoft Defender Vulnerability Management: DeviceInfo + DeviceTvmSoftwareVulnerabilities",
+  "divergences": [
+    {
+      "rows_affected": 9,
+      "what": "finding_id prefix is MDVMC-, not MDVM- -- a contract-driven adapter never mints into the hand-written adapter's id space."
+    }
+  ],
+  "finding": {
+    "asset_id": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "DeviceId",
+      "kind": "column"
+    },
+    "cve_id": {
+      "blank": "fatal",
+      "case": "upper",
+      "column": "CveId",
+      "kind": "parsed",
+      "parser": "cve_id"
+    },
+    "detected_date": {
+      "blank": "gap",
+      "case": "exact",
+      "column": "FirstSeenTimestamp",
+      "kind": "parsed",
+      "optional": true,
+      "params": {
+        "format": "iso_prefix"
+      },
+      "parser": "date"
+    },
+    "evidence": {
+      "join": "; ",
+      "kind": "composed",
+      "max_chars": 4096,
+      "parts": [
+        {
+          "join": " ",
+          "join_nonblank": [
+            "SoftwareVendor",
+            "SoftwareName",
+            "SoftwareVersion"
+          ],
+          "prefix": "Defender MDVM: "
+        },
+        {
+          "emit_if_any": [
+            "RecommendedSecurityUpdate",
+            "RecommendedSecurityUpdateId"
+          ],
+          "fallback_template": "recommended update: {RecommendedSecurityUpdate}",
+          "required_non_blank": [
+            "RecommendedSecurityUpdateId"
+          ],
+          "template": "recommended update: {RecommendedSecurityUpdate} ({RecommendedSecurityUpdateId})"
+        },
+        {
+          "required_non_blank": [
+            "DiskPaths"
+          ],
+          "template": "disk: {DiskPaths}"
+        },
+        {
+          "required_non_blank": [
+            "RegistryPaths"
+          ],
+          "template": "registry: {RegistryPaths}"
+        }
+      ]
+    },
+    "finding_id": {
+      "algorithm": "sha256",
+      "case": "upper",
+      "columns": [
+        "DeviceId",
+        "SoftwareVendor",
+        "SoftwareName",
+        "SoftwareVersion",
+        "CveId"
+      ],
+      "hex_len": 16,
+      "join": "\u001f",
+      "kind": "content_address",
+      "prefix": "MDVMC-",
+      "recipe_version": 1
+    },
+    "port": {
+      "kind": "not_collected"
+    },
+    "product": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "SoftwareName",
+      "kind": "column"
+    },
+    "scanner_severity": {
+      "blank": "fatal",
+      "case": "lower",
+      "column": "VulnerabilitySeverityLevel",
+      "kind": "vocabulary",
+      "table": {
+        "critical": "critical",
+        "high": "high",
+        "low": "low",
+        "medium": "medium"
+      },
+      "table_notes": {
+        "low": "Defender exports no 'informational' tier"
+      }
+    },
+    "service": {
+      "kind": "not_collected"
+    },
+    "version": {
+      "blank": "gap",
+      "case": "exact",
+      "column": "SoftwareVersion",
+      "kind": "column"
+    }
+  },
+  "finding_dedup": {
+    "content_targets": [
+      "scanner_severity",
+      "detected_date"
+    ],
+    "on_conflict": "fatal",
+    "on_identical": "collapse_and_count"
+  },
+  "format": "mdvm-gen",
+  "generated_at": "2026-09-04T19:00:00Z",
+  "generator": {
+    "attempts": 1,
+    "call_log_digest": "sha256:6d1f0c93a77b41e2c0f5b8a9d2e34f7011ab5c6d7e8f90a1b2c3d4e5f6a7b8c9",
+    "completion_tokens": 3117,
+    "estimated_cost_usd": 0.089,
+    "model": "claude-sonnet-5",
+    "prompt_tokens": 14208,
+    "tool": "rhino adapt propose"
+  },
+  "header": {
+    "assets": {
+      "columns": [
+        "Timestamp",
+        "DeviceId",
+        "DeviceName",
+        "OSPlatform",
+        "OSBuild",
+        "OSVersion",
+        "IsInternetFacing",
+        "AssetValue",
+        "ExposureLevel",
+        "MachineGroup"
+      ],
+      "sha256": "sha256:76ae45c5008e9ed975d32808cc1c63fbf45328e2d83cb487a732036b123993e3"
+    },
+    "findings": {
+      "columns": [
+        "DeviceId",
+        "DeviceName",
+        "OSPlatform",
+        "OSVersion",
+        "OSArchitecture",
+        "SoftwareVendor",
+        "SoftwareName",
+        "SoftwareVersion",
+        "CveId",
+        "VulnerabilitySeverityLevel",
+        "RecommendedSecurityUpdate",
+        "RecommendedSecurityUpdateId",
+        "CveTags"
+      ],
+      "sha256": "sha256:c68625dc7909dd5ad77c4417ce8276eba55015494f021e562b99ac0ef7ab7de0"
+    },
+    "mode": "declared"
+  },
+  "not_collected": {
+    "always_asset": [
+      "business_function",
+      "compensating_controls",
+      "data_sensitivity",
+      "environment",
+      "owner",
+      "patch_restrictions",
+      "patch_window",
+      "role"
+    ],
+    "always_finding": [
+      "detected_date",
+      "port",
+      "service"
+    ],
+    "per_row_eligible_asset": [
+      "criticality",
+      "internet_exposed",
+      "os_build"
+    ],
+    "per_row_eligible_finding": [
+      "version"
+    ]
+  },
+  "observed": null,
+  "review": {
+    "confirmed_at": "2026-09-04T20:00:00Z",
+    "confirmed_by": "andy.kopshin@gmail.com",
+    "confirmed_version": 1,
+    "content_digest": "sha256:df6199c57bdf2107fbcee4908c8b3246fbde7875817a8c5cc0fc446c0b29b43a",
+    "decision_digest": "sha256:d7a803d22f93c97c2f0fde07d3a706eee38e9ec02f2087a04ede19a22c3c1ffd",
+    "state": "confirmed"
+  },
+  "source": {
+    "assets_filename": "devices.csv",
+    "delimiter": ",",
+    "encoding": "auto",
+    "findings_filename": "vulnerabilities.csv",
+    "first_data_row": 2,
+    "layout": "two_file",
+    "quotechar": "\""
+  },
+  "unmapped_columns": {
+    "devices.csv": {
+      "ExposureLevel": {
+        "disposition": "deliberately_dropped",
+        "reason": "Defender's own computed exposure verdict"
+      },
+      "MachineGroup": {
+        "disposition": "deliberately_dropped",
+        "reason": "a Defender RBAC scope, not a documented role vocabulary"
+      },
+      "OSVersion": {
+        "disposition": "ignored",
+        "reason": "a display alias for OSBuild"
+      }
+    },
+    "vulnerabilities.csv": {
+      "CveTags": {
+        "disposition": "ignored",
+        "reason": "a JSON array in a cell; no multi-value reader"
+      },
+      "DeviceName": {
+        "disposition": "ignored",
+        "reason": "denormalised copy of devices.csv"
+      },
+      "OSArchitecture": {
+        "disposition": "ignored",
+        "reason": "no schema field, no scoring axis"
+      },
+      "OSPlatform": {
+        "disposition": "ignored",
+        "reason": "denormalised copy; scope vocabulary is evaluated on the asset side"
+      },
+      "OSVersion": {
+        "disposition": "ignored",
+        "reason": "denormalised copy"
+      }
+    }
+  },
+  "validator_overrides": [
+    {
+      "applied": {
+        "kind": "default_by",
+        "table": "ROLE_DEFAULT_BY_OS_CLASS"
+      },
+      "path": "asset.role",
+      "proposed": {
+        "column": "MachineGroup",
+        "kind": "vocabulary"
+      },
+      "rule": "the reviewer moved MachineGroup to unmapped_columns and accepted the OS-class default"
+    }
+  ],
+  "version": 1
+}
