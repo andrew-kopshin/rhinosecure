@@ -85,36 +85,31 @@ Finding (one per row)
 
 The role boundary
 ------------------
-`Asset.role` is a required, closed 7-value vocabulary (dc, exchange,
-iis_web, sql, file, workstation, dev) built for a Windows Active Directory
+`Asset.role`'s vocabulary was originally 7 values (dc, exchange, iis_web,
+sql, file, workstation, dev) built for a Windows Active Directory
 enterprise fleet (CLAUDE.md Section 2). BluePeak's `Asset_Type` column has
 ~28 distinct values describing a modern, heterogeneous, largely non-Windows
 fleet: firewalls, a Kubernetes cluster, a container host, network and
 identity/email gateways, a wireless controller, printers, cloud portals,
 and web applications/APIs with no IIS or Windows evidence (one is
-literally a Java gateway, another sits on `DEV-LNX-07`).
+literally a Java gateway, another sits on `DEV-LNX-07`). An earlier
+version of this adapter excluded every Asset_Type without one of the 7
+original roles as a scope-boundary problem (adapters/base.py's "Two kinds
+of refusal") rather than fabricate a blast-radius weight for it -- 23 of
+50 rows in the real file. Running the adapter against that real file
+directly motivated a scoring-model decision instead: `scoring
+.ROLE_BLAST_RADIUS` gained 8 new roles (CLAUDE.md Section 3 has the full
+weight table and reasoning for each), and `ROLE_BY_ASSET_TYPE` below now
+maps all ~28 known Asset_Type values, not just the original 13. Nothing
+in this adapter decided the weights -- that stayed a scoring.py decision,
+same discipline as `role`'s OS-class default in adapters/base.py's own
+docstring -- this file only decided which Asset_Type maps to which
+*name*.
 
-`ROLE_BY_ASSET_TYPE` below maps only the ~13 Asset_Type values with an
-honest equivalent (Domain Controller -> dc, Database Server -> sql,
-Workstation/Laptop/Privileged Workstation -> workstation, and a handful of
-generic-server types -> file, the same "most generic server role"
-fallback `defender.py`'s own docstring uses for an unclassified Windows
-server). Every other Asset_Type is excluded -- not fatal, a scope-boundary
-problem rather than a data-quality one (adapters/base.py's "Two kinds of
-refusal"), the same posture `defender.py` already takes for a non-Windows
-`OSPlatform`: forcing e.g. a Kubernetes cluster or a perimeter firewall
-into `iis_web` or `file` would assert something false about it and
-produce a confident-looking but fabricated blast-radius weight
-(scoring.ROLE_BLAST_RADIUS), which is the exact "produce a wrong-but-
-plausible number" failure the whole not_collected/refuse-rather-than-guess
-discipline exists to prevent. Every excluded asset, and every finding that
-referenced one, is still reported (IngestReport.excluded_assets/
-excluded_findings, cli.py's `_print_exclusions`) -- the rest of the batch
-scores normally. This is a deliberate scope boundary (CLAUDE.md Section
-2's Windows-only fleet decision), not a gap to widen inside an adapter --
-extending the role vocabulary is a scoring-model decision (see
-adapters/base.py's own docstring on the same point for `role`'s OS-class
-default), out of an adapter's remit.
+An Asset_Type genuinely outside even this wider vocabulary would still
+exclude, not guess -- the mechanism in "Messy realities" below is
+unchanged, there is simply nothing left in the real file that triggers
+it today.
 
 The compensating-control union
 -------------------------------
@@ -153,7 +148,9 @@ Messy realities, and what each one does
 - Asset_Type with no entry in ROLE_BY_ASSET_TYPE: excluded, not fatal --
   see "The role boundary" above. Its findings are excluded too, cascading,
   reported as "its asset was excluded: ..." rather than a separate orphan
-  message for the same root cause.
+  message for the same root cause. Nothing in the real 50-row file
+  triggers this today (the table now covers every Asset_Type it contains);
+  kept as a real, exercised code path for whatever a future export names.
 - Repeated Asset_ID rows (the same asset has more than one finding):
   compensating controls union (see above); every other asset field must
   agree across rows or collapse to the later Last_Observed date (this
@@ -216,9 +213,12 @@ REQUIRED_COLUMNS = (
 )
 OPTIONAL_COLUMNS = ("MITRE_ATTACK_Technique", "Exploit_Maturity", "Business_Impact")
 
-# Asset_Type -> AssetRole. Anything not listed is refused, not mapped to
+# Asset_Type -> AssetRole. Anything not listed is excluded, not mapped to
 # the nearest neighbour -- see "The role boundary" in the module docstring.
+# Weights and reasoning for the non-Windows-core roles: scoring.py's
+# ROLE_BLAST_RADIUS, CLAUDE.md Section 3.
 ROLE_BY_ASSET_TYPE: dict[str, str] = {
+    # Windows AD-enterprise core
     "Domain Controller": "dc",
     "Database Server": "sql",
     "Workstation": "workstation",
@@ -232,6 +232,22 @@ ROLE_BY_ASSET_TYPE: dict[str, str] = {
     "Network Management Server": "file",
     "DNS Server": "file",
     "Development Server": "file",
+    # Perimeter/platform infrastructure
+    "Identity Gateway": "identity_gateway",
+    "Cloud Management Portal": "identity_gateway",  # its own impact framing is credential theft, not workload control
+    "Firewall": "firewall",
+    "Kubernetes Cluster": "container_orchestrator",
+    "Email Security Gateway": "email_gateway",
+    "Network Appliance": "network_appliance",
+    "Application Gateway": "network_appliance",
+    "Wireless Controller": "network_appliance",
+    "Reverse Proxy": "network_appliance",
+    "Mobile Sync Gateway": "network_appliance",
+    "Web Application": "web_app",
+    "Web API": "web_app",
+    "Web Server": "web_app",
+    "Container Host": "container_host",
+    "Printer": "printer",
 }
 
 CRITICALITY_BY_SOURCE: dict[str, int] = {"critical": 5, "high": 4, "medium": 3, "low": 2}

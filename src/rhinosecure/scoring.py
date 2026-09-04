@@ -50,6 +50,14 @@ SEVERITY_BASE_SCORE: dict[ScannerSeverity, float] = {
 }
 
 # How much a compromise of this role matters, independent of any one asset.
+#
+# The first seven are the Windows AD-enterprise core (CLAUDE.md Section 2).
+# The rest are perimeter/platform infrastructure a real Windows enterprise's
+# fleet always has around that core, even though none of it is Windows --
+# added when adapters/bluepeak.py's synthetic export made the gap concrete
+# (CLAUDE.md Section 1). No new weight reaches dc's 1.0 ceiling, so
+# RISK_NORMALIZATION and every already-scored finding are unaffected --
+# this is additive, not a renormalization.
 ROLE_BLAST_RADIUS: dict[AssetRole, float] = {
     "dc": 1.0,
     "exchange": 0.9,
@@ -58,6 +66,40 @@ ROLE_BLAST_RADIUS: dict[AssetRole, float] = {
     "file": 0.55,
     "workstation": 0.3,
     "dev": 0.2,
+    # Federated auth (SSO) or a cloud administrative control plane --
+    # compromise means potential impersonation of any connected user, or
+    # theft of the credentials that manage cloud resources. Reach is
+    # broader than mail alone, so it ties exchange rather than sitting
+    # below it.
+    "identity_gateway": 0.9,
+    # Perimeter traffic control -- compromise means the attacker controls
+    # what crosses the network boundary, and can intercept, redirect, or
+    # disable other defenses. Not one exposed thing; the thing everything
+    # else's safety assumed was intact.
+    "firewall": 0.85,
+    # Kubernetes/cluster control plane -- compromise means potential
+    # control over the whole production workload fleet, not one box.
+    "container_orchestrator": 0.85,
+    # Mail-plane security control -- inspection/filtering bypass and a
+    # mail-flow foothold. Below exchange: a control layer around the mail
+    # store, not the store itself.
+    "email_gateway": 0.75,
+    # VPN gateways, wireless controllers, reverse proxies, API/application
+    # gateways, mobile sync gateways -- access/connectivity chokepoints
+    # serving multiple downstream consumers. Narrower than a firewall's
+    # full-traffic control, but still a shared dependency, not a single
+    # endpoint.
+    "network_appliance": 0.65,
+    # Platform-agnostic web application/API -- same functional blast-
+    # radius profile as iis_web; the only difference is not asserting an
+    # IIS/Windows host.
+    "web_app": 0.6,
+    # A single container host -- blast radius scoped to whatever's
+    # co-located on that one box, comparable to one exposed web server.
+    "container_host": 0.6,
+    # Lowest tier by design -- a typically dead-end device with limited
+    # lateral-movement value.
+    "printer": 0.15,
 }
 
 ENVIRONMENT_WEIGHT: dict[Environment, float] = {

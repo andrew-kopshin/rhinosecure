@@ -203,6 +203,13 @@ as-is prints one message naming exactly where the Windows-only scope boundary si
 partial table. A filtered 27-row subset (the mappable rows only) runs and scores cleanly end to
 end -- table, `Contested: 0/27`, full `--explain` rationale, zero network calls.
 
+**Superseded below, twice.** The whole-batch refusal above was replaced by per-record exclusion
+(reported, not fatal -- the entry further down this section on the mechanism), and the 27-mapped/
+23-excluded role split was then closed almost entirely by extending `scoring.ROLE_BLAST_RADIUS`
+itself (Section 3's own "Decided" note) -- the real file now scores all 50 rows. Both entries
+below are kept as-is rather than rewritten, since they're accurate history of what was actually
+built and in what order, not the current state on their own.
+
 Two mapping mistakes running against the real file caught before they became bugs. **`Asset_ID`
 rows repeat** (a device can have more than one finding) and most per-row fields must then agree
 across an asset's rows or the batch refuses the same way Defender's `DeviceId` handling does --
@@ -311,6 +318,27 @@ set a coherent story.
 Representative asset roles: Active Directory domain controller, Exchange server, IIS-hosted
 public web server, SQL Server, file server, employee web portal, payroll server, developer
 workstations, isolated dev/lab box.
+
+**Decided, and this note is a draft for review, not a settled correction the way the ones above
+are.** The role vocabulary (Section 3) grew 8 roles beyond this list once a synthetic
+non-Windows-adjacent export (`adapters/bluepeak.py`, Section 1) made the gap concrete: a real
+Windows enterprise's fleet was never *just* domain-joined boxes. A firewall, a VPN gateway, an
+identity/SSO gateway, a Kubernetes cluster — none of it Windows — sits around every Windows AD
+core in practice, and the alternative (excluding every finding on that hardware, the posture
+this project actually shipped first) hid real risk rather than narrowing scope honestly; running
+the adapter against a real file is what surfaced that a KEV-listed firewall and VPN gateway
+finding were being dropped from the plan entirely, not merely scored conservatively.
+
+The Windows-only decision above is not reversed by this: the fleet's *core* — the anchor CVEs,
+ATT&CK technique mapping, KB-article remediation guidance — is still built for, and stays, a
+Windows AD enterprise. What changed is the claim that the fleet *is* that core and nothing else.
+Two things this does **not** currently do, flagged so they aren't assumed done by omission:
+`enrich/attack.py`'s local ATT&CK index still filters to Windows-platform techniques only
+(Section 11) — harmless for BluePeak (it self-reports its own technique, bypassing that index
+entirely) but would under-serve ATT&CK enrichment for a non-Windows asset on any format that
+*does* go through live lookup; and `adapters/defender.py`'s `OS_PLATFORMS` allowlist still
+excludes macOS/Linux devices outright — newly *possible* to reconsider now that roles exist to
+represent them, but a separate decision, not made here.
 
 ### `assets.csv`
 
@@ -427,6 +455,42 @@ an equal-weighted sum (25% each) of:
 - Environment (prod > staging > dev)
 - Data sensitivity
 - Blast radius implied by role (a DC compromise is not a workstation compromise)
+
+**Decided.** `ROLE_BLAST_RADIUS` (`scoring.py`) started as 7 Windows AD-enterprise roles.
+Running `adapters/bluepeak.py`'s adapter (Section 1) against its real 50-row file made the gap
+concrete: 23 of the 50 rows described assets with no honest fit in that vocabulary — a firewall,
+a VPN gateway, a Kubernetes cluster, none of it Windows — and the adapter's original posture
+(exclude rather than fabricate a weight) meant those 23 findings never reached a plan at all.
+Extended instead, by 8 roles, each weighed against the existing seven rather than dropped in
+arbitrarily:
+
+| Role | Weight | Anchored against | Why |
+|---|---|---|---|
+| `identity_gateway` | 0.90 | = `exchange` | SSO/federated auth, or a cloud administrative control plane. Compromise means potential impersonation of any connected user, or theft of the credentials that manage cloud resources — reach broader than mail alone. |
+| `firewall` | 0.85 | = `sql` | Perimeter traffic control. Compromise means the attacker controls what crosses the network boundary, and can intercept, redirect, or disable other defenses — not one exposed thing, the thing everything else's safety assumed was intact. |
+| `container_orchestrator` | 0.85 | = `sql` | Kubernetes/cluster control plane. Compromise means potential control over the whole production workload fleet, not one box. |
+| `email_gateway` | 0.75 | between `iis_web` and `sql` | Mail-plane security control. Compromise means inspection/filtering bypass and a mail-flow foothold — below `exchange` since it's a control layer around the mail store, not the store. |
+| `network_appliance` | 0.65 | above `iis_web` | VPN gateways, wireless controllers, reverse proxies, API/application gateways, mobile sync gateways. Access/connectivity chokepoints serving multiple downstream consumers — narrower than a firewall's full-traffic control, still a shared dependency. |
+| `web_app` | 0.60 | = `iis_web` | Platform-agnostic web application/API. Same functional blast-radius profile as `iis_web`; the only difference is not asserting an IIS/Windows host. |
+| `container_host` | 0.60 | = `iis_web` | A single container host. Blast radius scoped to whatever's co-located on that one box, comparable to one exposed web server. |
+| `printer` | 0.15 | below `dev` | Lowest tier by design — a typically dead-end device with limited lateral-movement value. |
+
+No new weight reaches `dc`'s 1.0 ceiling, so `RISK_NORMALIZATION` and every already-scored
+finding (demo fixture, `defender-sample`) are unaffected — additive, not a renormalization.
+`adapters/bluepeak.py`'s `ROLE_BY_ASSET_TYPE` now maps all ~28 `Asset_Type` values the real file
+contains onto these 15 roles; nothing in the adapter decided a weight, only which `Asset_Type`
+maps to which role name — the weight itself stayed a `scoring.py` decision, the same split
+`role`'s OS-class default already draws in `adapters/base.py`. Confirmed: `rhino run --format
+bluepeak --data bluepeak --seed 42` now scores all 50 rows (0 excluded, was 27/50); the firewall
+and VPN-gateway findings — both KEV-listed — rose to `contested` at the top of the ranked table,
+which is exactly the kind of signal a Windows-only vocabulary had no way to surface. Native
+fixture output confirmed unchanged (`Contested: 3/24 (12.5%)`, byte-identical).
+
+This does not reopen Section 2's Windows-only decision for the anchor CVEs, ATT&CK mapping, or
+KB-article remediation guidance — see Section 2's own note on this. A dedicated `server` role
+(Section 3's "Open items" below) is a related, still-open, separate decision: it would give an
+already-mapped-to-`file` asset (e.g. `Application Server`, `Development Server` — mapped, never
+excluded) its own honest, OS-agnostic name at the same 0.55 weight, not a new weight tier.
 
 Compensating controls are applied **after** the composite, as a separate multiplicative
 decay — not folded into the weighted sum. A control is an actual reduction in realized

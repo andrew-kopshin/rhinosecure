@@ -9,15 +9,58 @@ from rhinosecure.scoring import (
     KEV_FLOOR_MULTIPLIER,
     Bucket,
     CapacityAllocation,
+    ImpactInputs,
     RankableFinding,
+    ROLE_BLAST_RADIUS,
     ThreatInputs,
     apply_capacity_limit,
     bucket_for,
     contested_rate,
+    impact_composite,
     score_threat,
 )
 
 DEMO_DIR = Path(__file__).resolve().parents[1] / "data" / "demo"
+
+
+# --- role vocabulary: the Windows AD core plus perimeter/platform roles -----
+
+
+def test_role_blast_radius_covers_the_windows_core_and_the_perimeter_roles():
+    """The Windows AD-enterprise core is unchanged; the 8 perimeter/
+    platform roles added for adapters/bluepeak.py are all present, each
+    below dc's 1.0 ceiling so RISK_NORMALIZATION never moved (this is an
+    additive change, not a renormalization -- see CLAUDE.md Section 3)."""
+    core = {"dc": 1.0, "exchange": 0.9, "sql": 0.85, "iis_web": 0.6, "file": 0.55, "workstation": 0.3, "dev": 0.2}
+    for role, weight in core.items():
+        assert ROLE_BLAST_RADIUS[role] == weight
+
+    perimeter = {
+        "identity_gateway": 0.9,
+        "firewall": 0.85,
+        "container_orchestrator": 0.85,
+        "email_gateway": 0.75,
+        "network_appliance": 0.65,
+        "web_app": 0.6,
+        "container_host": 0.6,
+        "printer": 0.15,
+    }
+    for role, weight in perimeter.items():
+        assert ROLE_BLAST_RADIUS[role] == weight
+
+    assert set(ROLE_BLAST_RADIUS) == set(core) | set(perimeter)
+    assert max(ROLE_BLAST_RADIUS.values()) == 1.0  # dc is still the sole ceiling
+
+
+def test_new_roles_actually_move_the_impact_composite():
+    """Not just present in the table -- reachable through the same
+    weighted-sum formula every role goes through, at the value the table
+    declares."""
+    base = dict(impact_base=10.0, criticality=5, environment="prod", data_sensitivity="regulated")
+    firewall = impact_composite(ImpactInputs(**base, role="firewall"))
+    printer = impact_composite(ImpactInputs(**base, role="printer"))
+    dc = impact_composite(ImpactInputs(**base, role="dc"))
+    assert printer < firewall < dc
 
 
 def _scored_by_finding_id():

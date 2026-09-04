@@ -213,11 +213,13 @@ def test_every_documented_role_mapping_is_accepted(tmp_path):
 
 def test_unmapped_asset_type_is_excluded_not_fatal(tmp_path):
     """Scope boundary, not data quality (adapters/base.py's "Two kinds of
-    refusal"): the mappable row still scores; the Firewall row is
+    refusal"): the mappable row still scores; a genuinely out-of-
+    vocabulary Asset_Type (ROLE_BY_ASSET_TYPE now covers every type in
+    the real 50-row file, so this uses one that will never be in it) is
     excluded and reported, not fatal to the batch."""
     data_dir = _sample_dir(
         tmp_path,
-        [_row(record_id="VULN-0001", asset_id="A1"), _row(record_id="VULN-0002", asset_id="A2", cve="CVE-2099-10002", asset_type="Firewall")],
+        [_row(record_id="VULN-0001", asset_id="A1"), _row(record_id="VULN-0002", asset_id="A2", cve="CVE-2099-10002", asset_type="Mainframe")],
     )
     adapter = get_adapter("bluepeak")
     assets, enriched = load_batch(data_dir, adapter)
@@ -226,7 +228,7 @@ def test_unmapped_asset_type_is_excluded_not_fatal(tmp_path):
     assert set(assets) == {"A1"}
     assert [f.finding.finding_id for f in findings] == ["VULN-0001"]
     assert set(adapter.stats.excluded_assets) == {"A2"}
-    assert "Firewall" in adapter.stats.excluded_assets["A2"]
+    assert "Mainframe" in adapter.stats.excluded_assets["A2"]
     assert "has no honest equivalent" in adapter.stats.excluded_assets["A2"]
     assert adapter.stats.excluded_findings == {
         "VULN-0002": "its asset (A2) was excluded: " + adapter.stats.excluded_assets["A2"]
@@ -240,12 +242,49 @@ def test_unmapped_asset_type_alongside_a_fatal_problem_still_refuses_everything(
     data_dir = _sample_dir(
         tmp_path,
         [
-            _row(record_id="VULN-0001", asset_id="A1", asset_type="Firewall"),
+            _row(record_id="VULN-0001", asset_id="A1", asset_type="Mainframe"),
             _row(record_id="VULN-0002", asset_id="A2", cve="CVE-2099-10002", criticality="not-a-tier"),
         ],
     )
     with pytest.raises(AdapterError, match="Asset_Criticality"):
         load_batch(data_dir, get_adapter("bluepeak"))
+
+
+def test_perimeter_and_platform_asset_types_map_to_their_new_roles(tmp_path):
+    """The role vocabulary extension this adapter exists to demonstrate --
+    CLAUDE.md Section 3 has the weight table and reasoning; this only
+    checks the name mapping, not the weights themselves (scoring.py's own
+    tests do that)."""
+    perimeter_types = {
+        "Identity Gateway": "identity_gateway",
+        "Cloud Management Portal": "identity_gateway",
+        "Firewall": "firewall",
+        "Kubernetes Cluster": "container_orchestrator",
+        "Email Security Gateway": "email_gateway",
+        "Network Appliance": "network_appliance",
+        "Application Gateway": "network_appliance",
+        "Wireless Controller": "network_appliance",
+        "Reverse Proxy": "network_appliance",
+        "Mobile Sync Gateway": "network_appliance",
+        "Web Application": "web_app",
+        "Web API": "web_app",
+        "Web Server": "web_app",
+        "Container Host": "container_host",
+        "Printer": "printer",
+    }
+    rows = [
+        _row(record_id=f"VULN-{i:04d}", asset_id=f"A{i}", hostname=f"h{i}.bluepeak.local", asset_type=t)
+        for i, t in enumerate(sorted(perimeter_types), start=1)
+    ]
+    data_dir = _sample_dir(tmp_path, rows)
+    adapter = get_adapter("bluepeak")
+    assets, enriched = load_batch(data_dir, adapter)
+    list(enriched)
+
+    assert not adapter.stats.excluded_assets  # every type above now maps
+    by_hostname_index = {a.asset_id: a.role for a in assets.values()}
+    for i, asset_type in enumerate(sorted(perimeter_types), start=1):
+        assert by_hostname_index[f"A{i}"] == perimeter_types[asset_type]
 
 
 # --- messy realities --------------------------------------------------

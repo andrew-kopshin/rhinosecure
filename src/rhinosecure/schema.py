@@ -17,7 +17,15 @@ from typing import ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-AssetRole = Literal["dc", "exchange", "iis_web", "sql", "file", "workstation", "dev"]
+AssetRole = Literal[
+    # Windows AD-enterprise core (CLAUDE.md Section 2).
+    "dc", "exchange", "iis_web", "sql", "file", "workstation", "dev",
+    # Perimeter/platform infrastructure around that core -- CLAUDE.md
+    # Section 3's "A real Windows enterprise's fleet was never just
+    # domain-joined boxes" reframing; weights in scoring.ROLE_BLAST_RADIUS.
+    "identity_gateway", "firewall", "container_orchestrator", "email_gateway",
+    "network_appliance", "web_app", "container_host", "printer",
+]
 Environment = Literal["prod", "staging", "dev"]
 DataSensitivity = Literal["none", "internal", "confidential", "regulated"]
 ScannerSeverity = Literal["critical", "high", "medium", "low", "informational"]
