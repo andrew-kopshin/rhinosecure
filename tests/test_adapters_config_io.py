@@ -116,8 +116,62 @@ def test_written_file_is_pretty_printed_and_sorted_with_trailing_newline(tmp_pat
     text = path.read_text(encoding="utf-8")
     assert text.endswith("\n")
     assert len(text.splitlines()) > 1  # pretty-printed, not one line
-    assert text == json.dumps(written.model_dump(mode="json"), indent=2, sort_keys=True) + "\n"
+    # by_alias -- see _dump_for_disk. Identical to a plain dump for THIS
+    # contract (bluepeak-gen has no `derived`/`default_by` block, so no
+    # aliased field exists to differ), which is exactly why the alias bug
+    # below went unnoticed; asserted in the aliased form anyway so this pins
+    # the intent rather than passing coincidentally.
+    assert text == json.dumps(written.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True) + "\n"
     assert '"asset"' in text.splitlines()[1]  # sorted keys -> "asset" sorts first, right after the opening brace
+
+
+# --- the `from`/`from_` alias, found while building slice 7 -----------------
+#
+# DerivedMapping.from_ / DefaultByKeyedBy.from_ carry alias="from" (a Python
+# keyword). A plain model_dump() emits the field name, so writing a contract
+# that HAS a derived block turned `"from"` into `"from_"` on disk -- a key
+# neither the design document nor any hand-written contract uses. Latent
+# since slice 3, because nothing wrote such a contract back until `rhino
+# adapt confirm`. The bluepeak contract cannot catch it (no derived block);
+# every test below uses mdvm, which has one.
+
+
+def test_writing_a_contract_with_a_derived_block_keeps_the_from_alias(tmp_path):
+    path = tmp_path / "mdvm-gen.json"
+    write_contract(path, _unconfirmed_mdvm())
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert on_disk["asset"]["os"] == {"kind": "derived", "from": "os_platform", "output": "os"}
+    assert on_disk["asset"]["role"]["keyed_by"]["from"] == "os_platform"
+    assert "from_" not in json.dumps(on_disk)
+
+
+def test_overwrite_contract_keeps_the_from_alias_too(tmp_path):
+    path = tmp_path / "mdvm-gen.json"
+    overwrite_contract(path, _unconfirmed_mdvm())
+    assert "from_" not in path.read_text(encoding="utf-8")
+
+
+def test_the_alias_round_trips_without_disturbing_either_digest(tmp_path):
+    """The fix must be digest-neutral: digests hash the NON-aliased dump, so
+    what a confirmation signs is unchanged by how the file spells `from`."""
+    from rhinosecure.adapters.config_model import compute_content_digest, compute_decision_digest
+
+    original = _unconfirmed_mdvm()
+    path = tmp_path / "mdvm-gen.json"
+    overwrite_contract(path, original)
+    reloaded = read_contract(path)
+    assert reloaded == original
+    assert compute_content_digest(reloaded) == compute_content_digest(original)
+    assert compute_decision_digest(reloaded) == compute_decision_digest(original)
+
+
+def test_a_confirmed_contract_survives_a_write_read_round_trip(tmp_path):
+    """End to end: confirm, persist, re-read, and the engine's own gate still
+    accepts it -- the property `rhino adapt confirm` depends on."""
+    path = tmp_path / "mdvm-gen.json"
+    confirmed = confirm_contract(_unconfirmed_mdvm(), at="2026-09-05T00:00:00Z", by="x")
+    overwrite_contract(path, confirmed)
+    assert_confirmed(read_contract(path))  # must not raise
 
 
 # --- confirm_contract --------------------------------------------------------

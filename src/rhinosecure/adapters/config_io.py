@@ -87,7 +87,7 @@ def write_contract(path: Path, contract: Contract) -> Contract:
             existing_version = None
     version = (existing_version + 1) if existing_version is not None else 1
     to_write = contract.model_copy(update={"version": version})
-    _atomic_write_json(path, to_write.model_dump(mode="json"))
+    _atomic_write_json(path, dump_for_disk(to_write))
     return to_write
 
 
@@ -101,8 +101,29 @@ def overwrite_contract(path: Path, contract: Contract) -> None:
     than the one just signed -- the signature and the content would
     disagree the moment the file is re-read (`assert_confirmed` would then
     refuse a contract this module itself just confirmed). Still atomic
-    (`.tmp` sibling, then `replace`)."""
-    _atomic_write_json(path, contract.model_dump(mode="json"))
+    (`.tmp` sibling, then `replace`), and still written through
+    `_dump_for_disk` -- see its docstring for the `from`/`from_` alias that
+    preserves."""
+    _atomic_write_json(path, dump_for_disk(contract))
+
+
+def dump_for_disk(contract: Contract) -> dict:
+    """`by_alias=True`, and that matters: `DerivedMapping.from_` /
+    `DefaultByKeyedBy.from_` carry `alias="from"` because `from` is a Python
+    keyword, and a plain `model_dump()` emits the FIELD name -- so a contract
+    read from disk with `"from": "os_platform"` and written back through here
+    would silently become `"from_": "os_platform"`, a key the design document
+    and every hand-written contract spell `from`. It still re-validates
+    (`populate_by_name=True` accepts both), which is exactly why this went
+    unnoticed: nothing before `rhino adapt confirm` ever wrote a contract
+    containing a `derived` mapping back to disk.
+
+    Digest-neutral, verified: `compute_content_digest`/`compute_decision_digest`
+    always hash `model_dump(mode="json")` WITHOUT `by_alias`, so what is
+    hashed is unchanged by this and both committed contracts' stored digests
+    still verify after a round trip through here. The alias belongs to the
+    file format, not to the signature."""
+    return contract.model_dump(mode="json", by_alias=True)
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:

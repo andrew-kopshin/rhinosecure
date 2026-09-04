@@ -43,7 +43,7 @@ import csv
 import hashlib
 import re
 from collections import Counter
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import IO, Any
@@ -309,7 +309,9 @@ class ConfiguredAdapter(IngestAdapter):
     review a human reads is produced by exactly this code, not a second
     implementation of it."""
 
-    def __init__(self, contract: Contract, *, collector_factory: type[ProblemCollector] = ProblemCollector) -> None:
+    def __init__(
+        self, contract: Contract, *, collector_factory: Callable[[Path], ProblemCollector] = ProblemCollector
+    ) -> None:
         assert_confirmed(contract)
         super().__init__()
         self.contract = contract
@@ -326,6 +328,17 @@ class ConfiguredAdapter(IngestAdapter):
         #: than refuses. Empty before `load_assets` runs, and whenever
         #: nothing has drifted.
         self.header_notices: list[str] = []
+        #: Populated by `load_assets`: the exact filename -> column-list view
+        #: it handed `validate_contract`, i.e. AFTER `_filtered_for_validation`
+        #: dropped any column that is real but undeclared. Retained because a
+        #: caller re-validating this contract later (adapters/review.py, before
+        #: it signs one) must validate against the same view the engine used:
+        #: validating against the RAW header instead makes a vendor's new
+        #: column -- which `header.mode="declared"` deliberately tolerates as
+        #: a notice -- come back as a V08 "neither mapped nor in
+        #: unmapped_columns" refusal, precisely in the drift case a re-review
+        #: exists to report. Empty before `load_assets` runs.
+        self.headers: dict[str, list[str]] = {}
 
     @property
     def run_label(self) -> str:
@@ -473,17 +486,15 @@ class ConfiguredAdapter(IngestAdapter):
             notices += _check_header_mode(header.mode, self.findings_filename, header.findings.columns, findings_header)
         self.header_notices = notices
 
-        validate_contract(
-            self.contract,
-            {
-                self.assets_filename: _filtered_for_validation(header.mode, header.assets.columns, assets_header),
-                self.findings_filename: _filtered_for_validation(
-                    header.mode,
-                    header.assets.columns if self.contract.source.layout == "single_file" else header.findings.columns,
-                    findings_header,
-                ),
-            },
-        )
+        self.headers = {
+            self.assets_filename: _filtered_for_validation(header.mode, header.assets.columns, assets_header),
+            self.findings_filename: _filtered_for_validation(
+                header.mode,
+                header.assets.columns if self.contract.source.layout == "single_file" else header.findings.columns,
+                findings_header,
+            ),
+        }
+        validate_contract(self.contract, self.headers)
         self._assets_header_set = set(assets_header)
 
         grouping = self.contract.asset_grouping
@@ -630,7 +641,19 @@ class ConfiguredAdapter(IngestAdapter):
         with f:
             for row_no, row in ingest.iter_csv_rows(path, reader):
                 mapped = self._map_finding_row(row, row_no, self._collector_factory(path))
-                assert mapped is not None  # the validation pass already refused anything unmappable
+                if mapped is None:
+                    # Unreachable with the real `ProblemCollector`: the
+                    # validation pass above already refused the batch over
+                    # any unmappable row. Reachable with a NON-RAISING one
+                    # (adapters/probe.py's `NonRaisingProblemCollector`, used
+                    # by adapters/review.py to measure a contract under
+                    # review), where `raise_if_fatal` deliberately does not
+                    # stop the pass. This was an `assert`, which failed with
+                    # an empty message, was not an `IngestError`, and so
+                    # escaped every `except IngestError` in cli.py as a
+                    # traceback -- and vanished entirely under `python -O`,
+                    # leaving a TypeError on the unpack below instead.
+                    continue
                 identity_key, _content, finding = mapped
                 if finding.finding_id in excluded:
                     continue

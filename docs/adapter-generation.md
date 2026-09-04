@@ -30,7 +30,7 @@ difference.
 | 4 | CLI read path — `--adapter-config` on `rhino run` / `rhino constraint add`, mutually exclusive with `--format`; provenance banner. End to end with hand-written contracts, no LLM anywhere. | **Complete** — `b8cae6f` |
 | 5 | `provides_enrichment` / `SourceEnrichment` for config-driven sources, so a pre-enriched export (BluePeak-shaped) skips live NVD/KEV/EPSS/ATT&CK the way the hand-written BluePeak adapter already does. | **Complete** — no dedicated commit; pulled forward into 1/2/4 (`Enrichment`, `provides_enrichment`, `_resolve_enrichment`) because Slice 2's differential test against `BluePeakAdapter` couldn't pass without it. `data/adapters/bluepeak-gen.json` exercises it end to end. |
 | 6 | `adapters/probe.py`: a non-raising collector plus a bounded full-file column profiler. `rhino adapt probe <name>` / `list`. Still no LLM, no key, writes nothing. | **Complete.** `NonRaisingProblemCollector` is the exact class `configured.py`'s `ConfiguredAdapter` docstring already named ahead of time as a future `collector_factory` — built now, not yet wired anywhere (Slice 7's job). `profile_csv`/`profile_source` stream a whole file once, bounding only what they *retain* per column (`MAX_DISTINCT_TRACKED`, `MAX_SAMPLE_VALUES`), never how much they *read* — CLAUDE.md Section 1's "nothing may assume the dataset is small enough to hold in memory or fetch in one pass," applied to the tool that runs before any format-specific code exists. `rhino adapt list` scans `data/` for subdirectories with a `.csv` file and flags which already match a registered `--format`; `rhino adapt probe <name>` resolves `<name>` exactly like `--data` and reports, per column: blank rate, distinct-value count (honestly capped, never a guess dressed up as exact), min/max length, sample values, and `looks_like` tags (`cve_id`, `int`, `float`, `date_iso`, `timestamp`, `date_us_slash`/`date_eu_slash`, `constant`, `binary`, `identity_candidate`) computed from the SAME code-owned pattern definitions `configured.py` uses for real parsing — but never fed back into a contract automatically; a tag is a hint for a human or Slice 8's future inference agent, and an ambiguous slash-date column honestly gets both `date_us_slash` and `date_eu_slash` rather than one guessed and the other hidden. |
-| 7 | `rhino adapt confirm` / `rereview` and the attestation gate. | **Partially built.** The library pieces already exist and would be reused: attestation validation is `validate_contract`'s V18 (Slice 1), digest stamping is `confirm_contract` (Slice 3) — and confirming deliberately does *not* bump version (`overwrite_contract`'s whole reason for existing: a bump would invalidate the digest it just signed). Slice 6 adds a third: `probe.py`'s `NonRaisingProblemCollector`, ready to pass as `ConfiguredAdapter`'s `collector_factory` for the re-probe-and-refuse-while-fatal step. What's genuinely missing is the CLI verb itself and `rereview`'s merge-by-slot-digest logic. |
+| 7 | `rhino adapt confirm` / `rereview` and the attestation gate. | **Complete** — `adapters/review.py`. `confirm` measures, gates, and signs; `rereview` measures and reports and *cannot* write (no code path from it to `overwrite_contract`), so a CI drift check can never produce a confirmed contract nobody read. The re-probe is a real `ingest.load_batch` through a real `ConfiguredAdapter` with `probe.py`'s `NonRaisingProblemCollector`, so the artifact a human signs is produced by the code that executes the mapping. See "The review" below. |
 | 8 | Phase 1 itself: the inference agent (`agents/schema_inference.py`) and `rhino adapt propose`. | Not started |
 | 9 | Provenance surfaced in `export.py` / `rhino web`. | Not started |
 
@@ -111,6 +111,99 @@ sets overlap on 9 fields (an author picks either), diverge on 6
 enumerated/typed fields that can only be `"gap"` (no blank member exists,
 e.g. `criticality`), and 2 free-text fields that can only be `"absent_fact"`
 (no `NOT_COLLECTED_DEFAULTS` entry exists, e.g. `evidence`).
+
+## The review (`rhino adapt confirm` / `rereview`)
+
+```
+rhino adapt confirm  NAME_OR_PATH --data DIR --by IDENTITY
+                     [--attest ITEM=TEXT]... [--reconfirm] [--reset-identity]
+rhino adapt rereview NAME_OR_PATH --data DIR [--attest ITEM=TEXT]...
+```
+
+`--data` is required and never defaulted: a signature covers specific bytes
+and cannot inherit which ones. `--by` is required and never inferred from
+`$USER` or git config — an inferred signature is a fabricated one. The
+timestamp comes from `cli.py`, the only place that reads the clock
+(`config_io.py`'s docstring reserves it there), so `review.py` is testable
+with a literal.
+
+**Measuring a contract the engine refuses to construct.**
+`ConfiguredAdapter.__init__` calls `assert_confirmed` before it sets an
+attribute, so the object that must measure an *unconfirmed* contract is the
+one object that refuses to exist for it. Resolved by satisfying the gate,
+not routing around it: `_provisional` stamps an in-memory copy through the
+ordinary `confirm_contract` with a sentinel identity, and that copy is
+function-local — never returned by a public name, never written. Rejected:
+extracting the constructor body to call it on an `__new__`'d instance (a
+second construction path around a gate whose value is being the only one),
+and a `review_only=` flag on the constructor the ingest path itself calls.
+`_provisional` clears `review` (so a *drifted* contract is still
+measurable — `rereview` is the only command left that can inspect one) and
+clears `observed` (or V18 reads a stale exclusion count and the fresh
+measurement refuses itself).
+
+**Order, which is not negotiable.** measure → build `observed` → merge
+attestations → `confirm_contract` (stamp) → `validate_contract` **last** →
+round-trip verify → write. Validating before stamping reports a spurious
+`content_digest` mismatch, because `observed` moved while `review` still
+carries the old digest. The validation uses `adapter.headers` — the engine's
+own post-`_filtered_for_validation` view — because validating against the raw
+header turns a vendor's new column, which `header.mode="declared"`
+deliberately tolerates as a notice, into a V08 refusal at the last step, in
+exactly the drift case a re-review exists for.
+
+**What `observed` holds:** `measured_at`/`measured_by`/`measured_by_command`,
+`contract_version`, `assets_loaded`, `findings_loaded`, the two
+`duplicate_*_collapsed` counters, `excluded_assets`/`excluded_findings` as
+plain **ints** (V18 reads those two at the top level and adds them),
+`excluded_asset_reasons` (reason text → count), `not_collected_assets`/
+`not_collected_findings`, and `header_notices`. Deliberately absent: any cell
+value, any record id, and the *finding*-side exclusion reasons — a cascaded
+reason embeds its asset's id, and a contract is committed to git. All of that
+prints to the terminal, which is not.
+
+**The attestation gate is a two-shot loop, not a prompt.** `--attest
+ITEM=TEXT` (repeatable, split on the first `=`, validated against
+`ATTESTATION_ITEMS` — its first consumer). Nothing is ever auto-generated:
+synthesizing the sentence that sanctions a measurement is the silent
+absorption the whole design exists to prevent. The C3 ordering hazard —
+the measurement *discovers* exclusions, so V18 then demands an `exclusions`
+attestation that does not exist yet — resolves by order: shot one measures,
+refuses, writes nothing, and prints the exclusions **with their reasons**;
+shot two supplies the text. An attestation for a condition that does not
+hold is also refused: a signed acknowledgment of something that never
+happened reads later as evidence someone looked.
+
+**Merge-by-slot-digest** partitions the 24 slots into unchanged / changed /
+new / orphaned, so a reviewer re-reads one line instead of the whole
+contract, and drives which prior *claims* survive: everything carries while
+`decision_digest` is unchanged; once a decision moves,
+`finding_id.synthesized` carries only while `finding.finding_id`'s own slot
+is unchanged. A digest cannot reconstruct what it hashed, so the report names
+which slot moved and prints its current node — the previous one is in git.
+Both committed contracts recorded **no** `slot_digests` (legal), so the
+coarse fallback is a live path, announced loudly; confirming records them, so
+a contract passes through it at most once.
+
+**Known limitation, flagged not fixed:** `enrichment` and `union`
+attestations cannot carry forward once any decision moves, because no stored
+digest covers those subtrees individually — so an unrelated one-word edit
+makes a reviewer retype them, and prose retyped under duress reads like a
+fresh judgment without being one. The fix is to have `compute_slot_digests`
+also emit entries for the `enrichment` and `asset_grouping` subtrees; that
+changes what `confirm_contract` stamps and what `assert_confirmed` compares
+(Slice 3 machinery and one of its pinned tests), so it is a digest-format
+decision rather than a CLI one.
+
+**Two defects this slice surfaced**, both latent since Slice 3 and both
+reachable only now that something actually writes contracts and measures with
+a non-raising collector: `config_io` wrote `"from_"` instead of the
+documented `"from"` for `derived`/`default_by` mappings (`dump_for_disk` now
+uses `by_alias=True`; digest-neutral, since digests hash the non-aliased
+dump), and `configured.load_findings`' `assert mapped is not None` fired as
+a message-less `AssertionError` under a non-raising collector — not an
+`IngestError`, so it escaped every `except IngestError` as a traceback, and
+vanished entirely under `python -O`.
 
 ## Rule 1: fatal-vs-exclude forward-traces to `role`, not a config key
 

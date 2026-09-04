@@ -168,3 +168,216 @@ def test_adapt_with_no_subcommand_is_rejected_by_argparse():
 def test_adapt_probe_with_no_name_is_rejected_by_argparse():
     with pytest.raises(SystemExit):
         main(["adapt", "probe"])
+
+
+# --- rhino adapt confirm / rereview ------------------------------------------
+#
+# Slice 7. The library's own correctness is tests/test_adapters_review.py;
+# this section is CLI-only -- flag wiring, exit codes, and what prints. Every
+# write happens against a tmp_path copy: the two committed contracts are
+# pinned byte-for-byte by the differential suite, and rewriting one so a new
+# command's output looks good is what CLAUDE.md Section 8 rule 1 forbids.
+
+import json as _json
+import sys as _sys
+from datetime import datetime
+
+from rhinosecure.adapters.config_io import read_contract, write_contract
+from rhinosecure.adapters.config_model import Contract
+
+BLUEPEAK_DATA = str(REPO_ROOT / "data" / "bluepeak")
+COMMITTED_DIR = REPO_ROOT / "data" / "adapters"
+
+
+def _scratch_contract(tmp_path):
+    _sys.path.insert(0, str(REPO_ROOT / "tests"))
+    from test_adapters_config_model import bluepeak_gen_dict
+
+    path = tmp_path / "scratch-gen.json"
+    write_contract(path, Contract.model_validate(bluepeak_gen_dict()))
+    return path
+
+
+def test_rereview_of_a_committed_contract_exits_zero_and_writes_nothing(capsys):
+    path = COMMITTED_DIR / "mdvm-gen.json"
+    before = path.read_bytes()
+    assert main(["adapt", "rereview", "mdvm-gen", "--data", "defender-sample"]) == 0
+    out = capsys.readouterr().out
+    assert "Measurement" in out
+    assert "No drift and no problems." in out
+    assert path.read_bytes() == before
+
+
+def test_rereview_reports_the_measurement_before_the_contracts_own_claims(capsys):
+    """A reviewer should form an impression from measurements, not from
+    assurances -- so the measured section must come first."""
+    main(["adapt", "rereview", "mdvm-gen", "--data", "defender-sample"])
+    out = capsys.readouterr().out
+    assert out.index("Measurement") < out.index("Contract state")
+
+
+def test_rereview_shows_which_scoring_inputs_are_documented_defaults(capsys):
+    """The line a claim-only review cannot produce: a mapping can run
+    perfectly clean while every Impact input is fabricated."""
+    main(["adapt", "rereview", "mdvm-gen", "--data", "defender-sample"])
+    out = capsys.readouterr().out
+    assert "Values produced for the scoring inputs" in out
+    assert "not collected -- documented default" in out
+
+
+def test_rereview_prints_each_ignored_columns_measured_shape_beside_its_reason(capsys):
+    main(["adapt", "rereview", "mdvm-gen", "--data", "defender-sample"])
+    out = capsys.readouterr().out
+    assert "Columns this contract declares it does not read" in out
+    assert "ExposureLevel" in out
+    assert "measured:" in out
+
+
+def test_rereview_says_so_when_no_slot_digests_were_recorded(capsys):
+    """C5: the state both committed contracts are actually in."""
+    main(["adapt", "rereview", "bluepeak-gen", "--data", "bluepeak"])
+    out = capsys.readouterr().out
+    assert "recorded no slot_digests" in out
+
+
+def test_rereview_does_not_accept_an_identity():
+    with pytest.raises(SystemExit):
+        main(["adapt", "rereview", "mdvm-gen", "--data", "defender-sample", "--by", "someone"])
+
+
+def test_confirm_requires_by():
+    with pytest.raises(SystemExit):
+        main(["adapt", "confirm", "mdvm-gen", "--data", "defender-sample"])
+
+
+def test_confirm_requires_data():
+    with pytest.raises(SystemExit):
+        main(["adapt", "confirm", "mdvm-gen", "--by", "someone"])
+
+
+def test_confirm_signs_a_scratch_contract_and_exits_zero(tmp_path, capsys):
+    path = _scratch_contract(tmp_path)
+    assert main(["adapt", "confirm", str(path), "--data", BLUEPEAK_DATA, "--by", "r@example.com"]) == 0
+    out = capsys.readouterr().out
+    assert "Signed:" in out and "slot digest(s) recorded" in out
+    written = read_contract(path)
+    assert written.review.state == "confirmed"
+    assert written.review.confirmed_by == "r@example.com"
+    assert written.observed["assets_loaded"] > 0
+
+
+def test_confirm_refuses_an_already_confirmed_contract_and_exits_one(tmp_path, capsys):
+    path = _scratch_contract(tmp_path)
+    main(["adapt", "confirm", str(path), "--data", BLUEPEAK_DATA, "--by", "r@example.com"])
+    capsys.readouterr()
+    before = path.read_bytes()
+    assert main(["adapt", "confirm", str(path), "--data", BLUEPEAK_DATA, "--by", "r@example.com"]) == 1
+    err = capsys.readouterr().err
+    assert "--reconfirm" in err
+    assert path.read_bytes() == before
+
+
+def test_reconfirm_signs_again(tmp_path, capsys):
+    path = _scratch_contract(tmp_path)
+    main(["adapt", "confirm", str(path), "--data", BLUEPEAK_DATA, "--by", "first@example.com"])
+    capsys.readouterr()
+    assert (
+        main([
+            "adapt", "confirm", str(path), "--data", BLUEPEAK_DATA,
+            "--by", "second@example.com", "--reconfirm",
+        ])
+        == 0
+    )
+    assert read_contract(path).review.confirmed_by == "second@example.com"
+
+
+def test_confirm_records_a_real_utc_timestamp(tmp_path, capsys):
+    """cli.py is where the clock is read (config_io.py's docstring reserves
+    it for exactly here), so the stamped time must be a real one."""
+    path = _scratch_contract(tmp_path)
+    main(["adapt", "confirm", str(path), "--data", BLUEPEAK_DATA, "--by", "r@example.com"])
+    capsys.readouterr()
+    datetime.strptime(read_contract(path).review.confirmed_at, "%Y-%m-%dT%H:%M:%SZ")  # must not raise
+
+
+def test_a_bad_attest_argument_is_refused_before_anything_is_written(tmp_path, capsys):
+    path = _scratch_contract(tmp_path)
+    before = path.read_bytes()
+    assert (
+        main([
+            "adapt", "confirm", str(path), "--data", BLUEPEAK_DATA, "--by", "r@example.com",
+            "--attest", "not-an-item=text",
+        ])
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "not an attestation item" in err
+    assert path.read_bytes() == before
+
+
+def test_a_missing_contract_is_a_clean_error_not_a_traceback(tmp_path, capsys):
+    assert main(["adapt", "confirm", str(tmp_path / "nope.json"), "--data", BLUEPEAK_DATA, "--by", "x"]) == 1
+    err = capsys.readouterr().err
+    assert "contract error" in err
+    assert "Traceback" not in err
+
+
+def test_a_structurally_broken_contract_is_a_clean_error(tmp_path, capsys):
+    path = tmp_path / "broken.json"
+    path.write_text('{"format": "x"}', encoding="utf-8")
+    assert main(["adapt", "rereview", str(path), "--data", BLUEPEAK_DATA]) == 1
+    err = capsys.readouterr().err
+    assert "contract error" in err
+    assert "Traceback" not in err
+
+
+def test_data_pointed_at_the_wrong_fleet_refuses_and_exits_one(tmp_path, capsys):
+    path = _scratch_contract(tmp_path)
+    assert main(["adapt", "rereview", str(path), "--data", "demo"]) == 1
+    assert "HALTED" in capsys.readouterr().err
+
+
+def test_rereview_exits_one_when_a_mapping_decision_has_moved(tmp_path, capsys):
+    path = _scratch_contract(tmp_path)
+    main(["adapt", "confirm", str(path), "--data", BLUEPEAK_DATA, "--by", "r@example.com"])
+    capsys.readouterr()
+    edited = _json.loads(path.read_text(encoding="utf-8"))
+    edited["asset"]["hostname"]["case"] = "lower"
+    path.write_text(_json.dumps(edited, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    assert main(["adapt", "rereview", str(path), "--data", BLUEPEAK_DATA]) == 1
+    out = capsys.readouterr().out
+    assert "a MAPPING DECISION has changed" in out
+    assert "NEEDS REVIEW asset.hostname" in out
+    assert "23 unchanged, 1 changed" in out
+
+
+def test_the_run_banner_notices_a_size_mismatch_against_what_was_signed(tmp_path, capsys):
+    """Nothing else in the codebase reads `observed`, so without this a
+    contract confirmed against a small sample and then run against a full
+    export is undetectable."""
+    from rhinosecure.adapters.config_io import confirm_contract, overwrite_contract
+    from rhinosecure.adapters.config_model import Review
+
+    path = _scratch_contract(tmp_path)
+    main(["adapt", "confirm", str(path), "--data", BLUEPEAK_DATA, "--by", "r@example.com"])
+    capsys.readouterr()
+
+    edited = _json.loads(path.read_text(encoding="utf-8"))
+    edited["observed"]["assets_loaded"] = 3  # as if signed against a trimmed sample
+    path.write_text(_json.dumps(edited, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    # That edit voids the signature, so re-sign the doctored content.
+    doctored = read_contract(path).model_copy(update={"review": Review()})
+    overwrite_contract(path, confirm_contract(doctored, at="2026-09-05T00:00:00Z", by="r@example.com"))
+
+    assert main(["run", "--adapter-config", str(path), "--data", "bluepeak", "--seed", "42"]) == 0
+    assert "was confirmed against 3 asset(s)" in capsys.readouterr().out
+
+
+def test_the_banner_says_nothing_when_the_contract_has_no_measurement(capsys):
+    """Both committed contracts predate `observed` being written at all --
+    their output must not change."""
+    assert main(["run", "--adapter-config", "bluepeak-gen", "--data", "bluepeak", "--seed", "42"]) == 0
+    out = capsys.readouterr().out
+    assert "Using adapter config" in out
+    assert "was confirmed against" not in out

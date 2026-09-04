@@ -1372,3 +1372,182 @@ fix, and every exit code). All 719 tests pass under `.venv312`; confirmed separa
 (Python 3.14, excluding the modules that already couldn't collect there before this session) that
 `test_adapters_probe.py` and `test_cli_adapt.py` both pass cleanly -- `probe.py` has no `crewai`
 dependency, so it needed no lazy-import treatment the way `agents.*`/`memory` do.
+
+**docs/adapter-generation.md Slice 7 built: `adapters/review.py`, `rhino adapt confirm`/`rereview`.**
+The slice was already "partially built" on paper -- V18 validated attestations (Slice 1),
+`confirm_contract` stamped digests (Slice 3), and Slice 6 had just added the non-raising collector
+the re-probe needed. What was missing was the part that makes a human confirmation mean anything:
+the verbs, the re-probe, and the merge-by-slot-digest logic.
+
+**Designed by panel before any code was written, because the decisions interact.** Four independent
+designs (framed around gate integrity, reviewer UX, codebase convention, and failure modes) judged
+by three adversarial lenses (correctness, convention fit, whether the review is real). Two judges
+independently ranked the same design first and converged on nearly every question, and the judges
+verified their claims by running code rather than reading it -- which is where several of the
+decisions below come from.
+
+**The chicken-and-egg, and why the fix is the boring one.** `ConfiguredAdapter.__init__` calls
+`assert_confirmed` before it sets a single attribute, so the one object that must measure an
+UNCONFIRMED contract is the one object that refuses to exist for it. Confirmed by running it, not
+assumed. Resolved by SATISFYING the gate rather than routing around it: `_provisional` stamps an
+in-memory copy through the ordinary `confirm_contract` with a sentinel identity, and that copy is
+function-local -- never returned by a public name, never written, never handed to scoring. The
+rejected alternative was extracting the engine's constructor body so a review could call it on an
+`__new__`'d instance; that adds a second supported construction path around a gate whose entire
+value is being the only one, then guards it with naming discipline -- the class of protection
+`config_model.py`'s own docstring refuses to rely on when it argues against an `on_unmapped` key.
+Two details of `_provisional` are load-bearing rather than cosmetic, and both were found by running
+the thing: clearing `review` first (so `confirm_contract` recomputes digests over CURRENT content,
+which is what keeps a DRIFTED contract measurable at all -- `rereview` is the only command left
+that can inspect one), and clearing `observed` (because `load_assets` runs `validate_contract` on
+every load and V18 reads the stored exclusion count, so a stale measurement makes the fresh
+measurement refuse itself).
+
+**The order is not negotiable, and validating in the wrong place produces a spurious failure.**
+measure -> build `observed` -> merge attestations -> `confirm_contract` (stamp) -> `validate_contract`
+LAST -> in-memory round-trip verify -> single write. Validating before stamping reports a
+`review.content_digest` mismatch on every already-confirmed contract, because `observed` has moved
+while `review` still carries the old digest. And the validation has to use the engine's own
+`_filtered_for_validation` header view, not a freshly read raw header -- otherwise a vendor's new
+column, which `header.mode="declared"` deliberately tolerates as a notice, comes back as a V08
+"neither mapped nor in unmapped_columns" refusal at the very last step, in precisely the drift case
+a re-review exists to report. `ConfiguredAdapter` now records that view as `self.headers` for this
+reason.
+
+**`rereview` cannot write, structurally.** Not "does not by default" -- there is no code path from
+`sign=False` to `overwrite_contract`. One verb reports, one verb signs, and only the signing verb
+takes an identity, so a CI drift check can never produce a confirmed contract nobody read.
+`confirm` refuses an already-confirmed contract without `--reconfirm`, which is also the mechanical
+guard on CLAUDE.md Section 8 rule 1: both committed contracts are confirmed with matching digests,
+so no bare invocation can rewrite `bluepeak-gen.json` or `mdvm-gen.json` and break the two pinned
+differential tests. Demonstrated the write path on scratch copies throughout; a test asserts the
+committed files are byte-identical after both verbs run against them.
+
+**The attestation gate is a two-shot loop, not a prompt** (this codebase has no interactive input
+anywhere). `--attest ITEM=TEXT`, repeatable, split on the first `=` so the text may contain one,
+validated against `ATTESTATION_ITEMS` -- which turns out to be that constant's first consumer:
+`Attestation.item` is a bare `str`, so before this a typo (`exclusion` for `exclusions`)
+constructed happily and V18 then refused for a missing item while the file visibly contained an
+attestation. The C3 ordering hazard -- the measurement DISCOVERS exclusions, so V18 then demands an
+`exclusions` attestation that does not exist yet -- resolves by order: shot one measures, refuses,
+writes nothing, and prints the exclusions with their reasons; shot two supplies the sentence.
+Exercised end to end against a real BluePeak file with one row's `Asset_Type` set to an unmappable
+value: 1 excluded asset + 1 cascaded finding, refusal naming `['exclusions']`, then a clean sign.
+Nothing is ever auto-generated -- synthesizing the sentence that sanctions a measurement is the
+silent absorption the whole design exists to prevent. An attestation for a condition that does NOT
+hold is refused too: a signed acknowledgment of something that never happened reads later as
+evidence someone looked.
+
+**V18's policy is now extracted rather than duplicated.** `required_attestations`/
+`missing_attestations` (`config_model.py`) are the single definition behind both the validator's
+refusal and `review.py`'s need to PREDICT it before signing -- the same anti-drift move the module
+already makes deriving `GAP_LEGAL_TARGETS` from `NOT_COLLECTED_DEFAULTS`. `validate_contract` still
+emits byte-identical problem strings (insertion order is V18's own emission order). While extracting
+it, closed a live crash: `observed` is `dict[str, Any]`, so a hand-edited contract storing the
+`id -> reason` DICT that `IngestStats` carries under the identical names made V18 add two dicts and
+raise a bare `TypeError` out of the validator instead of refusing. `_observed_exclusion_count` now
+refuses.
+
+**Merge-by-slot-digest does both halves.** The partition (unchanged / changed / new / orphaned) is
+what `compute_slot_digests`' own docstring says it exists for -- a reviewer re-reads one line
+instead of the whole contract, confirmed live: edit one mapping's `case` and the re-review reports
+`23 unchanged, 1 changed` and names it. The report also states plainly that a digest cannot
+reconstruct what it hashed, so it prints the CURRENT node and points at `git show HEAD:<path>` for
+the previous one. The second half is which of the reviewer's prior CLAIMS survive: everything
+carries while `decision_digest` is unchanged; once a decision moves, `finding_id.synthesized`
+carries only while `finding.finding_id`'s own slot is unchanged. `exclusions` never carries on
+digest grounds -- it describes a measurement, not a mapping. **C5, the no-`slot_digests` fallback,
+is the state both committed contracts are actually in**, not a hypothetical; it is announced loudly
+and self-heals, since confirming records them.
+
+**A bug the tests caught, in the carry-forward gate itself.** The first implementation refused
+whenever an attestation was dropped by drift -- including when the reviewer had just supplied a
+fresh sentence for that exact item in the same invocation. `still_missing` is the real gate (a
+dropped item that was not re-supplied lands there anyway), so the drop is now context printed for
+the reader, not a refusal. Caught by `test_a_changed_finding_id_recipe_is_refused_without_reset_identity`,
+which exercised `--reset-identity` with a re-supplied attestation and got a refusal it should not
+have.
+
+**What the reviewer actually sees, which is the point of the whole feature.** The report leads with
+the measurement -- assets/findings loaded, what collapsed, what was excluded and why -- before any
+of the contract's own claims about itself, so an impression forms from measurements rather than
+assurances (a test pins that ordering). Then two sections that exist because a claim-only review
+cannot produce them. First, the values the mapping actually produced for the enumerated Impact
+inputs beside how many are documented defaults: on `mdvm-gen`/`defender-sample` that reads
+`environment prod x5 -- 5/5 not collected`, `data_sensitivity internal x5 -- 5/5`, `role file x3,
+workstation x2 -- 5/5` -- a mapping that runs perfectly clean while three of the four Impact inputs
+are fabricated, which is exactly the failure a signature over a hash cannot catch. Only enumerated
+targets are tallied; free text (`hostname`, `owner`, `business_function`, `product`, `evidence`) is
+never counted and never persisted. Second, every column the contract declares it deliberately does
+not read, with its stated prose reason beside its MEASURED shape from Slice 6's profiler --
+`unmapped_columns` is a signed claim that nothing otherwise checks, and this is where a mapping
+hides the patch-window column somebody dismissed as operational metadata.
+
+**`observed` is written for the first time, and what is NOT in it was decided deliberately.** Flat,
+because V18 reads `excluded_assets`/`excluded_findings` at the top level and adds them, so both are
+plain ints there. Asset-side exclusion reasons are recorded (they carry the source's own vocabulary
+token and the known vocabulary -- schema information) keyed by reason text with a count, never by
+record. Finding-side reasons are NOT: a cascaded reason embeds its asset's id, which on a real
+export is a device identifier, and a contract is committed to git. No cell value, no record id, ever.
+All of it prints to the terminal, which is not committed.
+
+**Closed the gap that made a signature mean less than it looks.** Nothing in the codebase read
+`observed` except V18, so a contract confirmed against a friendly six-row sample and then run
+against a six-million-row export was completely undetectable -- and the re-probe's own cost is
+exactly what pushes an operator toward the small sample. `_print_adapter_config_banner` now compares
+the counts the confirmation measured against the counts this run loaded and prints a notice when
+they differ. Stated as a notice, not enforced: there is no defensible threshold yet, and the point
+is to put the mismatch in front of a person at the moment it matters. Silent for a contract with no
+measurement, which is both committed contracts today -- so no existing output changes, and a test
+pins that.
+
+**Two latent defects surfaced, both reachable only now.** `config_io` wrote `"from_"` instead of the
+documented `"from"` for `derived`/`default_by` mappings, because `model_dump()` emits the field name
+rather than the alias -- latent since Slice 3 because nothing had ever written a contract containing
+a `derived` block back to disk, and `confirm` is that something. Fixed with `by_alias=True`, verified
+digest-neutral (digests hash the non-aliased dump, so both committed contracts' stored digests still
+verify), and pinned by tests that fail without the fix -- the pre-existing serialization test could
+not catch it, since it uses the one contract with no `derived` block. And `configured.load_findings`'
+`assert mapped is not None` fired as a message-less `AssertionError` under a non-raising collector --
+not an `IngestError`, so it escaped every `except IngestError` in cli.py as a traceback, and vanished
+under `python -O`, leaving a `TypeError` on the tuple unpack instead. Now `if mapped is None:
+continue`, provably behavior-identical on every production path.
+
+**Adversarial review caught two more defects, both of which the tests written for this slice had
+missed for the same reason: the fixtures were too healthy.** A 5-dimension review (gate integrity,
+correctness, privacy, regression, test quality) with two independent skeptics per finding, each
+instructed to refute rather than confirm. The run was cut short by a session limit -- the regression
+and test-quality reviewers and most verifiers never completed -- so this is a partial review, and
+the remaining dimensions are still open. Of what did complete: the one privacy finding
+(`observed.excluded_asset_reasons` persisting source vocabulary tokens) was refuted unanimously,
+both skeptics noting it is documented, pinned by a test, and gated behind an `exclusions`
+attestation a human must write after seeing every reason on screen. Two survived, both real, both
+reproduced before fixing:
+
+1. **A contract that did not already carry its shape-required attestations could never be
+   confirmed.** `validate_contract` runs inside `ConfiguredAdapter.load_assets`, so V18's structural
+   requirements (`enrichment`, `union`, `finding_id.synthesized`) fired during the MEASUREMENT --
+   before `--attest` was merged. The pass halted with 0 rows and the refusal blamed the source, so
+   supplying the attestation could never help. That is the normal state of a freshly proposed
+   contract, so it would have blocked the entire propose -> confirm flow Slice 8 exists to produce.
+   Both committed fixtures already carry their attestations, which is exactly why every test passed.
+   Fixed by merging attestations BEFORE measuring, and by listing the missing-attestation refusal
+   ahead of the generic fatal-problems line, since the former is often the CAUSE of the latter.
+2. **The identity freeze could be walked past three different ways.** It was keyed on
+   `finding.finding_id in slots.changed`, but `review` sits outside both digests, so `slot_digests`
+   is unsigned evidence that can be absent (the state of BOTH committed contracts), partially
+   deleted (`partition_slots` then classifies the slot as `new`, not `changed`), or removed whole.
+   In each case a changed content-address recipe was re-signed in silence, re-keying every
+   `memory.decisions` row for the format -- confirmed by loading before and after and observing two
+   disjoint `finding_id` sets. Fixed by inverting the gate to "refuse unless the identity slot is
+   PROVABLY unchanged", which closes all three at once, with wording that distinguishes "known to
+   have changed" from "cannot be determined from this file".
+
+**Verification.** 60 new tests (783 total, up from 723): `tests/test_adapters_review.py` (41 -- the
+measurement against real committed data including that its numbers equal what `rhino run` reports,
+every refusal path, the C3 two-shot loop, carry-forward under three drift shapes, `--attest`
+parsing, the two review findings above, and that the committed contracts are byte-identical after
+both verbs run) and a confirm/rereview section in `tests/test_cli_adapt.py` (19 -- flag wiring, exit
+codes, output ordering, and the banner notice). Plus 4 in `tests/test_adapters_config_io.py` for the
+alias fix. All 783 pass; the two pinned differential tests and every `rhino run` byte-identical test are
+untouched, and `git status data/adapters/` is clean after the whole suite.

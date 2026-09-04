@@ -46,13 +46,18 @@ def get_adapter(name: str) -> IngestAdapter:
         raise AdapterError(f"unknown ingest format {name!r}; known formats: {sorted(FORMATS)}") from None
 
 
-def _resolve_config_path(name_or_path: str, config_dir: Path | None) -> Path:
+def resolve_config_path(name_or_path: str, config_dir: Path | None = None) -> Path:
     """A bare name (no path separator, no `.json` suffix) resolves under
     `config_dir` (default `DEFAULT_ADAPTER_CONFIG_DIR`, `data/adapters/`);
     anything that already looks like a path -- absolute, has a directory
     component, or ends `.json` -- is used exactly as given. This is what
     lets `--adapter-config bluepeak-gen` and `--adapter-config
-    ./scratch/my-contract.json` both work from the same flag."""
+    ./scratch/my-contract.json` both work from the same flag.
+
+    Public because `rhino adapt confirm`/`rereview` (cli.py) name a contract
+    by the same rule -- they cannot reuse `load_config_adapter` itself, which
+    constructs a `ConfiguredAdapter` and so refuses exactly the unconfirmed
+    contract those commands exist to review."""
     candidate = Path(name_or_path)
     if candidate.is_absolute() or candidate.suffix == ".json" or len(candidate.parts) > 1:
         return candidate
@@ -86,7 +91,7 @@ def load_config_adapter(name_or_path: str, *, config_dir: Path | None = None) ->
     from rhinosecure.adapters.config_io import read_contract
     from rhinosecure.adapters.configured import ConfiguredAdapter
 
-    path = _resolve_config_path(name_or_path, config_dir)
+    path = resolve_config_path(name_or_path, config_dir)
     if not path.is_file():
         raise AdapterError(
             f"adapter config {name_or_path!r} not found (looked for {path}). Configs are confirmed "
@@ -114,4 +119,5 @@ __all__ = [
     "NativeAdapter",
     "get_adapter",
     "load_config_adapter",
+    "resolve_config_path",
 ]

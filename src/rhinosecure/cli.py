@@ -145,15 +145,24 @@ full design reasoning.
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import sys
 import textwrap
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
-from rhinosecure.adapters import DEFAULT_FORMAT, FORMATS, get_adapter, load_config_adapter
+from rhinosecure.adapters import (
+    DEFAULT_FORMAT,
+    FORMATS,
+    get_adapter,
+    load_config_adapter,
+    resolve_config_path,
+)
 from rhinosecure.adapters.config_model import Contract
 from rhinosecure.adapters.probe import ColumnProfile, FileProfile, ProbeError, profile_source
+from rhinosecure.adapters.review import Measurement, ReviewError, ReviewOutcome, review_contract
 from rhinosecure.enrich.attack import load_index as load_attack_index
 from rhinosecure.enrich.cache import OfflineCacheMissError, SnapshotCache
 from rhinosecure.enrich.kev import load_catalog as load_kev_catalog
@@ -615,18 +624,49 @@ def _print_capacity_result(result: CapacitySubmissionResult) -> None:
         )
 
 
-def _print_adapter_config_banner(contract: Contract | None) -> None:
+def _print_adapter_config_banner(contract: Contract | None, report: IngestReport | None = None) -> None:
     """The provenance a config-driven run has that a built-in --format
     never does: which reviewed contract produced this plan, and which
     confirmed revision. Printed above _print_exclusions -- before any
     number a reader could otherwise form an impression from without
     knowing it came from a human-reviewed mapping rather than a built-in
-    one. A no-op for a built-in --format run (contract is None there)."""
+    one. A no-op for a built-in --format run (contract is None there).
+
+    When the contract carries a measurement from its own confirmation
+    (`observed`, written by `rhino adapt confirm` -- adapters/review.py),
+    this also compares what was signed against what just loaded. Nothing
+    else in the codebase reads `observed` except V18, so without this a
+    contract confirmed against a friendly six-row sample and then run
+    against a six-million-row export is completely undetectable -- and the
+    re-probe's own cost is exactly what pushes an operator toward the small
+    sample. Stated as a notice, not enforced: there is no defensible
+    threshold yet, and the point is to put the mismatch in front of a person
+    at the moment it matters. Silent when the contract was confirmed before
+    this existed (`observed` is null on both committed contracts today), so
+    no existing output changes."""
     if contract is None:
         return
     print(
         f"Using adapter config {contract.format!r} v{contract.version}, confirmed "
         f"{contract.review.confirmed_at} by {contract.review.confirmed_by}"
+    )
+    observed = contract.observed or {}
+    if report is None or not observed:
+        return
+    signed_assets, signed_findings = observed.get("assets_loaded"), observed.get("findings_loaded")
+    if not isinstance(signed_assets, int) or not isinstance(signed_findings, int):
+        return
+    if (signed_assets, signed_findings) == (report.assets_total, report.findings_total):
+        return
+    print(
+        _wrap(
+            f"note: this mapping was confirmed against {signed_assets} asset(s) and "
+            f"{signed_findings} finding(s); this run loaded {report.assets_total} and "
+            f"{report.findings_total}. A signature covers the mapping, not this data -- "
+            "re-review it (`rhino adapt rereview`) if the source has changed shape.",
+            indent="  ",
+            continuation_indent="  ",
+        )
     )
 
 
@@ -835,6 +875,187 @@ def _print_probe_report(data_dir: Path, profiles: list[FileProfile]) -> None:
             print("\n  No observations.")
 
 
+def _utc_now_iso() -> str:
+    """The one place `rhino adapt confirm` reads the clock. `config_io.py`'s
+    module docstring reserves this for the CLI on purpose ("The caller (a
+    later slice's CLI) is where 'now' and 'who' actually get read"), so
+    `adapters/review.py` stays clock-free and testable with a literal."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _print_review_header(outcome: ReviewOutcome, data_dir: Path) -> None:
+    contract = outcome.contract
+    print(f"Reviewing {contract.format!r} v{contract.version} ({outcome.path})")
+    print(f"  source: {data_dir}")
+
+
+def _print_measurement(m: Measurement) -> None:
+    """What the mapping actually did, first -- before any of the contract's
+    own claims about itself. A reviewer should form an impression from
+    measurements, not from assurances."""
+    print("\nMeasurement -- the real mapping, over the real files:")
+    collapsed_a = f", {m.duplicate_assets_collapsed} repeated row(s) collapsed" if m.duplicate_assets_collapsed else ""
+    collapsed_f = f", {m.duplicate_findings_collapsed} duplicate row(s) collapsed" if m.duplicate_findings_collapsed else ""
+    print(f"  assets    {m.assets_loaded} loaded{collapsed_a}")
+    print(f"  findings  {m.findings_loaded} loaded{collapsed_f}")
+    if m.excluded_assets or m.excluded_findings:
+        print(f"  excluded  {len(m.excluded_assets)} asset(s), {len(m.excluded_findings)} finding(s)")
+        for asset_id, reason in sorted(m.excluded_assets.items()):
+            print(_wrap(f"{asset_id}: {reason}", indent="    - ", continuation_indent="      "))
+        for finding_id, reason in sorted(m.excluded_findings.items()):
+            print(_wrap(f"{finding_id}: {reason}", indent="    - ", continuation_indent="      "))
+    for notice in m.header_notices:
+        print(_wrap(f"header: {notice}", indent="  ! ", continuation_indent="    "))
+
+
+def _print_value_distribution(m: Measurement) -> None:
+    """The values the mapping actually produced for the enumerated scoring
+    inputs, beside how many of them are documented defaults rather than
+    facts from the export. This is the line a claim-only review cannot
+    produce: a mapping can run perfectly clean while every Impact input is
+    fabricated, and that is exactly what this shows."""
+    if not m.value_distribution:
+        return
+    print("\nValues produced for the scoring inputs (Impact axis):")
+    rows = []
+    for target, counts in m.value_distribution.items():
+        shown = ", ".join(f"{value} x{count}" for value, count in list(counts.items())[:4])
+        gap = m.asset_gaps.get(target, 0)
+        note = f"{gap}/{m.assets_loaded} not collected -- documented default" if gap else ""
+        rows.append((target, shown, note))
+    _print_rows(("field", "values produced", "provenance"), rows)
+
+
+def _print_gaps(m: Measurement) -> None:
+    if not m.asset_gaps and not m.finding_gaps:
+        return
+    print("\nFields no record carries (adapters/base.py's NOT_COLLECTED_DEFAULTS are in effect):")
+    for kind, total, gaps in (("assets", m.assets_loaded, m.asset_gaps), ("findings", m.findings_loaded, m.finding_gaps)):
+        by_count: dict[int, list[str]] = {}
+        for name, count in gaps.items():
+            by_count.setdefault(count, []).append(name)
+        for count in sorted(by_count, reverse=True):
+            label = f"  {kind:<8} {count}/{total}  "
+            print(_wrap(", ".join(sorted(by_count[count])), indent=label, continuation_indent=" " * len(label)))
+
+
+def _print_unmapped_profiles(m: Measurement) -> None:
+    """Each column the contract declares it deliberately does not read, with
+    its stated reason and its MEASURED shape side by side. `unmapped_columns`
+    is a signed claim that nothing otherwise checks -- this is where a
+    dismissed column that actually carries a patch window becomes visible."""
+    if not m.unmapped_profiles:
+        return
+    print("\nColumns this contract declares it does not read:")
+    by_file: dict[str, list[tuple[str, dict]]] = {}
+    for key, p in sorted(m.unmapped_profiles.items()):
+        filename, column = key.split(":", 1)
+        by_file.setdefault(filename, []).append((column, p))
+    for filename, entries in by_file.items():
+        # Grouped by file, because the same column name can legitimately
+        # appear in both of a two-file source (a denormalised copy) with a
+        # different stated reason on each side.
+        print(f"  {filename}")
+        for column, p in entries:
+            print(_wrap(f"[{p['disposition']}] {p['reason']}", indent=f"    {column}: ", continuation_indent="        "))
+            looks = ", ".join(p["looks_like"]) or "--"
+            samples = ", ".join(str(s)[:26] for s in p["samples"]) or "--"
+            print(f"        measured: {p['blank']}/{p['rows']} blank, {p['distinct']} distinct, {looks}; e.g. {samples}"[:100])
+
+
+def _print_contract_state(outcome: ReviewOutcome) -> None:
+    drift, contract = outcome.drift, outcome.contract
+    print("\nContract state:")
+    if not drift.was_confirmed:
+        print(f"  never confirmed (review.state={drift.state!r}) -- nothing to compare against yet")
+    else:
+        print(f"  confirmed {contract.review.confirmed_at} by {contract.review.confirmed_by}")
+        if drift.content_matches and drift.decision_matches:
+            print("  digests match -- the file has not been edited since it was signed")
+        else:
+            if not drift.decision_matches:
+                print("  a MAPPING DECISION has changed since this was signed")
+            elif not drift.content_matches:
+                print("  edited since signing, but outside the mapping decisions (observed/provenance only)")
+    slots = drift.slots
+    if not slots.available:
+        if drift.was_confirmed:
+            print(
+                _wrap(
+                    "this contract recorded no slot_digests at confirmation time, so a re-review cannot "
+                    "be proportional -- every slot is in scope. Re-confirming records them, so a "
+                    "contract passes through this fallback at most once.",
+                    indent="  ! ",
+                    continuation_indent="    ",
+                )
+            )
+    else:
+        print(f"  slots: {len(slots.unchanged)} unchanged, {len(slots.changed)} changed, "
+              f"{len(slots.new)} new, {len(slots.orphaned)} orphaned")
+        for name in slots.moved:
+            node = outcome.contract.asset.get(name.split(".", 1)[1]) if name.startswith("asset.") else \
+                outcome.contract.finding.get(name.split(".", 1)[1])
+            rendered = json.dumps(node.model_dump(mode="json", by_alias=True), sort_keys=True) if node else "(removed)"
+            print(_wrap(f"{name} -> {rendered}", indent="    NEEDS REVIEW ", continuation_indent="      "))
+        if slots.moved:
+            print(_wrap(
+                "a digest cannot reconstruct what it hashed -- the previous mapping for these is in "
+                "git (`git show HEAD:<path>`), not here.", indent="    ", continuation_indent="    "))
+
+
+def _print_attestations(outcome: ReviewOutcome) -> None:
+    print("\nAttestations:")
+    for item, reason in sorted(outcome.required.items()):
+        print(_wrap(f"{item} -- required because {reason}", indent="  required: ", continuation_indent="    "))
+    if not outcome.required:
+        print("  none required by this contract's shape or this measurement")
+    for reason in outcome.attestations_dropped:
+        print(_wrap(f"no longer carries forward -- {reason}", indent="  - ", continuation_indent="    "))
+    for previous, new in outcome.attestations_replaced:
+        print(_wrap(f"{new.item}: replacing the text recorded at {previous.at}", indent="  ! ", continuation_indent="    "))
+    for attestation in outcome.attestations_added:
+        print(_wrap(f"{attestation.item}: {attestation.text}", indent="  + ", continuation_indent="    "))
+
+
+def _print_review_problems(m: Measurement) -> None:
+    if m.fatal_problems:
+        print(f"\n{len(m.fatal_problems)} problem(s) the mapping hit on this source:", file=sys.stderr)
+        for message in m.fatal_problems:
+            print(_wrap(message, indent="  - ", continuation_indent="    "), file=sys.stderr)
+    if m.halted_by is not None:
+        print(_wrap(
+            f"the pass stopped here: {m.halted_by}", indent="\n  HALTED: ", continuation_indent="    "
+        ), file=sys.stderr)
+
+
+def _print_review(outcome: ReviewOutcome, data_dir: Path, *, verb: str) -> None:
+    _print_review_header(outcome, data_dir)
+    _print_measurement(outcome.measurement)
+    _print_value_distribution(outcome.measurement)
+    _print_gaps(outcome.measurement)
+    _print_unmapped_profiles(outcome.measurement)
+    _print_contract_state(outcome)
+    _print_attestations(outcome)
+    _print_review_problems(outcome.measurement)
+    if outcome.written and outcome.signed is not None:
+        review_block = outcome.signed.review
+        print(
+            f"\nSigned: {outcome.signed.format!r} v{outcome.signed.version} confirmed "
+            f"{review_block.confirmed_at} by {review_block.confirmed_by}, "
+            f"{len(review_block.slot_digests or {})} slot digest(s) recorded."
+        )
+        print(f"Wrote {outcome.path}")
+        return
+    if outcome.refusals:
+        print(f"\n{verb} refused -- nothing was written:", file=sys.stderr)
+        for refusal in outcome.refusals:
+            print(_wrap(refusal, indent="  - ", continuation_indent="    "), file=sys.stderr)
+        return
+    if verb == "rereview":
+        clean = outcome.measurement.is_clean and outcome.drift.content_matches and outcome.drift.decision_matches
+        print(f"\nNo drift and no problems." if clean else "\nReviewed. See above; nothing was written.")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="rhino")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -978,6 +1199,59 @@ def main(argv: list[str] | None = None) -> int:
     )
     adapt_probe_parser.add_argument("name", help="dataset name under data/, or a path (same resolution as --data)")
 
+    adapt_confirm_parser = adapt_subparsers.add_parser(
+        "confirm", help="measure a contract against real files, then sign it -- the only verb that writes"
+    )
+    adapt_rereview_parser = adapt_subparsers.add_parser(
+        "rereview", help="measure a confirmed contract and report what has moved since it was signed; writes nothing"
+    )
+    for sub in (adapt_confirm_parser, adapt_rereview_parser):
+        sub.add_argument(
+            "config",
+            metavar="NAME_OR_PATH",
+            help="contract name (resolves to data/adapters/<name>.json) or a path to one",
+        )
+        sub.add_argument(
+            "--data",
+            required=True,
+            help=(
+                "dataset name under data/, or a path, to measure the mapping against. Required and "
+                "never defaulted: a signature covers specific bytes, and it cannot inherit which ones"
+            ),
+        )
+        sub.add_argument(
+            "--attest",
+            action="append",
+            metavar="ITEM=TEXT",
+            default=[],
+            help=(
+                "supply an attestation, repeatable. Nothing is auto-generated -- the value of the "
+                "item is that a person wrote the sentence"
+            ),
+        )
+    adapt_confirm_parser.add_argument(
+        "--by",
+        required=True,
+        metavar="IDENTITY",
+        help=(
+            "who is signing. Required, and never inferred from $USER or git config: an inferred "
+            "signature is a fabricated one"
+        ),
+    )
+    adapt_confirm_parser.add_argument(
+        "--reconfirm",
+        action="store_true",
+        help="required to re-sign a contract that is already confirmed, replacing that signature",
+    )
+    adapt_confirm_parser.add_argument(
+        "--reset-identity",
+        action="store_true",
+        help=(
+            "required to re-sign when finding.finding_id's recipe has changed -- it re-keys every "
+            "decision memory.decisions has recorded for this format"
+        ),
+    )
+
     args = parser.parse_args(argv)
     _ensure_utf8_stdio()
 
@@ -1062,7 +1336,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         scored = result.scored
-        _print_adapter_config_banner(result.contract)
+        _print_adapter_config_banner(result.contract, result.report)
         _print_exclusions(result.report)
         _print_table(scored)
         _print_contested_rate(contested_rate(s.bucket.value for s in scored))
@@ -1178,6 +1452,47 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         _print_probe_report(data_dir, profiles)
         return 0
+
+    if args.command == "adapt" and args.adapt_command in ("confirm", "rereview"):
+        from pydantic import ValidationError
+
+        from rhinosecure.adapters.config_io import read_contract
+
+        sign = args.adapt_command == "confirm"
+        data_dir = _resolve_data_dir(args.data)
+        config_path = resolve_config_path(args.config)
+        try:
+            contract = read_contract(config_path)
+        except IngestError as exc:  # ContractIOError, an AdapterError, an IngestError
+            print(f"contract error: {exc}", file=sys.stderr)
+            return 1
+        except ValidationError as exc:
+            print(f"contract error: {config_path}: not a valid adapter config -- {exc}", file=sys.stderr)
+            return 1
+
+        try:
+            outcome = review_contract(
+                config_path,
+                contract,
+                data_dir,
+                at=_utc_now_iso(),
+                by=args.by if sign else None,
+                attest=args.attest,
+                sign=sign,
+                reconfirm=getattr(args, "reconfirm", False),
+                reset_identity=getattr(args, "reset_identity", False),
+            )
+        except ReviewError as exc:
+            print(f"{args.adapt_command} refused: {exc}", file=sys.stderr)
+            return 1
+        except IngestError as exc:
+            print(f"contract error: {exc}", file=sys.stderr)
+            return 1
+
+        _print_review(outcome, data_dir, verb=args.adapt_command)
+        if sign:
+            return 0 if outcome.written else 1
+        return 0 if outcome.ok and outcome.drift.content_matches and outcome.drift.decision_matches else 1
 
     return 1
 

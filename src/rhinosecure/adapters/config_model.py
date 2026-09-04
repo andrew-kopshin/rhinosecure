@@ -666,6 +666,70 @@ class ValidatorOverride(BaseModel):
 ATTESTATION_ITEMS: frozenset[str] = frozenset({"enrichment", "union", "finding_id.synthesized", "exclusions"})
 
 
+def _observed_exclusion_count(observed: "dict[str, Any] | None") -> tuple[int, list[str]]:
+    """`(records observed says were excluded, problems)`.
+
+    `Contract.observed` is `dict[str, Any]` by design, so nothing stops a
+    hand-edited contract from storing the `id -> reason` DICT that
+    `IngestStats` carries under these identical names. V18 used to add the
+    two values directly, which made that case raise a bare `TypeError` out
+    of the validator rather than refuse -- an unhandled crash where the
+    whole module's discipline is to name the problem. `rhino adapt confirm`
+    (adapters/review.py) is the first thing that ever writes this block and
+    always writes ints; this makes everything else a refusal."""
+    if not observed:
+        return 0, []
+    total = 0
+    problems: list[str] = []
+    for key in ("excluded_assets", "excluded_findings"):
+        value = observed.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            problems.append(
+                f"observed.{key} is a {type(value).__name__}, not an int -- V18 counts excluded "
+                "records with it, so it must be a plain count (adapters/review.py writes one)"
+            )
+            continue
+        total += value
+    return total, problems
+
+
+def required_attestations(contract: Contract) -> dict[str, str]:
+    """Which attestation items this contract's own shape demands, mapped to
+    the reason each is demanded (V18).
+
+    Extracted so the validator and a caller that must PREDICT it share one
+    definition. `adapters/review.py` is that caller: it has to tell a
+    reviewer what to attest to *before* the contract is signed, and a second
+    copy of this policy would be free to drift from the one that actually
+    refuses. Same anti-drift move this module already makes deriving
+    `GAP_LEGAL_TARGETS` from `NOT_COLLECTED_DEFAULTS`.
+
+    Insertion order is V18's own emission order, so `validate_contract`'s
+    messages stay byte-identical to what they were before this was
+    extracted."""
+    required: dict[str, str] = {}
+    if contract.enrichment is not None:
+        required["enrichment"] = "the enrichment block is present"
+    if contract.asset_grouping.union_fields:
+        required["union"] = "asset_grouping.union_fields is non-empty"
+    if isinstance(contract.finding.get("finding_id"), ContentAddressMapping):
+        required["finding_id.synthesized"] = "finding.finding_id is a content_address"
+    excluded, _problems = _observed_exclusion_count(contract.observed)
+    if excluded > 0:
+        required["exclusions"] = "observed reports excluded record(s)"
+    return required
+
+
+def missing_attestations(contract: Contract) -> list[str]:
+    """The items `required_attestations` demands that the contract does not
+    carry -- what V18 will refuse over, computable before anything is
+    signed."""
+    present = {a.item for a in contract.attestations}
+    return [item for item in required_attestations(contract) if item not in present]
+
+
 class Attestation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1260,18 +1324,14 @@ def validate_contract(contract: Contract, headers: "dict[str, list[str]]") -> No
             f"      in file:    {contract.not_collected.model_dump()}"
         )
 
-    # -- attestations required by the contract's own shape (V18)
-    present_items = {a.item for a in contract.attestations}
-    if contract.enrichment is not None and "enrichment" not in present_items:
-        problems.append("attestations: 'enrichment' is required because the enrichment block is present")
-    if contract.asset_grouping.union_fields and "union" not in present_items:
-        problems.append("attestations: 'union' is required because asset_grouping.union_fields is non-empty")
-    if isinstance(finding_id_mapping, ContentAddressMapping) and "finding_id.synthesized" not in present_items:
-        problems.append("attestations: 'finding_id.synthesized' is required because finding.finding_id is a content_address")
-    if contract.observed:
-        excluded = (contract.observed.get("excluded_assets") or 0) + (contract.observed.get("excluded_findings") or 0)
-        if excluded > 0 and "exclusions" not in present_items:
-            problems.append("attestations: 'exclusions' is required because observed reports excluded record(s)")
+    # -- attestations required by the contract's own shape (V18). The policy
+    # itself lives in `required_attestations`/`missing_attestations` above, so
+    # adapters/review.py can predict this refusal instead of re-deriving it.
+    _excluded, observed_problems = _observed_exclusion_count(contract.observed)
+    problems.extend(observed_problems)
+    reasons = required_attestations(contract)
+    for item in missing_attestations(contract):
+        problems.append(f"attestations: {item!r} is required because {reasons[item]}")
 
     # -- digests match, if the contract carries them (V19)
     if contract.review.content_digest is not None:
