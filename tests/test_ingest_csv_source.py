@@ -264,3 +264,40 @@ def test_ragged_row_message_names_the_true_line_after_an_embedded_newline(tmp_pa
     message = str(excinfo.value)
     assert "row 4" in message
     assert "row 3" not in message
+
+
+# --- duplicate header names are refused, not silently corrupted ---------
+
+
+def test_a_duplicate_column_name_is_refused(tmp_path):
+    """The silent-corruption path this guards. csv.DictReader reports every
+    occurrence in fieldnames but keeps only the LAST one's value in every
+    row -- confirmed: reading back ['CveId','Severity','CveId'] against
+    'A,High,B' gives {'CveId': 'B', 'Severity': 'High'}, with the first
+    CveId column's value gone and no error raised anywhere."""
+    path = tmp_path / "x.csv"
+    path.write_bytes(b"CveId,Severity,CveId\nCVE-2020-1472,High,CVE-2021-34527\n")
+    with pytest.raises(IngestError) as excinfo:
+        ingest.open_csv(path)
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert "'CveId'" in message
+    assert "more than once" in message
+
+
+def test_a_duplicate_column_name_refuses_through_a_real_adapter(tmp_path):
+    data_dir = _reencode(DEFENDER_SAMPLE, tmp_path / "dup", "utf-8")
+    devices = data_dir / "devices.csv"
+    header, rest = devices.read_text(encoding="utf-8").split("\n", 1)
+    devices.write_text(f"{header},DeviceId\n{rest}", encoding="utf-8")
+    with pytest.raises(IngestError) as excinfo:
+        load_batch(data_dir, get_adapter("defender"))
+    assert "more than once" in str(excinfo.value)
+
+
+def test_no_duplicate_columns_is_unaffected(tmp_path):
+    """The check must not false-positive on an ordinary well-formed header."""
+    path = _write(tmp_path / "x.csv", [{"a": "1", "b": "2"}], ["a", "b"])
+    f, reader = ingest.open_csv(path)
+    with f:
+        assert reader.fieldnames == ["a", "b"]

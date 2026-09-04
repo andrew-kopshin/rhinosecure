@@ -201,7 +201,8 @@ def detect_encoding(path: Path) -> str:
 
 
 def open_csv(path: Path) -> tuple[IO[str], csv.DictReader]:
-    """Open a source CSV in the encoding it declares, header already read.
+    """Open a source CSV in the encoding it declares, header already read
+    and checked for a repeated column name.
 
     Every adapter reads its files through here so encoding handling, and the
     refusal when it fails, are identical across formats. The header is forced
@@ -211,15 +212,33 @@ def open_csv(path: Path) -> tuple[IO[str], csv.DictReader]:
     touch `fieldnames` first. That error is a `ValueError`, not an
     `IngestError`, so before this it escaped every `except IngestError` in
     cli.py and reached the user as a traceback.
+
+    A duplicate column name is refused for the same reason: `csv.DictReader`
+    reports every occurrence in `fieldnames` but silently keeps only the
+    *last* one's value in each row (verified: `['CveId','Severity','CveId']`
+    reads back as `{'CveId': <second column's value>, 'Severity': ...}`,
+    with no error and no trace of the first column at all). Every adapter's
+    header check confirms a required name is *present*; none of them checks
+    that it appears exactly once, so a mapping written against the first
+    occurrence would silently read the second column's data instead.
     """
     encoding = detect_encoding(path)
     f = path.open(newline="", encoding=encoding)
     reader = csv.DictReader(f)
     try:
-        reader.fieldnames  # noqa: B018 -- forces the header read; a bad codec fails here
+        fieldnames = list(reader.fieldnames or [])
     except UnicodeDecodeError as exc:
         f.close()
         raise IngestError(_decode_error_message(path, encoding, exc)) from exc
+    duplicates = sorted({name for name in fieldnames if fieldnames.count(name) > 1})
+    if duplicates:
+        f.close()
+        raise IngestError(
+            f"{path}: column name(s) {duplicates} appear more than once in the header "
+            f"{fieldnames!r}. A CSV reader keeps only the last occurrence's value in every row, "
+            "so a mapping against the first one would silently read the wrong column. "
+            "Re-export the file with unique column names."
+        )
     return f, reader
 
 
