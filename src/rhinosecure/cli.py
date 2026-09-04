@@ -135,7 +135,8 @@ import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
-from rhinosecure.adapters import DEFAULT_FORMAT, FORMATS, get_adapter
+from rhinosecure.adapters import DEFAULT_FORMAT, FORMATS, get_adapter, load_config_adapter
+from rhinosecure.adapters.config_model import Contract
 from rhinosecure.enrich.attack import load_index as load_attack_index
 from rhinosecure.enrich.cache import OfflineCacheMissError, SnapshotCache
 from rhinosecure.enrich.kev import load_catalog as load_kev_catalog
@@ -183,29 +184,49 @@ class RunResult:
     data gaps (`_print_ingest_report`, `_print_gap_note`), which
     `ScoredFinding` alone can't supply: it carries no Asset and no
     `not_collected`. `not_collected_by_finding` only holds findings that
-    have any (empty for the native fixture)."""
+    have any (empty for the native fixture).
+
+    `contract` is the confirmed ingest contract behind a `--adapter-config`
+    run (`ConfiguredAdapter.contract`), or `None` for a built-in `--format`
+    -- `main` reads it to print which reviewed mapping produced this plan,
+    above the exclusion report."""
 
     scored: list[ScoredFinding]
     assets: dict[str, Asset]
     not_collected_by_finding: dict[str, frozenset[str]]
     report: IngestReport
+    contract: Contract | None = None
 
 
-def run(data_dir: Path, seed: int, *, offline: bool = False, fmt: str = DEFAULT_FORMAT) -> list[ScoredFinding]:
-    """Ingest (via the `fmt` adapter), enrich, score, rank. The
-    list-returning form every existing caller uses; see run_with_report."""
-    return run_with_report(data_dir, seed, offline=offline, fmt=fmt).scored
+def run(
+    data_dir: Path, seed: int, *, offline: bool = False, fmt: str = DEFAULT_FORMAT, adapter_config: str | None = None
+) -> list[ScoredFinding]:
+    """Ingest (via the `fmt` adapter, or `adapter_config` if given), enrich,
+    score, rank. The list-returning form every existing caller uses; see
+    run_with_report."""
+    return run_with_report(data_dir, seed, offline=offline, fmt=fmt, adapter_config=adapter_config).scored
 
 
 def run_with_report(
-    data_dir: Path, seed: int, *, offline: bool = False, fmt: str = DEFAULT_FORMAT
+    data_dir: Path, seed: int, *, offline: bool = False, fmt: str = DEFAULT_FORMAT, adapter_config: str | None = None
 ) -> RunResult:
     # Scoring is fully deterministic (no sampling); the seed is accepted
     # now so the CLI contract does not change once Slice 4's ToT beam
     # search introduces anything seed-sensitive.
     random.seed(seed)
 
-    adapter = get_adapter(fmt)
+    # adapter_config, when given, wins outright -- cli.py's argparse group
+    # already makes --format/--adapter-config mutually exclusive, so this
+    # is never resolving a genuine conflict, just picking whichever path
+    # supplied something. `fmt` is rebound to the resolved adapter's OWN
+    # declared name afterward: a no-op for a built-in (`adapter.format ==
+    # fmt` already), and correct for a contract, whose `format` need not
+    # equal the --adapter-config argument itself (a path vs. the name the
+    # contract declares) -- every print/report below reads `fmt`, not the
+    # original argument, from this point on.
+    adapter = load_config_adapter(adapter_config) if adapter_config else get_adapter(fmt)
+    fmt = adapter.format
+    contract = getattr(adapter, "contract", None)
     assets, enriched = load_batch(data_dir, adapter)
 
     if adapter.provides_enrichment:
@@ -238,6 +259,7 @@ def run_with_report(
         assets=assets,
         not_collected_by_finding=not_collected_by_finding,
         report=tally.report(fmt, assets, adapter.stats),
+        contract=contract,
     )
 
 
@@ -248,6 +270,7 @@ def run_agents(
     offline: bool = False,
     db_path: Path | str | None = None,
     fmt: str = DEFAULT_FORMAT,
+    adapter_config: str | None = None,
 ) -> Coordinator:
     """Dispatches the Slice 3 crew over every finding in `data_dir`, the
     agent equivalent of `run`. Returns the `Coordinator` itself, not just
@@ -262,12 +285,22 @@ def run_agents(
     up whatever constraints are already on file (CLAUDE.md Section 7's
     worked example), not just when a constraint was just submitted in
     the same invocation.
+
+    `adapter_config`, when given, resolves the ingest adapter the same way
+    `run_with_report` does -- see its own comment for why `fmt` is rebound
+    to the resolved adapter's own declared name afterward. `Coordinator`
+    gets `ingest_format=adapter.run_label`, not the bare name: for a
+    config-driven run that includes the confirmed revision
+    (`"<format>@v<version>"`), so two runs against different revisions of
+    the same contract are distinguishable in `memory.runs`, which a plain
+    format name never was.
     """
     from rhinosecure.agents.coordinator import Coordinator
     from rhinosecure.memory import DEFAULT_DB_PATH, Memory
 
     random.seed(seed)  # see run()'s comment -- still a no-op for now
-    adapter = get_adapter(fmt)
+    adapter = load_config_adapter(adapter_config) if adapter_config else get_adapter(fmt)
+    fmt = adapter.format
     assets, enriched = load_batch(data_dir, adapter)
     findings = list(enriched)
     _warn_of_exclusions(adapter.stats, fmt)
@@ -277,7 +310,8 @@ def run_agents(
         cache=SnapshotCache(offline=offline),
         memory=memory,
         assets=assets,
-        ingest_format=fmt,
+        ingest_format=adapter.run_label,
+        contract=getattr(adapter, "contract", None),
     )
     coordinator.run(findings)
     return coordinator
@@ -291,6 +325,7 @@ def submit_constraint(
     offline: bool = False,
     db_path: Path | str | None = None,
     fmt: str = DEFAULT_FORMAT,
+    adapter_config: str | None = None,
 ) -> ConstraintSubmissionResult | CapacitySubmissionResult:
     """CLI entry point for `rhino constraint add` -- the agent equivalent
     of `run`/`run_agents`, dispatching `agents/coordinator.py`'s
@@ -300,12 +335,15 @@ def submit_constraint(
     `fmt` selects the ingest adapter exactly as it does for `run`. This is
     the path that most needs a non-native format to work: a real scanner
     export carries no patch window, compensating control, or role (see
-    adapters/base.py), and this command is how a human supplies them."""
+    adapters/base.py), and this command is how a human supplies them --
+    `adapter_config` is how it does that for a config-driven contract, the
+    same way `run_with_report`/`run_agents` resolve one."""
     from rhinosecure.agents.coordinator import Coordinator
     from rhinosecure.memory import DEFAULT_DB_PATH, Memory
 
     random.seed(seed)
-    adapter = get_adapter(fmt)
+    adapter = load_config_adapter(adapter_config) if adapter_config else get_adapter(fmt)
+    fmt = adapter.format
     assets, enriched = load_batch(data_dir, adapter)
     findings = list(enriched)
     _warn_of_exclusions(adapter.stats, fmt)
@@ -315,7 +353,8 @@ def submit_constraint(
         cache=SnapshotCache(offline=offline),
         memory=memory,
         assets=assets,
-        ingest_format=fmt,
+        ingest_format=adapter.run_label,
+        contract=getattr(adapter, "contract", None),
     )
     return coordinator.submit_constraint(text, findings, seed=seed)
 
@@ -559,6 +598,21 @@ def _print_capacity_result(result: CapacitySubmissionResult) -> None:
         )
 
 
+def _print_adapter_config_banner(contract: Contract | None) -> None:
+    """The provenance a config-driven run has that a built-in --format
+    never does: which reviewed contract produced this plan, and which
+    confirmed revision. Printed above _print_exclusions -- before any
+    number a reader could otherwise form an impression from without
+    knowing it came from a human-reviewed mapping rather than a built-in
+    one. A no-op for a built-in --format run (contract is None there)."""
+    if contract is None:
+        return
+    print(
+        f"Using adapter config {contract.format!r} v{contract.version}, confirmed "
+        f"{contract.review.confirmed_at} by {contract.review.confirmed_by}"
+    )
+
+
 def _print_exclusions(report: IngestReport) -> None:
     """Scope-boundary exclusions (adapters/base.py's `ProblemCollector
     .exclude` -- e.g. Defender's non-Windows `OSPlatform`, BluePeak's
@@ -720,7 +774,8 @@ def main(argv: list[str] | None = None) -> int:
             "memory.DEFAULT_DB_PATH) -- constraints on file there are picked up automatically"
         ),
     )
-    run_parser.add_argument(
+    run_format_group = run_parser.add_mutually_exclusive_group()
+    run_format_group.add_argument(
         "--format",
         default=DEFAULT_FORMAT,
         choices=sorted(FORMATS),
@@ -730,6 +785,17 @@ def main(argv: list[str] | None = None) -> int:
             "(DeviceInfo) + vulnerabilities.csv (DeviceTvmSoftwareVulnerabilities); bluepeak reads a "
             "single pre-enriched synthetic_cve_inventory_50.csv, trusting its own CVSS/exploitation/"
             "ATT&CK fields instead of fetching (adapters/bluepeak.py)"
+        ),
+    )
+    run_format_group.add_argument(
+        "--adapter-config",
+        default=None,
+        metavar="NAME_OR_PATH",
+        help=(
+            "use a declarative, human-reviewed ingest contract instead of a built-in --format -- "
+            "a bare name resolves to data/adapters/<name>.json, or pass a path directly. The "
+            "contract must already be confirmed (adapters/config_io.py); mutually exclusive with "
+            "--format"
         ),
     )
     run_parser.add_argument(
@@ -764,7 +830,8 @@ def main(argv: list[str] | None = None) -> int:
     constraint_add_parser.add_argument(
         "--db", default=None, help="path to the memory.py SQLite file (default: memory.DEFAULT_DB_PATH)"
     )
-    constraint_add_parser.add_argument(
+    constraint_format_group = constraint_add_parser.add_mutually_exclusive_group()
+    constraint_format_group.add_argument(
         "--format",
         default=DEFAULT_FORMAT,
         choices=sorted(FORMATS),
@@ -773,6 +840,12 @@ def main(argv: list[str] | None = None) -> int:
             "export carries no patch window, compensating control, or role, so this is the "
             "command that supplies them"
         ),
+    )
+    constraint_format_group.add_argument(
+        "--adapter-config",
+        default=None,
+        metavar="NAME_OR_PATH",
+        help="use a declarative ingest contract instead of a built-in --format, same as `rhino run --adapter-config`",
     )
 
     web_parser = subparsers.add_parser(
@@ -809,7 +882,12 @@ def main(argv: list[str] | None = None) -> int:
             # neither exception can propagate out of run_agents.
             try:
                 coordinator = run_agents(
-                    data_dir, args.seed, offline=args.offline, db_path=args.db, fmt=args.format
+                    data_dir,
+                    args.seed,
+                    offline=args.offline,
+                    db_path=args.db,
+                    fmt=args.format,
+                    adapter_config=args.adapter_config,
                 )
             except IngestError as exc:
                 print(f"ingest error: {exc}", file=sys.stderr)
@@ -821,6 +899,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"LLM config error: {exc}", file=sys.stderr)
                 return 1
 
+            _print_adapter_config_banner(coordinator.contract)
             recommendations = coordinator.ranked()
             _print_agent_table(recommendations)
             _print_failures(coordinator, verbose=args.verbose)
@@ -841,7 +920,7 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     write_run_export(
                         Path(args.export),
-                        fmt=args.format,
+                        fmt=coordinator.contract.format if coordinator.contract else coordinator.ingest_format,
                         data_dir=data_dir,
                         seed=args.seed,
                         offline=args.offline,
@@ -856,7 +935,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         try:
-            result = run_with_report(data_dir, args.seed, offline=args.offline, fmt=args.format)
+            result = run_with_report(
+                data_dir, args.seed, offline=args.offline, fmt=args.format, adapter_config=args.adapter_config
+            )
         except IngestError as exc:
             print(f"ingest error: {exc}", file=sys.stderr)
             return 1
@@ -865,6 +946,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         scored = result.scored
+        _print_adapter_config_banner(result.contract)
         _print_exclusions(result.report)
         _print_table(scored)
         _print_contested_rate(contested_rate(s.bucket.value for s in scored))
@@ -888,7 +970,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 write_run_export(
                     Path(args.export),
-                    fmt=args.format,
+                    fmt=result.report.format,
                     data_dir=data_dir,
                     seed=args.seed,
                     offline=args.offline,
@@ -914,7 +996,13 @@ def main(argv: list[str] | None = None) -> int:
 
         try:
             result = submit_constraint(
-                args.text, data_dir, args.seed, offline=args.offline, db_path=args.db, fmt=args.format
+                args.text,
+                data_dir,
+                args.seed,
+                offline=args.offline,
+                db_path=args.db,
+                fmt=args.format,
+                adapter_config=args.adapter_config,
             )
         except IngestError as exc:
             print(f"ingest error: {exc}", file=sys.stderr)

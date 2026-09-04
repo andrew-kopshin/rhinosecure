@@ -127,14 +127,26 @@ class _FakeCoordinator:
     last_memory = None
     last_assets = None
     last_ingest_format = None
+    last_contract = None
 
     def __init__(
-        self, data_dir, cache=None, *, memory=None, verbose=False, assets=None, ingest_format="native"
+        self,
+        data_dir,
+        cache=None,
+        *,
+        memory=None,
+        verbose=False,
+        assets=None,
+        ingest_format="native",
+        contract=None,
     ):
         _FakeCoordinator.last_init_args = (data_dir, cache)
         _FakeCoordinator.last_memory = memory
         _FakeCoordinator.last_assets = assets
         _FakeCoordinator.last_ingest_format = ingest_format
+        _FakeCoordinator.last_contract = contract
+        self.contract = contract
+        self.ingest_format = ingest_format
         self.state = SimpleNamespace(
             research_failures=_FakeCoordinator.failures.get("research", {}),
             environment_failures=_FakeCoordinator.failures.get("environment", {}),
@@ -163,6 +175,7 @@ def _reset_fake_coordinator():
     _FakeCoordinator.last_memory = None
     _FakeCoordinator.last_assets = None
     _FakeCoordinator.last_ingest_format = None
+    _FakeCoordinator.last_contract = None
 
 
 def _fake_recommendation(finding_id="F01", risk_score=42.0, bucket="next_window"):
@@ -545,7 +558,7 @@ def _fake_submission_result(*, persisted=True, deltas=None, unresolved=()):
 def test_constraint_add_wires_args_and_dispatches(monkeypatch):
     calls = {}
 
-    def fake_submit(text, data_dir, seed, *, offline, db_path, fmt="native"):
+    def fake_submit(text, data_dir, seed, *, offline, db_path, fmt="native", adapter_config=None):
         calls["args"] = (text, data_dir, seed, offline, db_path)
         return _fake_submission_result()
 
@@ -571,7 +584,9 @@ def test_constraint_add_db_flag_defaults_to_none_meaning_default_db_path(monkeyp
     calls = {}
     monkeypatch.setattr(
         "rhinosecure.cli.submit_constraint",
-        lambda text, data_dir, seed, *, offline, db_path, fmt="native": calls.__setitem__("db_path", db_path)
+        lambda text, data_dir, seed, *, offline, db_path, fmt="native", adapter_config=None: calls.__setitem__(
+            "db_path", db_path
+        )
         or _fake_submission_result(),
     )
 

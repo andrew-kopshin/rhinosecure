@@ -152,6 +152,7 @@ from rhinosecure.agents.risk import (
     verify_scoring_matches_tool,
 )
 from rhinosecure.adapters import DEFAULT_FORMAT
+from rhinosecure.adapters.config_model import Contract
 from rhinosecure.enrich.attack import load_index as load_attack_index
 from rhinosecure.enrich.cache import SnapshotCache
 from rhinosecure.enrich.kev import load_catalog as load_kev_catalog
@@ -437,6 +438,7 @@ class Coordinator:
         max_parse_attempts: int = DEFAULT_MAX_PARSE_ATTEMPTS,
         assets: dict[str, Asset] | None = None,
         ingest_format: str = DEFAULT_FORMAT,
+        contract: Contract | None = None,
     ):
         """`assets` is the fleet inventory this run reasons about, indexed
         by asset_id -- what `_asset_index` feeds to Environment's
@@ -451,7 +453,19 @@ class Coordinator:
 
         `ingest_format` is recorded on the `runs` row so a stored decision
         says which adapter produced the inventory behind it; it selects
-        nothing and must match the format `assets` actually came from.
+        nothing and must match the format `assets` actually came from. For
+        a config-driven run, the caller passes the adapter's own
+        `run_label` (`"<format>@v<version>"`, adapters/base.py) here, not
+        the bare format name -- two runs against different REVISIONS of
+        the same contract are not the same mapping, and comparing their
+        `decisions` rows without knowing which revision produced each one
+        would silently compare two different things.
+
+        `contract` is the confirmed ingest contract behind a config-driven
+        run (`adapters.ConfiguredAdapter.contract`), or `None` for a
+        built-in `--format`. Purely informational -- cli.py reads it to
+        print which reviewed mapping produced a plan; nothing in this
+        class's own behavior depends on it.
         """
         self.data_dir = data_dir
         self.cache = cache or SnapshotCache()
@@ -459,6 +473,7 @@ class Coordinator:
         self.verbose = verbose
         self.max_parse_attempts = max_parse_attempts
         self.ingest_format = ingest_format
+        self.contract = contract
         self._asset_index = assets if assets is not None else load_asset_index(data_dir / "assets.csv")
         self.state: RunState | None = None
 

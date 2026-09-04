@@ -302,10 +302,22 @@ def test_export_flag_does_not_change_agents_console_output(monkeypatch, tmp_path
     )
 
     class _FakeCoordinator:
-        def __init__(self, data_dir, cache=None, *, memory=None, verbose=False, assets=None, ingest_format="native"):
+        def __init__(
+            self,
+            data_dir,
+            cache=None,
+            *,
+            memory=None,
+            verbose=False,
+            assets=None,
+            ingest_format="native",
+            contract=None,
+        ):
             self.memory = memory
             self.cache = cache or SnapshotCache()
             self._asset_index = assets or {}
+            self.contract = contract
+            self.ingest_format = ingest_format
             self.state = SimpleNamespace(
                 enriched_by_id=enriched_by_id,
                 research_by_id={"F01": research},
