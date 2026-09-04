@@ -1281,3 +1281,94 @@ floor, ATT&CK T1190, and per-asset impact composites (0.925/0.750/0.400). The Ol
 fixture; the prompts are the ones written and tuned against claude-sonnet-5, with no adaptation
 attempted for a weaker instruction-follower. A larger local model, a different quantization, or
 loosened schema/grounding requirements might behave differently -- none of that was tried.
+
+**docs/adapter-generation.md Slice 6 built: `adapters/probe.py`, `rhino adapt probe`/`list`.** The
+next unbuilt piece behind that design's own build-order table -- Slices 1-4 (contract model,
+`ConfiguredAdapter` engine, confirmation digests, CLI read path) and Slice 5 (source enrichment)
+were already complete; this is the first thing a human runs against a source nobody has written a
+mapping for yet, ahead of Slice 8's not-yet-built phase-1 inference agent. No LLM, no API key, no
+network, writes nothing -- pure local file profiling.
+
+**Built exactly the two things the design doc named, nothing more.** `NonRaisingProblemCollector`
+(a `ProblemCollector` whose `raise_if_fatal` never raises) is not new invention -- `configured.py`'s
+`ConfiguredAdapter` docstring already named this exact class ahead of time: "`collector_factory`
+defaults to the real `ProblemCollector`; a probe (a later slice) passes a non-raising recording
+subclass instead." Built now, in the slice the design document assigns it to; not yet wired as
+anyone's `collector_factory` -- that is Slice 7's re-probe-and-refuse-while-fatal step, still open.
+`profile_csv`/`profile_source` are the bounded full-file column profiler: every row is read exactly
+once (CLAUDE.md Section 1's "nothing may assume the dataset is small enough to hold in memory or
+fetch in one pass," which a first-N-rows peek would have violated outright), but each column's
+retained state is capped (`MAX_DISTINCT_TRACKED=500` distinct values tracked, `MAX_SAMPLE_VALUES=8`
+samples kept) so memory stays bounded independent of row count. Past the cap, `distinct_overflow`
+marks the count as a verified lower bound, never a guess presented as exact -- and the same
+discipline extends to `looks_like`'s `identity_candidate` tag, which a dedicated test confirms
+never fires once a column has overflowed, even though every value really was distinct before the
+cap was reached.
+
+**`looks_like` reuses `configured.py`'s own code-owned pattern definitions, but is explicitly not
+authoritative over them.** `_CVE_ID_PATTERN`, the ISO/US-slash/EU-slash date checks, and the
+timestamp check are duplicated as small private constants in `probe.py` rather than imported --
+matching this codebase's own established precedent (`_BLANK_BEARING_KINDS` already lives
+independently in both `config_model.py` and `configured.py`) rather than inventing a new shared
+module, and the stakes of drift are much lower here: a wrong hint costs nothing, since nothing
+downstream trusts it automatically. Every tag requires EVERY non-blank value in the column to
+match, computed exactly over the whole file via a per-value "still true" flag, never approximated
+from a sample. Two honestly-disclosed limitations, not bugs: a column can get both
+`date_us_slash` and `date_eu_slash` at once when every day-of-month value seen is <=12 (neither
+reading is contradicted, so neither is silently dropped); and there is no `bool` tag at all, since
+unlike a CVE id or an ISO date, a boolean vocabulary is not fixed across sources (`True/False`,
+`Y/N`, `1/0` all appear in real exports) -- a column with exactly two distinct values is tagged
+`binary` instead, a weaker, honest claim a human confirms by reading the two actual values in
+`sample_values`.
+
+**Duplicate header names and ragged rows are recorded, never raised -- the opposite posture from
+every other adapter in this package, deliberately.** `native.py`/`defender.py`/`bluepeak.py`/
+`configured.py` all refuse loudly the moment a value doesn't fit an already-decided mapping; this
+module runs BEFORE any mapping exists, so there is nothing yet to be unfaithful to, and refusing on
+a messy real-world file would defeat the entire point of looking at one. A repeated header name
+is accumulated last-occurrence-wins, verified against a test that gives the two occurrences
+genuinely different values and confirms only the LAST one's values survive -- matching
+`ingest.open_csv`'s own documented `csv.DictReader` behavior exactly, so the profile shows what a
+real mapping would actually read, not an average of two columns that don't exist. A short row's
+missing trailing column is not counted as blank -- mirrors `ingest.iter_csv_rows`'s own documented
+distinction ("a truncated row is not a row with blank cells") for the real engine, verified with a
+dedicated test. A mid-file decode error stops the scan and sets `truncated=True` rather than
+raising, so a caller sees real partial results plus a `problems` entry instead of nothing at all.
+
+**CLI: `rhino adapt list` and `rhino adapt probe <name>` (cli.py).** `list` scans `data/` for
+subdirectories containing at least one `.csv` file and, for each one, names every registered
+`--format` whose expected filenames are already present (a subset check, so unrelated extra CSVs
+alongside a full native or Defender file set don't disqualify a match) -- pure directory listing,
+no file content read, so a user isn't pointed at probing a source that already has a working,
+reviewed built-in adapter. `probe <name>` resolves `<name>` exactly like `--data`
+(`_resolve_data_dir`, reused verbatim) and prints, per file, a column table (blank rate, distinct
+count, value length range, `looks_like` tags, bounded samples) via the same `_print_rows` helper
+`_print_table` already uses, followed by every recorded observation or "No observations." A
+duplicate header name is de-duplicated in the printed table itself (iterating
+`dict.fromkeys(profile.header)`) even though `FileProfile.header` keeps the raw, duplicate-bearing
+list -- the `problems` section already explains the duplication, so showing the same resolved
+column twice would only be confusing, not more informative.
+
+**Verified against the real committed sample files, not just synthetic tmp_path CSVs.** `rhino
+adapt probe defender-sample` correctly reproduces facts already documented elsewhere in this file:
+`devices.csv`'s `DeviceId` shows 6 rows but only 5 distinct values (the one repeated device row
+built into that sample on purpose), and `vulnerabilities.csv`'s `CveId` shows 10 rows but 9
+distinct values (the one duplicate finding row). `rhino adapt probe bluepeak` correctly tags
+`CVE_ID` as `cve_id` and `Company`/`Data_Source` as `constant` on the real 50-row file. `rhino
+adapt list` against the real `data/` directory correctly surfaces `demo`/`demo-anchor` as `native`,
+`defender-sample` as `defender`, `bluepeak` as `bluepeak`, and excludes `data/adapters/` (JSON
+contracts, no CSVs) and `data/snapshots/` (nested JSON) entirely.
+
+**Verification.** 57 new tests: `tests/test_adapters_probe.py` (39 -- every `looks_like` tag
+individually, the distinct-value cap and its interaction with `identity_candidate`, duplicate-
+header last-wins accumulation, ragged-row short/long handling and its message cap, encoding
+detection reuse, both failure modes (`ProbeError` on an unreadable/empty file, on a directory with
+no CSVs), and smoke tests against the real `demo`/`bluepeak`/`defender-sample` files asserting only
+column names and structural facts, never a specific fixture VALUE, since `test_no_fixture_coupling
+.py` already enforces exactly that discipline for `adapters/*.py` and this module is now inside its
+glob), `tests/test_cli_adapt.py` (18 -- argument wiring, directory discovery including the subset-
+match check and the no-`data/`-directory case, output formatting, the header-deduplication display
+fix, and every exit code). All 719 tests pass under `.venv312`; confirmed separately under `.venv`
+(Python 3.14, excluding the modules that already couldn't collect there before this session) that
+`test_adapters_probe.py` and `test_cli_adapt.py` both pass cleanly -- `probe.py` has no `crewai`
+dependency, so it needed no lazy-import treatment the way `agents.*`/`memory` do.

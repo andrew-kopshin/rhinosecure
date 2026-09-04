@@ -124,6 +124,22 @@ a missing extra is reported as a normal CLI error, not an ImportError
 traceback. `web/server.py`'s own module docstring has the read-only
 contract: that module reads the export file off disk and nothing else --
 no pipeline run, no agent/LLM call, no memory.py write, ever.
+
+`rhino adapt list` / `rhino adapt probe <name>` are docs/adapter-generation
+.md's Slice 6: tools for looking at a source nobody has written a mapping
+for yet, ahead of Slice 8's not-yet-built phase-1 inference agent. `list`
+scans `data/` for subdirectories that contain at least one `.csv` file and
+names which, if any, already match a registered `--format`'s expected
+filenames (`_discover_probe_sources`) -- purely a directory listing, no
+file content is read. `probe <name>` resolves `<name>` exactly like `--data`
+(`_resolve_data_dir`) and hands it to `adapters/probe.py`'s
+`profile_source`, which reads every .csv file there in full and reports,
+per column, how much of it is blank, how many distinct values it takes, and
+which of a small set of code-owned patterns every non-blank value happens
+to satisfy -- a hint for a human (or a future LLM) proposing a mapping,
+never itself a mapping. Neither command makes an LLM call, needs an API
+key, or writes anything; `adapters/probe.py`'s own module docstring has the
+full design reasoning.
 """
 
 from __future__ import annotations
@@ -137,6 +153,7 @@ from pathlib import Path
 
 from rhinosecure.adapters import DEFAULT_FORMAT, FORMATS, get_adapter, load_config_adapter
 from rhinosecure.adapters.config_model import Contract
+from rhinosecure.adapters.probe import ColumnProfile, FileProfile, ProbeError, profile_source
 from rhinosecure.enrich.attack import load_index as load_attack_index
 from rhinosecure.enrich.cache import OfflineCacheMissError, SnapshotCache
 from rhinosecure.enrich.kev import load_catalog as load_kev_catalog
@@ -729,6 +746,95 @@ def _print_gap_note(asset: Asset, finding_gaps: frozenset[str]) -> None:
     )
 
 
+@dataclass(frozen=True)
+class ProbeSource:
+    """One `data/` subdirectory `rhino adapt list` found -- a candidate
+    argument for `rhino adapt probe`. `matches_format` names every
+    registered `--format` whose expected filenames are all present here
+    (a subset check: extra, unrelated CSVs alongside them don't disqualify
+    a match) -- purely so a user isn't pointed at probing a source that
+    already has a working, reviewed, built-in adapter."""
+
+    name: str
+    csv_files: tuple[str, ...]
+    matches_format: tuple[str, ...]
+
+
+def _discover_probe_sources() -> list[ProbeSource]:
+    data_root = REPO_ROOT / "data"
+    if not data_root.is_dir():
+        return []
+    sources: list[ProbeSource] = []
+    for entry in sorted(data_root.iterdir(), key=lambda p: p.name):
+        if not entry.is_dir():
+            continue
+        try:
+            csv_files = sorted(p.name for p in entry.iterdir() if p.is_file() and p.suffix.lower() == ".csv")
+        except OSError as exc:
+            print(f"Note: could not list {entry} -- {exc}", file=sys.stderr)
+            continue
+        if not csv_files:
+            continue
+        csv_set = set(csv_files)
+        matches = sorted(
+            fmt for fmt, cls in FORMATS.items() if {cls.assets_filename, cls.findings_filename} <= csv_set
+        )
+        sources.append(ProbeSource(name=entry.name, csv_files=tuple(csv_files), matches_format=tuple(matches)))
+    return sources
+
+
+def _print_adapt_list(sources: list[ProbeSource]) -> None:
+    if not sources:
+        print(f"No candidate sources found under {REPO_ROOT / 'data'} (no subdirectory has a .csv file).")
+        return
+    headers = ("name", "files", "known format")
+    rows = [
+        (s.name, ", ".join(s.csv_files), ", ".join(s.matches_format) or "-- (rhino adapt probe candidate)")
+        for s in sources
+    ]
+    _print_rows(headers, rows)
+
+
+_PROBE_SAMPLE_CHARS = 24
+_PROBE_SAMPLES_SHOWN = 3
+
+
+def _column_row(col: ColumnProfile, row_count: int) -> tuple[str, str, str, str, str, str]:
+    length = f"{col.min_length}-{col.max_length}" if col.min_length is not None else "--"
+    distinct = f"{col.distinct_count}{'+' if col.distinct_overflow else ''}"
+    shown = col.sample_values[:_PROBE_SAMPLES_SHOWN]
+    samples = ", ".join(v if len(v) <= _PROBE_SAMPLE_CHARS else v[: _PROBE_SAMPLE_CHARS - 1] + "…" for v in shown)
+    if col.distinct_count > len(shown) or col.distinct_overflow:
+        samples = f"{samples}, ..." if samples else "..."
+    return (
+        col.name,
+        f"{col.blank}/{row_count}",
+        distinct,
+        length,
+        ", ".join(col.looks_like) or "--",
+        samples or "--",
+    )
+
+
+def _print_probe_report(data_dir: Path, profiles: list[FileProfile]) -> None:
+    print(f"Probing {data_dir} ({len(profiles)} file(s))")
+    for profile in profiles:
+        status = " -- STOPPED EARLY, see observations below" if profile.truncated else ""
+        print(
+            f"\n{profile.path.name} -- {profile.encoding}, {profile.row_count} row(s), "
+            f"{len(profile.columns)} column(s){status}"
+        )
+        headers = ("column", "blank", "distinct", "len", "looks_like", "samples")
+        rows = [_column_row(profile.columns[name], profile.row_count) for name in dict.fromkeys(profile.header)]
+        _print_rows(headers, rows)
+        if profile.problems:
+            print(f"\n  {len(profile.problems)} observation(s) (not fatal):")
+            for message in profile.problems:
+                print(_wrap(message, indent="    - ", continuation_indent="      "))
+        else:
+            print("\n  No observations.")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="rhino")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -861,6 +967,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     web_parser.add_argument("--port", type=int, default=8420)
     web_parser.add_argument("--host", default="127.0.0.1", help="bind address (default: localhost only)")
+
+    adapt_parser = subparsers.add_parser(
+        "adapt", help="tools for building a declarative ingest contract for a new source (docs/adapter-generation.md)"
+    )
+    adapt_subparsers = adapt_parser.add_subparsers(dest="adapt_command", required=True)
+    adapt_subparsers.add_parser("list", help="list data/ subdirectories that look like candidate sources to probe")
+    adapt_probe_parser = adapt_subparsers.add_parser(
+        "probe", help="profile every .csv file in a source, column by column -- no LLM, no key, writes nothing"
+    )
+    adapt_probe_parser.add_argument("name", help="dataset name under data/, or a path (same resolution as --data)")
 
     args = parser.parse_args(argv)
     _ensure_utf8_stdio()
@@ -1047,6 +1163,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"RhinoSecure web viewer -- serving {resolved}")
         print(f"  http://{args.host}:{args.port}/")
         uvicorn.run(app, host=args.host, port=args.port)
+        return 0
+
+    if args.command == "adapt" and args.adapt_command == "list":
+        _print_adapt_list(_discover_probe_sources())
+        return 0
+
+    if args.command == "adapt" and args.adapt_command == "probe":
+        data_dir = _resolve_data_dir(args.name)
+        try:
+            profiles = profile_source(data_dir)
+        except ProbeError as exc:
+            print(f"probe error: {exc}", file=sys.stderr)
+            return 1
+        _print_probe_report(data_dir, profiles)
         return 0
 
     return 1
