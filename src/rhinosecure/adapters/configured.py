@@ -63,10 +63,12 @@ from rhinosecure.adapters.config_model import (
     DefaultByMapping,
     Derivation,
     DerivedMapping,
+    ContractValidationError,
     LiteralMapping,
     NotCollectedMapping,
     ParsedMapping,
     VocabularyMapping,
+    assert_confirmed,
     validate_contract,
 )
 from rhinosecure.schema import Asset, Finding, SourceEnrichment
@@ -222,15 +224,93 @@ def _read_header(contract: Contract, path: Path) -> list[str]:
         return list(reader.fieldnames or [])
 
 
+def _check_header_mode(mode: str, filename: str, declared_columns: list[str], real_columns: list[str]) -> list[str]:
+    """Compares `declared_columns` (what the contract recorded when it was
+    confirmed, `contract.header.assets`/`.findings`) against `real_columns`
+    (what the file has right now), under `mode`. Returns a list of NOTICE
+    strings -- non-empty only under "declared", for a column the contract
+    has never seen -- and raises `ContractValidationError` for anything the
+    mode treats as a hard refusal.
+
+    "declared" (the default): every declared column must still be present
+    -- missing or renamed refuses. A NEW column is a NOTICE, not an error:
+    a vendor growing one harmless field must not stop a scheduled run (a
+    guarantee people route around weekly is worse than none) -- but it is
+    never silent, since a column nobody has looked at may carry the patch
+    window this plan is missing. Column ORDER is irrelevant under this
+    mode: nothing in this engine maps positionally (every mapping reads a
+    column by name), so a reorder cannot change one byte of output, and
+    refusing on it would be a pure false positive that trains an operator
+    toward the looser mode for the wrong reason.
+
+    "frozen": the ordered column list must match exactly. Reorder,
+    addition, and removal all refuse -- the strictest mode, for a source
+    whose shape must never move without a human looking at it again.
+    """
+    real_set = set(real_columns)
+    declared_set = set(declared_columns)
+    missing = [c for c in declared_columns if c not in real_set]
+
+    if mode == "frozen":
+        if real_columns == declared_columns:
+            return []
+        added = [c for c in real_columns if c not in declared_set]
+        detail = []
+        if missing:
+            detail.append(f"missing {missing}")
+        if added:
+            detail.append(f"new {added}")
+        if not missing and not added:
+            detail.append("column order changed")
+        raise ContractValidationError(
+            f"{filename}: header.mode is 'frozen' and the header no longer matches exactly -- "
+            + "; ".join(detail)
+            + f". Declared: {declared_columns}. Actual: {real_columns}."
+        )
+
+    # declared
+    if missing:
+        raise ContractValidationError(
+            f"{filename}: declared column(s) {missing} are missing from the real header {real_columns} "
+            "-- renamed or removed since this contract was confirmed"
+        )
+    added = [c for c in real_columns if c not in declared_set]
+    if not added:
+        return []
+    return [
+        f"{filename} has {len(added)} column(s) this contract has never seen: {added}. It is not read. "
+        "A column nobody has looked at may carry the patch window this plan is missing."
+    ]
+
+
+def _filtered_for_validation(mode: str, declared_columns: list[str], real_columns: list[str]) -> list[str]:
+    """The header `validate_contract`'s own completeness check (V08) should
+    reason about. Under "frozen", `_check_header_mode` already guarantees
+    `real_columns == declared_columns` by the time this runs (anything else
+    raised already), so the real header is used unchanged. Under
+    "declared", a column new since confirmation is real but UNDECLARED --
+    `_check_header_mode` already turned it into a notice above, and V08
+    must not also demand it be mapped or listed in unmapped_columns (both
+    of which describe DECLARED columns only); this filters it out of what
+    V08 sees, so a harmless new field doesn't refuse an otherwise-clean run."""
+    if mode == "frozen":
+        return real_columns
+    declared_set = set(declared_columns)
+    return [c for c in real_columns if c in declared_set]
+
+
 class ConfiguredAdapter(IngestAdapter):
-    """Interprets one confirmed-or-not `Contract` (`review.state` is not
-    checked here -- see the module docstring; that gate is a later slice).
+    """Interprets one CONFIRMED `Contract` -- `__init__` refuses to
+    construct at all against anything else (`config_model.assert_confirmed`,
+    checked before a single byte of the source CSV is read: no file is
+    opened, no instance attribute is set, until the contract itself passes).
     `collector_factory` defaults to the real `ProblemCollector`; a probe (a
     later slice) passes a non-raising recording subclass instead, so the
     review a human reads is produced by exactly this code, not a second
     implementation of it."""
 
     def __init__(self, contract: Contract, *, collector_factory: type[ProblemCollector] = ProblemCollector) -> None:
+        assert_confirmed(contract)
         super().__init__()
         self.contract = contract
         self.format = contract.format
@@ -241,6 +321,11 @@ class ConfiguredAdapter(IngestAdapter):
         self._derivation_output_index: dict[str, dict[str, int]] = {
             name: {output: i for i, output in enumerate(d.outputs)} for name, d in contract.derived.items()
         }
+        #: Populated by `load_assets` -- notices for a header difference
+        #: `header.mode` tolerates (a new column under "declared") rather
+        #: than refuses. Empty before `load_assets` runs, and whenever
+        #: nothing has drifted.
+        self.header_notices: list[str] = []
 
     @property
     def run_label(self) -> str:
@@ -380,7 +465,25 @@ class ConfiguredAdapter(IngestAdapter):
         findings_header = (
             assets_header if self.contract.source.layout == "single_file" else _read_header(self.contract, findings_path)
         )
-        validate_contract(self.contract, {self.assets_filename: assets_header, self.findings_filename: findings_header})
+
+        header = self.contract.header
+        notices: list[str] = []
+        notices += _check_header_mode(header.mode, self.assets_filename, header.assets.columns, assets_header)
+        if self.contract.source.layout == "two_file":
+            notices += _check_header_mode(header.mode, self.findings_filename, header.findings.columns, findings_header)
+        self.header_notices = notices
+
+        validate_contract(
+            self.contract,
+            {
+                self.assets_filename: _filtered_for_validation(header.mode, header.assets.columns, assets_header),
+                self.findings_filename: _filtered_for_validation(
+                    header.mode,
+                    header.assets.columns if self.contract.source.layout == "single_file" else header.findings.columns,
+                    findings_header,
+                ),
+            },
+        )
         self._assets_header_set = set(assets_header)
 
         grouping = self.contract.asset_grouping

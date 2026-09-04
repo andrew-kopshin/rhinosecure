@@ -14,7 +14,14 @@ from pathlib import Path
 import pytest
 
 from rhinosecure.adapters.base import AdapterError, IngestAdapter
-from rhinosecure.adapters.config_model import Contract, ContractValidationError
+from rhinosecure.adapters.config_model import (
+    Contract,
+    ContractDigestMismatchError,
+    ContractNotConfirmedError,
+    ContractValidationError,
+    compute_content_digest,
+    compute_decision_digest,
+)
 from rhinosecure.adapters.configured import ConfiguredAdapter, _render_composed
 from rhinosecure.ingest import load_batch
 
@@ -39,6 +46,30 @@ def _bluepeak_gen() -> Contract:
 
 def _mdvm_gen() -> Contract:
     return Contract.model_validate(_confirmed(mdvm_gen_dict()))
+
+
+def _reconfirm(contract: Contract) -> Contract:
+    """Stamp fresh digests onto a MODIFIED contract and mark it confirmed --
+    for a test that changes something about an already-confirmed contract
+    (a version bump, a narrowed hex_len) and then needs ConfiguredAdapter to
+    actually accept it. `ConfiguredAdapter.__init__` now refuses any
+    contract whose state isn't "confirmed" or whose digests don't match
+    (config_model.assert_confirmed), so simply mutating a field and handing
+    the result to ConfiguredAdapter would fail that gate before the test
+    ever reaches what it's actually checking."""
+    proposed = contract.model_copy(update={"review": type(contract.review)()})
+    return proposed.model_copy(
+        update={
+            "review": type(contract.review)(
+                state="confirmed",
+                confirmed_at="2026-09-04T20:00:00Z",
+                confirmed_by="test-fixture",
+                confirmed_version=proposed.version,
+                content_digest=compute_content_digest(proposed),
+                decision_digest=compute_decision_digest(proposed),
+            )
+        }
+    )
 
 
 def _bp_dir(tmp_path: Path, rows: list[dict]) -> Path:
@@ -75,7 +106,7 @@ def test_is_an_ingest_adapter_with_instance_attributes_not_classvars():
 def test_run_label_includes_revision_and_updates_with_version():
     contract = _bluepeak_gen()
     assert ConfiguredAdapter(contract).run_label == f"bluepeak-gen@v{contract.version}"
-    bumped = contract.model_copy(update={"version": contract.version + 1})
+    bumped = _reconfirm(contract.model_copy(update={"version": contract.version + 1}))
     assert ConfiguredAdapter(bumped).run_label == f"bluepeak-gen@v{contract.version + 1}"
 
 
@@ -216,15 +247,152 @@ def test_a_truncation_collision_is_reported_distinctly_from_a_content_conflict(t
     than re-searched on every test run."""
     contract = _mdvm_gen()
     narrowed = contract.finding["finding_id"].model_copy(update={"hex_len": 8})
-    # review=None resets the digests too -- otherwise V19 (config_model.py's
-    # validate_contract) would refuse this modified copy for a stale-digest
-    # mismatch before the test ever reaches the collision it's checking for.
-    contract = contract.model_copy(
-        update={"finding": {**contract.finding, "finding_id": narrowed}, "review": type(contract.review)()}
-    )
+    # _reconfirm stamps fresh digests and marks it confirmed again --
+    # otherwise ConfiguredAdapter.__init__'s new gate (assert_confirmed)
+    # would refuse this modified copy before the test ever reaches the
+    # collision it's actually checking for.
+    contract = _reconfirm(contract.model_copy(update={"finding": {**contract.finding, "finding_id": narrowed}}))
     devices = [def_device(device_id=DC)]
     vulns = [def_vuln(device_id=DC, cve="CVE-2020-11429"), def_vuln(device_id=DC, cve="CVE-2020-13776")]
     data_dir = _def_dir(tmp_path, devices, vulns)
     with pytest.raises(AdapterError, match="collides"):
         _assets, findings = load_batch(data_dir, ConfiguredAdapter(contract))
         list(findings)
+
+
+# =========================================================================
+# Slice 3: the confirmation gate and header-mode enforcement
+# =========================================================================
+
+
+def test_unconfirmed_contract_refuses_to_construct():
+    contract = _bluepeak_gen().model_copy(update={"review": type(_bluepeak_gen().review)(state="proposed")})
+    with pytest.raises(ContractNotConfirmedError, match="rhino adapt confirm"):
+        ConfiguredAdapter(contract)
+
+
+def test_unconfirmed_contract_refuses_before_any_directory_is_touched():
+    """The gate fires in __init__, before load_assets ever runs -- proven
+    by never supplying a data_dir at all."""
+    contract = _bluepeak_gen().model_copy(update={"review": type(_bluepeak_gen().review)(state="proposed")})
+    with pytest.raises(ContractNotConfirmedError):
+        ConfiguredAdapter(contract)  # no data_dir passed anywhere -- can't have opened one
+
+
+def test_a_hand_edited_table_value_after_confirmation_refuses_to_construct():
+    contract = _bluepeak_gen()
+    edited = contract.model_copy(
+        update={"asset": {**contract.asset, "role": contract.asset["role"].model_copy(
+            update={"table": {**contract.asset["role"].table, "Domain Controller": "sql"}}
+        )}}
+    )
+    with pytest.raises(ContractDigestMismatchError, match="content_digest mismatch"):
+        ConfiguredAdapter(edited)
+
+
+def test_digest_mismatch_refuses_before_any_file_is_opened(tmp_path):
+    """Constructed with a data_dir that does not exist at all -- if the
+    gate fired anywhere other than __init__, this would raise
+    FileNotFoundError instead of the digest error."""
+    contract = _bluepeak_gen()
+    edited = contract.model_copy(
+        update={"asset": {**contract.asset, "role": contract.asset["role"].model_copy(
+            update={"table": {**contract.asset["role"].table, "Domain Controller": "sql"}}
+        )}}
+    )
+    with pytest.raises(ContractDigestMismatchError):
+        ConfiguredAdapter(edited)  # never touches tmp_path -- proves the gate needs no directory
+
+
+def test_not_collected_hand_edited_without_touching_the_mapping_refuses_end_to_end(tmp_path):
+    """V09 (config_model.validate_contract) already pins this at the unit
+    level (test_adapters_config_model.py); this confirms it still holds
+    end to end through the real engine, before any row is yielded."""
+    contract = _bluepeak_gen()
+    tampered = contract.model_copy(
+        update={"not_collected": contract.not_collected.model_copy(
+            update={"always_asset": [*contract.not_collected.always_asset, "compensating_controls"]}
+        )}
+    )
+    tampered = _reconfirm(tampered)
+    rows = [bp_row(record_id="VULN-0001", asset_id="A1")]
+    data_dir = _bp_dir(tmp_path, rows)
+    with pytest.raises(ContractValidationError, match="not_collected disagrees"):
+        load_batch(data_dir, ConfiguredAdapter(tampered))
+
+
+# --- header mode: declared vs frozen --------------------------------------
+
+
+def _bp_columns_with(*, rename: tuple[str, str] | None = None, add: str | None = None, reorder: bool = False) -> list[str]:
+    columns = list(BP_COLUMNS)
+    if rename:
+        old, new = rename
+        columns = [new if c == old else c for c in columns]
+    if add:
+        columns = columns + [add]
+    if reorder:
+        columns = columns[1:] + columns[:1]
+    return columns
+
+
+@pytest.mark.parametrize("mode", ["declared", "frozen"])
+def test_a_renamed_column_refuses_under_both_modes(tmp_path, mode):
+    contract = _bluepeak_gen()
+    contract = _reconfirm(contract.model_copy(update={"header": contract.header.model_copy(update={"mode": mode})}))
+    rows = [bp_row(record_id="VULN-0001", asset_id="A1")]
+    data_dir = _bp_dir(tmp_path, rows)
+    columns = _bp_columns_with(rename=("Asset_ID", "AssetId"))
+    bp_write(data_dir / BP_FILENAME, rows, columns=columns)
+    with pytest.raises(ContractValidationError, match="Asset_ID"):
+        load_batch(data_dir, ConfiguredAdapter(contract))
+
+
+def test_a_reordered_header_does_not_refuse_under_declared(tmp_path):
+    contract = _bluepeak_gen()  # mode defaults to "declared"
+    rows = [bp_row(record_id="VULN-0001", asset_id="A1")]
+    data_dir = _bp_dir(tmp_path, rows)
+    bp_write(data_dir / BP_FILENAME, rows, columns=_bp_columns_with(reorder=True))
+    assets, findings = load_batch(data_dir, ConfiguredAdapter(contract))
+    list(findings)
+    assert set(assets) == {"A1"}  # loaded cleanly -- nothing maps positionally
+
+
+def test_a_reordered_header_refuses_under_frozen(tmp_path):
+    contract = _bluepeak_gen()
+    contract = _reconfirm(contract.model_copy(update={"header": contract.header.model_copy(update={"mode": "frozen"})}))
+    rows = [bp_row(record_id="VULN-0001", asset_id="A1")]
+    data_dir = _bp_dir(tmp_path, rows)
+    bp_write(data_dir / BP_FILENAME, rows, columns=_bp_columns_with(reorder=True))
+    with pytest.raises(ContractValidationError, match="frozen"):
+        load_batch(data_dir, ConfiguredAdapter(contract))
+
+
+def test_a_new_column_is_a_notice_under_declared_not_a_refusal(tmp_path):
+    contract = _bluepeak_gen()
+    rows = [bp_row(record_id="VULN-0001", asset_id="A1")]
+    data_dir = _bp_dir(tmp_path, rows)
+    bp_write(data_dir / BP_FILENAME, rows, columns=_bp_columns_with(add="Exploitability_Score"))
+    adapter = ConfiguredAdapter(contract)
+    assets, findings = load_batch(data_dir, adapter)
+    list(findings)
+    assert set(assets) == {"A1"}
+    assert any("Exploitability_Score" in notice for notice in adapter.header_notices)
+
+
+def test_a_new_column_refuses_under_frozen(tmp_path):
+    contract = _bluepeak_gen()
+    contract = _reconfirm(contract.model_copy(update={"header": contract.header.model_copy(update={"mode": "frozen"})}))
+    rows = [bp_row(record_id="VULN-0001", asset_id="A1")]
+    data_dir = _bp_dir(tmp_path, rows)
+    bp_write(data_dir / BP_FILENAME, rows, columns=_bp_columns_with(add="Exploitability_Score"))
+    with pytest.raises(ContractValidationError, match="frozen"):
+        load_batch(data_dir, ConfiguredAdapter(contract))
+
+
+def test_header_notices_are_empty_by_default_on_the_real_committed_contract(tmp_path):
+    """No drift at all -- the real file matches what bluepeak-gen declared."""
+    adapter = ConfiguredAdapter(_bluepeak_gen())
+    assets, findings = load_batch(DATA_ROOT / "bluepeak", adapter)
+    list(findings)
+    assert adapter.header_notices == []

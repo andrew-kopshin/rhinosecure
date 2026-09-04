@@ -825,6 +825,102 @@ def compute_decision_digest(contract: Contract) -> str:
     return "sha256:" + hashlib.sha256(_canonical_json_bytes(data)).hexdigest()
 
 
+def compute_slot_digests(contract: Contract) -> dict[str, str]:
+    """One digest per target slot -- `"asset.<field>"` / `"finding.<field>"`
+    -- over that slot's own mapping node alone, nothing else. This is what
+    lets a future re-review (`rhino adapt rereview`) show ONLY the slots
+    whose decision actually moved: a vendor renaming one unrelated column
+    changes `decision_digest` (the whole mapping moved) but leaves every
+    OTHER slot's own digest untouched, so a reviewer re-confirms one line
+    instead of re-reading the whole contract. Optional on `Review` even
+    when confirmed -- a contract that never recorded these falls back to
+    the coarser content/decision signal (`assert_confirmed`)."""
+    digests: dict[str, str] = {}
+    for target, mapping in contract.asset.items():
+        data = mapping.model_dump(mode="json")
+        digests[f"asset.{target}"] = "sha256:" + hashlib.sha256(_canonical_json_bytes(data)).hexdigest()
+    for target, mapping in contract.finding.items():
+        data = mapping.model_dump(mode="json")
+        digests[f"finding.{target}"] = "sha256:" + hashlib.sha256(_canonical_json_bytes(data)).hexdigest()
+    return digests
+
+
+class ContractNotConfirmedError(ContractError):
+    """`review.state` is not `"confirmed"`. There is no `--force`, no env
+    var, no partial mode -- see `assert_confirmed`."""
+
+
+class ContractDigestMismatchError(ContractError):
+    """The contract's own recorded digest(s) no longer match its current
+    content -- it was hand-edited (or corrupted) after confirmation. See
+    `assert_confirmed`."""
+
+
+def assert_confirmed(contract: Contract) -> None:
+    """The engine's construction-time gate. `ConfiguredAdapter.__init__`
+    calls this before opening any file or setting any instance attribute:
+    refuses to proceed unless `review.state == "confirmed"` AND the
+    contract's own stored digests still match its current content.
+
+    Needs no header and touches no file -- digests are computed purely
+    from the contract's own fields, so a stale or unconfirmed contract is
+    refused before a single byte of the source CSV is read, exactly the
+    "checked before any file is opened" property this slice exists to add.
+
+    On a digest mismatch, if the contract recorded `slot_digests` at
+    confirmation time, this recomputes them now and names exactly which
+    slot(s) changed -- the same per-slot comparison a future `rhino adapt
+    rereview` uses to show only what moved. Without `slot_digests` (legal
+    -- optional even when confirmed), the message falls back to a coarser
+    but still meaningful signal: whether the edit touched a DECISION
+    subtree (content_digest AND decision_digest both mismatch) or only
+    provenance/measurement outside it (content_digest mismatches alone --
+    `observed`/`generator`/`generated_at` are the only fields that could
+    have moved)."""
+    if contract.review.state != "confirmed":
+        raise ContractNotConfirmedError(
+            f"contract {contract.format!r} is not confirmed (review.state={contract.review.state!r}). "
+            "Review its mapping and confirm it before it can ingest anything: "
+            f"rhino adapt confirm {contract.format} (a later slice's command)."
+        )
+
+    problems: list[str] = []
+    actual_content = compute_content_digest(contract)
+    content_matches = actual_content == contract.review.content_digest
+    if not content_matches:
+        problems.append(
+            f"content_digest mismatch: file says {contract.review.content_digest!r}, "
+            f"recomputed {actual_content!r}"
+        )
+
+    actual_decision = compute_decision_digest(contract)
+    decision_matches = actual_decision == contract.review.decision_digest
+    if not decision_matches:
+        problems.append(
+            f"decision_digest mismatch: file says {contract.review.decision_digest!r}, "
+            f"recomputed {actual_decision!r} -- a MAPPING DECISION changed since this was confirmed, "
+            "not just measurement or provenance"
+        )
+        if contract.review.slot_digests:
+            actual_slots = compute_slot_digests(contract)
+            changed = sorted(
+                name for name, stored in contract.review.slot_digests.items() if actual_slots.get(name) != stored
+            )
+            if changed:
+                problems.append(f"changed slot(s): {changed}")
+    elif not content_matches:
+        problems.append(
+            "decision_digest still matches -- the edit is outside the mapping decisions "
+            "(observed/generator/generated_at), not a scoring-relevant change"
+        )
+
+    if problems:
+        raise ContractDigestMismatchError(
+            f"contract {contract.format!r} was edited after it was confirmed "
+            f"(confirmed_at={contract.review.confirmed_at!r}):\n" + "\n".join(f"  - {p}" for p in problems)
+        )
+
+
 # ---------------------------------------------------------------------------
 # Cross-field validation. Structural rules enforceable from the contract
 # alone already live as pydantic validators above (V02, V04 [no default],
