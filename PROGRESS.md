@@ -1243,3 +1243,41 @@ unilaterally.
 All four fixes verified by hand (a monkeypatched `Path.iterdir` raising `PermissionError` for the
 exact directory under test; a real same-named directory; a stub adapter reusing one filename; a
 real partial-file directory) before writing the covering tests. 389 tests, up from 374.
+
+## 2026-09-04
+
+**Local-model swap tested: the seam works, the model didn't.** CLAUDE.md's trust-boundary section
+commits to a provider swap via `.env`, not code -- verified against a real local model instead of
+taken on faith. `RHINO_LLM_MODEL=ollama/llama3.1:8b` plus `RHINO_LLM_BASE_URL=http://localhost:11434`,
+no change to `llm.py` or any agent: `crewai.LLM` auto-detected the `ollama/` prefix and routed to
+Ollama's OpenAI-compatible endpoint (`http://localhost:11434/v1`); a direct `get_llm().call(...)`
+round-tripped correctly. Then ran the real pipeline against it: `rhino run --data demo-anchor
+--agents` (the 3-finding ProxyLogon anchor fixture -- one CVE, three hosts).
+
+**0/3 findings scored, two distinct failure modes, both caught rather than shipped.**
+- F02 and F03 failed at Research: `attack_techniques[].prevalence` came back as `"Common"` /
+  `"Likely"` -- free-text labels where `ResearchFinding` requires a float. Failed Pydantic
+  validation on all 3 structured-output retry attempts, then gave up.
+- F01 passed Research and Environment, then failed at Risk: its self-reported
+  `recommendation.risk_score` was 9.8; the `score_finding` tool it had just called actually
+  returned 85.52377816714133. `verify_scoring_matches_tool` (CLAUDE.md Section 8's
+  grounding-validation item) caught the mismatch and refused rather than ship the fabricated
+  number -- the first real case of that check firing on a genuine disagreement rather than a
+  synthetic test.
+
+Tool-calling itself wasn't the failure -- F01 really did call `score_finding` and get the real
+value back. The model just didn't faithfully report what the tool told it, and separately didn't
+respect a field's declared type. Both are model-capability gaps against a schema/grounding
+contract written and tuned against claude-sonnet-5, not a defect in the seam.
+
+**Side-by-side on the identical fixture.** Ran the same `demo-anchor` data through the default
+config immediately after, same command, no other change: 3/3 findings scored in 2m04s,
+reproducing the anchor demonstration exactly (`patch_now`/`next_window`/`mitigate_monitor` across
+EXCH01/EXCH02/EXCHDEV01), rationale correctly citing NVD CVSS 9.8, EPSS 1.000 clearing the KEV
+floor, ATT&CK T1190, and per-asset impact composites (0.925/0.750/0.400). The Ollama run took
+17m38s and produced nothing usable.
+
+**Caveats -- not tested here.** One quantized model (llama3.1:8b, Q4_K_M) against one 3-finding
+fixture; the prompts are the ones written and tuned against claude-sonnet-5, with no adaptation
+attempted for a weaker instruction-follower. A larger local model, a different quantization, or
+loosened schema/grounding requirements might behave differently -- none of that was tried.
