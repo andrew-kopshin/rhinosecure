@@ -238,6 +238,17 @@ def iter_csv_rows(path: Path, reader: csv.DictReader) -> Iterator[tuple[int, dic
     The single place every adapter's row loop goes through, so a rule about
     what a readable row *is* is stated once instead of per format.
 
+    The row number is `reader.line_num` -- the count of physical lines
+    consumed so far -- not an `enumerate(reader, start=2)` counter. Every
+    adapter used to count records, and the two agree only when every record
+    is exactly one physical line. A record whose evidence text has an
+    embedded newline (legal inside a quoted CSV field, and exactly the kind
+    of free-text column this project's own evidence fields are) consumes two
+    physical lines for one record, and every enumerate-based row number after
+    it in the file is then one low -- silently, since nothing about that
+    record itself looks wrong. `line_num` reports the true line and needs no
+    adjustment for what came before it.
+
     A row whose field count disagrees with the header is refused here. That
     matters most in the short-row direction: `csv.DictReader` fills a missing
     trailing column with `None`, every adapter reads cells as
@@ -256,7 +267,8 @@ def iter_csv_rows(path: Path, reader: csv.DictReader) -> Iterator[tuple[int, dic
     """
     columns = list(reader.fieldnames or [])
     try:
-        for row_no, row in enumerate(reader, start=2):
+        for row in reader:
+            row_no = reader.line_num
             overflow = row.get(None)
             if overflow is not None:
                 raise IngestError(

@@ -225,3 +225,42 @@ def test_a_ragged_row_refuses_through_a_real_adapter(tmp_path):
         assets, findings = load_batch(data_dir, get_adapter("defender"))
         list(findings)
     assert "fields but the header" in str(excinfo.value)
+
+
+# --- row numbers are physical line numbers, not record counts -----------
+
+
+def test_row_numbers_survive_an_embedded_newline(tmp_path):
+    """A quoted field may legally contain a newline -- exactly the shape of
+    a free-text evidence column. That record consumes two physical lines,
+    so a record-counting row number and the true line number diverge for
+    every row after it. iter_csv_rows must report the physical line."""
+    path = tmp_path / "x.csv"
+    path.write_bytes(
+        b'CveId,Evidence\n'
+        b'CVE-2020-1472,"line one\nline two"\n'  # rows 2-3
+        b'CVE-2021-34527,ok\n'  # row 4, not row 3
+    )
+    f, reader = ingest.open_csv(path)
+    with f:
+        numbers = [n for n, _row in ingest.iter_csv_rows(path, reader)]
+    assert numbers == [3, 4]
+
+
+def test_ragged_row_message_names_the_true_line_after_an_embedded_newline(tmp_path):
+    """The bug this guards: a message about a later row was off by one (or
+    more) for every embedded newline earlier in the file. Confirmed here by
+    also proving what the old enumerate-based count would have said (3),
+    against what the real line is (4)."""
+    path = tmp_path / "x.csv"
+    path.write_bytes(
+        b'CveId,Evidence,Extra\n'
+        b'CVE-2020-1472,"line one\nline two",ok\n'  # rows 2-3
+        b'CVE-2021-34527,ok\n'  # short row: physical line 4, record-count 3
+    )
+    f, reader = ingest.open_csv(path)
+    with f, pytest.raises(IngestError) as excinfo:
+        list(ingest.iter_csv_rows(path, reader))
+    message = str(excinfo.value)
+    assert "row 4" in message
+    assert "row 3" not in message
