@@ -322,3 +322,51 @@ def attach_threat_signals(
             "attack_prevalence": max(confirmed_prevalence, default=None),
         }
     )
+
+
+def attach_source_enrichment(enriched: EnrichedFinding) -> EnrichedFinding:
+    """Counterpart to `attach_threat_signals` for a pre-enriched source
+    (`enriched.finding.source_enrichment is not None` -- adapters/bluepeak.py
+    and any future adapter shaped like it): copies what the source already
+    supplied instead of calling NVD/KEV/EPSS/ATT&CK, which would spend
+    retries finding nothing for a CVE ID that was never real to begin with.
+    No network, no cache, no LLM call -- still deterministic, still callable
+    from either the deterministic path or agents/coordinator.py's capacity
+    flow, same as attach_threat_signals.
+
+    `attack_prevalence` is deliberately left untouched (not set to
+    anything): it is enrich/attack.py's own corpus-wide percentile-rank
+    statistic for a technique in the local ATT&CK index, and a source-
+    reported technique ID carries no such figure -- leaving it at
+    EnrichedFinding's own default (None) is the honest state, identical to
+    "no confirmed technique found" (see scoring.score_threat and
+    scoring._attack_rationale_lines, which both already treat
+    attack_prevalence=None as a no-op multiplier, not an error).
+
+    A finding with no `source_enrichment` is returned unchanged -- this
+    should never happen for a `provides_enrichment` adapter (every Finding
+    it yields sets the field), but this function never assumes that; a
+    missing signal degrades to EnrichedFinding's own defaults rather than
+    raising, the same "don't block a whole run over one row" discipline
+    adapters/defender.py's own refuse-vs-degrade split already follows.
+    """
+    source = enriched.finding.source_enrichment
+    if source is None:
+        return enriched
+    techniques: tuple[AttackTechniqueRef, ...] = ()
+    if source.attack_technique_id:
+        techniques = (
+            AttackTechniqueRef(
+                technique_id=source.attack_technique_id,
+                name=source.attack_technique_name,
+                confidence="source_reported",
+            ),
+        )
+    return enriched.model_copy(
+        update={
+            "is_kev": bool(source.known_exploited),
+            "attack_techniques": techniques,
+            "source_severity_score": source.severity_score,
+            "source_severity_label": source.severity_label,
+        }
+    )

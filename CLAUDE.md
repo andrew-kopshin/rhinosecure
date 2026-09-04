@@ -150,6 +150,76 @@ candidate. Without that, all three servers in the Defender sample carry the same
 and a constraint could land on a domain controller. Confirmed against a real run: that statement
 returns zero candidates and refuses, instead of resolving to a defaulted role.
 
+**A third adapter, and a second enrichment mode: `adapters/bluepeak.py`, a single-file,
+pre-enriched source, and `IngestAdapter.provides_enrichment`.** `data/bluepeak/
+synthetic_cve_inventory_50.csv` (BluePeak Technologies, fictional) is one denormalized file --
+a finding per row with its asset carried inline -- instead of the two-file assets/findings
+split every prior format used. `assets_filename == findings_filename` on this adapter, which
+`ingest._require_adapter_files`'s own `dict.fromkeys` dedup was already written to allow; the
+format is not a workaround for the `IngestAdapter` contract, it is the case that dedup was
+built for. It also breaks the "no live lookup will ever find anything" assumption in the
+opposite direction from Defender: its CVE IDs are synthetic (`CVE-2099-NNNNN`, every row's own
+`Data_Source` column says so) so NVD/KEV/EPSS/ATT&CK would cleanly find nothing, but the export
+already carries its own CVSS score, exploitation status, and ATT&CK technique per finding --
+discarding that to flatten it through the scanner-tier proxy would be a real loss of signal,
+not a gap to fill in later. `IngestAdapter.provides_enrichment` (`adapters/base.py`) is the new
+seam: `True` only for a source shaped like this, read by `cli.py`'s `run_with_report` to call
+`ingest.attach_source_enrichment` instead of `attach_threat_signals`, skipping the two bulk
+KEV/ATT&CK loads and every per-CVE lookup entirely rather than spending them on retries that
+would just find nothing. Mechanically: `Finding.source_enrichment` (a new, optional
+`SourceEnrichment` model, `schema.py`) carries what the adapter mapped; `attach_source_enrichment`
+copies it onto `EnrichedFinding.is_kev`/`attack_techniques` (tagged `confidence="source_reported"`,
+a value `AttackTechniqueRef.confidence`'s plain `str` type already accepted with no schema
+change) and onto two new, honestly-labeled fields, `EnrichedFinding.source_severity_score`/
+`source_severity_label`. `scoring._resolve_severity` checks the labeled pair first, before
+`nvd_base_score` -- never reusing the NVD-branded fields for a number NVD never scored, so the
+rationale can never misattribute a vendor's own self-reported CVSS to NVD (confirmed in
+`--explain` output: `"bluepeak-reported CVSS 8.8 used directly (source=bluepeak, not fetched..."`,
+distinct from either the `source=nvd` or `source=scanner` wording). `attack_prevalence` is
+deliberately left unset for a source-reported technique: it is `enrich/attack.py`'s own
+corpus-wide percentile stat, and a source has no such figure to report, so leaving it at
+`EnrichedFinding`'s own default is the honest state, not an oversight -- `_attack_rationale_lines`
+gained a third branch so the rationale says so explicitly rather than falling into "no
+technique mapping found." `run_agents`/`submit_constraint` are not wired for this yet -- they
+still dispatch Research's live-lookup tools for every format, harmless for this source (a
+graceful "not found" per lookup, the same as any not-yet-scored CVE) but without the precision
+`provides_enrichment` gives the deterministic path.
+
+The role vocabulary this project's `AssetRole` (`dc`, `exchange`, `iis_web`, `sql`, `file`,
+`workstation`, `dev`) was built for a Windows AD enterprise fleet (Section 2's own deliberate
+narrowing), and BluePeak's `Asset_Type` column describes a modern, largely non-Windows one --
+firewalls, a Kubernetes cluster, a container host, identity/email/network gateways, a wireless
+controller, printers, and web applications/APIs with no IIS or Windows evidence (one is
+literally a Java gateway). Decided (asked, not assumed): refuse every `Asset_Type` with no
+honest equivalent, same posture `adapters/defender.py` already takes for a non-Windows
+`OSPlatform` -- forcing e.g. a Kubernetes cluster into `file` would assert something false and
+produce a confident-looking but fabricated blast-radius weight, exactly the "wrong-but-plausible
+number" the whole not_collected/refuse-rather-than-guess discipline exists to prevent. Confirmed
+against the real file: 13 of ~28 distinct `Asset_Type` values map (`ROLE_BY_ASSET_TYPE`,
+`adapters/bluepeak.py`); the other 23 of the 50 rows refuse the whole batch at once, every
+offender listed -- there is no per-row skip-and-continue anywhere in this adapter layer (Defender
+doesn't have one either: one bad `OSPlatform` fails its whole file too), so running the file
+as-is prints one message naming exactly where the Windows-only scope boundary sits rather than a
+partial table. A filtered 27-row subset (the mappable rows only) runs and scores cleanly end to
+end -- table, `Contested: 0/27`, full `--explain` rationale, zero network calls.
+
+Two mapping mistakes running against the real file caught before they became bugs. **`Asset_ID`
+rows repeat** (a device can have more than one finding) and most per-row fields must then agree
+across an asset's rows or the batch refuses the same way Defender's `DeviceId` handling does --
+but two fields legitimately don't have to: `Assigned_Team` names which team is fixing *one
+finding*, not who owns the asset (`FIN-WS-014`'s two findings are assigned to different teams in
+the fixture), so an early version mapping it to `Asset.owner` hit a spurious refusal on exactly
+that asset; `owner` is `not_collected` instead now, and `Assigned_Team` still reaches the model
+via each finding's own `evidence`. `Compensating_Control` can also legitimately differ per
+finding on one asset (`FILE-SRV-01`'s two findings each declare a different real control --
+"SMB access segmented by department" on one, "Archive extraction limited to authenticated file
+services" on the other) -- unioning every distinct value across an asset's rows into
+`Asset.compensating_controls`, rather than requiring row-for-row agreement, is not a guess (both
+are real, declared facts, just declared on different rows) and only strengthens
+`score_impact`'s decay, never weakens it. Neither of these was anticipated before running the
+adapter against data it had never seen; both are recorded in `adapters/bluepeak.py`'s own module
+docstring, not just here.
+
 **Guardrail.** This is a design constraint, not a feature list. The following remain out of
 scope for the capstone build: live scanner API connectors, credential handling, PII or
 regulated-data handling, and multi-tenant concerns. Design so they're possible later; do not

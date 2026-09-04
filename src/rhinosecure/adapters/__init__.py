@@ -12,6 +12,7 @@ from rhinosecure.adapters.base import (
     AdapterError,
     IngestAdapter,
 )
+from rhinosecure.adapters.bluepeak import BluePeakAdapter
 from rhinosecure.adapters.defender import DefenderAdapter
 from rhinosecure.adapters.native import NativeAdapter
 
@@ -20,6 +21,7 @@ DEFAULT_FORMAT = NativeAdapter.format
 FORMATS: dict[str, type[IngestAdapter]] = {
     NativeAdapter.format: NativeAdapter,
     DefenderAdapter.format: DefenderAdapter,
+    BluePeakAdapter.format: BluePeakAdapter,
 }
 
 
@@ -36,6 +38,7 @@ __all__ = [
     "NOT_COLLECTED_DEFAULTS",
     "ROLE_DEFAULT_BY_OS_CLASS",
     "AdapterError",
+    "BluePeakAdapter",
     "DefenderAdapter",
     "IngestAdapter",
     "NativeAdapter",

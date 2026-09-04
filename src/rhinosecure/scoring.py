@@ -292,17 +292,30 @@ def bucket_for(
 
 def _resolve_severity(enriched: EnrichedFinding) -> tuple[float, str]:
     """The severity_base fed to both Threat and Impact, plus which source
-    it came from ("nvd" or "scanner") -- provenance the rationale surfaces.
+    it came from ("<label>" for a pre-enriched source, "nvd", or
+    "scanner") -- provenance the rationale surfaces.
 
-    NVD's CVSS base score is authoritative when NVD has scored the CVE: a
-    real, sourced number, not the fixed per-tier proxy scanner_severity
-    maps to (SEVERITY_BASE_SCORE was always documented as a stand-in
-    "until Slice 2 supplies the real vector" -- this is that). It
-    overrides scanner_severity outright when the two disagree at the tier
-    level, and is still preferred for precision when they happen to
-    agree. Falls back to the scanner's tier proxy only when NVD has no
-    CVSS data for this CVE.
+    A pre-enriched source's own score (`source_severity_score`, set by
+    `ingest.attach_source_enrichment` -- adapters/bluepeak.py and any
+    future adapter shaped like it) wins outright when present: such a
+    source's CVE IDs are typically synthetic, so NVD would never have
+    anything to say about them, and using the source's real number beats
+    flattening it to the fixed per-tier proxy. `source_severity_label`
+    (e.g. "bluepeak") is returned as the provenance label instead of
+    "nvd" -- this is never NVD's own data, and mislabeling it would make
+    the rationale assert something false about where the number came from.
+
+    Otherwise: NVD's CVSS base score is authoritative when NVD has scored
+    the CVE: a real, sourced number, not the fixed per-tier proxy
+    scanner_severity maps to (SEVERITY_BASE_SCORE was always documented
+    as a stand-in "until Slice 2 supplies the real vector" -- this is
+    that). It overrides scanner_severity outright when the two disagree
+    at the tier level, and is still preferred for precision when they
+    happen to agree. Falls back to the scanner's tier proxy only when
+    neither a pre-enriched source nor NVD has data for this CVE.
     """
+    if enriched.source_severity_score is not None:
+        return enriched.source_severity_score, enriched.source_severity_label or "source"
     if enriched.nvd_base_score is not None:
         return enriched.nvd_base_score, "nvd"
     return SEVERITY_BASE_SCORE[enriched.finding.scanner_severity], "scanner"
@@ -339,6 +352,7 @@ def _attack_rationale_lines(enriched: EnrichedFinding, threat: ThreatInputs) -> 
     matches are shown but never do (see build_threat_inputs)."""
     confirmed = [t for t in enriched.attack_techniques if t.confidence == "confirmed"]
     candidates = [t for t in enriched.attack_techniques if t.confidence == "candidate"]
+    source_reported = [t for t in enriched.attack_techniques if t.confidence == "source_reported"]
     lines: list[str] = []
     if confirmed:
         names = ", ".join(f"{t.technique_id} ({t.name})" for t in confirmed)
@@ -347,6 +361,15 @@ def _attack_rationale_lines(enriched: EnrichedFinding, threat: ThreatInputs) -> 
             f"ATT&CK: confirmed via procedure example -- {names}, prevalence={threat.attack_prevalence:.3f} "
             f"-> x{multiplier:.3f} threat multiplier"
         )
+    elif source_reported:
+        # A pre-enriched source's own technique mapping (ingest.
+        # attach_source_enrichment) -- not matched by enrich/attack.py, so
+        # there is no local corpus-prevalence figure for it and no threat
+        # adjustment, same as "no technique mapping found" below. Reported
+        # separately from that case only so the rationale doesn't claim
+        # nothing was found when the source did in fact name a technique.
+        names = ", ".join(f"{t.technique_id} ({t.name})" for t in source_reported)
+        lines.append(f"ATT&CK: {names} reported directly by the source -- no local prevalence stat, no threat adjustment")
     elif candidates:
         names = ", ".join(f"{t.technique_id} ({t.name})" for t in candidates)
         lines.append(
@@ -390,10 +413,19 @@ def _rationale(
                 f"scanner_severity='{scanner_tier}' agrees with NVD's tier ({nvd_tier}) -> using "
                 f"NVD's precise CVSS base score {severity_base:.1f} rather than the tier proxy (source=nvd)"
             )
-    else:
+    elif severity_source == "scanner":
         severity_line = (
             f"scanner severity '{scanner_tier}' -> base score {severity_base:.1f} "
             f"(source=scanner; NVD has no CVSS data for this CVE)"
+        )
+    else:
+        # A pre-enriched source's own CVSS score (ingest.
+        # attach_source_enrichment) -- not NVD's, so labeled by name
+        # rather than folded into "source=nvd"; not the scanner-tier
+        # proxy either, so scanner_tier is shown only as a cross-check.
+        severity_line = (
+            f"{severity_source}-reported CVSS {severity_base:.1f} used directly (source={severity_source}, "
+            f"not fetched -- see Finding.source_enrichment); scanner_severity='{scanner_tier}' for comparison"
         )
     lines = [
         severity_line,

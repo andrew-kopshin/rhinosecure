@@ -116,6 +116,12 @@ class AdapterError(IngestError):
 # enumerated Impact inputs use the modal enterprise value -- see the module
 # docstring for why modal, not worst-case. `role` is not here: it depends on
 # the record's OS class (ROLE_DEFAULT_BY_OS_CLASS).
+#
+# "os" was added alongside "os_build" for adapters/bluepeak.py: unlike
+# Defender (whose whole per-device axis is a Windows OS platform), a
+# pre-enriched, multi-platform source can have no reliable per-asset OS
+# signal at all -- Defender never needed a default here because it always
+# has one.
 NOT_COLLECTED_DEFAULTS: dict[str, object] = {
     # Asset
     "business_function": "",
@@ -123,6 +129,7 @@ NOT_COLLECTED_DEFAULTS: dict[str, object] = {
     "patch_window": "",
     "patch_restrictions": "",
     "compensating_controls": "",
+    "os": "",
     "os_build": "",
     "environment": "prod",
     "data_sensitivity": "internal",
@@ -147,11 +154,24 @@ class IngestAdapter(ABC):
     filenames are what the adapter expects to find under `--data`'s
     directory. `stats` is reset by each load call and filled in as its
     iterator is consumed -- a streaming loader cannot know how many
-    duplicate rows it collapsed until the stream is exhausted."""
+    duplicate rows it collapsed until the stream is exhausted.
+
+    `provides_enrichment`: True only for a source whose export already
+    carries CVSS/exploitation/technique data of its own -- Finding's it
+    yields populate `Finding.source_enrichment` (schema.py). `False`
+    (native, defender) means the caller must run the live
+    KEV/EPSS/NVD/ATT&CK lookups (`ingest.attach_threat_signals`) to get
+    those signals at all; `True` (adapters/bluepeak.py) means the caller
+    should skip that entirely -- both the bulk KEV/ATT&CK loads and the
+    per-CVE lookups would be pure overhead against a source whose CVE IDs
+    don't resolve anywhere live -- and call `ingest.attach_source_enrichment`
+    instead. A run-level switch, not a per-finding one, so a format either
+    is or isn't this shape; see adapters/bluepeak.py."""
 
     format: ClassVar[str]
     assets_filename: ClassVar[str]
     findings_filename: ClassVar[str]
+    provides_enrichment: ClassVar[bool] = False
 
     def __init__(self) -> None:
         self.stats = IngestStats()

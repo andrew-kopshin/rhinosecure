@@ -18,7 +18,7 @@ DEMO_DIR = Path(__file__).resolve().parents[1] / "data" / "demo"
 
 def test_native_is_the_default_format_and_defender_is_registered():
     assert DEFAULT_FORMAT == "native"
-    assert set(FORMATS) == {"native", "defender"}
+    assert set(FORMATS) == {"native", "defender", "bluepeak"}
     assert all(issubclass(cls, IngestAdapter) for cls in FORMATS.values())
     assert isinstance(get_adapter("native"), NativeAdapter)
 
@@ -63,7 +63,7 @@ def test_every_not_collected_default_is_valid_for_the_schema():
     finding_defaults = {k: v for k, v in NOT_COLLECTED_DEFAULTS.items() if k in Finding.model_fields}
     assert set(asset_defaults) | set(finding_defaults) == set(NOT_COLLECTED_DEFAULTS)
 
-    asset = Asset(asset_id="x", hostname="h", os="Windows 10", role="workstation", **asset_defaults,
+    asset = Asset(asset_id="x", hostname="h", role="workstation", **asset_defaults,
                   not_collected=frozenset(asset_defaults))
     finding = Finding(finding_id="f", asset_id="x", cve_id="CVE-2020-1472", scanner_severity="high",
                       **finding_defaults, not_collected=frozenset(finding_defaults))

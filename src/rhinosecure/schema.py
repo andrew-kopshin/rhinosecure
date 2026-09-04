@@ -82,6 +82,31 @@ class Asset(BaseModel):
         return bool(self.patch_window.strip())
 
 
+class SourceEnrichment(BaseModel):
+    """Threat-intel a pre-enriched source supplied directly on its own
+    export, to be trusted rather than fetched (adapters/bluepeak.py, and
+    any future adapter shaped like it -- a source whose CVE IDs are
+    synthetic, so a live NVD/KEV/EPSS/ATT&CK lookup would just spend
+    retries finding nothing). `None` on `Finding` for every other
+    adapter; native and defender both still go through the live
+    KEV/EPSS/NVD/ATT&CK lookups in `ingest.attach_threat_signals`.
+
+    `severity_label` names which source supplied `severity_score` (e.g.
+    "bluepeak") -- kept separate from NVD's own provenance label so
+    scoring.py's rationale never misattributes a vendor's self-reported
+    number to NVD. See `ingest.attach_source_enrichment` and
+    `scoring._resolve_severity`.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    severity_score: float
+    severity_label: str
+    known_exploited: bool | None = None
+    attack_technique_id: str = ""
+    attack_technique_name: str = ""
+
+
 class Finding(BaseModel):
     """One scanner finding. `not_collected` has the same meaning as on
     `Asset` -- e.g. an agent-based scanner that never observes a listening
@@ -101,6 +126,7 @@ class Finding(BaseModel):
     service: str = ""
     evidence: str = ""
     not_collected: frozenset[str] = frozenset()
+    source_enrichment: SourceEnrichment | None = None
 
     @field_validator("not_collected")
     @classmethod
@@ -136,6 +162,14 @@ class EnrichedFinding(BaseModel):
     (see `cli.py`) via `enrich/kev.py`, `enrich/epss.py`, `enrich/nvd.py`, and
     `enrich/attack.py`, going through `SnapshotCache` -- ingest.py itself does
     no enrichment or network access.
+
+    `source_severity_score`/`source_severity_label` are the counterpart for
+    a pre-enriched source (`finding.source_enrichment`, above): populated by
+    `ingest.attach_source_enrichment` instead of `attach_threat_signals`,
+    mirroring `nvd_base_score`/`nvd_severity` in shape so
+    `scoring._resolve_severity` can treat "source-reported" as a third,
+    honestly-labeled severity provenance alongside "nvd" and "scanner" --
+    never reusing the NVD-branded fields for a number NVD never scored.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -148,3 +182,5 @@ class EnrichedFinding(BaseModel):
     nvd_severity: str | None = None
     attack_techniques: tuple[AttackTechniqueRef, ...] = ()
     attack_prevalence: float | None = None
+    source_severity_score: float | None = None
+    source_severity_label: str | None = None

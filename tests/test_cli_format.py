@@ -146,7 +146,7 @@ def test_format_flag_lists_every_registered_adapter(capsys):
     with pytest.raises(SystemExit):
         main(["run", "--help"])
     out = capsys.readouterr().out
-    assert "--format {defender,native}" in out
+    assert "--format {bluepeak,defender,native}" in out
 
 
 # --- reported bug: --format defender with --data left at its default ------

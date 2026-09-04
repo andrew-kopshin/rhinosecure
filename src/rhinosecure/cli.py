@@ -89,6 +89,20 @@ list-of-ScoredFinding return (test_scoring.py and others call it that
 way); `run_with_report` is the same pipeline returning the assets and the
 report alongside, which is what `main` uses.
 
+`--format bluepeak` reads a pre-enriched single-file export
+(synthetic_cve_inventory_50.csv, adapters/bluepeak.py) whose own CVSS,
+exploitation, and ATT&CK-technique fields are trusted directly instead of
+fetched -- `IngestAdapter.provides_enrichment` (adapters/base.py) is the
+switch `run_with_report` reads to call `ingest.attach_source_enrichment`
+instead of `attach_threat_signals`, skipping the live KEV/EPSS/NVD/ATT&CK
+lookups (and their two bulk loads) entirely for a source whose CVE IDs
+would never resolve there anyway. `run_agents`/`submit_constraint` below
+are not format-aware in this respect yet -- they still dispatch Research's
+live-lookup tools for every format, which is harmless for `--format
+bluepeak` (a graceful "not found" per lookup, same as any not-yet-scored
+CVE) but does not yet give the agents path the same precision the
+deterministic path gets from a pre-enriched source.
+
 `--format` works on all three paths -- the deterministic pipeline,
 `--agents`, and `rhino constraint add`. `Coordinator` used to build its
 own asset index by reading `<data>/assets.csv` directly, which made a
@@ -129,10 +143,11 @@ from rhinosecure.ingest import (
     GapTally,
     IngestError,
     IngestReport,
+    attach_source_enrichment,
     attach_threat_signals,
     load_batch,
 )
-from rhinosecure.schema import Asset
+from rhinosecure.schema import Asset, EnrichedFinding
 from rhinosecure.scoring import ContestedRate, ScoredFinding, contested_rate, rank, score_finding
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -192,9 +207,22 @@ def run_with_report(
     adapter = get_adapter(fmt)
     assets, enriched = load_batch(data_dir, adapter)
 
-    cache = SnapshotCache(offline=offline)
-    kev_catalog = load_kev_catalog(cache)  # one bulk feed, loaded once for the whole run
-    attack_index = load_attack_index(cache)  # same shape: one filtered bundle, loaded once
+    if adapter.provides_enrichment:
+        # This format's own export already carries CVSS/exploitation/ATT&CK
+        # data per finding (Finding.source_enrichment) -- its CVE IDs
+        # typically don't resolve at NVD/KEV/EPSS/ATT&CK anyway (see
+        # adapters/bluepeak.py), so skip the live lookups, and the two bulk
+        # KEV/ATT&CK loads below, entirely rather than spending them on
+        # retries that would just find nothing.
+        def enrich(e: EnrichedFinding) -> EnrichedFinding:
+            return attach_source_enrichment(e)
+    else:
+        cache = SnapshotCache(offline=offline)
+        kev_catalog = load_kev_catalog(cache)  # one bulk feed, loaded once for the whole run
+        attack_index = load_attack_index(cache)  # same shape: one filtered bundle, loaded once
+
+        def enrich(e: EnrichedFinding) -> EnrichedFinding:
+            return attach_threat_signals(e, kev_catalog, attack_index, cache)
 
     tally = GapTally()
     scored: list[ScoredFinding] = []
@@ -203,7 +231,7 @@ def run_with_report(
         tally.observe(e.finding)
         if e.finding.not_collected:
             not_collected_by_finding[e.finding.finding_id] = e.finding.not_collected
-        scored.append(score_finding(attach_threat_signals(e, kev_catalog, attack_index, cache)))
+        scored.append(score_finding(enrich(e)))
     return RunResult(
         scored=rank(scored),
         assets=assets,
@@ -645,7 +673,9 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "ingest adapter for --data's files (adapters/): native reads assets.csv + findings.csv; "
             "defender reads Microsoft Defender Vulnerability Management exports devices.csv "
-            "(DeviceInfo) + vulnerabilities.csv (DeviceTvmSoftwareVulnerabilities)"
+            "(DeviceInfo) + vulnerabilities.csv (DeviceTvmSoftwareVulnerabilities); bluepeak reads a "
+            "single pre-enriched synthetic_cve_inventory_50.csv, trusting its own CVSS/exploitation/"
+            "ATT&CK fields instead of fetching (adapters/bluepeak.py)"
         ),
     )
     run_parser.add_argument(
