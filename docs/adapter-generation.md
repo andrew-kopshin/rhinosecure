@@ -142,9 +142,15 @@ measurable — `rereview` is the only command left that can inspect one) and
 clears `observed` (or V18 reads a stale exclusion count and the fresh
 measurement refuses itself).
 
-**Order, which is not negotiable.** measure → build `observed` → merge
-attestations → `confirm_contract` (stamp) → `validate_contract` **last** →
-round-trip verify → write. Validating before stamping reports a spurious
+**Order, which is not negotiable.** merge attestations (carried-forward plus
+`--attest`) → measure → build `observed` → `confirm_contract` (stamp) →
+`validate_contract` **last** → round-trip verify → write. Attestations merge
+*before* the measurement, not after: `ConfiguredAdapter.load_assets` runs
+`validate_contract` on every load, and V18's structural requirements
+(`enrichment`/`union`/`finding_id.synthesized`) depend only on the contract's
+shape — so measuring the pre-merge contract made `--attest` unable to ever
+help a freshly proposed contract, which doesn't yet carry them (the
+hardening round below). Validating before stamping reports a spurious
 `content_digest` mismatch, because `observed` moved while `review` still
 carries the old digest. The validation uses `adapter.headers` — the engine's
 own post-`_filtered_for_validation` view — because validating against the raw
@@ -161,6 +167,24 @@ plain **ints** (V18 reads those two at the top level and adds them),
 value, any record id, and the *finding*-side exclusion reasons — a cascaded
 reason embeds its asset's id, and a contract is committed to git. All of that
 prints to the terminal, which is not.
+
+**What prints but is never persisted: every column the contract declares it
+deliberately does not read, its stated reason beside its measured shape.**
+`unmapped_columns` carries a human- or model-authored prose reason per
+column, and it sits inside a decision subtree — a signed claim nothing
+otherwise checks. The review re-profiles each declared-ignored column with
+Slice 6's `probe.profile_csv` (blank rate, distinct count, `looks_like`
+tags, samples) and prints it directly beside the stated reason, so a column
+dismissed as "operational metadata, not needed" that is actually 0% blank
+with a handful of distinct values reading like a maintenance window is
+visible at review time, not discovered later. This is why `profile_csv`
+takes the contract's own `delimiter`/`quotechar`/`encoding`/`first_data_row`
+rather than assuming a bare CSV (the hardening round below, defect 4) — a
+wrong dialect used to make the whole section disappear in silence, the
+worst failure mode for the one part of the report whose job is to show what
+a mapping ignores. Slice 8's own reporting posture inherits this: a
+proposal an LLM cannot confidently map to a schema slot is exactly a
+declared-ignored column, and it should be reviewable the same way.
 
 **The attestation gate is a two-shot loop, not a prompt.** `--attest
 ITEM=TEXT` (repeatable, split on the first `=`, validated against
@@ -185,6 +209,19 @@ Both committed contracts recorded **no** `slot_digests` (legal), so the
 coarse fallback is a live path, announced loudly; confirming records them, so
 a contract passes through it at most once.
 
+**The identity freeze refuses unless the identity slot is *provably*
+unchanged, never merely "not known to have changed."** `--reset-identity` is
+required whenever a mapping decision has moved and `finding.finding_id`'s own
+slot cannot be shown to have held still — `review` sits outside both
+digests, so `slot_digests` is unsigned evidence that can be absent (the
+state of both committed contracts today), missing just that one entry, or
+removed entirely, and each of those used to let a changed content-address
+recipe through in silence, re-keying every `memory.decisions` row for the
+format (the hardening round below). `config_io.check_identity_recipe_unchanged`
+(Slice 3) isn't used here — it needs both the old and new contract, and both
+verbs read one file; comparing against the committed history (`git show
+HEAD:<path>`) is on the human.
+
 **Known limitation, flagged not fixed:** `enrichment` and `union`
 attestations cannot carry forward once any decision moves, because no stored
 digest covers those subtrees individually — so an unrelated one-word edit
@@ -193,7 +230,9 @@ fresh judgment without being one. The fix is to have `compute_slot_digests`
 also emit entries for the `enrichment` and `asset_grouping` subtrees; that
 changes what `confirm_contract` stamps and what `assert_confirmed` compares
 (Slice 3 machinery and one of its pinned tests), so it is a digest-format
-decision rather than a CLI one.
+decision rather than a CLI one. Unaffected by the hardening round below —
+none of those six defects touched attestation carry-forward for these two
+items; this remains open.
 
 **Two defects this slice surfaced**, both latent since Slice 3 and both
 reachable only now that something actually writes contracts and measures with
@@ -204,6 +243,20 @@ dump), and `configured.load_findings`' `assert mapped is not None` fired as
 a message-less `AssertionError` under a non-raising collector — not an
 `IngestError`, so it escaped every `except IngestError` as a traceback, and
 vanished entirely under `python -O`.
+
+**A subsequent adversarial review round found and fixed six more defects**
+(commits `48ac821`/`309b9a1`; PROGRESS.md is authoritative for how each was
+found and verified). Two reshaped mechanisms already described above: the
+attestation-merge ordering, and the identity freeze. Four more, all
+reachable only once something actually drove a real measurement through a
+real CLI: `rereview` could report a contract clean and exit 0 on exactly the
+drift `confirm` refuses (a fresh exclusion can make a new attestation
+required with no digest moving at all); the "columns this contract does not
+read" profile silently vanished for a non-comma delimiter or a banner row,
+since it read the file with the profiler's own defaults rather than the
+contract's declared dialect; a slot-digest key with no `.` in it crashed a
+printer; and the value-distribution report truncated to four values per
+field with no indication it had.
 
 ## Rule 1: fatal-vs-exclude forward-traces to `role`, not a config key
 

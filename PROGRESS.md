@@ -1602,3 +1602,47 @@ both verbs run) and a confirm/rereview section in `tests/test_cli_adapt.py` (21 
 codes, output ordering, and the banner notice). Plus 4 in `tests/test_adapters_config_io.py` for the
 alias fix and 3 in `tests/test_adapters_probe.py` for the dialect arguments. All 791 pass; the two pinned differential tests and every `rhino run` byte-identical test are
 untouched, and `git status data/adapters/` is clean after the whole suite.
+
+**CLAUDE.md gained an adapter-generation section (commit `ebd1273`), which surfaced that
+docs/adapter-generation.md itself had drifted from what the hardening round actually shipped.**
+CLAUDE.md had no mention of the LLM-assisted contract-authoring subsystem at all despite it being
+seven slices deep -- added a standalone section stating the two-phase split and why it exists
+(the same discipline Section 8 rules 2-3 already require of scoring), current slice status, and
+both design rules in full inline rather than only by reference (exclude is legal only for a check
+feeding `Asset.role`, forward-traced by the validator; every pattern a contract can invoke is a
+closed, code-owned catalog, never model-authored). Checking the "current status" sentence against
+`git log --follow -- docs/adapter-generation.md` found it was wrong: the design doc was never
+touched by `309b9a1` at all, and two of the six hardening defects (the attestation-merge ordering,
+the identity-freeze bypass) were found and fixed *before* `48ac821` was committed, not by it --
+"an adversarial review round (commit `309b9a1`)" attributed all six to the wrong commit. Corrected
+to name both commits.
+
+**The design doc's "Order, which is not negotiable" paragraph was never accurate, not merely
+stale.** `git show 48ac821:docs/adapter-generation.md` already carries the wrong text at the
+moment of that commit -- "measure -> build `observed` -> merge attestations" -- while `48ac821`'s
+own `review.py`, in the SAME commit, already merges attestations before measuring (the fix for
+defect 1, above). The prose was never updated to match a fix already made before the commit
+landed; there is no historical window in which this paragraph was true of the code it sat next
+to. Fixed to state the real order and, briefly, why attestations move first.
+
+**Checked directly whether the "Known limitation" (enrichment/union attestations can't provably
+carry forward) survived the six-defect hardening, since asked.** It does, unaffected: read
+`carried_attestations()`'s current source against the design doc's own prose line for line --
+identical for those two items, and none of the six defects touch that branch. They hardened a
+related but distinct mechanism instead, the `finding.finding_id` identity freeze, which lives in
+`review_contract` itself, not in `carried_attestations`. Added a sentence to the design doc saying
+so explicitly, since it's a reasonable thing to wonder from the outside and was previously
+unanswered either way.
+
+**docs/adapter-generation.md now also documents the identity freeze's real mechanism and the
+unmapped-column profile, neither of which had prose before.** The identity freeze
+(`--reset-identity`'s actual trigger -- refuse unless the slot is *provably* unchanged, never
+merely "not known to have changed," closing the three ways `slot_digests` being absent, missing
+one entry, or removed entirely used to let a changed recipe through in silence) had no
+description at all despite `--reset-identity` already appearing in the CLI usage block. And
+"every column the contract declares it deliberately does not read, profiled beside its stated
+reason" -- built in the initial `48ac821`, never mentioned anywhere in the design doc -- is now
+described, since defect 4 (`profile_csv` blind to the contract's own delimiter/encoding/banner
+row) was a correctness bug in exactly that feature, and Slice 8's own reporting posture is
+expected to inherit it: an LLM proposal's own low-confidence column is the same shape of thing as
+a declared-ignored one.

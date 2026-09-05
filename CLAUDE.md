@@ -1017,8 +1017,8 @@ source support, a non-raising column profiler (`rhino adapt probe`/`list`), and 
 confirm/re-review workflow itself (`rhino adapt confirm`/`rereview`) with its attestation
 gate. Two contracts are confirmed and committed: `data/adapters/bluepeak-gen.json`,
 `data/adapters/mdvm-gen.json` — both hand-authored, since Slice 8 doesn't exist yet to
-author one from an LLM call. Slice 7 was hardened by an adversarial review round (commit
-`309b9a1`) that found and fixed six defects after the initial build — PROGRESS.md is
+author one from an LLM call. Slice 7 was hardened by an adversarial review round spanning
+commits `48ac821` and `309b9a1` that found and fixed six defects — PROGRESS.md is
 authoritative for what they were and how each was verified. Not built: Slice 8, the
 phase-1 inference agent behind `rhino adapt propose`; and Slice 9, surfacing contract
 provenance in `export.py`/`rhino web`.
