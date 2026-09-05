@@ -11,6 +11,7 @@ from rhinosecure.agents.risk import (
     build_risk_agent,
     build_risk_task,
     build_risk_tools,
+    merge_research_into_enriched,
     verify_scoring_matches_tool,
 )
 from rhinosecure.llm import LLMConfig, get_llm
@@ -55,6 +56,7 @@ RESEARCH = ResearchFinding(
     severity_disagreement=False,
     is_kev=True,
     kev_date_added="2021-11-03",
+    kev_due_date="2021-11-17",
     epss_score=0.99996,
     epss_percentile=0.99988,
     attack_techniques=[
@@ -135,6 +137,15 @@ def test_score_finding_tool_matches_calling_scoring_directly_with_research_signa
     assert call_log[0]["args"] == {"finding_id": "F01"}
     assert call_log[0]["result"] == result
     assert result["constraints_applied"] == []
+
+
+def test_merge_research_into_enriched_carries_kev_due_date_through():
+    """The one field export.py's `_agents_finding_entry`/cli.py's
+    `--track-remediation` both need on the agents path -- must come from
+    research, not the pre-Research default on ENRICHED itself (None)."""
+    merged = merge_research_into_enriched(ENRICHED, RESEARCH)
+    assert merged.kev_due_date == "2021-11-17"
+    assert ENRICHED.kev_due_date is None  # ground truth is untouched
 
 
 # --- constraint overlay (agents/constraint_intake.py's apply_constraints) ---

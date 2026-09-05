@@ -155,6 +155,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from rhinosecure.agents.coordinator import Coordinator
     from rhinosecure.agents.schema_inference import ProposeResult
 
 from rhinosecure.adapters import (
@@ -179,6 +180,7 @@ from rhinosecure.ingest import (
     attach_threat_signals,
     load_batch,
 )
+from rhinosecure.remediation import REMEDIATION_STATUSES
 from rhinosecure.schema import Asset, EnrichedFinding
 from rhinosecure.scoring import ContestedRate, ScoredFinding, contested_rate, rank, score_finding
 
@@ -228,12 +230,18 @@ class RunResult:
     iteration -- `not_collected_by_finding`'s sparse "only names present"
     convention doesn't fit a boolean every finding has an answer for, so
     this dict holds every finding_id, `False` included, rather than treat
-    "absent from the dict" as a third state alongside True/False."""
+    "absent from the dict" as a third state alongside True/False.
+
+    `kev_due_date_by_finding` is the same shape, same reasoning, for
+    `remediation.py`'s overdue check: `EnrichedFinding.kev_due_date` is
+    another fact the same discarded per-iteration object carries and
+    `ScoredFinding` doesn't."""
 
     scored: list[ScoredFinding]
     assets: dict[str, Asset]
     not_collected_by_finding: dict[str, frozenset[str]]
     is_kev_by_finding: dict[str, bool]
+    kev_due_date_by_finding: dict[str, str | None]
     report: IngestReport
     contract: Contract | None = None
 
@@ -290,18 +298,21 @@ def run_with_report(
     scored: list[ScoredFinding] = []
     not_collected_by_finding: dict[str, frozenset[str]] = {}
     is_kev_by_finding: dict[str, bool] = {}
+    kev_due_date_by_finding: dict[str, str | None] = {}
     for e in enriched:  # still one lazy pass over the findings stream
         tally.observe(e.finding)
         if e.finding.not_collected:
             not_collected_by_finding[e.finding.finding_id] = e.finding.not_collected
-        enriched_finding = enrich(e)  # bound once: is_kev is read off it below, then it's scored
+        enriched_finding = enrich(e)  # bound once: is_kev/kev_due_date read off it below, then it's scored
         is_kev_by_finding[e.finding.finding_id] = enriched_finding.is_kev
+        kev_due_date_by_finding[e.finding.finding_id] = enriched_finding.kev_due_date
         scored.append(score_finding(enriched_finding))
     return RunResult(
         scored=rank(scored),
         assets=assets,
         not_collected_by_finding=not_collected_by_finding,
         is_kev_by_finding=is_kev_by_finding,
+        kev_due_date_by_finding=kev_due_date_by_finding,
         report=tally.report(fmt, assets, adapter.stats),
         contract=contract,
     )
@@ -804,6 +815,87 @@ def _print_gap_note(asset: Asset, finding_gaps: frozenset[str]) -> None:
     )
 
 
+def _tracked_findings_from_scored(result: RunResult) -> list:
+    from rhinosecure.remediation import TrackedFinding
+
+    return [
+        TrackedFinding(
+            finding_id=s.finding_id,
+            cve_id=s.cve_id,
+            hostname=s.hostname,
+            is_kev=result.is_kev_by_finding.get(s.finding_id, False),
+            kev_due_date=result.kev_due_date_by_finding.get(s.finding_id),
+        )
+        for s in result.scored
+    ]
+
+
+def _tracked_findings_from_recommendations(coordinator: Coordinator, recommendations: list) -> list:
+    """`research.is_kev`/`research.kev_due_date`, not `coordinator.state
+    .enriched_by_id[fid]`'s own fields -- the latter is always the
+    pre-Research default (False/None) on the agents path, since Research's
+    real KEV lookup is merged into a scoring input on demand and never
+    written back onto state.enriched_by_id. Same fix, same reasoning, as
+    export.py's `_agents_finding_entry` is_kev note."""
+    from rhinosecure.remediation import TrackedFinding
+
+    tracked = []
+    for r in recommendations:
+        research = coordinator.state.research_by_id.get(r.finding_id)
+        tracked.append(
+            TrackedFinding(
+                finding_id=r.finding_id,
+                cve_id=r.cve_id,
+                hostname=r.hostname,
+                is_kev=research.is_kev if research is not None else False,
+                kev_due_date=research.kev_due_date if research is not None else None,
+            )
+        )
+    return tracked
+
+
+def _print_remediation_summary(summary, *, db_path: str) -> None:
+    """Printed only when --track-remediation is given (see main()'s
+    dispatch) -- remediation.classify_remediation already did the actual
+    work; this only formats it. Contradictions print first and
+    unconditionally when present, before the tally a reader would
+    otherwise form an impression from first -- the same placement
+    _print_exclusions already argues for itself. Every other block
+    (overdue, undocumented acceptances) is silent when empty, matching
+    _print_failures/_print_exclusions' own convention."""
+    if summary.contradictions:
+        print("\nREOPENED -- marked remediated, but still detected in this scan:")
+        _print_rows(
+            ("finding_id", "cve_id", "hostname", "marked_remediated_at", "by", "note"),
+            [
+                (c.finding_id, c.cve_id, c.hostname, c.event.recorded_at, c.event.source, c.event.note or "")
+                for c in summary.contradictions
+            ],
+        )
+
+    open_total = summary.untracked_count + summary.status_counts.get("open", 0)
+    print(
+        f"\nRemediation tracking ({summary.total} finding(s), --db {db_path}): "
+        f"{open_total} open, {summary.status_counts.get('deferred', 0)} deferred, "
+        f"{summary.status_counts.get('accepted', 0)} accepted, "
+        f"{summary.status_counts.get('remediated', 0)} remediated"
+    )
+
+    if summary.overdue:
+        print("  open past its KEV due date:")
+        _print_rows(
+            ("finding_id", "cve_id", "hostname", "due_date", "status"),
+            [(o.finding_id, o.cve_id, o.hostname, o.due_date, o.status) for o in summary.overdue],
+        )
+
+    if summary.accepted_without_note:
+        print("  accepted without documentation:")
+        _print_rows(
+            ("finding_id", "cve_id", "hostname"),
+            [(a.finding_id, a.cve_id, a.hostname) for a in summary.accepted_without_note],
+        )
+
+
 @dataclass(frozen=True)
 class ProbeSource:
     """One `data/` subdirectory `rhino adapt list` found -- a candidate
@@ -1264,8 +1356,19 @@ def main(argv: list[str] | None = None) -> int:
         "--db",
         default=None,
         help=(
-            "with --agents, path to the memory.py SQLite file (default: "
-            "memory.DEFAULT_DB_PATH) -- constraints on file there are picked up automatically"
+            "path to the memory.py SQLite file (default: memory.DEFAULT_DB_PATH). With --agents, "
+            "constraints on file there are picked up automatically; with --track-remediation (either "
+            "path), this is where remediation history is read from"
+        ),
+    )
+    run_parser.add_argument(
+        "--track-remediation",
+        action="store_true",
+        help=(
+            "read memory.py's remediation history and print what's still open, what reappeared "
+            "after being marked remediated, what's past its KEV due date, and what was accepted "
+            "without a note. Opt-in: the plain deterministic path never touches memory.py "
+            "otherwise. With --agents, reuses the Memory that flag already constructs"
         ),
     )
     run_format_group = run_parser.add_mutually_exclusive_group()
@@ -1340,6 +1443,29 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         metavar="NAME_OR_PATH",
         help="use a declarative ingest contract instead of a built-in --format, same as `rhino run --adapter-config`",
+    )
+
+    remediation_parser = subparsers.add_parser(
+        "remediation", help="record and inspect what actually happened to a finding (memory.py's remediation_events)"
+    )
+    remediation_subparsers = remediation_parser.add_subparsers(dest="remediation_command", required=True)
+    remediation_mark_parser = remediation_subparsers.add_parser(
+        "mark", help="record a status change for one finding_id -- no ingest, no LLM, just a memory.py write"
+    )
+    remediation_mark_parser.add_argument("finding_id", help="the finding_id, e.g. F07 (from a prior `rhino run` table)")
+    remediation_mark_parser.add_argument("status", choices=sorted(REMEDIATION_STATUSES))
+    remediation_mark_parser.add_argument(
+        "--note", default=None, help="why -- required when marking a `remediated` finding back to `open`"
+    )
+    remediation_mark_parser.add_argument(
+        "--db", default=None, help="path to the memory.py SQLite file (default: memory.DEFAULT_DB_PATH)"
+    )
+    remediation_log_parser = remediation_subparsers.add_parser(
+        "log", help="print one finding_id's full remediation history, oldest first"
+    )
+    remediation_log_parser.add_argument("finding_id")
+    remediation_log_parser.add_argument(
+        "--db", default=None, help="path to the memory.py SQLite file (default: memory.DEFAULT_DB_PATH)"
     )
 
     web_parser = subparsers.add_parser(
@@ -1551,6 +1677,13 @@ def main(argv: list[str] | None = None) -> int:
             _print_failures(coordinator, verbose=args.verbose)
             _print_contested_rate(contested_rate(r.bucket for r in recommendations))
 
+            if args.track_remediation:
+                from rhinosecure import remediation
+
+                tracked = _tracked_findings_from_recommendations(coordinator, recommendations)
+                summary = remediation.classify_remediation(tracked, coordinator.memory.latest_remediation_events())
+                _print_remediation_summary(summary, db_path=str(coordinator.memory.db_path))
+
             if args.explain:
                 for r in recommendations:
                     print(f"\n{r.finding_id} ({r.cve_id} on {r.hostname}) -> {r.bucket}")
@@ -1597,6 +1730,15 @@ def main(argv: list[str] | None = None) -> int:
         _print_table(scored)
         _print_contested_rate(contested_rate(s.bucket.value for s in scored))
         _print_ingest_report(result.report)
+
+        if args.track_remediation:
+            from rhinosecure import remediation
+            from rhinosecure.memory import Memory
+
+            track_memory = Memory(args.db) if args.db else Memory()
+            tracked = _tracked_findings_from_scored(result)
+            summary = remediation.classify_remediation(tracked, track_memory.latest_remediation_events())
+            _print_remediation_summary(summary, db_path=str(track_memory.db_path))
 
         if args.explain:
             for s in scored:
@@ -1673,6 +1815,49 @@ def main(argv: list[str] | None = None) -> int:
         else:
             _print_constraint_result(result)
         return 0 if result.persisted else 1
+
+    if args.command == "remediation" and args.remediation_command == "mark":
+        from rhinosecure import remediation
+        from rhinosecure.memory import Memory
+
+        mark_memory = Memory(args.db) if args.db else Memory()
+        previous = mark_memory.latest_remediation_event_for_finding(args.finding_id)
+        previous_status = previous.status if previous is not None else None
+
+        if remediation.note_required_for_transition(previous_status, args.status) and not args.note:
+            print(
+                f"remediation mark: --note is required when marking {args.finding_id!r} back to "
+                "'open' from 'remediated' -- that's the transition where the reason matters most.",
+                file=sys.stderr,
+            )
+            return 1
+
+        if not mark_memory.decisions_for_finding(args.finding_id):
+            print(
+                f"warning: no scored run has ever seen finding_id {args.finding_id!r} -- check for "
+                "a typo. Recording it anyway.",
+                file=sys.stderr,
+            )
+
+        mark_memory.record_remediation_event(args.finding_id, args.status, note=args.note, source="human")
+        transition = f"{previous_status} -> {args.status}" if previous_status else f"(untracked) -> {args.status}"
+        note_suffix = f' -- "{args.note}"' if args.note else ""
+        print(f"Recorded: {args.finding_id} {transition}{note_suffix}")
+        return 0
+
+    if args.command == "remediation" and args.remediation_command == "log":
+        from rhinosecure.memory import Memory
+
+        log_memory = Memory(args.db) if args.db else Memory()
+        events = log_memory.remediation_events_for_finding(args.finding_id)
+        if not events:
+            print(f"no remediation history recorded for {args.finding_id!r}")
+            return 0
+        _print_rows(
+            ("recorded_at", "status", "source", "note"),
+            [(e.recorded_at, e.status, e.source, e.note or "") for e in events],
+        )
+        return 0
 
     if args.command == "web":
         try:

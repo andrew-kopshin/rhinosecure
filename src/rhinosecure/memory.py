@@ -61,6 +61,24 @@ that this module do the applying.
   before -- or without -- a replan resulting from it (again, no replan
   wiring lives here).
 
+**A sixth table, beyond Section 7 and beyond `capacity_constraints`:**
+`remediation_events` -- what actually happened to a finding, as opposed to
+`decisions`' record of what a run recommended. Append-only, like every
+other table here: a status is never updated in place, it is recorded
+again, so `record_remediation_event` never overwrites a prior row. This is
+deliberate, not just consistent -- CLAUDE.md's "Future direction:
+remediation execution" names a future execution outcome as "another way a
+finding's status changes," the same kind of write a human's own mark
+already is, just a different `source`. An append-only log is what lets
+both write the identical shape without the schema needing to change when
+execution exists. `remediation.py` (a new, equally I/O-free module) is
+where the read side's actual logic lives -- computing a fleet's current
+status, detecting a finding that reappeared after being marked
+`remediated`, and flagging one open past its CISA KEV due date -- exactly
+the same split `scoring.py`/this module already draw: pure computation in
+one place, pure persistence in the other, neither depending on the other's
+internals.
+
 Timestamps are UTC ISO 8601 strings (`datetime.now(timezone.utc)
 .isoformat()`), the same format `enrich/cache.py`'s `SnapshotEntry
 .retrieved_at` already uses, for the same reason: sortable as plain text,
@@ -158,6 +176,18 @@ CREATE TABLE IF NOT EXISTS capacity_constraints (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_capacity_constraints_run_id ON capacity_constraints (run_id);
+
+CREATE TABLE IF NOT EXISTS remediation_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    finding_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    note TEXT,
+    source TEXT NOT NULL,
+    source_detail TEXT,
+    run_id INTEGER REFERENCES runs (id),
+    recorded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_remediation_events_finding_id ON remediation_events (finding_id);
 """
 
 
@@ -235,6 +265,32 @@ class Feedback:
     id: int
     raw_input: str
     change_description: str
+    run_id: int | None
+    recorded_at: str
+
+
+@dataclass(frozen=True)
+class RemediationEvent:
+    """One recorded status change for one finding_id -- append-only, so
+    this is a row in the historical log, never "the" current record.
+    `status` is an unvalidated string, same as `Constraint.effect_kind`:
+    this module persists, it does not interpret -- the closed set
+    (`remediation.REMEDIATION_STATUSES`) is validated at the CLI layer.
+    `source` is `"human"` for every event recorded so far; `"execution"`
+    is reserved for the not-yet-built execution phase (CLAUDE.md's "Future
+    direction: remediation execution") -- an execution outcome is another
+    way this same table gets a new row, not a different mechanism.
+    `source_detail` is free text whose meaning depends on `source`; always
+    `None` today. `run_id` is nullable, provenance only, same shape as
+    `Feedback.run_id` -- a mark made outside any run (the ordinary case:
+    `rhino remediation mark` doesn't construct one) simply has none."""
+
+    id: int
+    finding_id: str
+    status: str
+    note: str | None
+    source: str
+    source_detail: str | None
     run_id: int | None
     recorded_at: str
 
@@ -330,6 +386,19 @@ def _feedback_from_row(row: sqlite3.Row) -> Feedback:
         id=row["id"],
         raw_input=row["raw_input"],
         change_description=row["change_description"],
+        run_id=row["run_id"],
+        recorded_at=row["recorded_at"],
+    )
+
+
+def _remediation_event_from_row(row: sqlite3.Row) -> RemediationEvent:
+    return RemediationEvent(
+        id=row["id"],
+        finding_id=row["finding_id"],
+        status=row["status"],
+        note=row["note"],
+        source=row["source"],
+        source_detail=row["source_detail"],
         run_id=row["run_id"],
         recorded_at=row["recorded_at"],
     )
@@ -671,3 +740,69 @@ class Memory:
                 "SELECT * FROM capacity_constraints WHERE run_id = ? ORDER BY id", (run_id,)
             ).fetchall()
         return [_capacity_constraint_from_row(r) for r in rows]
+
+    # --- remediation events ---------------------------------------------
+
+    def record_remediation_event(
+        self,
+        finding_id: str,
+        status: str,
+        *,
+        note: str | None = None,
+        source: str = "human",
+        source_detail: str | None = None,
+        run_id: int | None = None,
+    ) -> int:
+        """Appends one row -- never updates or replaces a prior event for
+        this finding_id, the same append-only discipline every other table
+        here follows. `status`/`source` are not validated against
+        anything (this module persists, it does not interpret -- see the
+        module docstring and `Constraint.effect_kind`'s identical
+        precedent); the closed status vocabulary lives in
+        `remediation.REMEDIATION_STATUSES`, checked by the CLI before this
+        is ever called."""
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO remediation_events (finding_id, status, note, source, source_detail, "
+                "run_id, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (finding_id, status, note, source, source_detail, run_id, _now()),
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
+    def remediation_events_for_finding(self, finding_id: str) -> list[RemediationEvent]:
+        """Full history for one finding, oldest first -- what `rhino
+        remediation log` reads."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM remediation_events WHERE finding_id = ? ORDER BY id", (finding_id,)
+            ).fetchall()
+        return [_remediation_event_from_row(r) for r in rows]
+
+    def latest_remediation_event_for_finding(self, finding_id: str) -> RemediationEvent | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM remediation_events WHERE finding_id = ? ORDER BY id DESC LIMIT 1",
+                (finding_id,),
+            ).fetchone()
+        return _remediation_event_from_row(row) if row is not None else None
+
+    def latest_remediation_events(self) -> dict[str, RemediationEvent]:
+        """Every tracked finding_id's current status in one query -- the
+        bulk read `rhino run --track-remediation` needs at fleet scale
+        (CLAUDE.md's own "no interface may assume demo scale" rule): one
+        query plus a join, not one `latest_remediation_event_for_finding`
+        call per finding. The join picks, per finding_id, the row whose id
+        equals that finding_id's own max id -- the same "latest row per
+        group" shape `decisions_for_finding`/`latest_decision_for_finding`
+        already establish, just computed for every finding_id at once."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT re.* FROM remediation_events re
+                INNER JOIN (
+                    SELECT finding_id, MAX(id) AS max_id FROM remediation_events GROUP BY finding_id
+                ) latest ON re.finding_id = latest.finding_id AND re.id = latest.max_id
+                """
+            ).fetchall()
+        return {row["finding_id"]: _remediation_event_from_row(row) for row in rows}

@@ -486,9 +486,11 @@ def attach_threat_signals(
     nvd_cvss = nvd_lookup(cve_id, cache)
     matches = attack_index.lookup(cve_id, enriched.finding.product, enriched.finding.evidence)
     confirmed_prevalence = [m.technique.prevalence for m in matches if m.confidence == "confirmed"]
+    kev_status = kev_catalog.status(cve_id)
     return enriched.model_copy(
         update={
-            "is_kev": kev_catalog.status(cve_id).is_listed,
+            "is_kev": kev_status.is_listed,
+            "kev_due_date": kev_status.due_date,
             "epss": epss.score if epss.is_scored else None,
             "nvd_base_score": nvd_cvss.base_score if nvd_cvss is not None else None,
             "nvd_severity": nvd_cvss.base_severity if nvd_cvss is not None else None,

@@ -633,3 +633,126 @@ def test_migration_is_idempotent_across_reopens(db_path: Path):
             )
     with Memory(db_path) as db:
         assert [r.ingest_format for r in db.list_runs()] == ["native"] * 3
+
+
+# --- remediation events ------------------------------------------------
+
+
+def test_record_remediation_event_returns_an_id_and_is_retrievable(db_path: Path):
+    with Memory(db_path) as db:
+        event_id = db.record_remediation_event("F14", "remediated", note="patched via WSUS")
+
+        [event] = db.remediation_events_for_finding("F14")
+        assert event.id == event_id
+        assert event.finding_id == "F14"
+        assert event.status == "remediated"
+        assert event.note == "patched via WSUS"
+        assert event.source == "human"  # default
+        assert event.source_detail is None
+        assert event.run_id is None
+        assert event.recorded_at  # non-empty timestamp
+
+
+def test_record_remediation_event_round_trips_source_and_source_detail(db_path: Path):
+    """Not validated by this module (Constraint.effect_kind's own
+    precedent) -- any string round-trips, including the not-yet-used
+    'execution' value CLAUDE.md's remediation-execution direction reserves."""
+    with Memory(db_path) as db:
+        db.record_remediation_event(
+            "F14", "remediated", source="execution", source_detail="job-42"
+        )
+        [event] = db.remediation_events_for_finding("F14")
+        assert event.source == "execution"
+        assert event.source_detail == "job-42"
+
+
+def test_record_remediation_event_can_reference_the_run_it_was_recorded_within(db_path: Path):
+    with Memory(db_path) as db:
+        run_id = _record_demo_run(db)
+        db.record_remediation_event("F14", "deferred", run_id=run_id)
+        [event] = db.remediation_events_for_finding("F14")
+        assert event.run_id == run_id
+
+
+def test_record_remediation_event_with_unknown_run_id_raises_integrity_error(db_path: Path):
+    with Memory(db_path) as db:
+        with pytest.raises(sqlite3.IntegrityError):
+            db.record_remediation_event("F14", "deferred", run_id=999)
+
+
+def test_record_remediation_event_note_defaults_to_none(db_path: Path):
+    with Memory(db_path) as db:
+        db.record_remediation_event("F14", "open")
+        assert db.remediation_events_for_finding("F14")[0].note is None
+
+
+def test_remediation_events_for_finding_does_not_leak_across_findings(db_path: Path):
+    with Memory(db_path) as db:
+        db.record_remediation_event("F01", "open")
+        db.record_remediation_event("F02", "remediated")
+        assert [e.status for e in db.remediation_events_for_finding("F01")] == ["open"]
+        assert [e.status for e in db.remediation_events_for_finding("F02")] == ["remediated"]
+
+
+def test_remediation_events_for_finding_returns_oldest_first(db_path: Path):
+    with Memory(db_path) as db:
+        db.record_remediation_event("F14", "deferred", note="scheduled")
+        db.record_remediation_event("F14", "remediated", note="patched")
+        db.record_remediation_event("F14", "open", note="regressed")
+        statuses = [e.status for e in db.remediation_events_for_finding("F14")]
+        assert statuses == ["deferred", "remediated", "open"]
+
+
+def test_remediation_events_for_finding_returns_empty_list_when_none_recorded(db_path: Path):
+    with Memory(db_path) as db:
+        assert db.remediation_events_for_finding("F14") == []
+
+
+def test_latest_remediation_event_for_finding_returns_the_most_recent(db_path: Path):
+    with Memory(db_path) as db:
+        db.record_remediation_event("F14", "deferred", note="scheduled")
+        db.record_remediation_event("F14", "remediated", note="patched")
+        latest = db.latest_remediation_event_for_finding("F14")
+        assert latest.status == "remediated"
+        assert latest.note == "patched"
+
+
+def test_latest_remediation_event_for_finding_returns_none_when_unknown(db_path: Path):
+    with Memory(db_path) as db:
+        assert db.latest_remediation_event_for_finding("NOPE") is None
+
+
+def test_latest_remediation_events_returns_one_row_per_finding(db_path: Path):
+    """The bulk read rhino run --track-remediation uses at fleet scale --
+    one query, not one latest_remediation_event_for_finding call per
+    finding_id."""
+    with Memory(db_path) as db:
+        db.record_remediation_event("F01", "open")
+        db.record_remediation_event("F02", "deferred", note="scheduled")
+        db.record_remediation_event("F02", "remediated", note="patched")  # F02's real latest
+        db.record_remediation_event("F03", "accepted", note="risk accepted")
+
+        latest = db.latest_remediation_events()
+        assert set(latest) == {"F01", "F02", "F03"}
+        assert latest["F01"].status == "open"
+        assert latest["F02"].status == "remediated"  # not "deferred" -- the OLDER event
+        assert latest["F03"].status == "accepted"
+
+
+def test_latest_remediation_events_returns_empty_dict_when_nothing_recorded(db_path: Path):
+    with Memory(db_path) as db:
+        assert db.latest_remediation_events() == {}
+
+
+def test_remediation_event_survives_a_new_session(db_path: Path):
+    """Same cross-session guarantee as
+    test_the_claude_md_worked_example_survives_a_new_session above --
+    tracking has to survive across runs, which starts with surviving a
+    closed and reopened Memory."""
+    with Memory(db_path) as session_one:
+        session_one.record_remediation_event("F14", "remediated", note="patched via WSUS")
+
+    with Memory(db_path) as session_two:
+        event = session_two.latest_remediation_event_for_finding("F14")
+        assert event.status == "remediated"
+        assert event.note == "patched via WSUS"

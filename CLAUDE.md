@@ -875,6 +875,40 @@ rank position relative to the declared limit — so `_print_capacity_result` sho
 transition, not a risk_score before/after pair. See Section 10's own "Decided" note and
 `agents/coordinator.py`'s `_submit_capacity_constraint` docstring for the full mechanism.
 
+**Remediation tracking is built: a sixth table, `remediation_events`, recording what actually
+happened to a finding — as opposed to `decisions`, which records what a run recommended.**
+This is the foundation "Future direction: remediation execution" (below) names but does not
+build: tracking, not executing. Append-only, like every table above — a status (`open`,
+`remediated`, `accepted`, `deferred`) is never updated in place, it is recorded again, with a
+timestamp, an optional note, and a `source` (`human` today; `execution` reserved, unused until
+that direction is actually built — the same kind of write, not a different mechanism, per that
+section's own framing of an execution result as "another way a finding's status changes"). A
+finding's current status is never stored, only derived — the latest event for its finding_id,
+the same discipline `contested_pct` already applies to itself. `remediation.py` (new, no I/O,
+no LLM, no `crewai` dependency — the same import-boundary discipline `scoring.py` holds itself
+to) is where the read side lives: `classify_remediation` computes, for a run's current
+findings, what's open, what's overdue past its CISA KEV due date (`EnrichedFinding
+.kev_due_date`, newly threaded through from `enrich/kev.py`'s already-fetched-and-discarded
+`KevStatus.due_date`, on both the deterministic and agents paths), what was accepted with no
+documenting note, and — the case a finding's tracking must survive scan-to-scan changes to
+detect — a finding whose latest recorded status is `remediated` but which is still present in
+the current scan. That last case is a **contradiction**, surfaced, never silently trusted or
+auto-resolved: nothing here decides whether it means a failed patch, a regression, or a data
+mismatch, the same "escalate rather than force a verdict" instinct `bucket_for`'s `contested`
+bucket already applies to a scoring question, applied here to a tracking one. `rhino remediation
+mark <finding_id> {open,remediated,accepted,deferred} [--note]` is deliberately the cheapest
+write in the CLI — no ingest, no LLM, since the operator already has an exact finding_id and an
+exact status, nothing to interpret. **Decided, asked not assumed:** marking a finding back to
+`open` from `remediated` requires `--note` — the one transition where the reason (a failed
+patch? a regression? the wrong finding_id?) matters most; every other transition stays
+optional. `rhino run --track-remediation` (opt-in — the plain deterministic path still never
+touches `memory.py` otherwise, preserving every existing byte-identical-output guarantee) and
+`rhino remediation log <finding_id>` are the read surfaces. Never feeds back into `scoring.py`:
+remediation status answers "have we already dealt with this," a different question from "how
+risky is this," and conflating them would violate Section 8 rule 2 in spirit even without
+touching it in code. Web UI surfacing (the Scenarios tab, CLAUDE.md's own prior addition) is a
+deliberate follow-up, not built here.
+
 ---
 
 ## 8. Non-negotiable build rules
@@ -1317,9 +1351,19 @@ tier here: agent runs make many calls and Opus costs significantly more per toke
 
 ## Future direction: remediation execution (recorded, not built)
 
-**This section records a scope decision. It is not a design, and nothing in it is built.**
-No code, schema, or interface described or implied below exists. Do not build against this
-section without a separate, explicit design pass first.
+**This section records a scope decision. It is not a design, and execution itself is not
+built.** No code, schema, or interface for actually running remediation exists. Do not build
+against this section without a separate, explicit design pass first.
+
+**One piece of the foundation this section anticipates is now built, and is documented in
+Section 7, not here: remediation tracking** (`memory.remediation_events`, `remediation.py`,
+`rhino remediation mark`/`rhino run --track-remediation`) — recording what actually happened to
+a finding (remediated, accepted, deferred) and reading that history back, including a human's
+`source="human"` mark and a reserved, not-yet-used `source="execution"` value for exactly the
+outcome this section describes. That is tracking outcomes, not producing them: nothing here
+executes anything, decides what to execute, or holds any credential to act on a real system.
+The open questions below are entirely about the latter and remain exactly as open as before
+tracking existed.
 
 **The decision.** RhinoSecure's mandate does not end at producing a ranked plan. The intended
 endpoint is a system that executes the remediation it recommends, not only ranks findings and

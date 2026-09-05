@@ -147,6 +147,7 @@ def merge_research_into_enriched(
     return enriched.model_copy(
         update={
             "is_kev": research.is_kev,
+            "kev_due_date": research.kev_due_date,
             "epss": research.epss_score,
             "nvd_base_score": research.nvd_base_score,
             "nvd_severity": research.nvd_severity,

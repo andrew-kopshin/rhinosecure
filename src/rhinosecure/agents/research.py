@@ -69,6 +69,7 @@ class ResearchFinding(BaseModel):
     severity_disagreement: bool = False
     is_kev: bool = False
     kev_date_added: str | None = None
+    kev_due_date: str | None = None
     epss_score: float | None = None
     epss_percentile: float | None = None
     attack_techniques: list[AttackTechniqueSummary] = []
@@ -223,7 +224,10 @@ def build_research_task(enriched: EnrichedFinding, agent: Agent) -> Task:
             "fences or prose before or after it: finding_id, cve_id, "
             "scanner_severity, nvd_base_score, nvd_severity, "
             "severity_disagreement (bool), is_kev (bool), kev_date_added, "
-            "epss_score, epss_percentile, attack_techniques (a list of "
+            "kev_due_date (CISA's remediation deadline for this CVE, from "
+            "lookup_kev's own due_date field -- null if not KEV-listed or "
+            "the catalog doesn't record one), epss_score, epss_percentile, "
+            "attack_techniques (a list of "
             "objects, each with technique_id, name, confidence, prevalence), "
             "exploitation_summary (a short prose summary), and sources (a "
             "list of strings citing each source and its retrieval time)."

@@ -3,9 +3,20 @@ from pathlib import Path
 
 import pytest
 
-from rhinosecure.ingest import IngestError, join_findings, load_assets, load_findings
+from rhinosecure.ingest import IngestError, attach_threat_signals, join_findings, load_assets, load_findings
+from rhinosecure.enrich.cache import SnapshotCache
+from rhinosecure.enrich.kev import KevCatalog
 
 DEMO_DIR = Path(__file__).resolve().parents[1] / "data" / "demo"
+
+
+class _EmptyAttackIndex:
+    """Stand-in for enrich.attack.TechniqueIndex -- attach_threat_signals
+    only ever calls .lookup(), so a real (payload-constructed) index isn't
+    needed to test the KEV/kev_due_date wiring these tests are about."""
+
+    def lookup(self, cve_id, product="", evidence="", *, limit=5):
+        return []
 
 
 def test_load_assets_is_lazy():
@@ -55,3 +66,33 @@ def test_invalid_row_raises_ingest_error(tmp_path: Path):
     )
     with pytest.raises(IngestError):
         list(load_assets(assets_csv))
+
+
+# --- attach_threat_signals: kev_due_date wiring -----------------------------
+
+
+def _f14():
+    by_id = {e.finding.finding_id: e for e in join_findings(DEMO_DIR / "findings.csv", DEMO_DIR / "assets.csv")}
+    return by_id["F14"]  # CVE-2023-23397, KEV-listed, real committed snapshot
+
+
+def test_attach_threat_signals_carries_the_real_kev_due_date():
+    """F14/CVE-2023-23397 -- data/snapshots/kev.json's own dateAdded/
+    dueDate for this CVE, not a guess."""
+    cache = SnapshotCache(offline=True)
+    kev_catalog = KevCatalog({"CVE-2023-23397": {"dateAdded": "2023-03-14", "dueDate": "2023-04-04"}})
+
+    enriched = attach_threat_signals(_f14(), kev_catalog, _EmptyAttackIndex(), cache)
+
+    assert enriched.is_kev is True
+    assert enriched.kev_due_date == "2023-04-04"
+
+
+def test_attach_threat_signals_kev_due_date_is_none_when_not_kev_listed():
+    cache = SnapshotCache(offline=True)
+    empty_kev_catalog = KevCatalog({})  # no entries at all -- CVE-2023-23397 is_listed=False
+
+    enriched = attach_threat_signals(_f14(), empty_kev_catalog, _EmptyAttackIndex(), cache)
+
+    assert enriched.is_kev is False
+    assert enriched.kev_due_date is None

@@ -165,11 +165,15 @@ class EnrichedFinding(BaseModel):
     """A Finding joined to its Asset, plus whatever live threat signals have
     been attached so far.
 
-    `is_kev`/`epss`/`nvd_base_score`/`nvd_severity`/`attack_techniques`/
-    `attack_prevalence` are populated by `rhino run` after `join_findings`
-    (see `cli.py`) via `enrich/kev.py`, `enrich/epss.py`, `enrich/nvd.py`, and
-    `enrich/attack.py`, going through `SnapshotCache` -- ingest.py itself does
-    no enrichment or network access.
+    `is_kev`/`kev_due_date`/`epss`/`nvd_base_score`/`nvd_severity`/
+    `attack_techniques`/`attack_prevalence` are populated by `rhino run` after
+    `join_findings` (see `cli.py`) via `enrich/kev.py`, `enrich/epss.py`,
+    `enrich/nvd.py`, and `enrich/attack.py`, going through `SnapshotCache` --
+    ingest.py itself does no enrichment or network access. `kev_due_date` is
+    CISA's own remediation deadline for a KEV-listed CVE (`enrich/kev.py`'s
+    `KevStatus.due_date`) -- never fed into `scoring.py` (Section 3's KEV
+    floor is a boolean, not a countdown), read only by `remediation.py`'s
+    overdue check.
 
     `source_severity_score`/`source_severity_label` are the counterpart for
     a pre-enriched source (`finding.source_enrichment`, above): populated by
@@ -185,6 +189,7 @@ class EnrichedFinding(BaseModel):
     finding: Finding
     asset: Asset
     is_kev: bool = False
+    kev_due_date: str | None = None
     epss: float | None = None
     nvd_base_score: float | None = None
     nvd_severity: str | None = None

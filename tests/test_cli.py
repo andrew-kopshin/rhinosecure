@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from rhinosecure.enrich.cache import OfflineCacheMissError
-from rhinosecure.cli import main, run, run_agents
+from rhinosecure.cli import main, run, run_agents, run_with_report
 
 DEMO_DIR = Path(__file__).resolve().parents[1] / "data" / "demo"
 
@@ -128,6 +128,12 @@ class _FakeCoordinator:
     last_assets = None
     last_ingest_format = None
     last_contract = None
+    # finding_id -> a stand-in for ResearchFinding (needs only .is_kev/
+    # .kev_due_date, the two fields _tracked_findings_from_recommendations
+    # reads) -- empty by default, so every test that doesn't set this gets
+    # the same "no research on file" defaults (False/None) real cli.py code
+    # already falls back to when research_by_id.get(fid) is None.
+    research_by_id: dict = {}
 
     def __init__(
         self,
@@ -147,6 +153,7 @@ class _FakeCoordinator:
         _FakeCoordinator.last_contract = contract
         self.contract = contract
         self.ingest_format = ingest_format
+        self.memory = memory
         self.state = SimpleNamespace(
             research_failures=_FakeCoordinator.failures.get("research", {}),
             environment_failures=_FakeCoordinator.failures.get("environment", {}),
@@ -154,6 +161,7 @@ class _FakeCoordinator:
             tot_failures=_FakeCoordinator.failures.get("tot", {}),
             tot_by_id=_FakeCoordinator.tot_by_id,
             last_raw_output=_FakeCoordinator.last_raw_output,
+            research_by_id=_FakeCoordinator.research_by_id,
         )
 
     def run(self, findings):
@@ -176,6 +184,7 @@ def _reset_fake_coordinator():
     _FakeCoordinator.last_assets = None
     _FakeCoordinator.last_ingest_format = None
     _FakeCoordinator.last_contract = None
+    _FakeCoordinator.research_by_id = {}
 
 
 def _fake_recommendation(finding_id="F01", risk_score=42.0, bucket="next_window"):
@@ -998,3 +1007,233 @@ def test_ensure_utf8_stdio_tolerates_a_stream_without_reconfigure(monkeypatch):
     monkeypatch.setattr("sys.stderr", _NoReconfigure())
 
     _ensure_utf8_stdio()  # must not raise even when neither stream supports reconfigure()
+
+
+# --- kev_due_date plumbing (RunResult) --------------------------------------
+
+
+def test_run_with_report_carries_is_kev_and_kev_due_date_for_the_real_fixture():
+    """F14 (CVE-2023-23397) is the demo fixture's KEV-listed, no-control,
+    no-window contested case -- the real committed snapshot's own
+    dateAdded/dueDate, not a guess (data/snapshots/kev.json)."""
+    result = run_with_report(DEMO_DIR, seed=42, offline=True)
+    assert result.is_kev_by_finding["F14"] is True
+    assert result.kev_due_date_by_finding["F14"] == "2023-04-04"
+    non_kev = next(fid for fid, kev in result.is_kev_by_finding.items() if not kev)
+    assert result.kev_due_date_by_finding[non_kev] is None
+
+
+# --- run --track-remediation (deterministic path) ---------------------------
+
+
+def test_run_without_track_remediation_prints_nothing_remediation_related(capsys):
+    assert main(["run", "--data", "demo", "--seed", "42", "--offline"]) == 0
+    out = capsys.readouterr().out
+    assert "Remediation tracking" not in out
+    assert "REOPENED" not in out
+
+
+def test_run_track_remediation_reports_open_when_nothing_is_tracked(tmp_path, capsys):
+    db_path = tmp_path / "track.db"
+    assert main(
+        ["run", "--data", "demo", "--seed", "42", "--offline", "--track-remediation", "--db", str(db_path)]
+    ) == 0
+    out = capsys.readouterr().out
+    assert "Remediation tracking (24 finding(s)" in out
+    assert "24 open, 0 deferred, 0 accepted, 0 remediated" in out
+    assert "REOPENED" not in out
+
+
+def test_run_track_remediation_flags_a_reappeared_remediated_finding(tmp_path, capsys):
+    from rhinosecure.memory import Memory
+
+    db_path = tmp_path / "track.db"
+    Memory(db_path).record_remediation_event("F14", "remediated", note="patched via WSUS")
+
+    assert main(
+        ["run", "--data", "demo", "--seed", "42", "--offline", "--track-remediation", "--db", str(db_path)]
+    ) == 0
+    out = capsys.readouterr().out
+    assert "REOPENED -- marked remediated, but still detected in this scan" in out
+    assert "F14" in out.split("REOPENED")[1].split("Remediation tracking")[0]
+    assert "patched via WSUS" in out
+    assert "23 open, 0 deferred, 0 accepted, 1 remediated" in out
+
+
+def test_run_track_remediation_flags_overdue_kev_and_undocumented_acceptance(tmp_path, capsys):
+    from rhinosecure.memory import Memory
+
+    db_path = tmp_path / "track.db"
+    memory = Memory(db_path)
+    memory.record_remediation_event("F14", "accepted")  # no note -- undocumented
+    memory.record_remediation_event("F11", "deferred", note="scheduled")
+
+    assert main(
+        ["run", "--data", "demo", "--seed", "42", "--offline", "--track-remediation", "--db", str(db_path)]
+    ) == 0
+    out = capsys.readouterr().out
+    assert "open past its KEV due date" in out
+    assert "F14" in out.split("open past its KEV due date")[1].split("accepted without documentation")[0]
+    assert "accepted without documentation" in out
+    assert "F14" in out.split("accepted without documentation")[1]
+
+
+def test_remediation_mark_open_from_accepted_does_not_require_a_note(tmp_path, capsys):
+    """The note requirement is scoped to exactly one transition
+    (remediated -> open) -- accepted -> open stays optional."""
+    from rhinosecure.memory import Memory
+
+    db_path = tmp_path / "track.db"
+    Memory(db_path).record_remediation_event("F14", "accepted")
+
+    exit_code = main(["remediation", "mark", "F14", "open", "--db", str(db_path)])
+    assert exit_code == 0
+    assert "Recorded: F14 accepted -> open" in capsys.readouterr().out
+
+
+# --- run --track-remediation --agents ---------------------------------------
+
+
+def test_run_agents_track_remediation_reads_research_is_kev_not_the_pre_research_default(
+    monkeypatch, tmp_path, capsys
+):
+    """coordinator.state.enriched_by_id[fid].is_kev is always the
+    pre-Research default (False) on the agents path -- the correct value
+    comes from research_by_id, exactly the export.py `_agents_finding_entry`
+    fix. Reproduced here: a fake recommendation whose real research says
+    is_kev=True/kev_due_date in the past must show up as overdue, which it
+    could not if this read the wrong field."""
+    monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
+    db_path = tmp_path / "track.db"
+
+    _FakeCoordinator.result = [_fake_recommendation(finding_id="F01", bucket="next_window")]
+    _FakeCoordinator.research_by_id = {
+        "F01": SimpleNamespace(is_kev=True, kev_due_date="2020-01-01"),
+    }
+
+    exit_code = main(["run", "--data", "demo", "--agents", "--track-remediation", "--db", str(db_path)])
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "open past its KEV due date" in out
+    assert "F01" in out.split("open past its KEV due date")[1]
+
+
+def test_run_agents_track_remediation_reuses_coordinators_own_memory(monkeypatch, tmp_path):
+    """No second Memory is opened for --agents --track-remediation --
+    coordinator.memory (already constructed by run_agents()) is read
+    directly, not reopened at --db a second time."""
+    from rhinosecure.memory import Memory
+
+    monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
+    db_path = tmp_path / "track.db"
+    Memory(db_path).record_remediation_event("F01", "deferred", note="scheduled")
+
+    _FakeCoordinator.result = [_fake_recommendation(finding_id="F01", bucket="next_window")]
+
+    assert main(["run", "--data", "demo", "--agents", "--track-remediation", "--db", str(db_path)]) == 0
+    assert _FakeCoordinator.last_memory is not None
+    assert _FakeCoordinator.last_memory.db_path == db_path
+
+
+# --- rhino remediation mark / log -------------------------------------------
+
+
+def test_remediation_mark_records_and_prints_confirmation(tmp_path, capsys):
+    db_path = tmp_path / "track.db"
+    exit_code = main(["remediation", "mark", "F14", "remediated", "--note", "patched via WSUS", "--db", str(db_path)])
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Recorded: F14 (untracked) -> remediated" in out
+    assert "patched via WSUS" in out
+
+    from rhinosecure.memory import Memory
+
+    event = Memory(db_path).latest_remediation_event_for_finding("F14")
+    assert event.status == "remediated"
+    assert event.note == "patched via WSUS"
+    assert event.source == "human"
+
+
+def test_remediation_mark_unknown_finding_id_warns_but_still_records(tmp_path, capsys):
+    db_path = tmp_path / "track.db"
+    exit_code = main(["remediation", "mark", "NOPE-999", "deferred", "--db", str(db_path)])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "no scored run has ever seen finding_id 'NOPE-999'" in captured.err
+    assert "Recorded: NOPE-999" in captured.out
+
+    from rhinosecure.memory import Memory
+
+    assert Memory(db_path).latest_remediation_event_for_finding("NOPE-999").status == "deferred"
+
+
+def test_remediation_mark_known_finding_id_prints_no_warning(tmp_path, capsys):
+    from rhinosecure.memory import Memory
+
+    db_path = tmp_path / "track.db"
+    run_id = Memory(db_path).record_run(
+        data_dir="demo", ingest_format="native", seed=42, offline=True, agents=False,
+        total_findings=1, contested_count=0, contested_total=1,
+    )
+    Memory(db_path).record_decision(
+        run_id=run_id, finding_id="F14", cve_id="CVE-2023-23397", asset_id="A09", hostname="WKS-FIN12",
+        risk_score=25.5, bucket="contested", rationale=["r"], verdict_summary="v", narrative="n",
+    )
+
+    exit_code = main(["remediation", "mark", "F14", "remediated", "--note", "fixed", "--db", str(db_path)])
+    assert exit_code == 0
+    assert "no scored run has ever seen" not in capsys.readouterr().err
+
+
+def test_remediation_mark_open_from_remediated_without_note_is_refused(tmp_path, capsys):
+    db_path = tmp_path / "track.db"
+    assert main(["remediation", "mark", "F14", "remediated", "--note", "fixed", "--db", str(db_path)]) == 0
+    capsys.readouterr()
+
+    exit_code = main(["remediation", "mark", "F14", "open", "--db", str(db_path)])
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "--note is required" in err
+    assert "'open' from 'remediated'" in err
+
+    from rhinosecure.memory import Memory
+
+    # refused BEFORE writing -- the finding's latest status is unchanged
+    assert Memory(db_path).latest_remediation_event_for_finding("F14").status == "remediated"
+
+
+def test_remediation_mark_open_from_remediated_with_note_succeeds(tmp_path, capsys):
+    db_path = tmp_path / "track.db"
+    assert main(["remediation", "mark", "F14", "remediated", "--note", "fixed", "--db", str(db_path)]) == 0
+    capsys.readouterr()
+
+    exit_code = main(
+        ["remediation", "mark", "F14", "open", "--note", "regressed after patch", "--db", str(db_path)]
+    )
+    assert exit_code == 0
+    assert "Recorded: F14 remediated -> open" in capsys.readouterr().out
+
+    from rhinosecure.memory import Memory
+
+    assert Memory(db_path).latest_remediation_event_for_finding("F14").status == "open"
+
+
+def test_remediation_log_with_no_history(tmp_path, capsys):
+    db_path = tmp_path / "track.db"
+    exit_code = main(["remediation", "log", "F14", "--db", str(db_path)])
+    assert exit_code == 0
+    assert "no remediation history recorded for 'F14'" in capsys.readouterr().out
+
+
+def test_remediation_log_prints_full_history_oldest_first(tmp_path, capsys):
+    db_path = tmp_path / "track.db"
+    main(["remediation", "mark", "F14", "deferred", "--note", "scheduled", "--db", str(db_path)])
+    main(["remediation", "mark", "F14", "remediated", "--note", "patched", "--db", str(db_path)])
+    capsys.readouterr()
+
+    exit_code = main(["remediation", "log", "F14", "--db", str(db_path)])
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert out.index("deferred") < out.index("remediated")
+    assert "scheduled" in out
+    assert "patched" in out

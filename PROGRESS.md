@@ -2088,3 +2088,122 @@ with the exact reconciliation notice named above. Zero console errors throughout
 916 passed, 1 skipped (test count unchanged -- existing `test_export.py` assertions were extended
 in place, not added as new test functions); the deterministic-path subset (`test_export.py`,
 `test_cli.py`) confirmed separately clean under `.venv` (Python 3.14).
+
+**Remediation tracking built: what a run recommended vs. what actually happened, closing the
+gap CLAUDE.md's own "Future direction: remediation execution" section named as its unbuilt
+foundation.** Proposed and approved in conversation first, same discipline as the chat layer and
+scenario views. Storage is a sixth `memory.py` table, `remediation_events` -- append-only, like
+every table already there, because the design brief was explicit that an execution outcome is
+"another way a finding's status changes," the identical kind of write a human's own mark already
+is, just a different `source` (`"human"` today, `"execution"` reserved and unused). A finding's
+current status is never stored, only derived -- the latest event for its finding_id, the same
+"derived, never stored" discipline `RunRecord.contested_pct` already applies to itself.
+`Memory.latest_remediation_events()` is one bulk query (a `MAX(id)`-per-`finding_id` join, not
+one `latest_remediation_event_for_finding` call per finding) -- the fleet-scale discipline
+CLAUDE.md's own "no interface may assume demo scale" rule now names explicitly, applied here on
+day one rather than fixed later.
+
+**`remediation.py` (new): the read side, pure computation, zero I/O, zero `crewai` dependency --
+the same import-boundary discipline `scoring.py` already holds itself to, so this module is
+importable from the deterministic path, the agents path, and any future consumer without
+dragging either in.** `classify_remediation(findings, latest_events, today=...)` returns a
+`RemediationSummary`: per-status counts (open/remediated/accepted/deferred, `untracked` kept
+separate from an explicit `open` event -- both currently read as "not resolved," but only one has
+a note explaining why someone changed their mind), a **contradiction** list (latest status
+`remediated` but the finding_id is still present in the current scan -- the case the task was
+specifically asked to design for), an **overdue** list (`is_kev` and `kev_due_date` in the past
+and not `remediated` -- evaluated against every currently-scanned finding, tracked or not, since
+"nobody has looked at this" is itself a kind of still-needing-attention), and an
+**accepted-without-a-note** list. Never resolves a contradiction itself -- it only surfaces it,
+the same "escalate rather than force a verdict" instinct `bucket_for`'s `contested` bucket already
+applies to a scoring question, applied here to a tracking one; nothing writes a new event to "fix"
+the contradiction except a human (or a future execution outcome) recording one.
+
+**A real gap surfaced while designing the KEV-overdue check, fixed rather than worked around:**
+`enrich/kev.py`'s `KevStatus` already fetches CISA's `dueDate`, but `ingest.attach_threat_signals`
+read only `.is_listed` off it and discarded `.due_date` -- it never reached `EnrichedFinding`. On
+the agents path it was the same shape of bug the export.py `is_kev` fix (earlier this session)
+already found once: `agents/research.py`'s `lookup_kev` tool already returns `due_date` in its
+JSON (Research can and does reason about it -- PROGRESS.md 2026-09-03's ToT critic manually
+noticed two overdue KEV dates), but `ResearchFinding` had no field to capture it, so it never
+became a structured fact. Fixed across the whole chain: `EnrichedFinding.kev_due_date` (schema.py),
+`attach_threat_signals` sets it from `kev_catalog.status(cve_id).due_date` (ingest.py),
+`ResearchFinding.kev_due_date` plus the task's `expected_output` (agents/research.py),
+`merge_research_into_enriched` maps it through (agents/risk.py), and `cli.RunResult` gains a
+sibling `kev_due_date_by_finding: dict[str, str | None]` next to the existing `is_kev_by_finding`,
+populated in the same loop. On the agents path, `cli.py`'s own new
+`_tracked_findings_from_recommendations` reads `research.kev_due_date`/`research.is_kev` directly
+off `coordinator.state.research_by_id`, not `coordinator.state.enriched_by_id[fid]`'s own fields --
+the latter is always the pre-Research default (`False`/`None`) on that path, since Research's real
+KEV lookup is merged into a scoring input on demand and never written back onto
+`state.enriched_by_id`. Same fix, same reasoning, as export.py's `_agents_finding_entry` is_kev
+correction. `scoring.py` is untouched throughout -- `kev_due_date` is read only by
+`remediation.py`'s overdue check, never fed into the threat term.
+
+**CLI: the cheapest write in the whole surface, and one required-note guard.** `rhino remediation
+mark <finding_id> {open,remediated,accepted,deferred} [--note TEXT] [--db PATH]` -- no `--data`,
+no `--format`, no ingest, no LLM: the operator already has an exact finding_id (from a prior
+`rhino run` table) and an exact status, nothing to interpret, which is what makes "deterministic
+and free" trivial here rather than something to engineer for. `remediation.note_required_for_
+transition(previous_status, new_status)` is one pure predicate -- true only for `remediated ->
+open`, the transition named explicitly (asked, not assumed) as the one where the reason matters
+most; every other transition, including `open` from anything else, stays optional. **A real bug
+caught by manual testing, not a unit test:** the first version of the CLI's refusal check tested
+whether a note was *required* for the transition but never checked whether `--note` had actually
+been *supplied* -- so `remediation mark F14 open --note "..."` refused identically to the same
+command with no note at all, since the code never looked at `args.note`. Caught immediately by
+running the command by hand with a note attached and watching it fail anyway; fixed by adding the
+missing `and not args.note` to the condition, then reverified both directions live before writing
+the regression test. An unknown finding_id (never seen by any scored run, checked against
+`memory.decisions_for_finding`) warns to stderr but still records -- refusing would need the
+command to somehow know the "right" spelling from a tool that deliberately loads no fleet data at
+all. `rhino remediation log <finding_id>` prints full history, oldest first, or an honest "no
+history recorded" rather than an empty table.
+
+**`rhino run --track-remediation`: opt-in, deliberately, not automatic.** The plain deterministic
+`rhino run` has never touched `memory.py` at all, and several existing tests pin its console
+output byte-for-byte -- making tracking automatic would be a silent behavior change and would
+start creating a `rhinosecure.db` file for someone running `rhino run --offline` just to look at
+scores, the exact stray-file class of problem a prior session's test-isolation fix (2026-09-03)
+was about. `--db` was extended to the plain path for the first time (previously "with --agents"
+only) to name where tracking history is read from. With `--agents`, no second `Memory` is opened
+-- `coordinator.memory` (already constructed by `run_agents()`) is reused directly, confirmed by a
+dedicated test asserting no second connection is made. Printed output: a REOPENED block (only when
+non-empty, printed *before* the tally so a contradiction is never a footnote under numbers a
+reader already formed an impression from -- the same placement argument `_print_exclusions`
+already makes for itself), then the open/deferred/accepted/remediated tally, then overdue and
+undocumented-acceptance blocks (each silent when empty, matching `_print_failures`/
+`_print_exclusions`'s own convention).
+
+**Verified live against the real 24-finding demo fixture, not just synthetic tests.** Marked F14
+(CVE-2023-23397, real KEV due date 2023-04-04 from the committed snapshot) `remediated`, then ran
+`rhino run --data demo --seed 42 --offline --track-remediation`: F14 correctly printed under
+REOPENED (still present in the scan despite being marked fixed) and correctly excluded from the
+overdue list (a contradiction is a more specific fact about the same finding, not a second,
+redundant flag). Marking F15 `accepted` with no note and F11 `deferred` with one, the same run
+correctly listed eleven real fixture findings as overdue past their actual cached KEV due dates
+(each one is_kev with a real dateAdded/dueDate, none invented), correctly tagged F11's overdue
+entry `deferred` and F15's `accepted`, and correctly listed only F15 under "accepted without
+documentation." Reproduced the note-required bug and its fix live in the same session, both
+before and after.
+
+**Verification.** 55 new tests: `tests/test_remediation.py` (36, new -- `classify_remediation`
+and `note_required_for_transition` in full isolation: every status combination, contradiction
+detection, overdue in every combination of is_kev/due_date/status including a malformed due-date
+string that must not raise, accepted-with-blank-or-whitespace-note still flagged, a finding with
+history absent from the current scan contributing nothing), `tests/test_memory.py` (+13 --
+`remediation_events` round-trip including `source`/`source_detail`, the FK `run_id` behavior
+matching `decisions`/`feedback`'s own precedent, `latest_remediation_events`' bulk-query
+correctness against multiple findings each with multiple events, and cross-session persistence),
+`tests/test_cli.py` (+15 -- `remediation mark`/`log` wiring and exit codes, the note-required
+refusal in both directions, `--track-remediation` on both the deterministic and `--agents` paths,
+and the direct `RunResult.kev_due_date_by_finding`/`is_kev_by_finding` plumbing check against the
+real fixture -- `_FakeCoordinator` gained a `research_by_id` class attribute and `self.memory`
+for this), `tests/test_ingest.py` (+2 -- `attach_threat_signals`'s `kev_due_date` wiring, direct
+against a hand-built `KevCatalog`, both KEV-listed and not), `tests/test_risk_agent.py` (+1 --
+`merge_research_into_enriched` carries `kev_due_date` through and never mutates the ground-truth
+`EnrichedFinding`). Full suite: `.venv312` 983 passed, 1 skipped (up from 916); the
+deterministic-path subset (everything except `--agents`/`constraint add`/`web --enable-jobs`/the
+two new `--agents --track-remediation` tests) confirmed separately clean under `.venv` (Python
+3.14) -- same, unchanged 45-test crewai/chromadb boundary as every prior session, not a
+regression.
