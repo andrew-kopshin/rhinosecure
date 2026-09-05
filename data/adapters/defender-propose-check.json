@@ -1,0 +1,417 @@
+{
+  "asset": {
+    "asset_id": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "DeviceId",
+      "kind": "column",
+      "optional": false
+    },
+    "business_function": {
+      "kind": "not_collected"
+    },
+    "compensating_controls": {
+      "kind": "not_collected"
+    },
+    "criticality": {
+      "blank": "gap",
+      "case": "exact",
+      "column": "AssetValue",
+      "kind": "vocabulary",
+      "optional": false,
+      "table": {
+        "High": 5,
+        "Normal": 3
+      },
+      "table_notes": null
+    },
+    "data_sensitivity": {
+      "kind": "not_collected"
+    },
+    "environment": {
+      "kind": "not_collected"
+    },
+    "hostname": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "DeviceName",
+      "kind": "column",
+      "optional": false
+    },
+    "internet_exposed": {
+      "blank": "gap",
+      "case": "exact",
+      "column": "IsInternetFacing",
+      "kind": "parsed",
+      "optional": true,
+      "params": {
+        "false": [
+          "false"
+        ],
+        "true": [
+          "true"
+        ]
+      },
+      "parser": "bool"
+    },
+    "os": {
+      "blank": "gap",
+      "case": "exact",
+      "column": "OSPlatform",
+      "kind": "column",
+      "optional": true
+    },
+    "os_build": {
+      "blank": "gap",
+      "case": "exact",
+      "column": "OSBuild",
+      "kind": "column",
+      "optional": true
+    },
+    "owner": {
+      "kind": "not_collected"
+    },
+    "patch_restrictions": {
+      "kind": "not_collected"
+    },
+    "patch_window": {
+      "kind": "not_collected"
+    },
+    "role": {
+      "keyed_by": {
+        "from": "os_class_from_group",
+        "output": "os_class"
+      },
+      "kind": "default_by",
+      "table": "ROLE_DEFAULT_BY_OS_CLASS"
+    }
+  },
+  "asset_grouping": {
+    "key": "DeviceId",
+    "order_by": {
+      "column": "Timestamp",
+      "params": null,
+      "parser": "timestamp",
+      "required": true
+    },
+    "resolution": "agree_or_recency",
+    "union_fields": [],
+    "union_justification": {}
+  },
+  "attestations": [
+    {
+      "at": "2026-09-05T02:56:29Z",
+      "item": "finding_id.synthesized",
+      "text": "Reviewed the content_address recipe (sha256 over DeviceId, CveId, SoftwareName, SoftwareVersion, 16 hex chars, lowercase): vulnerabilities.csv has no natural per-finding id column, and this composite correctly collapses the one true duplicate row (outlook/CVE-2023-23397) observed in the sample. Understood that this recipe is now frozen for this format (data/adapters/defender-propose-check.json) and differs from the hand-written defender.py adapters own recipe (which also hashes SoftwareVendor and uses uppercase hex), so finding_id values -- and any memory.decisions keyed on them -- will not match between the two formats; accepted since they are registered as separate --format/--adapter-config names."
+    }
+  ],
+  "config_schema_version": "1.0.0",
+  "derived": {
+    "os_class_from_group": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "MachineGroup",
+      "outputs": [
+        "os_class"
+      ],
+      "table": {
+        "Servers": [
+          "server"
+        ],
+        "Workstations": [
+          "client"
+        ]
+      },
+      "table_notes": null
+    }
+  },
+  "description": "Microsoft Defender for Endpoint-style vulnerability scanner export split into a devices asset file and a per-CVE vulnerabilities finding file, joined on DeviceId.",
+  "divergences": [],
+  "enrichment": null,
+  "finding": {
+    "asset_id": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "DeviceId",
+      "kind": "column",
+      "optional": false
+    },
+    "cve_id": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "CveId",
+      "kind": "parsed",
+      "optional": false,
+      "params": {},
+      "parser": "cve_id"
+    },
+    "detected_date": {
+      "kind": "not_collected"
+    },
+    "evidence": {
+      "join": "; ",
+      "kind": "composed",
+      "max_chars": 4096,
+      "parts": [
+        {
+          "emit_if_any": null,
+          "fallback_template": null,
+          "required_non_blank": [
+            "RecommendedSecurityUpdate"
+          ],
+          "template": "Recommended update: {RecommendedSecurityUpdate}"
+        },
+        {
+          "emit_if_any": [
+            "RecommendedSecurityUpdateId"
+          ],
+          "fallback_template": "Security update ID: not available",
+          "required_non_blank": [],
+          "template": "Security update ID: {RecommendedSecurityUpdateId}"
+        }
+      ]
+    },
+    "finding_id": {
+      "algorithm": "sha256",
+      "case": "lower",
+      "columns": [
+        "DeviceId",
+        "CveId",
+        "SoftwareName",
+        "SoftwareVersion"
+      ],
+      "hex_len": 16,
+      "join": "",
+      "kind": "content_address",
+      "prefix": "",
+      "recipe_version": 1
+    },
+    "port": {
+      "kind": "not_collected"
+    },
+    "product": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "SoftwareName",
+      "kind": "column",
+      "optional": false
+    },
+    "scanner_severity": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "VulnerabilitySeverityLevel",
+      "kind": "vocabulary",
+      "optional": false,
+      "table": {
+        "Critical": "critical",
+        "High": "high",
+        "Medium": "medium"
+      },
+      "table_notes": null
+    },
+    "service": {
+      "kind": "not_collected"
+    },
+    "version": {
+      "blank": "absent_fact",
+      "case": "exact",
+      "column": "SoftwareVersion",
+      "kind": "column",
+      "optional": true
+    }
+  },
+  "finding_dedup": {
+    "content_targets": [
+      "asset_id",
+      "cve_id",
+      "product",
+      "version"
+    ],
+    "on_conflict": "fatal",
+    "on_identical": "collapse_and_count"
+  },
+  "format": "defender-propose-check",
+  "generated_at": "2026-09-05T02:56:01Z",
+  "generator": {
+    "attempts": 2,
+    "call_log_digest": "sha256:dc07743be12dbf0cc28ca8240ab7c623abba38676a901a5730624b4923b6f2f2",
+    "completion_tokens": 69492,
+    "estimated_cost_usd": 0.751806,
+    "model": "claude-sonnet-5",
+    "prompt_tokens": 28443,
+    "tool": "rhino-adapt-propose"
+  },
+  "header": {
+    "assets": {
+      "columns": [
+        "Timestamp",
+        "DeviceId",
+        "DeviceName",
+        "OSPlatform",
+        "OSBuild",
+        "OSVersion",
+        "IsInternetFacing",
+        "AssetValue",
+        "ExposureLevel",
+        "MachineGroup"
+      ],
+      "sha256": "sha256:bca11fc6f9da24b40cb94db695fccce3b56677bf1facf542dce13a52c5e78f5b"
+    },
+    "findings": {
+      "columns": [
+        "DeviceId",
+        "DeviceName",
+        "OSPlatform",
+        "OSVersion",
+        "OSArchitecture",
+        "SoftwareVendor",
+        "SoftwareName",
+        "SoftwareVersion",
+        "CveId",
+        "VulnerabilitySeverityLevel",
+        "RecommendedSecurityUpdate",
+        "RecommendedSecurityUpdateId",
+        "CveTags"
+      ],
+      "sha256": "sha256:9f4e6357ea0d252e6bd04115b31b15513add14275985e9e3c48c79a25abd31ab"
+    },
+    "mode": "declared"
+  },
+  "not_collected": {
+    "always_asset": [
+      "business_function",
+      "compensating_controls",
+      "data_sensitivity",
+      "environment",
+      "owner",
+      "patch_restrictions",
+      "patch_window",
+      "role"
+    ],
+    "always_finding": [
+      "detected_date",
+      "port",
+      "service"
+    ],
+    "per_row_eligible_asset": [
+      "criticality",
+      "internet_exposed",
+      "os",
+      "os_build"
+    ],
+    "per_row_eligible_finding": []
+  },
+  "observed": {
+    "assets_loaded": 5,
+    "contract_version": 1,
+    "duplicate_assets_collapsed": 1,
+    "duplicate_findings_collapsed": 1,
+    "excluded_asset_reasons": {},
+    "excluded_assets": 0,
+    "excluded_findings": 0,
+    "findings_loaded": 9,
+    "header_notices": [],
+    "measured_at": "2026-09-05T03:54:43Z",
+    "measured_by": "Andrew Kopshin",
+    "measured_by_command": "confirm",
+    "not_collected_assets": {
+      "business_function": 5,
+      "compensating_controls": 5,
+      "criticality": 1,
+      "data_sensitivity": 5,
+      "environment": 5,
+      "owner": 5,
+      "patch_restrictions": 5,
+      "patch_window": 5,
+      "role": 5
+    },
+    "not_collected_findings": {
+      "detected_date": 9,
+      "port": 9,
+      "service": 9
+    }
+  },
+  "review": {
+    "confirmed_at": "2026-09-05T03:54:43Z",
+    "confirmed_by": "Andrew Kopshin",
+    "confirmed_version": 1,
+    "content_digest": "sha256:45465f63a15c44f4dec61480ebe3d3ebd036a29debf7d24261837823de999a61",
+    "decision_digest": "sha256:f32d9c67b451a290721c83b5a1863a281caede773ee90266ea08c01728caf836",
+    "slot_digests": {
+      "asset.asset_id": "sha256:58b04e0cb4524791ffa2cbe6d830bbfcf4dae493818c014bc532903118cf147d",
+      "asset.business_function": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "asset.compensating_controls": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "asset.criticality": "sha256:ef029de714c22fb7a98910174061a980871d5afc228a192aafd0c9143492e5cc",
+      "asset.data_sensitivity": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "asset.environment": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "asset.hostname": "sha256:158b20ea465e36ab517223b751ceb82ff7c87848f90ec0d4eb9b7431b475f2e5",
+      "asset.internet_exposed": "sha256:4b023c5266bb5e59c750f37b095f9590453f713b134db6542902651e941dfe9d",
+      "asset.os": "sha256:7dddd63cf79b4b972015831f05a01324e6a2aa55d7ceac278725d34384fc2b86",
+      "asset.os_build": "sha256:e4a9a48c6203ce61380a5db824cfc98b8147e3657a42a9beb58897906c69a721",
+      "asset.owner": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "asset.patch_restrictions": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "asset.patch_window": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "asset.role": "sha256:1dfd1c07a5199f2d0d4162f7d0dfd34e29a75b2cbb1cd58e022981461c94d0c9",
+      "finding.asset_id": "sha256:58b04e0cb4524791ffa2cbe6d830bbfcf4dae493818c014bc532903118cf147d",
+      "finding.cve_id": "sha256:dafbf4cdb70b72865588c977091350c71a0c701cc9d5ea456456d3c643f26109",
+      "finding.detected_date": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "finding.evidence": "sha256:d44b0a5eded5696c0a8e96a1ed3194f7ca75b6107a2beea83898cc79548dfe48",
+      "finding.finding_id": "sha256:1eb59c1ea1642bcb717386b664b75293249d74e0053631504e784c5b1e3f6778",
+      "finding.port": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "finding.product": "sha256:4bd5cdb8bcf09f452239d3c2f2ac12292193d449485e044583bbc395206fc7de",
+      "finding.scanner_severity": "sha256:357230f3009133a5baba41b534eb1a53c786c4cc1647966a49688ac6a74ee484",
+      "finding.service": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "finding.version": "sha256:656afe623fd5ea5615938e08654e487835d21c3d3086cb7bcee258d0ea8dfb9c"
+    },
+    "state": "confirmed"
+  },
+  "source": {
+    "assets_filename": "devices.csv",
+    "delimiter": ",",
+    "encoding": "utf-8",
+    "findings_filename": "vulnerabilities.csv",
+    "first_data_row": 2,
+    "layout": "two_file",
+    "quotechar": "\""
+  },
+  "unmapped_columns": {
+    "devices.csv": {
+      "ExposureLevel": {
+        "disposition": "ignored",
+        "reason": "Also considered as a candidate for asset.criticality alongside AssetValue; ambiguous which column is authoritative, so left unmapped rather than guessed."
+      },
+      "OSVersion": {
+        "disposition": "ignored",
+        "reason": "Redundant with OSPlatform for asset.os; no separate os_version target exists in the schema."
+      }
+    },
+    "vulnerabilities.csv": {
+      "CveTags": {
+        "disposition": "deliberately_dropped",
+        "reason": "Constant empty-list literal '[]' on every row; carries no usable information."
+      },
+      "DeviceName": {
+        "disposition": "ignored",
+        "reason": "Redundant with the asset-side hostname, already reachable via the DeviceId join; no finding target needs it."
+      },
+      "OSArchitecture": {
+        "disposition": "ignored",
+        "reason": "Constant 'x64' across all rows; carries no discriminating information and no target field for architecture exists."
+      },
+      "OSPlatform": {
+        "disposition": "ignored",
+        "reason": "Redundant with asset.os; no finding-level OS target exists."
+      },
+      "OSVersion": {
+        "disposition": "ignored",
+        "reason": "Redundant with asset-level OS version info; no finding target for it."
+      },
+      "SoftwareVendor": {
+        "disposition": "ignored",
+        "reason": "Constant 'microsoft' across all rows; no separate vendor target exists distinct from finding.product."
+      }
+    }
+  },
+  "validator_overrides": [],
+  "version": 1
+}
