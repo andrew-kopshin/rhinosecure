@@ -68,6 +68,17 @@ This has a binding design consequence: **no component may assume its input is sy
 
 Swapping in a real scanner export should require a new ingest adapter and nothing else.
 
+**The same discipline extends to scale, stated explicitly rather than left to be inferred.**
+The demo fixture — 24 findings, 12 assets, frozen for reproducibility — is scaffolding for
+development, not the target. RhinoSecure is being built as a real application for real
+fleets: hundreds to thousands of findings, real scanner exports, real operators running it
+against production data. Just as no component may assume its input is synthetic, **no
+interface — CLI output, the web UI, the chat layer, the job substrate — may assume demo
+scale.** Anything that works correctly at 24 findings and breaks, degrades unacceptably, or
+becomes unusable at 500 is a **defect**, to be found and fixed with the same seriousness as a
+component that silently guesses at a fixture-specific value — not a limitation excused by the
+size of the fixture it was built and tested against.
+
 **Built.** The adapter seam exists: `src/rhinosecure/adapters/` — `base.py` (the `IngestAdapter`
 contract every format implements, `AdapterError`, and the representation of fields a source
 format has no concept of, below), `native.py` (the existing `assets.csv`/`findings.csv` loaders,
@@ -310,6 +321,22 @@ to the MVP.
 explored branches. MCP is a model-to-tool protocol, not an inter-agent state bus. Agent state
 lives in the Coordinator and SQLite. MCP is optional and, if used at all, only to expose the
 enrichment tools.
+
+**Left open at fleet scale, named here so it is found by design rather than by surprise.**
+Two gaps, neither with a fix yet, both direct consequences of the scale rule above:
+
+- **UI pagination and filtering.** The web UI's Findings/Contested tables — and any scenario
+  view built on the same export — render every finding in one pass, with no pagination or
+  filtering. Fine at 24 rows; untested, and likely unusable in a browser, at hundreds or
+  thousands.
+- **Chat context strategy at fleet scale.** `agents/chat.py`'s default is to serialize the
+  whole export into the prompt on every turn. Its deterministic pre-filter
+  (`build_scoped_export`, PROGRESS.md 2026-09-05) narrows *which* findings carry full detail
+  once a question names one, but nothing yet addresses what happens when the export itself no
+  longer fits in a single prompt at all, regardless of what the question names. This is the
+  same concern the "nothing may assume the dataset is small enough to fetch in one pass"
+  bullet above already states, now concrete for a consumer that didn't exist when that bullet
+  was written.
 
 ---
 
@@ -890,6 +917,20 @@ organization is weak.
   dispatch; agent code calls that interface and never instantiates a provider client directly.
   This keeps a self-hosted or on-premises model a substitution rather than a rewrite — the
   realistic requirement for any organization unwilling to transmit its vulnerability data.
+
+**Self-hosted deployment is a first-class target, not a fallback.** The seam above is not a
+hedge against a hypothetical future need — an organization unwilling to transmit its own
+vulnerability data to a third-party API is a realistic deployment, not an edge case, and this
+project is built to actually work that way, not merely to compile that way. Confirmed, not
+just designed: pointing `RHINO_LLM_MODEL`/`RHINO_LLM_BASE_URL` (`.env`) at a local Ollama
+model routes through `llm.py` with zero code change (PROGRESS.md 2026-09-04). The chat
+layer's deterministic context-narrowing pre-filter exists partly *for* this target, not only
+for the hosted path: a self-hosting operator is more likely to be running a smaller local
+model, and narrowing context is a concrete, measured mitigation for the "lost in the middle"
+long-context failure that class of model is most prone to — confirmed by retesting the
+identical model and question with and without the filter and getting a wrong answer, then a
+correct one (PROGRESS.md 2026-09-05). Self-hosted is a mode this project tests against, not
+an assumption resting on the seam merely existing.
 
 **Operational properties inherited from the LLM dependency:** per-run cost, availability tied
 to an external service, and non-deterministic output. The first two are accepted. The third is
