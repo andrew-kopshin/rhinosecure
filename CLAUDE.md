@@ -1100,18 +1100,22 @@ contract resolves through `rhino run --adapter-config <name>` / `rhino constrain
 scoring, enrichment, and the agents never know a run came from a contract instead of a
 built-in `--format`.
 
-**Status.** Slices 1–8 are built: the contract schema and validator, the phase-2 engine
+**Status.** All nine slices are built: the contract schema and validator, the phase-2 engine
 (proven differentially identical to the hand-written BluePeak and Defender adapters on
 real data), the confirmation-digest gate, `--adapter-config` on the CLI, pre-enriched-
 source support, a non-raising column profiler (`rhino adapt probe`/`list`), the
 confirm/re-review workflow itself (`rhino adapt confirm`/`rereview`) with its attestation
-gate, and now the phase-1 inference agent (`agents/schema_inference.py`, `rhino adapt
-propose`) itself. Two contracts are confirmed and committed: `data/adapters/bluepeak-gen.json`,
-`data/adapters/mdvm-gen.json` — both hand-authored, from before Slice 8 existed to author
-one from an LLM call. Slice 7 was hardened by an adversarial review round spanning
-commits `48ac821` and `309b9a1` that found and fixed six defects — PROGRESS.md is
-authoritative for what they were and how each was verified. Not built: Slice 9, surfacing
-contract provenance in `export.py`/`rhino web`.
+gate, the phase-1 inference agent (`agents/schema_inference.py`, `rhino adapt propose`),
+and now contract provenance surfaced in `export.py`/`rhino web` (a new top-level
+`provenance` export key, and an Overview "Mapping provenance" card — `docs/adapter-
+generation.md`'s Slice 9 entry has the full mechanism, including three adjacent defects
+found and fixed alongside it). Two contracts are confirmed and committed:
+`data/adapters/bluepeak-gen.json`, `data/adapters/mdvm-gen.json` — both hand-authored,
+from before Slice 8 existed to author one from an LLM call, and Slice 9 deliberately
+never surfaces their `generator` blocks for this reason (see its own docstring). Slice 7
+was hardened by an adversarial review round spanning commits `48ac821` and `309b9a1` that
+found and fixed six defects — PROGRESS.md is authoritative for what they were and how
+each was verified.
 
 **Slice 8, built.** `rhino adapt propose NAME --data DIR [--assets-file/--findings-file]
 [--from-proposal PATH] [--report-out PATH] [--max-attempts N] [--sample-rows N]

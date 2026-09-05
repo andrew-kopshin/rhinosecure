@@ -215,8 +215,9 @@ function renderOverview(data) {
   }).join("");
 
   const cr = data.summary.contested_rate;
-  const gapsHtml = renderDataGaps(data.summary.data_gaps);
+  const gapsHtml = renderDataGaps(data.summary.data_gaps, data.provenance);
   const usageHtml = renderUsageSummary(data.usage, data.run.agents);
+  const provenanceHtml = renderProvenance(data.provenance);
 
   el.innerHTML = `
     <div class="card">
@@ -236,11 +237,52 @@ function renderOverview(data) {
       <h3>Data gaps</h3>
       ${gapsHtml}
     </div>
+    ${provenanceHtml}
     ${usageHtml}
   `;
 }
 
-function renderDataGaps(gaps) {
+function shortHash(s) {
+  if (!s) return "";
+  return s.length > 20 ? `${s.slice(0, 18)}…` : s;
+}
+
+function renderProvenance(prov) {
+  if (!prov) {
+    return `
+      <div class="card">
+        <h3>Mapping provenance</h3>
+        <p class="empty-note">Built-in adapter — no reviewed contract behind this run.</p>
+      </div>
+    `;
+  }
+
+  const drift = prov.scale_drift
+    ? `<p class="gap-note">
+        This mapping was <strong>confirmed</strong> against ${prov.scale_drift.signed_assets} asset(s) and
+        ${prov.scale_drift.signed_findings} finding(s), but this run <strong>loaded</strong>
+        ${prov.scale_drift.loaded_assets} and ${prov.scale_drift.loaded_findings}. A signature covers the
+        mapping, not the data volume — this can be expected if the source has simply grown since it was
+        reviewed, but if the <em>shape</em> of the data has changed, re-review the contract
+        (<code>rhino adapt rereview</code>) before trusting this run's numbers.
+      </p>`
+    : "";
+
+  return `
+    <div class="card">
+      <h3>Mapping provenance</h3>
+      <p class="stat-line">Contract <code>${esc(prov.format)}</code> v${esc(prov.version)}</p>
+      <p class="hint">Confirmed ${formatTime(prov.confirmed_at)} by ${esc(prov.confirmed_by)}</p>
+      ${drift}
+      <p class="hint">
+        content <code title="${esc(prov.content_digest)}">${esc(shortHash(prov.content_digest))}</code>
+        · decision <code title="${esc(prov.decision_digest)}">${esc(shortHash(prov.decision_digest))}</code>
+      </p>
+    </div>
+  `;
+}
+
+function renderDataGaps(gaps, prov) {
   const assetGapEntries = Object.entries(gaps.asset_gaps || {}).sort((a, b) => b[1] - a[1]);
   const findingGapEntries = Object.entries(gaps.finding_gaps || {}).sort((a, b) => b[1] - a[1]);
   const hasGaps =
@@ -248,9 +290,10 @@ function renderDataGaps(gaps) {
     findingGapEntries.length > 0 ||
     gaps.duplicate_assets_collapsed > 0 ||
     gaps.duplicate_findings_collapsed > 0;
+  const flag = prov ? `--adapter-config ${gaps.format}` : `--format ${gaps.format}`;
 
   if (!hasGaps) {
-    return `<p class="empty-note">No data gaps -- every field this run needed was collected from the source (--format ${esc(gaps.format)}).</p>`;
+    return `<p class="empty-note">No data gaps -- every field this run needed was collected from the source (${esc(flag)}).</p>`;
   }
 
   const assetCol = assetGapEntries.length

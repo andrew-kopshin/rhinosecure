@@ -2187,6 +2187,87 @@ entry `deferred` and F15's `accepted`, and correctly listed only F15 under "acce
 documentation." Reproduced the note-required bug and its fix live in the same session, both
 before and after.
 
+**Adapter-generation Slice 9: contract provenance surfaced in `export.py` / `rhino web` -- the
+last unbuilt piece of adapter generation, now built.** Mapped every subsystem it touches
+(`export.py`, the web UI, `cli.py`'s existing Slice 4 banner, `config_model.Contract`, the ingest
+seam, and the pinned tests) before writing anything, and confirmed the `Contract` object was
+*already* reaching both export builders (`RunResult.contract`, `Coordinator.contract`) -- both
+call sites already dereferenced it just to grab the bare `.format` string and threw the rest away.
+No new plumbing needed to get the object into `export.py`; the work was deciding what to do with
+it once there.
+
+**Decided, proposed before implementing (asked, not assumed).** A new top-level `provenance` key
+-- `null` for a built-in `--format` run, otherwise `format`/`version`/`confirmed_at`/
+`confirmed_by`/`content_digest`/`decision_digest` plus `scale_drift` (non-`null` only when the
+contract's confirm-time `observed` measurement disagrees with what this run actually loaded).
+Every field mirrors exactly what `cli._print_adapter_config_banner` (Slice 4) already prints to a
+terminal -- no new facts, just a new surface. **Deliberately excludes `Contract.generator`** (the
+phase-1 LLM's model/token/cost record): `data/adapters/bluepeak-gen.json` and `mdvm-gen.json` are
+both hand-authored (CLAUDE.md already says so) but carry byte-identical placeholder `generator`
+blocks -- the same fabricated token counts, cost, and `call_log_digest` on both, and a `tool`
+string ("rhino adapt propose", with a space) the real agent never even writes (it writes
+"rhino-adapt-propose"). Surfacing that in a UI card would present invented numbers as real audit
+trail. "Provenance," in this codebase's own vocabulary, has always meant the Slice 4 banner's four
+facts plus proof of an unedited signature -- never the phase-1 cost accounting, which stays
+`rhino adapt propose`/`confirm`-only.
+
+**Three adjacent defects found while mapping the surface, fixed in the same slice (same root
+cause: comparing a bare format name where a revision-qualified label was needed, or vice versa).**
+(1) `export._capacity_history` compared a historical run's stored `ingest_format` (`memory.runs`
+stores `adapter.run_label`, `"<format>@v<version>"` for a config-driven run) against the current
+run's *bare* `fmt` -- so every capacity constraint filed by a config-driven run compared unequal
+to its own run and rendered a false "Stale -- from a different run" pill in the web UI. Fixed by
+computing a `_current_run_label(fmt, contract)` helper (mirrors `ConfiguredAdapter.run_label`'s
+formula without importing it -- `export.py` has only the `Contract`, never the adapter object) and
+comparing against that instead; renamed the parameter `fmt` -> `run_label` on
+`_capacity_history`/`_constraints_section` so a future reader can't make the same mistake by
+accident. (2) Three places hardcoded `--format {name}` into human-readable prose
+(`_print_exclusions`, `_print_ingest_report`, `_warn_of_exclusions` in `cli.py`; `_ingest_detail`
+in `export.py`; `_log_exclusions` in `web/jobs.py`) even on a config-driven run, where the real
+invoking flag is `--adapter-config` -- confirmed live: `rhino run --adapter-config bluepeak-gen
+--data bluepeak --seed 42` printed `Data gaps (--format bluepeak-gen): ...` before the fix. Added
+one small `_ingest_flag(fmt, contract)` helper, duplicated (not imported) in both `cli.py` and
+`export.py` since the two modules deliberately don't import each other at module level -- a
+one-line ternary, not worth a shared dependency. (3) `rhino web --enable-jobs --adapter-config X`
+printed `format: native` in its own startup banner (`job_config.fmt` is `args.format`, whose
+argparse default is untouched when `--adapter-config` is supplied instead) -- fixed to name the
+adapter config when one is set.
+
+**Test impact, confirmed narrow.** Only two existing tests needed updating, both for the wording
+fix: `tests/test_cli_adapter_config.py`'s two byte-identical-output comparisons normalize
+`"--format bluepeak-gen"` / `"--format mdvm-gen"` down to the built-in run's wording -- the
+normalization target itself moved to `"--adapter-config bluepeak-gen"` / `"--adapter-config
+mdvm-gen"`, confirmed by running both config-driven commands live first and checking exactly which
+line changed (only the "Data gaps" line -- neither fixture currently has an exclusion or a
+`_warn_of_exclusions` case to exercise the other two spots). `tests/test_export.py` gained the
+version bump (1.1.0 -> 1.2.0) and five new tests: `provenance is None` on a real native run and on
+a real (fake-crewai) agents run with an empty-fixture contract-driven agents stand-in; a real
+`--adapter-config bluepeak-gen` run's `provenance` block asserted field-for-field against the
+loaded `Contract` object itself (never a hand-typed literal, so the test can't silently drift from
+what the contract actually says); and a `scale_drift` test built by `contract.model_copy(update=
+{"observed": {...}})` on the real bluepeak-gen contract to inject a synthetic signed-vs-loaded
+mismatch, since neither committed contract's real `observed` is populated. Full suite: 986 passed,
+1 skipped (up from 983 -- five new provenance tests, `test_no_fixture_coupling` still the one
+skip).
+
+**Verified live in the browser, not just asserted in tests.** Started `rhino web` against a real
+`--adapter-config bluepeak-gen --data bluepeak` export: the sidebar's ingest-stage detail already
+read "via --adapter-config bluepeak-gen" (the wording fix propagates for free, since the sidebar
+just prints `pipeline.ingest.detail` verbatim), and the Overview tab's new "Mapping provenance"
+card showed `Contract bluepeak-gen v2`, `Confirmed Sep 4, 2026 ... by andy.kopshin@gmail.com`, and
+truncated content/decision digests with the full value on hover. Then wrote a second export from
+the same real run with `contract.model_copy(update={"observed": {"assets_loaded": 3,
+"findings_loaded": 3}})` spliced in (the real contract's own `observed` is null, so this is the
+only way to exercise `scale_drift` against real data) and confirmed the card renders a full
+amber explanatory note -- "confirmed against 3... but this run loaded 47 and 50... re-review the
+contract (`rhino adapt rereview`) if the shape has changed" -- not just the two bare numbers side
+by side, per an explicit requirement added when the design was proposed. Also confirmed the
+built-in-adapter empty state ("Built-in adapter -- no reviewed contract behind this run") on a
+plain `--data demo` export, and that its own "Data gaps" wording correctly stayed `--format
+native` rather than picking up the new `--adapter-config` wording meant only for a contract run.
+`docs/adapter-generation.md`'s Slice 9 row and CLAUDE.md's adapter-generation "Status" paragraph
+both updated to record all nine slices complete.
+
 **Verification.** 55 new tests: `tests/test_remediation.py` (36, new -- `classify_remediation`
 and `note_required_for_transition` in full isolation: every status combination, contradiction
 detection, overdue in every combination of is_kev/due_date/status including a malformed due-date

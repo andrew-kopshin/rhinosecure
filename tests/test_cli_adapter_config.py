@@ -44,7 +44,7 @@ def test_bluepeak_gen_prints_a_table_byte_identical_to_format_bluepeak(capsys):
     # format name -- required so severity_label can never be confused with
     # the built-in "bluepeak"'s own). Strip exactly those two, nothing else.
     via_config_normalized = [
-        line.replace("--format bluepeak-gen", "--format bluepeak")
+        line.replace("--adapter-config bluepeak-gen", "--format bluepeak")
         for line in via_config
         if not line.startswith("Using adapter config")
     ]
@@ -83,7 +83,7 @@ def test_mdvm_gen_differs_from_format_defender_only_in_the_declared_ways(capsys)
     via_config = capsys.readouterr().out.splitlines()
 
     via_config_normalized = [
-        line.replace("MDVMC-", "MDVM-").replace("--format mdvm-gen", "--format defender")
+        line.replace("MDVMC-", "MDVM-").replace("--adapter-config mdvm-gen", "--format defender")
         for line in via_config
         if not line.startswith("Using adapter config")
     ]

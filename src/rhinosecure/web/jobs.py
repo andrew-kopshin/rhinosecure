@@ -302,8 +302,9 @@ def _log_exclusions(adapter: Any, fmt: str) -> None:
     total = len(stats.excluded_assets) + len(stats.excluded_findings)
     if total == 0:
         return
+    flag = f"--adapter-config {fmt}" if getattr(adapter, "contract", None) is not None else f"--format {fmt}"
     print(
-        f"Note: --format {fmt} excluded {len(stats.excluded_assets)} asset(s) and "
+        f"Note: {flag} excluded {len(stats.excluded_assets)} asset(s) and "
         f"{len(stats.excluded_findings)} finding(s) outside this project's declared scope "
         "(not a data-quality problem) while seeding the web job substrate's plan.",
         file=sys.stderr,

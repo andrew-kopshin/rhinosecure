@@ -44,11 +44,12 @@ def test_deterministic_export_matches_schema_shape(tmp_path):
 
     data = json.loads(export_path.read_text(encoding="utf-8"))
 
-    assert data["export_schema_version"] == "1.1.0"
+    assert data["export_schema_version"] == "1.2.0"
     assert data["generated_at"]  # non-empty ISO 8601 string
     assert data["run"] == {
         "data_dir": str(DEMO_DIR), "format": "native", "seed": 42, "offline": True, "agents": False,
     }
+    assert data["provenance"] is None  # native is a built-in adapter -- no contract behind it
 
     assert set(data["pipeline"].keys()) == set(PIPELINE_STAGES)
     for stage in ("ingest", "enrichment", "scoring"):
@@ -124,6 +125,100 @@ def test_deterministic_export_is_valid_json_written_atomically(tmp_path):
     assert export_path.exists()
     assert not export_path.with_name(export_path.name + ".tmp").exists()
     json.loads(export_path.read_text(encoding="utf-8"))  # must not raise
+
+
+# --- provenance: config-driven contract identity ------------------------
+
+BLUEPEAK_DIR = Path(__file__).resolve().parents[1] / "data" / "bluepeak"
+
+
+def test_deterministic_export_carries_contract_provenance_for_a_config_driven_run(tmp_path):
+    from rhinosecure.export import write_run_export
+
+    result = run_with_report(BLUEPEAK_DIR, seed=42, adapter_config="bluepeak-gen")
+    export_path = tmp_path / "export.json"
+
+    write_run_export(
+        export_path, fmt=result.report.format, data_dir=BLUEPEAK_DIR, seed=42, offline=False,
+        agents=False, result=result, memory=None,
+    )
+    data = json.loads(export_path.read_text(encoding="utf-8"))
+
+    contract = result.contract
+    assert contract is not None  # sanity: this run actually went through ConfiguredAdapter
+    assert data["provenance"] == {
+        "format": contract.format,
+        "version": contract.version,
+        "confirmed_at": contract.review.confirmed_at,
+        "confirmed_by": contract.review.confirmed_by,
+        "content_digest": contract.review.content_digest,
+        "decision_digest": contract.review.decision_digest,
+        "scale_drift": None,  # bluepeak-gen.json's observed is null -- nothing to compare against
+    }
+    # the wording fix that came with provenance: the flag named is the one
+    # actually used to invoke this run, never a --format that doesn't exist
+    assert "via --adapter-config bluepeak-gen" in data["pipeline"]["ingest"]["detail"]
+
+
+def test_deterministic_export_reports_scale_drift_when_observed_disagrees(tmp_path):
+    from dataclasses import replace
+
+    from rhinosecure.export import write_run_export
+
+    result = run_with_report(BLUEPEAK_DIR, seed=42, adapter_config="bluepeak-gen")
+    signed_contract = result.contract.model_copy(
+        update={"observed": {"assets_loaded": 3, "findings_loaded": 3}}
+    )
+    result = replace(result, contract=signed_contract)
+    export_path = tmp_path / "export.json"
+
+    write_run_export(
+        export_path, fmt=result.report.format, data_dir=BLUEPEAK_DIR, seed=42, offline=False,
+        agents=False, result=result, memory=None,
+    )
+    data = json.loads(export_path.read_text(encoding="utf-8"))
+
+    assert data["provenance"]["scale_drift"] == {
+        "signed_assets": 3,
+        "signed_findings": 3,
+        "loaded_assets": result.report.assets_total,
+        "loaded_findings": result.report.findings_total,
+    }
+
+
+def test_agents_export_carries_contract_provenance_for_a_config_driven_run(tmp_path):
+    """A minimal, hand-built Coordinator stand-in -- proves the agents
+    builder wires `coordinator.contract` into `provenance` the same way
+    the deterministic builder wires `result.contract`, without paying for
+    a real (fake-crewai) agent run just to exercise this one field."""
+    from rhinosecure.adapters import load_config_adapter
+    from rhinosecure.enrich.cache import SnapshotCache
+    from rhinosecure.export import write_run_export
+
+    contract = load_config_adapter("bluepeak-gen").contract
+    coordinator = SimpleNamespace(
+        contract=contract,
+        cache=SnapshotCache(),
+        _asset_index={},
+        state=SimpleNamespace(
+            enriched_by_id={}, research_by_id={}, research_failures={},
+            environment_failures={}, risk_failures={}, tot_failures={},
+            risk_by_id={}, tot_by_id={},
+            research_usage=None, environment_usage=None, risk_usage=None, tot_usage=None,
+        ),
+        ranked=lambda: [],
+    )
+    export_path = tmp_path / "export.json"
+
+    write_run_export(
+        export_path, fmt="bluepeak-gen", data_dir=BLUEPEAK_DIR, seed=42, offline=False,
+        agents=True, coordinator=coordinator, memory=None,
+    )
+    data = json.loads(export_path.read_text(encoding="utf-8"))
+
+    assert data["provenance"]["format"] == "bluepeak-gen"
+    assert data["provenance"]["version"] == contract.version
+    assert data["provenance"]["confirmed_by"] == contract.review.confirmed_by
 
 
 # --- deterministic path: constraints.asset_scoped's "not applied" note --
@@ -543,6 +638,7 @@ def test_agents_export_full_shape_with_contested_finding_and_constraint(monkeypa
     data = json.loads(export_path.read_text(encoding="utf-8"))
 
     assert data["run"]["agents"] is True
+    assert data["provenance"] is None  # this Coordinator was built with no contract (native)
     assert data["pipeline"]["agents"]["status"] == "completed"
     assert data["pipeline"]["tot"]["status"] == "completed"
     assert "1 contested finding(s) resolved, 0 failed" in data["pipeline"]["tot"]["detail"]

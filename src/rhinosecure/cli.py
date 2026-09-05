@@ -356,9 +356,10 @@ def run_agents(
     random.seed(seed)  # see run()'s comment -- still a no-op for now
     adapter = load_config_adapter(adapter_config) if adapter_config else get_adapter(fmt)
     fmt = adapter.format
+    contract = getattr(adapter, "contract", None)
     assets, enriched = load_batch(data_dir, adapter)
     findings = list(enriched)
-    _warn_of_exclusions(adapter.stats, fmt)
+    _warn_of_exclusions(adapter.stats, fmt, contract)
     memory = Memory(db_path if db_path is not None else DEFAULT_DB_PATH)
     coordinator = Coordinator(
         data_dir,
@@ -366,7 +367,7 @@ def run_agents(
         memory=memory,
         assets=assets,
         ingest_format=adapter.run_label,
-        contract=getattr(adapter, "contract", None),
+        contract=contract,
     )
     coordinator.run(findings)
     return coordinator
@@ -399,9 +400,10 @@ def submit_constraint(
     random.seed(seed)
     adapter = load_config_adapter(adapter_config) if adapter_config else get_adapter(fmt)
     fmt = adapter.format
+    contract = getattr(adapter, "contract", None)
     assets, enriched = load_batch(data_dir, adapter)
     findings = list(enriched)
-    _warn_of_exclusions(adapter.stats, fmt)
+    _warn_of_exclusions(adapter.stats, fmt, contract)
     memory = Memory(db_path if db_path is not None else DEFAULT_DB_PATH)
     coordinator = Coordinator(
         data_dir,
@@ -409,7 +411,7 @@ def submit_constraint(
         memory=memory,
         assets=assets,
         ingest_format=adapter.run_label,
-        contract=getattr(adapter, "contract", None),
+        contract=contract,
     )
     return coordinator.submit_constraint(text, findings, seed=seed)
 
@@ -699,7 +701,16 @@ def _print_adapter_config_banner(contract: Contract | None, report: IngestReport
     )
 
 
-def _print_exclusions(report: IngestReport) -> None:
+def _ingest_flag(fmt: str, contract: Contract | None) -> str:
+    """How this run's ingest source is actually invoked from the CLI --
+    `--format X` for a built-in adapter, `--adapter-config X` for a
+    confirmed contract. Duplicated in `export.py` rather than imported: a
+    one-line formula, and the two modules deliberately don't import each
+    other at module level."""
+    return f"--adapter-config {fmt}" if contract is not None else f"--format {fmt}"
+
+
+def _print_exclusions(report: IngestReport, contract: Contract | None = None) -> None:
     """Scope-boundary exclusions (adapters/base.py's `ProblemCollector
     .exclude` -- e.g. Defender's non-Windows `OSPlatform`, BluePeak's
     unmapped `Asset_Type`), printed BEFORE the table, unlike the gap
@@ -713,9 +724,9 @@ def _print_exclusions(report: IngestReport) -> None:
     original_assets = report.assets_total + len(report.excluded_assets)
     original_findings = report.findings_total + len(report.excluded_findings)
     print(
-        f"Excluded (--format {report.format}): {len(report.excluded_assets)}/{original_assets} asset(s), "
-        f"{len(report.excluded_findings)}/{original_findings} finding(s) -- outside this project's declared "
-        "scope, not a data-quality problem. The rest of the batch is scored below."
+        f"Excluded ({_ingest_flag(report.format, contract)}): {len(report.excluded_assets)}/{original_assets} "
+        f"asset(s), {len(report.excluded_findings)}/{original_findings} finding(s) -- outside this project's "
+        "declared scope, not a data-quality problem. The rest of the batch is scored below."
     )
     by_reason: dict[str, list[str]] = {}
     for asset_id, reason in report.excluded_assets.items():
@@ -729,7 +740,7 @@ def _print_exclusions(report: IngestReport) -> None:
     print()
 
 
-def _warn_of_exclusions(stats: IngestStats, fmt: str) -> None:
+def _warn_of_exclusions(stats: IngestStats, fmt: str, contract: Contract | None = None) -> None:
     """The `--agents`/`constraint add` paths' counterpart to
     `_print_exclusions` -- they don't build a full `IngestReport` (no
     `GapTally` pass over the enriched findings), so this is a shorter,
@@ -740,7 +751,7 @@ def _warn_of_exclusions(stats: IngestStats, fmt: str) -> None:
     if total == 0:
         return
     print(
-        f"Note: --format {fmt} excluded {len(stats.excluded_assets)} asset(s) and "
+        f"Note: {_ingest_flag(fmt, contract)} excluded {len(stats.excluded_assets)} asset(s) and "
         f"{len(stats.excluded_findings)} finding(s) outside this project's declared scope "
         "(not a data-quality problem) -- run `rhino run` (without --agents) for the full "
         "breakdown of what and why.",
@@ -748,7 +759,7 @@ def _warn_of_exclusions(stats: IngestStats, fmt: str) -> None:
     )
 
 
-def _print_ingest_report(report: IngestReport) -> None:
+def _print_ingest_report(report: IngestReport, contract: Contract | None = None) -> None:
     """The data-gap summary for a non-native format: which schema fields
     the export had no concept of (or left blank), on how many records,
     and what the adapter collapsed on the way in. Prints nothing when
@@ -761,7 +772,10 @@ def _print_ingest_report(report: IngestReport) -> None:
         return
     print()
     if report.has_gaps:
-        print(f"Data gaps (--format {report.format}): fields this export has no concept of, or left blank.")
+        print(
+            f"Data gaps ({_ingest_flag(report.format, contract)}): fields this export has no concept of, "
+            "or left blank."
+        )
         print(
             _wrap(
                 "The values in effect for them are documented defaults (adapters/base.py, "
@@ -1726,10 +1740,10 @@ def main(argv: list[str] | None = None) -> int:
 
         scored = result.scored
         _print_adapter_config_banner(result.contract, result.report)
-        _print_exclusions(result.report)
+        _print_exclusions(result.report, result.contract)
         _print_table(scored)
         _print_contested_rate(contested_rate(s.bucket.value for s in scored))
-        _print_ingest_report(result.report)
+        _print_ingest_report(result.report, result.contract)
 
         if args.track_remediation:
             from rhinosecure import remediation
@@ -1898,9 +1912,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"warning: export file does not exist yet: {resolved}", file=sys.stderr)
         print(f"RhinoSecure web viewer -- serving {resolved}")
         if args.enable_jobs:
+            ingest_label = (
+                f"adapter config: {job_config.adapter_config}"
+                if job_config.adapter_config
+                else f"format: {job_config.fmt}"
+            )
             print(
                 f"  write mode enabled -- jobs will run agent code (dataset: {job_config.data_dir}, "
-                f"format: {job_config.fmt}) and persist to {db_path}"
+                f"{ingest_label}) and persist to {db_path}"
             )
         if args.enable_chat:
             print("  chat enabled -- POST /api/chat calls the LLM seam per question (reads only, no writes)")
