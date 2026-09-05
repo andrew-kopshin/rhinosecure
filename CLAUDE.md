@@ -42,8 +42,13 @@ this project.
 - Exploiting anything
 - EDR/telemetry ingestion, log analysis, PowerShell behavior analysis
 - Alert triage or incident investigation
-- Automated remediation execution
+- Automated remediation execution †
 - Production-grade vulnerability management features
+
+† Out of scope for the capstone build described in this document. No longer treated as a
+permanent boundary — see "Future direction: remediation execution" at the end of this file
+for a recorded (not built) scope decision that reverses this for a later phase, and the
+"Safety and guardrails" section's revised Checkpoint 6 correction for what that changes.
 
 ### Synthetic data is a scaffold, not the design
 
@@ -894,21 +899,31 @@ why the deterministic path is fenced off from the agents.
 
 ## Safety and guardrails
 
-**Checkpoint 6 correction.** CP6 described the agent as monitoring live system activity,
-ingesting telemetry and system logs, and taking high-impact actions on a system — deleting
-files, permanently blocking software, changing security settings — that must be gated behind
-human approval. None of that describes RhinoSecure. Per Section 1, live scanning,
-EDR/telemetry ingestion, and automated remediation execution are explicitly out of scope.
-RhinoSecure ingests two static CSVs (`assets.csv`, `findings.csv`), enriches from read-only
-public sources, and emits a ranked plan — a document, not an action. It holds no write path to
-any monitored system, so "gate destructive actions behind human approval" doesn't apply: there
-is no system action to gate, because the agent's only write access is to its own SQLite memory
-(Section 7) and `out/` plan files. Where CP6's underlying concern is real — the agent shouldn't
-force a conclusion it can't support, and a human should be the backstop when signals conflict —
-that concern is honored here, just realized as escalation inside a *report* rather than a
-permission check on a *system call*. The rest of this section keeps what CP6 got right
-(trusted-source-only enrichment, least-privilege tool access, escalate rather than force) and
-drops what described a different product.
+**Checkpoint 6 correction — revised.** CP6 described the agent as monitoring live system
+activity, ingesting telemetry and system logs, and taking high-impact actions on a system —
+deleting files, permanently blocking software, changing security settings — that must be gated
+behind human approval. None of that describes RhinoSecure **as built today**. Per Section 1,
+live scanning and EDR/telemetry ingestion are explicitly out of scope, full stop; automated
+remediation execution is out of scope for *this build* specifically, and — per "Future direction:
+remediation execution" at the end of this file — is now a recorded future direction rather than a
+permanent boundary. This paragraph originally treated all three the same way; it no longer does,
+and the rest of this correction is revised accordingly rather than left asserting a boundary that
+section reverses.
+
+RhinoSecure, as built, ingests two static CSVs (`assets.csv`, `findings.csv`), enriches from
+read-only public sources, and emits a ranked plan — a document, not an action. It holds no write
+path to any monitored system, so "gate destructive actions behind human approval" has nothing to
+gate yet: the agent's only write access is to its own SQLite memory (Section 7) and `out/` plan
+files. That is a fact about the current build, not a reason CP6's underlying concern doesn't
+apply — it does, and "Future direction: remediation execution" commits to a human gate (accept,
+amend, or reject) on every recommendation before anything runs, for exactly that reason, once
+execution exists to gate. Separately, and unaffected by any of this: CP6's concern that the agent
+shouldn't force a conclusion it can't support, and that a human should be the backstop when
+signals conflict, is already honored today as escalation inside a *report* (`contested`,
+Section 6) rather than a permission check on a *system call* — that piece was correct before and
+stays correct now. The rest of this section keeps what CP6 got right (trusted-source-only
+enrichment, least-privilege tool access, escalate rather than force) and drops what described a
+different product.
 
 ### Implemented
 
@@ -1256,3 +1271,48 @@ tier here: agent runs make many calls and Opus costs significantly more per toke
 - MITRE ATT&CK — `mitre-attack/attack-stix-data` on GitHub (use the Enterprise bundle; filter to Windows platform)
 
 **Tooling:** DB Browser for SQLite for inspecting the memory database.
+
+---
+
+## Future direction: remediation execution (recorded, not built)
+
+**This section records a scope decision. It is not a design, and nothing in it is built.**
+No code, schema, or interface described or implied below exists. Do not build against this
+section without a separate, explicit design pass first.
+
+**The decision.** RhinoSecure's mandate does not end at producing a ranked plan. The intended
+endpoint is a system that executes the remediation it recommends, not only ranks findings and
+explains them — with a human gate on every recommendation: **accept, amend, or reject**, before
+anything runs. This reverses the position "Safety and guardrails" took on CP6 — that section's
+Checkpoint 6 correction is revised in place, above, rather than left contradicting this one.
+
+**Section 1's scaffold rule still governs, and matters more here than anywhere else in this
+document.** The synthetic fixture is a prototyping constraint, not a property of the system
+(Section 1: "no component may assume its input is synthetic"; "RhinoSecure is designed to read
+real enterprise vulnerability data"). That rule was written against ingest and scoring, where
+getting it wrong costs a wrong number in a report — a mislabeled synthetic row is recoverable by
+correcting the row and rerunning. Execution changes the cost function: a patch pushed to a real
+production server is not undone by rerunning anything. The adapter-seam discipline that let a
+real Defender export be "an adapter and nothing else" (Section 1) does not, by itself, make
+executing against a real fleet safe — that discipline was built and validated for reading data,
+never for acting on it, and nothing about the plan-only build to date exercises the execution
+risk at all.
+
+**Open questions — not decided, not designed, listed so they aren't answered by accident later:**
+
+- **What layer actually executes.** Driving existing patch-management infrastructure that
+  already has its own staged-rollout and audit trail (WSUS, Intune, SCCM), versus RhinoSecure
+  reaching endpoints directly. These are different trust and blast-radius profiles, and nothing
+  here favors one.
+- **What credentials that requires.** Whichever layer executes needs standing access to push
+  changes to production systems — categorically different from anything this project holds
+  today (an LLM API key; read-only public threat-intel sources named in Section 4/11).
+- **How rollback works when a patch breaks production.** Accept/amend/reject gates the decision
+  to apply a fix. It says nothing about what happens after a fix is applied and turns out to be
+  wrong, and no rollback mechanism is assumed.
+- **How the job substrate extends to cover it.** `web/jobs.py`'s `JOB_HANDLERS` dispatch table
+  was built generically enough that a new job *kind* is meant to be a small addition — but that
+  claim was made and tested for a second *planning* job (a future full `--agents` run), not an
+  *executing* one. Whether an execution job fits the same shape, the same single-job-at-a-time
+  concurrency model, and the same failure-taxonomy pattern the constraint-submission job uses is
+  open, not assumed to transfer.
