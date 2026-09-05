@@ -1962,3 +1962,39 @@ finding still enriching correctly (proving grounding stays correct regardless of
 recorded above -- that's a truthfulness problem in the prose itself, and narrowing the context
 doesn't make a model that already passed grounding tell the truth about what it was given. Different
 failure, different fix; both are now recorded against the same feature.
+
+**Retest: `qwen2.5:32b` against the F14 question again, now with the pre-filter narrowing context
+from 42KB to 7KB -- correct this time, confirming the hypothesis above rather than just asserting
+it.** Same question, same model, same fixture; the only thing that changed is that F14 is now one
+full finding among 23 compact ones instead of one record buried in a 24-entry blob. The answer
+correctly named all three real facts the deterministic scorer's own rationale states: KEV-listed
+(confirmed exploitation), no compensating control, no patch window -- and that this combination is
+why the finding was routed to Tree-of-Thought rather than landing in one of the four real buckets.
+No invented CVE, no invented hostname, no false claim that the rationale was missing. This is
+evidence, not just plausible reasoning, that the earlier full-context failure on this same model was
+a long-context retrieval problem -- losing track of one record inside a large blob -- and not a
+capability ceiling: the model didn't get smarter between the two runs, the context got smaller and
+better-organized. Response time was roughly 10 minutes on CPU -- local inference through the same
+provider-agnostic `llm.py` seam works, but at a real latency cost the hosted Anthropic path doesn't
+have; nothing about that cost is specific to this model or question, it's the operational tradeoff
+CLAUDE.md's "Trust boundary and provider independence" section already named as inherited from any
+LLM dependency, now with a concrete number attached instead of an abstract caveat.
+
+**The three-model progression, end to end, is now a clean record of three DIFFERENT failure modes,
+not three points on one difficulty scale:**
+
+| Model | Tested against | Result |
+|---|---|---|
+| `llama3.1:8b` | The main agent pipeline (Research/Environment/Risk), 2026-09-04 -- predates the chat layer, a different subsystem, included here for the full local-model picture rather than implying an apples-to-apples chat comparison | Outright structured-output/grounding failure: 0/3 findings scored. Loud -- caught by existing machinery, nothing shipped. |
+| `qwen2.5:14b` | The chat layer, full context, above | Schema-valid, citation-grounded, PROSE fabricated (invented "incomplete data collection" instead of the real KEV/no-control/no-window reason). Quiet -- passed every mechanical check that exists, still wrong. |
+| `qwen2.5:32b` | The chat layer, full context, then again with the pre-filter | Full context: invented a CVE/asset/hostname for F14 and claimed its real rationale was absent. Pre-filtered context: correct, matching the export's real rationale exactly. |
+
+Three genuinely different shapes of failure -- can't produce the schema at all; produces it but
+lies in the prose; loses track of the right record in too much context -- and only the third one is
+what a smaller, better-organized prompt can fix. The other two remain open, unrelated problems: a
+model that can't hit the schema needs a different model or a stricter decoding constraint, not less
+context, and a model whose PROSE lies while its citation is real needs the general "grounding
+validation" mechanism CLAUDE.md's Safety and guardrails section already names as unbuilt, not a
+smaller prompt. Local inference is a working free option for the one failure mode it actually
+addresses -- confirmed working, not merely plausible -- with response time as the real, measured
+tradeoff against it.
