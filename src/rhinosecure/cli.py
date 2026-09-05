@@ -982,7 +982,19 @@ def _print_propose_report(data_dir: Path, name: str, result: "ProposeResult") ->
             f"Result: {len(unresolved)} slot(s) unresolved, "
             f"{len(result.grounding.failed_slots)} slot(s)/reference(s) failed grounding -- NOT written."
         )
-        print(_wrap(f"Blocking: {blocking}", indent="  ", continuation_indent="    "))
+        if blocking:
+            print(_wrap(f"Blocking: {blocking}", indent="  ", continuation_indent="    "))
+        if result.incomplete_reason:
+            # Every slot was mapped and grounding was clean, but assembly's
+            # own validate_contract safety net still refused (an illegal
+            # vocabulary value, an illegal union_fields entry, etc.) --
+            # blocking alone would print as empty here with no explanation.
+            print(
+                _wrap(
+                    f"validate_contract refused the assembled contract: {result.incomplete_reason}",
+                    indent="  ! ", continuation_indent="    ",
+                )
+            )
 
     g = result.generator
     print(

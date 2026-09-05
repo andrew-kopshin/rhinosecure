@@ -83,6 +83,7 @@ from rhinosecure.adapters.config_model import (
     RESERVED_PROVENANCE_LABELS,
     UNIONABLE_TARGETS,
     AssetGrouping,
+    Attestation,
     Contract,
     Derivation,
     Enrichment,
@@ -99,6 +100,7 @@ from rhinosecure.adapters.config_model import (
     _composed_columns,  # the exact placeholder-extraction validate_contract itself uses
     _FORMAT_PATTERN,  # the exact pattern Contract.format itself is checked against
     ContractValidationError,
+    missing_attestations,
     validate_contract,
 )
 from rhinosecure.adapters.configured import _apply_case  # the exact case transform applied before any table lookup
@@ -669,11 +671,29 @@ def assemble_contract(
     # mean "actually valid" rather than merely "the parts we checked looked
     # fine". A failure here is reported the same as any other assembly
     # refusal -- not silently downgraded to a caveat.
+    #
+    # V18 (attestations) is deliberately checked against a PLACEHOLDER copy,
+    # never the real `contract`: attestations are a confirm-time human act
+    # (config_io's own "Order, which is not negotiable" -- attestations are
+    # merged in, THEN validate_contract runs, in `rhino adapt confirm`), so a
+    # freshly-proposed contract can never carry one yet. Without this, any
+    # proposal using `content_address` for finding_id (exactly the case it
+    # exists for: no natural id column) would fail V18 unconditionally and
+    # could never be assembled at all -- confirmed by running this against a
+    # real source. The placeholder attestations exist only in the copy
+    # handed to `validate_contract` here; the `contract` this function
+    # returns and the caller writes to disk carries none, so `rhino adapt
+    # confirm` still correctly demands the real ones later.
     headers = {proposal.meta.assets_filename: assets_profile.header}
     if proposal.meta.findings_filename != proposal.meta.assets_filename:
         headers[proposal.meta.findings_filename] = findings_profile.header
+    placeholder_attestations = [
+        Attestation(item=item, text="propose-time structural check only -- not a real attestation", at=generated_at)
+        for item in missing_attestations(contract)
+    ]
+    check_contract = contract.model_copy(update={"attestations": list(contract.attestations) + placeholder_attestations})
     try:
-        validate_contract(contract, headers)
+        validate_contract(check_contract, headers)
     except ContractValidationError as exc:
         raise ProposalIncompleteError(
             f"every slot was mapped and grounded, but the assembled contract fails the real contract "
@@ -860,9 +880,24 @@ def _build_task_description(name: str, layout: str, assets_filename: str, findin
     sample_text = "\n\n".join(_sample_rows(profiles[f], sample_rows) for f in dict.fromkeys([assets_filename, findings_filename]))
     return (
         f"Propose an ingest contract named {name!r} for a new vulnerability-scanner source.\n\n"
-        f"source_layout: {layout!r}\nassets_filename: {assets_filename!r}\nfindings_filename: {findings_filename!r}\n"
-        "Your `meta.format`/`meta.source_layout`/`meta.assets_filename`/`meta.findings_filename` MUST echo "
-        "these four facts exactly -- they are not yours to redecide.\n\n"
+        f"source_layout: {layout!r}\nassets_filename: {assets_filename!r}\nfindings_filename: {findings_filename!r}\n\n"
+        "Your top-level JSON output MUST have exactly this shape -- these are the ONLY top-level "
+        "keys, and `meta` has EXACTLY these six keys, spelled exactly this way (the format name "
+        f'field is `"format"`, never `"name"`):\n'
+        "{\n"
+        '  "meta": {\n'
+        f'    "format": {name!r}, "description": "<one sentence describing this source>",\n'
+        f'    "source_layout": {layout!r}, "assets_filename": {assets_filename!r}, '
+        f'"findings_filename": {findings_filename!r},\n'
+        '    "reasoning_summary": "<one or two sentences on your overall mapping approach>"\n'
+        "  },\n"
+        '  "asset": {...one entry per asset.* target, see below...},\n'
+        '  "finding": {...one entry per finding.* target, see below...},\n'
+        '  "derived": {} ,   "asset_grouping": {...},   "finding_dedup": {...},\n'
+        '  "enrichment": null,   "unmapped_columns": {...},   "open_questions": []\n'
+        "}\n"
+        "The four echoed facts (`format`, `source_layout`, `assets_filename`, `findings_filename`) "
+        "are not yours to redecide -- copy them verbatim from above.\n\n"
         f"{profile_text}\n\n{sample_text}\n\n{_GRAMMAR_REFERENCE}\n\n"
         "Map every asset.* and finding.* target to a real column where you can, honestly, and mark it "
         "unresolved where you cannot. Account for every column in unmapped_columns if it feeds no mapping. "
@@ -910,6 +945,13 @@ class ProposeResult:
     contract: Contract | None
     generator: Generator
     profiles: dict[str, FileProfile]
+    #: Set only when `contract is None` AND the reason isn't already fully
+    #: explained by an unresolved slot or a grounding failure -- i.e. the
+    #: `validate_contract` safety net inside `assemble_contract` is what
+    #: refused (an illegal vocabulary value, an illegal `union_fields`
+    #: entry, etc.). Without this, a human sees "0 unresolved, 0 grounding
+    #: failures -- NOT written" with no way to tell why.
+    incomplete_reason: str | None = None
 
 
 def _check_meta_matches(proposal: AdapterProposal, name: str, layout: str, assets_filename: str, findings_filename: str) -> None:
@@ -1010,9 +1052,14 @@ def propose_contract(
         )
 
     report = check_grounding(proposal, profiles)
+    incomplete_reason: str | None = None
     try:
         contract = assemble_contract(proposal, profiles, report, generator=generator, generated_at=generated_at)
-    except ProposalIncompleteError:
+    except ProposalIncompleteError as exc:
         contract = None
+        incomplete_reason = str(exc)
 
-    return ProposeResult(proposal=proposal, grounding=report, contract=contract, generator=generator, profiles=profiles)
+    return ProposeResult(
+        proposal=proposal, grounding=report, contract=contract, generator=generator, profiles=profiles,
+        incomplete_reason=incomplete_reason,
+    )

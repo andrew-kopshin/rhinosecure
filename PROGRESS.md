@@ -1732,3 +1732,64 @@ findings_profile`, unable to prove `is_asset` selects the right side at all), `d
 `validate_contract` safety net against an illegal vocabulary value and an illegal `union_fields`
 entry. Full suite: 861 passed, 1 skipped. `git status` confirmed clean of any stray write outside
 the intended files throughout.
+
+**Differential check, for real: `rhino adapt propose` against the committed Defender fixture,
+confirmed, run, and diffed against the hand-written `defender.py` adapter on the same data.** This
+is the first real (non-mocked-Crew) exercise of the whole propose -> confirm -> run pipeline, and
+it surfaced two more real defects no unit test had a chance to catch, because a hand-crafted test
+fixture always already matches the schema the test author had in mind.
+
+1. **The prompt never actually stated `ProposalMeta`'s field names.** All 3 attempts failed to
+   parse: the model produced `meta.name` instead of `meta.format`, and omitted `description`/
+   `reasoning_summary` entirely -- reasonable inferences from context (the CLI's own positional
+   argument is literally called `name`), but `_build_task_description` never gave the model an
+   explicit key-name list for `meta`, only prose describing the four echoed facts. Fixed: the task
+   description now opens with a literal, exact top-level JSON skeleton naming all six `meta` keys.
+   Second attempt with the fix: parsed clean on attempt 1.
+2. **`assemble_contract`'s new `validate_contract` safety net (added by the adversarial review
+   above) unconditionally refused any proposal using `content_address` for `finding_id`** -- V18
+   requires a `finding_id.synthesized` attestation, but attestations are a confirm-time human act
+   (`config_io`'s own "attestations merge in, THEN validate_contract runs" ordering); a freshly
+   assembled proposal can never carry one yet. Since `content_address` exists specifically for a
+   source with no natural finding-id column -- exactly Defender's `vulnerabilities.csv` -- this
+   meant the safety net, meant to catch real defects, instead made an entire legitimate class of
+   proposal unassemblable. Fixed: `assemble_contract` validates against a COPY of the contract
+   carrying placeholder attestations for whatever `missing_attestations` would demand, never the
+   real one -- so the structural check still runs in full, but the contract actually returned and
+   written carries zero attestations, and `rhino adapt confirm` still correctly demands the real
+   one later. A related, smaller gap fixed alongside it: `propose_contract` was silently discarding
+   the `ProposalIncompleteError` message whenever `assemble_contract`'s validator (not grounding)
+   was what refused, so the CLI could print "0 unresolved, 0 grounding failures -- NOT written"
+   with no way to tell why -- `ProposeResult.incomplete_reason` now carries it through.
+
+**The differential result itself, once both fixes landed:** the model, unprompted, chose a
+DIFFERENT derivation source than the hand-written adapter for `asset.role` (`MachineGroup`
+Servers/Workstations, vs. `defender.py`'s own `OSPlatform`-keyed `OS_PLATFORMS` table) -- both
+correct, because `MachineGroup` happens to correlate perfectly with OS class in this fixture --
+and correctly left `asset.criticality` UNRESOLVED rather than guess between `AssetValue` and
+`ExposureLevel` (two candidate columns, no way to know which one the target's 1-5 scale intends,
+or that `AssetValue`'s Low/Normal/High needs the exact numeric mapping `defender.py` hand-encodes).
+Hand-completed `criticality` the same way `defender.py` does (`AssetValue` -> 1/3/5) to finish the
+check -- with `"Low"` correctly OMITTED from the table, since this fixture never exercises it and
+grounding refused a value it can't verify (a real, structural difference from the hand-written
+adapter's table, which encodes all three documented tiers regardless of any one sample: a
+confirmed contract's vocabulary coverage is bounded by what its reviewed sample actually contained
+in a way a general-purpose Python table isn't).
+
+**The scored, ranked, bucketed output is BYTE-IDENTICAL to `defender.py`'s own** across all 9
+findings: same risk_score, same bucket, same 6/9 (66.7%) contested rate, same Impact-axis values
+(role, environment, data_sensitivity, criticality, internet_exposed), same not_collected gaps.
+The only real differences: `finding_id` values themselves (a different, but equally valid,
+content_address recipe -- `defender.py` additionally hashes `SoftwareVendor` and uses uppercase
+hex; `memory.decisions` rows will not be shared between the two formats, an accepted tradeoff
+recorded in the confirm attestation), and the ATT&CK "unconfirmed candidate" technique lists for
+5 of 9 findings -- traced to `enrich/attack.match`'s query text being `f"{product} {evidence}"`:
+the propose-generated contract's composed `evidence` (remediation trail only) differs from
+`defender.py`'s own (which restates vendor/product/version first), so semantic retrieval over a
+genuinely different query string surfaces a different candidate set. Neither difference touches
+scoring -- unconfirmed ATT&CK candidates are never used in it.
+
+`data/adapters/defender-propose-check.json` (confirmed, signed by an automated identity for this
+check, not a named human maintainer) is left uncommitted pending a decision on whether to keep it
+as a third example contract or discard it -- unlike `bluepeak-gen.json`/`mdvm-gen.json`, it is the
+first ever produced by the actual phase-1 agent rather than hand-authored.

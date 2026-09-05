@@ -817,6 +817,39 @@ def test_two_file_layout_assembles_and_validates_end_to_end(two_file_profiles):
     })
 
 
+def test_assemble_contract_succeeds_with_a_content_address_finding_id_and_no_attestations(profiles):
+    """A real-world regression, caught only by actually running propose
+    against the Defender fixture: `validate_contract`'s V18 requires a
+    `finding_id.synthesized` attestation whenever finding.finding_id is a
+    content_address -- but attestations are a confirm-time human act
+    (config_io's own "attestations merge in, THEN validate_contract runs"
+    ordering) and a freshly assembled proposal can never carry one yet.
+    Without the placeholder-attestation workaround in assemble_contract,
+    EVERY proposal using content_address (exactly the case it exists for:
+    no natural finding-id column) would fail assembly unconditionally."""
+    data = _full_proposal_dict(overrides_finding={
+        "finding_id": _mapped(
+            {"kind": "content_address", "algorithm": "sha256", "columns": ["Asset_ID", "Cve"], "join": "", "prefix": "", "hex_len": 16, "case": "upper", "recipe_version": 1},
+            columns_cited=["Asset_ID", "Cve"],
+        ),
+    })
+    # Finding_ID's own column is no longer consumed by the overridden finding_id mapping above --
+    # account for it so this test isolates the attestation fix, not a stray V08 column-accounting gap.
+    data["unmapped_columns"] = {"data.csv": {"Finding_ID": {"disposition": "ignored", "reason": "test", "profile_cited": "n/a"}}}
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles)
+    assert report.failures == []
+    contract = assemble_contract(proposal, profiles, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract.attestations == []  # the real, written contract carries no placeholder
+    # Exactly what `rhino adapt confirm` must still refuse until a human supplies the real
+    # attestation -- the placeholder trick is scoped to assemble_contract's own internal
+    # structural check and must never leak into the contract this function returns.
+    from rhinosecure.adapters.config_model import ContractValidationError as _CVE
+
+    with pytest.raises(_CVE, match="finding_id.synthesized"):
+        validate_contract(contract, {"data.csv": _HEADER})
+
+
 # --- load_saved_proposal: a hand-edited file with a real schema error --------
 
 
