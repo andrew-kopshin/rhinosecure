@@ -521,6 +521,615 @@ function branchHtml(b, nearTie) {
   `;
 }
 
+/* ---------------- scenarios ---------------- */
+
+/* Deterministic and free -- pure filtering/summarizing of data.findings,
+ * already fetched. No fetch(), no job substrate, no model call anywhere
+ * below. Selection state lives only in this tab/session (a Set of
+ * finding_id, persisted to sessionStorage -- see reconcileSelection). */
+
+/* Mirrors scoring.ROLE_BLAST_RADIUS's >=0.85 tier (scoring.py) -- duplicated
+ * here rather than shared, the same call this codebase already makes for
+ * small code-owned constants that cross a module boundary (e.g. probe.py's
+ * own copy of configured.py's CVE-id pattern): cheap to keep in sync, and a
+ * static frontend has no Python import to reach for anyway. If scoring.py's
+ * table changes, update this list to match. */
+const HIGH_BLAST_RADIUS_ROLES = new Set([
+  "dc", "exchange", "identity_gateway", "sql", "firewall", "container_orchestrator",
+]);
+
+const COVERAGE_ITEM_CAP = 5;
+const SCENARIO_PAGE_SIZE = 50;
+
+let scenarioMode = "recommended"; // "recommended" | "selection"
+let selectedFindingIds = new Set();
+let scenarioSelectionKey = null; // plan-identity key the current selection was loaded/reconciled against
+let scenarioReconcileNotice = null; // set by reconcileSelection; shown once, dismissible
+let scenarioFilters = {
+  buckets: new Set(),
+  kev: null, // null = any, true = KEV only, false = non-KEV only
+  exposed: null, // null = any, true = internet-exposed only, false = not-exposed only
+  role: "",
+  highBlastRadius: false,
+  onlyUnaddressed: false,
+  search: "",
+};
+let scenarioPage = 1;
+
+function scenarioStorageKey(data) {
+  const r = data.run;
+  return `rhinosecure:scenario-selection:${r.data_dir}|${r.format}|${r.seed}|${r.agents}`;
+}
+
+function loadPersistedSelection(key) {
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (!raw) return new Set();
+    const ids = JSON.parse(raw);
+    return new Set(Array.isArray(ids) ? ids : []);
+  } catch (err) {
+    return new Set(); // sessionStorage unavailable (private mode, etc.) -- start clean, never fatal
+  }
+}
+
+function persistSelection(key) {
+  if (!key) return;
+  try {
+    sessionStorage.setItem(key, JSON.stringify([...selectedFindingIds]));
+  } catch (err) {
+    // best-effort convenience only -- never block the UI on storage failing
+  }
+}
+
+/* Runs once per full renderScenarios() pass, never from a results-only
+ * update. A DIFFERENT plan identity (data_dir/format/seed/agents changed)
+ * starts from THAT plan's own persisted selection rather than inheriting
+ * one built against an unrelated fleet; the SAME identity (a live
+ * job-triggered refresh, or the same page still open) keeps whatever is
+ * already in memory and only drops finding_ids that no longer exist --
+ * reported, never silently absorbed. */
+function reconcileSelection(data) {
+  const key = scenarioStorageKey(data);
+  if (key !== scenarioSelectionKey) {
+    selectedFindingIds = loadPersistedSelection(key);
+    scenarioSelectionKey = key;
+  }
+  const known = new Set(data.findings.map((f) => f.finding_id));
+  const removed = [...selectedFindingIds].filter((id) => !known.has(id));
+  if (removed.length) {
+    removed.forEach((id) => selectedFindingIds.delete(id));
+    scenarioReconcileNotice =
+      `${removed.length} previously-selected finding(s) are no longer in this plan and were ` +
+      `removed from your selection: ${removed.map(esc).join(", ")}.`;
+    persistSelection(key);
+  } else {
+    scenarioReconcileNotice = null;
+  }
+}
+
+function recommendedFindingIds(data) {
+  return data.findings.filter((f) => f.bucket === "patch_now" || f.bucket === "contested").map((f) => f.finding_id);
+}
+
+/* The one predicate the filter bar, the bulk "select/clear shown" actions,
+ * and a coverage category's "+N more" link all share -- so "what's
+ * visible" and "what a bulk action acts on" can never silently disagree. */
+function findingMatchesFilters(f, filters) {
+  if (filters.buckets.size && !filters.buckets.has(f.bucket)) return false;
+  if (filters.kev === true && !f.is_kev) return false;
+  if (filters.kev === false && f.is_kev) return false;
+  if (filters.exposed === true && !f.asset.internet_exposed) return false;
+  if (filters.exposed === false && f.asset.internet_exposed) return false;
+  if (filters.role && f.asset.role !== filters.role) return false;
+  if (filters.highBlastRadius && !HIGH_BLAST_RADIUS_ROLES.has(f.asset.role)) return false;
+  if (filters.onlyUnaddressed && selectedFindingIds.has(f.finding_id)) return false;
+  if (filters.search) {
+    const q = filters.search.toLowerCase();
+    const hay = `${f.hostname} ${f.cve_id} ${f.finding_id}`.toLowerCase();
+    if (!hay.includes(q)) return false;
+  }
+  return true;
+}
+
+function filteredScenarioFindings(data) {
+  return data.findings.filter((f) => findingMatchesFilters(f, scenarioFilters));
+}
+
+/* "What this selection leaves exposed" -- most severe first, each with
+ * real identities (not just a count) up to COVERAGE_ITEM_CAP, plus a
+ * bucket-by-bucket addressed/exposed breakdown. `filter` on each category
+ * is the partial scenarioFilters a "+N more" click applies -- see
+ * wireCoverageLinks. deferred_capacity is deliberately NOT one of these
+ * categories (a separate callout below): it means "lost a rank-position
+ * race under a capacity limit", not "the plan has nothing to say about
+ * this," and folding it into "exposed" would misrepresent that. */
+function computeCoverage(findings, selectedIds) {
+  const exposed = findings.filter((f) => !selectedIds.has(f.finding_id));
+
+  const categories = [
+    {
+      key: "patch_now",
+      label: "unaddressed patch_now finding(s)",
+      items: exposed.filter((f) => f.bucket === "patch_now"),
+      filter: { buckets: new Set(["patch_now"]) },
+    },
+    {
+      key: "contested",
+      label: "unaddressed contested finding(s)",
+      items: exposed.filter((f) => f.bucket === "contested"),
+      filter: { buckets: new Set(["contested"]) },
+    },
+    {
+      key: "kev_exposed",
+      label: "unaddressed KEV finding(s) that are internet-exposed",
+      items: exposed.filter((f) => f.is_kev && f.asset.internet_exposed),
+      filter: { kev: true, exposed: true },
+    },
+    {
+      key: "kev_only",
+      label: "unaddressed KEV finding(s) (not internet-exposed)",
+      items: exposed.filter((f) => f.is_kev && !f.asset.internet_exposed),
+      filter: { kev: true, exposed: false },
+    },
+    {
+      key: "high_blast_radius",
+      label: "unaddressed finding(s) on a high-blast-radius asset (domain controller, mail/identity, database, or firewall/cluster core)",
+      items: exposed.filter((f) => HIGH_BLAST_RADIUS_ROLES.has(f.asset.role)),
+      filter: { highBlastRadius: true },
+    },
+  ];
+
+  const bucketBreakdown = BUCKET_ORDER.map((b) => ({
+    bucket: b,
+    addressed: findings.filter((f) => f.bucket === b && selectedIds.has(f.finding_id)).length,
+    exposed: findings.filter((f) => f.bucket === b && !selectedIds.has(f.finding_id)).length,
+  }));
+
+  return {
+    total: findings.length,
+    addressedCount: findings.length - exposed.length,
+    exposedCount: exposed.length,
+    categories: categories.filter((c) => c.items.length > 0),
+    allClear: categories.every((c) => c.items.length === 0),
+    bucketBreakdown,
+    deferredCapacityCount: findings.filter((f) => f.bucket === "deferred_capacity").length,
+  };
+}
+
+function coverageCategoryHtml(cat) {
+  const shown = cat.items.slice(0, COVERAGE_ITEM_CAP);
+  const extra = cat.items.length - shown.length;
+  const itemsText = shown.map((f) => `${esc(f.hostname)}/${esc(f.cve_id)} (${f.risk_score.toFixed(1)})`).join(", ");
+  const moreHtml =
+    extra > 0
+      ? ` <button type="button" class="coverage-more-link" data-category="${esc(cat.key)}">+${extra} more</button>`
+      : "";
+  return `<li class="coverage-item-row"><strong>${cat.items.length}</strong> ${esc(cat.label)} — ${itemsText}${moreHtml}</li>`;
+}
+
+function coverageSummaryHtml(coverage) {
+  const capacityNote = coverage.deferredCapacityCount
+    ? `<p class="coverage-capacity-note">${coverage.deferredCapacityCount} finding(s) were bumped by a fleet-wide capacity limit this cycle and are not scheduled — see the Constraints tab.</p>`
+    : "";
+  const body = coverage.allClear
+    ? `<p class="coverage-all-clear">No KEV, contested, or high-blast-radius-asset findings left exposed.</p>`
+    : `<ul class="coverage-list">${coverage.categories.map(coverageCategoryHtml).join("")}</ul>`;
+  const bucketRows = coverage.bucketBreakdown
+    .map(
+      (row) => `
+      <tr>
+        <td><span class="bucket-pill bucket-${row.bucket}">${bucketLabel(row.bucket)}</span></td>
+        <td class="num">${row.addressed}</td>
+        <td class="num">${row.exposed}</td>
+      </tr>`
+    )
+    .join("");
+
+  return `
+    <div class="card coverage-card">
+      <h3>Coverage</h3>
+      <p class="coverage-headline">
+        <strong>${coverage.addressedCount}</strong> of ${coverage.total} finding(s) selected —
+        leaves <strong>${coverage.exposedCount}</strong> unaddressed
+      </p>
+      ${capacityNote}
+      ${body}
+      <table class="bucket-breakdown-table">
+        <thead><tr><th>Bucket</th><th>Addressed</th><th>Exposed</th></tr></thead>
+        <tbody>${bucketRows}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+/* Clicking a coverage category's "+N more" jumps into Selection mode
+ * filtered to exactly that category (plus onlyUnaddressed, since every
+ * coverage category is about what's NOT yet selected) -- the coverage
+ * summary and the filter bar share the same predicate vocabulary
+ * (findingMatchesFilters), so "what this line describes" and "what you see
+ * after clicking it" can never drift apart. */
+function wireCoverageLinks(container, categories) {
+  const byKey = Object.fromEntries(categories.map((c) => [c.key, c.filter]));
+  container.querySelectorAll(".coverage-more-link").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const partial = byKey[btn.dataset.category];
+      if (!partial) return;
+      scenarioFilters = {
+        buckets: new Set(), kev: null, exposed: null, role: "",
+        highBlastRadius: false, onlyUnaddressed: true, search: "",
+        ...partial,
+      };
+      scenarioMode = "selection";
+      scenarioPage = 1;
+      renderScenarios();
+    });
+  });
+}
+
+function scenarioTableHtml(rows, opts) {
+  const withCheckboxes = Boolean(opts && opts.withCheckboxes);
+  const checkboxHeader = withCheckboxes ? "<th></th>" : "";
+  const trs = rows
+    .map((f) => {
+      const checkboxCell = withCheckboxes
+        ? `<td><input type="checkbox" class="scenario-row-checkbox" data-finding-id="${esc(f.finding_id)}" ${
+            selectedFindingIds.has(f.finding_id) ? "checked" : ""
+          }></td>`
+        : "";
+      return `
+        <tr class="scenario-row">
+          ${checkboxCell}
+          <td><code>${esc(f.finding_id)}</code></td>
+          <td>${esc(f.cve_id)}</td>
+          <td>${esc(f.hostname)}</td>
+          <td><span class="bucket-pill bucket-${esc(f.bucket)}">${bucketLabel(f.bucket)}</span></td>
+          <td class="num">${f.risk_score.toFixed(1)}</td>
+          <td>${f.is_kev ? '<span class="flag-yes">KEV</span>' : '<span class="dim">—</span>'}</td>
+          <td>${f.asset.internet_exposed ? '<span class="flag-yes">Exposed</span>' : '<span class="dim">—</span>'}</td>
+          <td>${esc(f.asset.role)}</td>
+          <td><button type="button" class="view-finding-link" data-finding-id="${esc(f.finding_id)}">View</button></td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  return `
+    <table class="findings-table scenario-table">
+      <thead>
+        <tr>${checkboxHeader}<th>Finding</th><th>CVE</th><th>Host</th><th>Bucket</th><th>Risk</th><th>KEV</th><th>Exposed</th><th>Role</th><th></th></tr>
+      </thead>
+      <tbody>${trs}</tbody>
+    </table>
+  `;
+}
+
+function wireScenarioRowLinks(container) {
+  container.querySelectorAll(".view-finding-link").forEach((btn) => {
+    btn.addEventListener("click", () => jumpToFinding(btn.dataset.findingId));
+  });
+}
+
+/* ---- Recommended mode: fixed, read-only ---- */
+
+function recommendedModeHtml(data) {
+  const recommended = [...data.findings]
+    .filter((f) => f.bucket === "patch_now" || f.bucket === "contested")
+    .sort((a, b) => b.risk_score - a.risk_score);
+  const recommendedIds = new Set(recommended.map((f) => f.finding_id));
+  const coverage = computeCoverage(data.findings, recommendedIds);
+
+  const tableHtml = recommended.length
+    ? scenarioTableHtml(recommended, { withCheckboxes: false })
+    : `<p class="empty-note">Nothing lands in patch_now or contested in this plan right now.</p>`;
+
+  return `
+    <div class="card">
+      <h3>What the plan says to patch now</h3>
+      <p class="hint">
+        Every <span class="bucket-pill bucket-patch_now">${bucketLabel("patch_now")}</span> finding, plus every
+        <span class="bucket-pill bucket-contested">${bucketLabel("contested")}</span> finding -- the deterministic
+        scorer could not honestly assign one of the four real buckets to these, so they need human or
+        Tree-of-Thought judgment rather than being silently treated as fine.
+      </p>
+      ${tableHtml}
+      ${
+        recommended.length
+          ? `<button type="button" class="secondary-btn" id="start-from-recommended-btn">Start a custom selection from this set (${recommended.length})</button>`
+          : ""
+      }
+    </div>
+    ${coverageSummaryHtml(coverage)}
+  `;
+}
+
+function wireRecommendedModeEvents(data) {
+  const tab = document.getElementById("tab-scenarios");
+  const recommendedIds = recommendedFindingIds(data);
+
+  const startBtn = document.getElementById("start-from-recommended-btn");
+  if (startBtn) {
+    startBtn.addEventListener("click", () => {
+      selectedFindingIds = new Set(recommendedIds);
+      persistSelection(scenarioSelectionKey);
+      scenarioMode = "selection";
+      scenarioPage = 1;
+      renderScenarios();
+    });
+  }
+
+  wireCoverageLinks(tab, computeCoverage(data.findings, new Set(recommendedIds)).categories);
+  wireScenarioRowLinks(tab);
+}
+
+/* ---- Selection mode: bulk filter + build a custom scenario ---- */
+
+function kevFilterLabel(state) {
+  if (state === true) return "KEV: yes";
+  if (state === false) return "KEV: no";
+  return "KEV: any";
+}
+function exposedFilterLabel(state) {
+  if (state === true) return "Exposed: yes";
+  if (state === false) return "Exposed: no";
+  return "Exposed: any";
+}
+function cycleTriState(state) {
+  if (state === null) return true;
+  if (state === true) return false;
+  return null;
+}
+function distinctRoles(findings) {
+  return [...new Set(findings.map((f) => f.asset.role))].sort();
+}
+
+function selectionModeHtml(data) {
+  const roles = distinctRoles(data.findings);
+  const bucketChips = BUCKET_ORDER.map(
+    (b) => `
+      <button type="button" class="chip bucket-chip bucket-${b} ${scenarioFilters.buckets.has(b) ? "active" : ""}" data-bucket="${b}">${bucketLabel(b)}</button>`
+  ).join("");
+  const roleOptions = [
+    `<option value="">All roles</option>`,
+    `<option value="__high__" ${scenarioFilters.highBlastRadius ? "selected" : ""}>High blast radius (dc, exchange, sql, firewall...)</option>`,
+    ...roles.map(
+      (r) =>
+        `<option value="${esc(r)}" ${!scenarioFilters.highBlastRadius && scenarioFilters.role === r ? "selected" : ""}>${esc(r)}</option>`
+    ),
+  ].join("");
+
+  return `
+    <div class="card scenario-filter-card">
+      <div class="filter-row">
+        <div class="filter-group">${bucketChips}</div>
+        <button type="button" class="chip tri-chip" id="kev-filter-btn">${kevFilterLabel(scenarioFilters.kev)}</button>
+        <button type="button" class="chip tri-chip" id="exposed-filter-btn">${exposedFilterLabel(scenarioFilters.exposed)}</button>
+        <select id="role-filter-select">${roleOptions}</select>
+        <input type="search" id="scenario-search-input" placeholder="Search host, CVE, finding ID" value="${esc(scenarioFilters.search)}">
+        <label class="checkbox-label">
+          <input type="checkbox" id="only-unaddressed-checkbox" ${scenarioFilters.onlyUnaddressed ? "checked" : ""}> Only unaddressed
+        </label>
+      </div>
+    </div>
+    <div id="scenario-results"></div>
+  `;
+}
+
+function scenarioResultsHtml(data) {
+  const filtered = filteredScenarioFindings(data);
+  const shown = filtered.slice(0, scenarioPage * SCENARIO_PAGE_SIZE);
+  const hasMore = shown.length < filtered.length;
+
+  const toolbarHtml = `
+    <div class="selection-toolbar">
+      <span class="selection-count">
+        ${filtered.length} of ${data.findings.length} finding(s) match this filter ·
+        <strong>${selectedFindingIds.size} selected</strong>
+      </span>
+      <div class="toolbar-actions">
+        <button type="button" id="select-filtered-btn" ${filtered.length ? "" : "disabled"}>Select all ${filtered.length} shown</button>
+        <button type="button" id="clear-filtered-btn" ${filtered.length ? "" : "disabled"}>Clear shown from selection</button>
+        <button type="button" id="clear-selection-btn" ${selectedFindingIds.size ? "" : "disabled"}>Clear entire selection</button>
+        <button type="button" id="start-from-recommended-btn">Start from recommended</button>
+      </div>
+    </div>
+  `;
+
+  const tableHtml = shown.length
+    ? scenarioTableHtml(shown, { withCheckboxes: true })
+    : `<p class="empty-note">No findings match this filter.</p>`;
+
+  const loadMoreHtml = hasMore
+    ? `<button type="button" id="scenario-load-more-btn" class="secondary-btn">Load more (showing ${shown.length} of ${filtered.length})</button>`
+    : "";
+
+  const coverage = computeCoverage(data.findings, selectedFindingIds);
+
+  return `${toolbarHtml}${tableHtml}${loadMoreHtml}${coverageSummaryHtml(coverage)}`;
+}
+
+/* Rebuilds only #scenario-results -- never the filter bar itself, so
+ * typing in the search box never loses focus/cursor position (the classic
+ * innerHTML-replace-while-typing bug). Every mutation that doesn't touch
+ * the filter bar's own controls (a checkbox click, a bulk action, a
+ * search keystroke) goes through this; anything that changes the filter
+ * bar's own rendered state (a chip, the tri-state buttons, the role
+ * select) goes through the fuller wireSelectionModeEvents/renderScenarios
+ * instead, which is safe since those are discrete clicks, not typing. */
+function updateScenarioResults(data) {
+  const container = document.getElementById("scenario-results");
+  if (!container) return;
+  container.innerHTML = scenarioResultsHtml(data);
+  wireScenarioResultsEvents(data);
+}
+
+function wireScenarioResultsEvents(data) {
+  const container = document.getElementById("scenario-results");
+  if (!container) return;
+
+  container.querySelectorAll(".scenario-row-checkbox").forEach((cb) => {
+    cb.addEventListener("change", () => {
+      if (cb.checked) selectedFindingIds.add(cb.dataset.findingId);
+      else selectedFindingIds.delete(cb.dataset.findingId);
+      persistSelection(scenarioSelectionKey);
+      updateScenarioResults(data);
+    });
+  });
+
+  const selectFilteredBtn = document.getElementById("select-filtered-btn");
+  if (selectFilteredBtn) {
+    selectFilteredBtn.addEventListener("click", () => {
+      filteredScenarioFindings(data).forEach((f) => selectedFindingIds.add(f.finding_id));
+      persistSelection(scenarioSelectionKey);
+      updateScenarioResults(data);
+    });
+  }
+  const clearFilteredBtn = document.getElementById("clear-filtered-btn");
+  if (clearFilteredBtn) {
+    clearFilteredBtn.addEventListener("click", () => {
+      filteredScenarioFindings(data).forEach((f) => selectedFindingIds.delete(f.finding_id));
+      persistSelection(scenarioSelectionKey);
+      updateScenarioResults(data);
+    });
+  }
+  const clearSelectionBtn = document.getElementById("clear-selection-btn");
+  if (clearSelectionBtn) {
+    clearSelectionBtn.addEventListener("click", () => {
+      selectedFindingIds.clear();
+      persistSelection(scenarioSelectionKey);
+      updateScenarioResults(data);
+    });
+  }
+  const startFromRecommendedBtn = document.getElementById("start-from-recommended-btn");
+  if (startFromRecommendedBtn) {
+    startFromRecommendedBtn.addEventListener("click", () => {
+      selectedFindingIds = new Set(recommendedFindingIds(data));
+      persistSelection(scenarioSelectionKey);
+      updateScenarioResults(data);
+    });
+  }
+  const loadMoreBtn = document.getElementById("scenario-load-more-btn");
+  if (loadMoreBtn) {
+    loadMoreBtn.addEventListener("click", () => {
+      scenarioPage += 1;
+      updateScenarioResults(data);
+    });
+  }
+
+  wireCoverageLinks(container, computeCoverage(data.findings, selectedFindingIds).categories);
+  wireScenarioRowLinks(container);
+}
+
+function wireSelectionModeEvents(data) {
+  const tab = document.getElementById("tab-scenarios");
+
+  tab.querySelectorAll(".bucket-chip").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const b = btn.dataset.bucket;
+      if (scenarioFilters.buckets.has(b)) scenarioFilters.buckets.delete(b);
+      else scenarioFilters.buckets.add(b);
+      scenarioPage = 1;
+      renderScenarios();
+    });
+  });
+  const kevBtn = document.getElementById("kev-filter-btn");
+  if (kevBtn) {
+    kevBtn.addEventListener("click", () => {
+      scenarioFilters.kev = cycleTriState(scenarioFilters.kev);
+      scenarioPage = 1;
+      renderScenarios();
+    });
+  }
+  const exposedBtn = document.getElementById("exposed-filter-btn");
+  if (exposedBtn) {
+    exposedBtn.addEventListener("click", () => {
+      scenarioFilters.exposed = cycleTriState(scenarioFilters.exposed);
+      scenarioPage = 1;
+      renderScenarios();
+    });
+  }
+  const roleSelect = document.getElementById("role-filter-select");
+  if (roleSelect) {
+    roleSelect.addEventListener("change", () => {
+      const v = roleSelect.value;
+      scenarioFilters.highBlastRadius = v === "__high__";
+      scenarioFilters.role = v === "__high__" ? "" : v;
+      scenarioPage = 1;
+      renderScenarios();
+    });
+  }
+  const onlyUnaddressed = document.getElementById("only-unaddressed-checkbox");
+  if (onlyUnaddressed) {
+    onlyUnaddressed.addEventListener("change", () => {
+      scenarioFilters.onlyUnaddressed = onlyUnaddressed.checked;
+      scenarioPage = 1;
+      renderScenarios();
+    });
+  }
+  const searchInput = document.getElementById("scenario-search-input");
+  if (searchInput) {
+    searchInput.addEventListener("input", () => {
+      scenarioFilters.search = searchInput.value;
+      scenarioPage = 1;
+      updateScenarioResults(data); // results only -- see updateScenarioResults' own note
+    });
+  }
+
+  updateScenarioResults(data);
+}
+
+/* ---- entry point ---- */
+
+function renderScenarios() {
+  const data = lastExportData;
+  const el = document.getElementById("tab-scenarios");
+  if (!data || !el) return;
+
+  reconcileSelection(data);
+  scenarioPage = 1;
+
+  if (!data.findings.length) {
+    el.innerHTML = `<p class="empty-note">No findings in this export.</p>`;
+    return;
+  }
+
+  const noticeHtml = scenarioReconcileNotice
+    ? `<div class="scenario-notice">${esc(scenarioReconcileNotice)} <button type="button" class="dismiss-notice-btn" id="dismiss-reconcile-notice" aria-label="Dismiss">&times;</button></div>`
+    : "";
+  const modeToggleHtml = `
+    <div class="scenario-mode-toggle">
+      <button type="button" class="mode-btn ${scenarioMode === "recommended" ? "active" : ""}" data-mode="recommended">Recommended</button>
+      <button type="button" class="mode-btn ${scenarioMode === "selection" ? "active" : ""}" data-mode="selection">Selection</button>
+    </div>
+  `;
+
+  el.innerHTML = `${noticeHtml}${modeToggleHtml}<div id="scenario-body"></div>`;
+
+  const dismissBtn = document.getElementById("dismiss-reconcile-notice");
+  if (dismissBtn) {
+    dismissBtn.addEventListener("click", () => {
+      scenarioReconcileNotice = null;
+      const notice = el.querySelector(".scenario-notice");
+      if (notice) notice.remove();
+    });
+  }
+  el.querySelectorAll(".mode-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      scenarioMode = btn.dataset.mode;
+      scenarioPage = 1;
+      renderScenarios();
+    });
+  });
+
+  const body = document.getElementById("scenario-body");
+  if (scenarioMode === "recommended") {
+    body.innerHTML = recommendedModeHtml(data);
+    wireRecommendedModeEvents(data);
+  } else {
+    body.innerHTML = selectionModeHtml(data);
+    wireSelectionModeEvents(data);
+  }
+}
+
 /* ---------------- constraints ---------------- */
 
 function renderConstraints(data) {
@@ -906,6 +1515,7 @@ function renderAll(data) {
   renderOverview(data);
   renderFindings(data);
   renderContested(data);
+  renderScenarios();
   renderConstraints(data);
 }
 

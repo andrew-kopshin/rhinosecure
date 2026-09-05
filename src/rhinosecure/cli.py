@@ -219,11 +219,21 @@ class RunResult:
     `contract` is the confirmed ingest contract behind a `--adapter-config`
     run (`ConfiguredAdapter.contract`), or `None` for a built-in `--format`
     -- `main` reads it to print which reviewed mapping produced this plan,
-    above the exclusion report."""
+    above the exclusion report.
+
+    `is_kev_by_finding` exists for the same reason `not_collected_by_finding`
+    does: `ScoredFinding` carries neither. The web UI's scenario views
+    (coverage-by-KEV-status) need finding-level KEV status, which lives on
+    the `EnrichedFinding` `run_with_report`'s loop builds and discards each
+    iteration -- `not_collected_by_finding`'s sparse "only names present"
+    convention doesn't fit a boolean every finding has an answer for, so
+    this dict holds every finding_id, `False` included, rather than treat
+    "absent from the dict" as a third state alongside True/False."""
 
     scored: list[ScoredFinding]
     assets: dict[str, Asset]
     not_collected_by_finding: dict[str, frozenset[str]]
+    is_kev_by_finding: dict[str, bool]
     report: IngestReport
     contract: Contract | None = None
 
@@ -279,15 +289,19 @@ def run_with_report(
     tally = GapTally()
     scored: list[ScoredFinding] = []
     not_collected_by_finding: dict[str, frozenset[str]] = {}
+    is_kev_by_finding: dict[str, bool] = {}
     for e in enriched:  # still one lazy pass over the findings stream
         tally.observe(e.finding)
         if e.finding.not_collected:
             not_collected_by_finding[e.finding.finding_id] = e.finding.not_collected
-        scored.append(score_finding(enrich(e)))
+        enriched_finding = enrich(e)  # bound once: is_kev is read off it below, then it's scored
+        is_kev_by_finding[e.finding.finding_id] = enriched_finding.is_kev
+        scored.append(score_finding(enriched_finding))
     return RunResult(
         scored=rank(scored),
         assets=assets,
         not_collected_by_finding=not_collected_by_finding,
+        is_kev_by_finding=is_kev_by_finding,
         report=tally.report(fmt, assets, adapter.stats),
         contract=contract,
     )

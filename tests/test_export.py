@@ -12,10 +12,11 @@ DEMO_DIR = Path(__file__).resolve().parents[1] / "data" / "demo"
 
 FINDING_KEYS = {
     "finding_id", "cve_id", "asset_id", "hostname", "bucket", "risk_score",
-    "threat_score", "impact_score", "rationale", "verdict_summary", "narrative",
-    "constraints_applied", "cited_text", "sources", "not_collected",
+    "threat_score", "impact_score", "is_kev", "asset", "rationale", "verdict_summary",
+    "narrative", "constraints_applied", "cited_text", "sources", "not_collected",
     "asset_not_collected", "has_tot",
 }
+ASSET_SUMMARY_KEYS = {"role", "internet_exposed", "criticality", "environment", "data_sensitivity"}
 SOURCE_KEYS = {"source", "key", "retrieved_at"}
 PIPELINE_STAGES = ("ingest", "enrichment", "scoring", "agents", "tot")
 
@@ -43,7 +44,7 @@ def test_deterministic_export_matches_schema_shape(tmp_path):
 
     data = json.loads(export_path.read_text(encoding="utf-8"))
 
-    assert data["export_schema_version"] == "1.0.0"
+    assert data["export_schema_version"] == "1.1.0"
     assert data["generated_at"]  # non-empty ISO 8601 string
     assert data["run"] == {
         "data_dir": str(DEMO_DIR), "format": "native", "seed": 42, "offline": True, "agents": False,
@@ -76,6 +77,8 @@ def test_deterministic_export_matches_schema_shape(tmp_path):
         assert set(entry.keys()) == FINDING_KEYS
         assert entry["threat_score"] is not None
         assert entry["impact_score"] is not None
+        assert isinstance(entry["is_kev"], bool)
+        assert set(entry["asset"].keys()) == ASSET_SUMMARY_KEYS
         assert entry["verdict_summary"] is None
         assert entry["narrative"] is None
         assert entry["constraints_applied"] == []
@@ -86,6 +89,11 @@ def test_deterministic_export_matches_schema_shape(tmp_path):
     f14 = by_id["F14"]  # the fixture's designated contested/bad-data case
     assert f14["bucket"] == "contested"
     assert f14["cve_id"] == "CVE-2023-23397"
+    assert f14["is_kev"] is True  # CVE-2023-23397 is CISA KEV-listed
+    assert f14["asset"] == {
+        "role": "workstation", "internet_exposed": False, "criticality": 2,
+        "environment": "prod", "data_sensitivity": "confidential",
+    }  # A09 / WKS-FIN12, data/demo/assets.csv
     assert any("bucket=contested" in line for line in f14["rationale"])
     source_names = {s["source"] for s in f14["sources"]}
     assert source_names == {"nvd", "kev", "epss", "attack"}
@@ -550,16 +558,34 @@ def test_agents_export_full_shape_with_contested_finding_and_constraint(monkeypa
         assert set(entry.keys()) == FINDING_KEYS
         assert entry["threat_score"] is None  # RiskRecommendation carries no such field
         assert entry["impact_score"] is None
+        assert set(entry["asset"].keys()) == ASSET_SUMMARY_KEYS
+
+    f01 = by_id["F01"]
+    assert f01["is_kev"] is False  # _research_json's default
+    assert f01["asset"] == {
+        "role": "exchange", "internet_exposed": True, "criticality": 5,
+        "environment": "prod", "data_sensitivity": "confidential",
+    }  # A01 / EXCH01, this file's own ASSETS_CSV
 
     f02 = by_id["F02"]
     assert f02["constraints_applied"] == ["the finance workstation now sits behind a WAF"]
     assert f02["verdict_summary"] == "fake verdict summary."
     assert set(f02["cited_text"]) >= {"research-source", "risk-source"}  # Research + Risk sources, deduped
     assert f02["has_tot"] is False
+    assert f02["is_kev"] is False
+    assert f02["asset"] == {
+        "role": "workstation", "internet_exposed": False, "criticality": 2,
+        "environment": "prod", "data_sensitivity": "confidential",
+    }  # A02 / WKS01 -- ground truth, unaffected by the compensating_control constraint on file
 
     f03 = by_id["F03"]
     assert f03["bucket"] == "contested"
     assert f03["has_tot"] is True
+    assert f03["is_kev"] is True  # _research_json("F03", ..., is_kev=True) -- also why it's contested
+    assert f03["asset"] == {
+        "role": "workstation", "internet_exposed": False, "criticality": 3,
+        "environment": "prod", "data_sensitivity": "internal",
+    }  # A03 / WKS02
 
     [contested_entry] = data["contested"]
     assert contested_entry["finding_id"] == "F03"

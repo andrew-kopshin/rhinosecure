@@ -1998,3 +1998,93 @@ validation" mechanism CLAUDE.md's Safety and guardrails section already names as
 smaller prompt. Local inference is a working free option for the one failure mode it actually
 addresses -- confirmed working, not merely plausible -- with response time as the real, measured
 tradeoff against it.
+
+**Scenario views built for the web UI: a Scenarios tab, two modes, both deterministic and free --
+no model call, no job substrate, purely client-side filtering/summarizing of the export already
+being served.** Proposed and approved in conversation first (context-fitting for the coverage
+summary, where the tab sits, selection persistence), matching this project's own "propose
+representation before building" discipline -- same shape as the chat layer's own design-first
+process, above. Not a CLAUDE.md-numbered slice, same reasoning as the chat layer: a web UI
+addition, not a scoring/agent change.
+
+**Recommended mode** is the fixed, non-editable read of "what the plan says to patch now" --
+`bucket ∈ {patch_now, contested}`, exactly as specified rather than including anything else (a
+`deferred_capacity` finding is a real `next_window` finding that lost a rank-position race under a
+capacity limit, a different fact than "the plan has nothing to say about this," so it gets its own
+callout line in the coverage summary instead of being folded into either "addressed" or "exposed").
+**Selection mode** is the free-form builder: a filter bar (bucket chips, a 3-state KEV toggle, a
+3-state internet-exposed toggle, a role dropdown that also offers "high blast radius" as one
+option, hostname/CVE/finding_id search) narrows what's visible; "Select all N shown" / "Clear N
+shown from selection" act on the FULL filtered set, not just the rendered page, since bulk
+selection at fleet scale means "by criterion," not "by what happens to be on screen" -- the user's
+own framing. A "Start from recommended" button seeds a selection from Recommended mode's fixed set
+without forcing a choice between the two modes being separate tools.
+
+**The coverage summary is the feature's actual design decision, per the user's own framing ("5 of
+24 selected" is useless).** `computeCoverage` (app.js) returns an ordered list of concrete
+exposure facts over whatever's NOT selected -- unaddressed patch_now, unaddressed contested,
+unaddressed KEV+internet-exposed, unaddressed KEV-only, unaddressed high-blast-radius-role -- each
+naming real findings (hostname/CVE/risk_score) up to a cap of 5 with a clickable "+N more" that
+jumps into Selection mode pre-filtered to exactly that category (onlyUnaddressed forced on), plus a
+bucket-by-bucket addressed/exposed breakdown table, plus an explicit "no KEV/contested/high-blast-
+radius findings left exposed" line when every category is empty -- silence would read as "nothing
+to check," not "checked, and it's clean." `findingMatchesFilters` is the one predicate the filter
+bar, the bulk actions, and a coverage category's own `filter` field all share, so "what's on
+screen," "what a bulk action acts on," and "what a coverage link jumps to" can never quietly
+disagree. `HIGH_BLAST_RADIUS_ROLES` (dc/exchange/identity_gateway/sql/firewall/
+container_orchestrator, scoring.ROLE_BLAST_RADIUS's own >=0.85 tier) is duplicated in app.js rather
+than shared -- the same call this codebase already makes for small code-owned constants across a
+module boundary (probe.py's own copy of configured.py's CVE pattern).
+
+**A real schema gap this surfaced, fixed rather than worked around client-side.** The export
+carried neither `is_kev` nor any asset attribute per finding -- both facts already computed
+upstream, just never serialized. `export.py`'s `_asset_summary` adds a nested `asset`
+(role/internet_exposed/criticality/environment/data_sensitivity) to every finding entry, free on
+both paths (the deterministic path already holds the full `Asset` for `not_collected`; the agents
+path uses `enriched.asset`, ground truth, never `EnvironmentAssessment`'s model-reconstructed
+view -- the same "don't trust the agent's own facts" reasoning `merge_research_into_enriched`'s own
+docstring already gives). `is_kev` took an actual fix, not just a pass-through: `cli.RunResult`
+never retained it at all on the deterministic path (the `EnrichedFinding` that has it is a
+discarded loop-local in `run_with_report` -- fixed by binding it once and adding a sibling
+`is_kev_by_finding: dict[str, bool]`, the same shape `not_collected_by_finding` already
+established); on the agents path, `coordinator.state.enriched_by_id[fid].is_kev` is ALWAYS the
+pre-Research default (`False`) -- Research's real KEV lookup is merged into a scoring input on
+demand (`merge_research_into_enriched`) and never written back onto `state.enriched_by_id`. Caught
+by reading `agents/risk.py`'s own merge function before writing the export code, not by a failing
+test -- reading `research.is_kev` directly (identical to what the merge would produce) is correct;
+reading `enriched.is_kev` would have silently exported `False` for every agents-path finding
+regardless of its real KEV status. `EXPORT_SCHEMA_VERSION` bumped `1.0.0 -> 1.1.0` (additive,
+nothing removed or renamed) -- per the user's own choice, a nested `asset` object rather than
+flattened `asset_role`/`asset_internet_exposed`/... keys.
+
+**Selection lives in the browser, persisted, reconciled on every render.** A `Set<finding_id>`,
+written to `sessionStorage` keyed by plan identity (`data_dir|format|seed|agents`) on every
+mutation. `reconcileSelection` runs once per full `renderScenarios()` pass (never from the
+results-only partial update a filter change or checkbox click triggers): a DIFFERENT plan identity
+loads THAT plan's own persisted selection instead of inheriting one built against an unrelated
+fleet; the SAME identity (a live job-triggered refresh via the existing `refreshExportAfterJob`, or
+the same page reloaded) keeps whatever's in memory and only drops finding_ids no longer present --
+reported in a dismissible one-line notice naming exactly which ids were dropped and why, never a
+silent count change.
+
+**Verified live in the browser against a synthetic ~320-finding export** (a scratch script
+cloning/perturbing the real demo export's findings -- not a fixture, not committed, generated
+purely to exercise "hundreds of findings" since no real fleet-scale dataset exists yet): Recommended
+mode correctly showed 26 patch_now + 4 contested = 30, with coverage summary arithmetic checking out
+exactly against the synthetic bucket distribution; a coverage category's "+N more" correctly jumped
+into Selection mode pre-filtered (confirmed for KEV+exposed); "Select all N shown" correctly
+self-corrected the "only unaddressed" view to 0 once those findings became addressed, and every
+bucket-breakdown row's addressed+exposed summed to that bucket's real total; pagination advanced
+50 -> 100 -> ... correctly; the search input retained focus and cursor position through every
+keystroke (the classic innerHTML-replace-while-typing bug this design deliberately avoids via a
+results-only partial re-render, confirmed via `document.activeElement` mid-type, not just visually);
+a row's "View" link correctly cross-navigated to the Findings tab and opened that exact finding's
+detail, reusing the existing `jumpToFinding` chat-citation idiom rather than a second
+implementation; selection persisted across a full page reload; and, simulating a live re-plan by
+editing the served export out from under an open tab and calling the same `fetch('/api/export')
+.then(renderAll)` path `refreshExportAfterJob` uses, three previously-selected finding_ids that had
+been removed from the export were correctly dropped from both in-memory and persisted selection
+with the exact reconciliation notice named above. Zero console errors throughout. `.venv312`:
+916 passed, 1 skipped (test count unchanged -- existing `test_export.py` assertions were extended
+in place, not added as new test functions); the deterministic-path subset (`test_export.py`,
+`test_cli.py`) confirmed separately clean under `.venv` (Python 3.14).

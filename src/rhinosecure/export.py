@@ -21,6 +21,26 @@ results on the agents side) are `null`/`[]` on the other -- never fabricated,
 never silently omitted, so a frontend built against one path's file never
 has to guess whether a missing key means "empty" or "doesn't apply here."
 
+**1.1.0: `is_kev` and a nested `asset` summary, added for the web UI's
+scenario views** (bulk selection and a coverage summary by bucket, KEV
+status, exposure, and asset role -- purely a client-side consumer of this
+file, no new scoring). Both are facts already computed upstream of this
+module; nothing here derives them. `asset` (`role`/`internet_exposed`/
+`criticality`/`environment`/`data_sensitivity`) is free on the
+deterministic path -- `_det_finding_entry` already holds the full `Asset`
+object for `not_collected` -- and ground truth on the agents path too
+(`enriched.asset`, never `EnvironmentAssessment`'s model-reconstructed
+view, same "don't trust the agent's own facts" reasoning `merge_research_
+into_enriched`'s docstring already gives). `is_kev` took an actual fix:
+`cli.RunResult` didn't retain it at all (see its own docstring's
+`is_kev_by_finding` note) on the deterministic path, and on the agents
+path `coordinator.state.enriched_by_id[fid].is_kev` is always the
+pre-Research default (`False`) -- Research's tool-based KEV lookup is
+merged into a scoring input on demand (`merge_research_into_enriched`),
+never written back onto `state.enriched_by_id`. The real, scored value is
+`research.is_kev` (identical to what `merge_research_into_enriched` would
+produce, without needing that merge just to read one field back off it).
+
 **Why this needs `from __future__ import annotations` and a `TYPE_CHECKING`
 guard for `Coordinator`, but imports `rhinosecure.memory`/`rhinosecure.cli`
 directly.** `agents.coordinator` imports `crewai` at module level, which
@@ -98,7 +118,7 @@ if TYPE_CHECKING:
     from rhinosecure.agents.coordinator import Coordinator
     from rhinosecure.cli import RunResult
 
-EXPORT_SCHEMA_VERSION = "1.0.0"
+EXPORT_SCHEMA_VERSION = "1.1.0"
 
 # memory.list_runs()/Memory has no list_capacity_constraints()/all_runs()
 # without a run_id -- reconstructing constraints.capacity (always
@@ -186,11 +206,32 @@ def _sources_for_cve(cache: SnapshotCache, cve_id: str) -> list[dict[str, Any]]:
     return entries
 
 
+def _asset_summary(asset: Any) -> dict[str, Any]:
+    """The Impact-axis facts (scoring.py) a finding's asset carries, in one
+    nested object -- for the web UI's scenario views (bulk select / coverage
+    by exposure, KEV status, and role) to filter and group by, without
+    reaching for a second, asset-keyed section of the export. Never the
+    operational fields (`patch_window`/`compensating_controls`/
+    `patch_restrictions`) -- those are mutable via a constraint and already
+    have their own representation (`constraints_applied`, the `constraints`
+    section); these five are not: no format's fill-in path touches them
+    (CLAUDE.md Section 3's own "Open items" note), so ground truth is always
+    what scoring actually used, constraint or not."""
+    return {
+        "role": asset.role,
+        "internet_exposed": asset.internet_exposed,
+        "criticality": asset.criticality,
+        "environment": asset.environment,
+        "data_sensitivity": asset.data_sensitivity,
+    }
+
+
 def _det_finding_entry(
     scored: Any,
     cache: SnapshotCache,
     assets: dict[str, Any],
     not_collected_by_finding: dict[str, frozenset[str]],
+    is_kev_by_finding: dict[str, bool],
     contested_ids: set[str],
 ) -> dict[str, Any]:
     asset = assets[scored.asset_id]
@@ -203,6 +244,8 @@ def _det_finding_entry(
         "risk_score": scored.risk_score,
         "threat_score": scored.threat_score,
         "impact_score": scored.impact_score,
+        "is_kev": is_kev_by_finding.get(scored.finding_id, False),
+        "asset": _asset_summary(asset),
         "rationale": list(scored.rationale),
         "verdict_summary": None,
         "narrative": None,
@@ -234,6 +277,11 @@ def _agents_finding_entry(
         "risk_score": recommendation.risk_score,
         "threat_score": None,
         "impact_score": None,
+        # research.is_kev, not enriched.is_kev -- see this module's own
+        # docstring (the 1.1.0 note) for why enriched.is_kev is always the
+        # pre-Research default here.
+        "is_kev": research.is_kev if research is not None else False,
+        "asset": _asset_summary(enriched.asset),
         "rationale": list(recommendation.scoring_rationale),
         "verdict_summary": recommendation.verdict_summary,
         "narrative": recommendation.narrative,
@@ -486,7 +534,9 @@ def _build_deterministic_export(
     contested_ids: set[str] = set()  # the deterministic path never dispatches ToT
 
     findings = [
-        _det_finding_entry(s, cache, result.assets, result.not_collected_by_finding, contested_ids)
+        _det_finding_entry(
+            s, cache, result.assets, result.not_collected_by_finding, result.is_kev_by_finding, contested_ids
+        )
         for s in scored
     ]
     rate = contested_rate(s.bucket.value for s in scored)

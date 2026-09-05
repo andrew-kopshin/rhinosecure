@@ -6,6 +6,12 @@
       "runtimeExecutable": ".venv312/Scripts/rhino.exe",
       "runtimeArgs": ["web", "--export", "out/export_demo.json", "--enable-chat", "--port", "8420"],
       "port": 8420
+    },
+    {
+      "name": "rhino-web-scenarios",
+      "runtimeExecutable": ".venv312/Scripts/rhino.exe",
+      "runtimeArgs": ["web", "--export", "out/export_fleet_scale.json", "--port", "8421"],
+      "port": 8421
     }
   ]
 }
