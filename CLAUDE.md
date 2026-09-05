@@ -1351,19 +1351,22 @@ tier here: agent runs make many calls and Opus costs significantly more per toke
 
 ## Future direction: remediation execution (recorded, not built)
 
-**This section records a scope decision. It is not a design, and execution itself is not
-built.** No code, schema, or interface for actually running remediation exists. Do not build
-against this section without a separate, explicit design pass first.
+**This section now records a design, agreed in discussion before any code was written — not
+just a scope decision, and still not built.** No code, schema, or interface for actually
+running remediation exists yet; the design below is what a build against this section would
+follow, replacing the open-ended questions this section originally left unanswered. Do not
+begin building it without re-reading this section first — a design agreed once is not a
+license to drift from it silently.
 
-**One piece of the foundation this section anticipates is now built, and is documented in
+**One piece of the foundation this design depends on is already built, and is documented in
 Section 7, not here: remediation tracking** (`memory.remediation_events`, `remediation.py`,
 `rhino remediation mark`/`rhino run --track-remediation`) — recording what actually happened to
 a finding (remediated, accepted, deferred) and reading that history back, including a human's
 `source="human"` mark and a reserved, not-yet-used `source="execution"` value for exactly the
-outcome this section describes. That is tracking outcomes, not producing them: nothing here
-executes anything, decides what to execute, or holds any credential to act on a real system.
-The open questions below are entirely about the latter and remain exactly as open as before
-tracking existed.
+outcome this design produces. That is tracking outcomes, not producing them: nothing built so
+far executes anything, decides what to execute, or holds any credential to act on a real
+system. The design below is entirely about the latter — how an execution outcome comes to
+exist in the first place, so it can be recorded through the mechanism that already does.
 
 **The decision.** RhinoSecure's mandate does not end at producing a ranked plan. The intended
 endpoint is a system that executes the remediation it recommends, not only ranks findings and
@@ -1383,21 +1386,198 @@ executing against a real fleet safe — that discipline was built and validated 
 never for acting on it, and nothing about the plan-only build to date exercises the execution
 risk at all.
 
-**Open questions — not decided, not designed, listed so they aren't answered by accident later:**
+### Execution model: generated change requests, not direct execution
 
-- **What layer actually executes.** Driving existing patch-management infrastructure that
-  already has its own staged-rollout and audit trail (WSUS, Intune, SCCM), versus RhinoSecure
-  reaching endpoints directly. These are different trust and blast-radius profiles, and nothing
-  here favors one.
-- **What credentials that requires.** Whichever layer executes needs standing access to push
-  changes to production systems — categorically different from anything this project holds
-  today (an LLM API key; read-only public threat-intel sources named in Section 4/11).
-- **How rollback works when a patch breaks production.** Accept/amend/reject gates the decision
-  to apply a fix. It says nothing about what happens after a fix is applied and turns out to be
-  wrong, and no rollback mechanism is assumed.
-- **How the job substrate extends to cover it.** `web/jobs.py`'s `JOB_HANDLERS` dispatch table
-  was built generically enough that a new job *kind* is meant to be a small addition — but that
-  claim was made and tested for a second *planning* job (a future full `--agents` run), not an
-  *executing* one. Whether an execution job fits the same shape, the same single-job-at-a-time
-  concurrency model, and the same failure-taxonomy pattern the constraint-submission job uses is
-  open, not assumed to transfer.
+**Decided, asked not assumed.** RhinoSecure never holds standing execution rights on a managed
+endpoint. It produces a structured action and hands it to whichever patch-management system
+already owns deployment for that fleet — WSUS, Intune, or SCCM — through a new adapter seam,
+`ExecutionAdapter`, one implementation per target system. This is Section 1's ingest-adapter
+pattern applied to the output side: "swapping in a real scanner export should require a new
+ingest adapter and nothing else" becomes "swapping in a real execution target should require a
+new execution adapter and nothing else." Nothing upstream of the adapter — proposal generation,
+the gate below, the job substrate — is meant to know or care which one is configured.
+
+The alternative — RhinoSecure reaching endpoints directly (WinRM/PSRemoting, SSH, or a bespoke
+agent) — was considered and rejected for the common case (patch deployment), not foreclosed for
+every case. Comparison, on the three axes this decision turns on:
+
+| | Direct execution | Generated change request |
+|---|---|---|
+| **Credentials** | Standing, broad execution rights on every endpoint — local admin over WinRM, or a privileged agent everywhere. Categorically unlike anything this project holds today (an LLM API key; read-only public threat-intel sources, Section 4/11). | A scoped service account or API app registration with rights to submit/approve *within that system's own permission model* — "approve updates for group X" on WSUS, a narrowly-scoped Graph app registration for Intune. Managed and revoked through the organization's own existing IAM, not a RhinoSecure-only secret store. |
+| **Rollback** | Entirely RhinoSecure's to invent. Windows patch rollback is not reliably clean, and there is no existing tooling to lean on — this would have to be designed and safety-validated per action type from zero before it could be trusted. | Inherited, not invented: WSUS decline/supersede, Intune reassignment, SCCM's phased-deployment retry — imperfect, not universal, but not built by this project. Represented as a per-adapter capability flag (`ExecutionAdapter.supports_rollback`, the identical shape `IngestAdapter.provides_enrichment` already establishes for "some sources have this, some genuinely don't"), refused loudly rather than silently no-op'd when an adapter lacks it. |
+| **Blast radius** | Bounded by nothing except RhinoSecure's own code. A bug in host-list resolution, a reused credential, a loop that doesn't stop — none of it is caught by an external system's staged rollout, because there isn't one in the loop. | Bounded by the target system's own deployment rings and maintenance windows — mature, already trusted by the organization for every other patch. Worst case, a bug here submits a bad *request*, which still has to clear a second, independent system's own guardrails before touching a machine. |
+
+Direct execution remains the right shape for a genuinely different case this design does not
+solve: a compensating control that isn't a patch at all, with no patch-management analog to
+route through. That case is out of scope here, not decided against in general — a separate
+design question for whenever a non-patch remediation actually needs automating, not one of the
+two named below.
+
+**Which of WSUS/Intune/SCCM gets an adapter first is not decided here.** It is a separate
+decision, made against whichever target system a real deployment actually needs, the same way
+Defender was the first real *ingest* adapter because a real export existed to test it against
+(Section 1) — not guessed at in the abstract.
+
+### What gets proposed, and by what
+
+Only findings with a real, structured target get an automatically generated proposal:
+`patch_now`/`next_window`/`deferred_capacity` findings with a known vendor patch. That mapping
+is deterministic, no LLM involved — the same shape `remediation.classify_remediation` already
+is. A ToT-resolved `contested` finding is explicitly **out of scope for automated proposal
+generation**: a `build_control` strategy's winning text is LLM-authored prose ("implement a
+real compensating control before the next patch cycle"), and turning prose into a structured,
+executable action is a separate, harder problem this design does not solve. A human authors
+that proposal by hand instead; it then passes through the identical gate below. Deferring this
+rather than letting an LLM draft the action itself matches the discipline that kept vocabulary
+tables and content-address recipes out of model hands in the adapter-generation design (Rule
+2) — proposing an executable action is exactly the kind of authority that stays code- or
+human-owned, never model-owned.
+
+### The accept/amend/reject gate
+
+A new, append-only table, `execution_proposals` — the same event-sourced shape
+`memory.remediation_events` already establishes, because a proposal's lifecycle (proposed →
+amended → accepted/rejected → dispatched → succeeded/failed) is exactly that kind of history,
+and because it needs to stay separate from `remediation_events`: that table is the coarse,
+human-facing "what happened" summary; a proposal is the much richer record of one attempt to
+make something happen. Only a *terminal* proposal outcome ever writes into `remediation_events`
+(see below) — the two tables are not the same list at different granularity, one is derived
+audit trail for the other.
+
+- **`proposed`** — the structured action plus rationale, citing the finding's real risk_score,
+  bucket, and evidence (the same "the model never computes the number, only cites it"
+  discipline `risk_score` and chat citations already enforce).
+- **`amended`** — a human changed something, but only by **selecting among closed, pre-vetted
+  options**: a different declared patch window, a different pre-configured target group, a
+  different action type the adapter already knows — never a free-form authored command. This is
+  Rule 2 from the adapter-generation design (nothing lets a human or a model author or select an
+  arbitrary pattern at runtime), applied to an action that eventually reaches a privileged
+  system rather than to a mapping that eventually reaches a CSV parser. Amending produces a new
+  version of the same proposal; it does not execute anything.
+- **`accepted`** — the only state that authorizes a job to be submitted. No note required — the
+  proposal's own rationale already stands as the record.
+- **`rejected`** — requires a note, the same "the reason matters most exactly where a decision
+  overrides the system's own recommendation" principle that made `--note` mandatory for
+  `remediated → open` (`remediation.note_required_for_transition`). Rejecting a proposal does
+  **not** by itself write to `remediation_events` — declining this specific action isn't a claim
+  about the finding's real-world status, it may just mean the operator intends to fix it a
+  different way. The finding's tracked status stays whatever it already was.
+
+### Extending the job substrate
+
+`web/jobs.py`'s `JOB_HANDLERS` dispatch table gets a third entry, `"execution_dispatch"`,
+alongside the existing `"constraint_submit"` and the still-reserved `"agent_run"` comment —
+confirming the generality that table's own docstring already claimed for itself, rather than
+assuming it transfers untested.
+
+- **Input is a `proposal_id`, never a decision.** The job never decides what to execute — that
+  already happened at `accepted`, before any job exists. Its only work is carrying out an
+  already-gated action, the same separation `_submit_capacity_constraint`'s "the model
+  interprets, code allocates" split already draws elsewhere.
+- **Submission and completion are decoupled in time — the one real structural difference from
+  every job kind built so far.** `constraint_submit` finishes fully within its own job
+  lifetime; approving a WSUS update or assigning an Intune script does not mean it's installed a
+  moment later, since the target system's own client applies it on its own schedule. So
+  `execution_dispatch`'s own `"succeeded"` means *the change request was accepted by the target
+  system*, not *the patch is on the machine* — an honest, narrower claim, not a shortcut. The
+  finding's tracked status does not move to `remediated` at this point.
+- **Reconciliation is a second, separate step**: a poll against the target system's own
+  reporting API for every `dispatched` proposal, checking whether it has since gone terminal.
+  Polling, not a webhook/callback, for a first build — it adds no inbound listener and no new
+  attack surface to a system whose current surface is entirely outbound calls to a fixed,
+  trusted set of APIs (Section 4/11's KEV/EPSS/NVD/ATT&CK sources drew the same boundary). A
+  webhook is a reasonable later optimization once polling is trusted, not assumed necessary now.
+- **Concurrency stays one-job-at-a-time, at least for a first build.** Nothing about two
+  execution jobs *structurally* races the way two `Coordinator.state` mutations would, but this
+  project has consistently bounded "how much gets changed in one motion" deliberately (the
+  entire point of the capacity-constraint feature) rather than allowed it implicitly. Reusing
+  `JobRegistry`'s existing single-slot enforcement is the conservative default; parallel
+  dispatch is a later, explicit relaxation once there's a real need to batch.
+- **Credentials are resolved once, lazily, on the first execution job** — the same "don't pay
+  the cost until needed" shape `PlanState.seed()` already uses for the Coordinator — read from
+  environment or a secrets file, and never passed through a job's own `input` JSON, since that
+  is stored and displayed in job history.
+
+### Failure and rollback
+
+Two different failures, given different, honest labels — the same instinct `web/jobs.py`'s own
+docstring already applies to `constraint_submit`'s four distinct outcomes.
+
+**Deployment fails outright** (the target system rejects the request, or reports install
+failure): the proposal goes to `failed`. No automatic retry — the same bounded-not-infinite
+instinct behind CLAUDE.md's still-open "tool-call retry cap" item (Safety and guardrails), and
+for a stronger reason here: retrying an execution whose real state is unknown risks
+double-applying or worse. A `remediation_events` row is still written (`source="execution"`),
+status left at whatever it already was — never `remediated`, since nothing landed — the note
+carrying the real failure reason. A failed attempt is audit trail, not noise to discard.
+
+**Deployment succeeds, but is later found to have broken something.** Two sub-cases:
+
+- If the break is the same vulnerability becoming detectable again (a bad patch, a revert, a
+  re-provisioned host), the next `rhino run --track-remediation` catches it automatically —
+  exactly the REOPENED/contradiction case `remediation.classify_remediation` already
+  implements, with zero new code required.
+- If the break is something a vulnerability scanner would never see (an application outage, a
+  service that won't start), a human says so explicitly: `rhino remediation mark <finding_id>
+  open --note "..."` — the command already built, already requiring that note because the
+  transition is `remediated → open`.
+
+**Rollback is a per-adapter capability, not a universal promise** — `ExecutionAdapter
+.supports_rollback`, checked before any rollback is attempted, refused loudly when an adapter
+lacks it rather than silently doing nothing. This keeps CLAUDE.md's own open question ("no
+rollback mechanism is assumed") honestly unresolved for target systems that genuinely have
+nothing to offer, rather than papering over it with a promise this project can't keep for every
+adapter.
+
+### From an execution outcome to a `remediation_events` row
+
+The one piece that needs no new schema — reserved for exactly this in the tracking design:
+
+```python
+# terminal SUCCESS
+memory.record_remediation_event(
+    finding_id=proposal.finding_id, status="remediated",
+    note=f"Executed via {adapter.name}: {proposal.action_summary}",
+    source="execution", source_detail=str(proposal.id),
+    run_id=proposal.originating_run_id,
+)
+
+# terminal FAILURE
+memory.record_remediation_event(
+    finding_id=proposal.finding_id, status="open",
+    note=f"Execution via {adapter.name} failed: {failure_reason}",
+    source="execution", source_detail=str(proposal.id),
+)
+```
+
+`source="execution"` was written into `memory.py` and left unused on exactly this reasoning: an
+execution result is "another way a finding's status changes," the same kind of write a human's
+own mark already is. Nothing about the `remediation_events` schema, `classify_remediation`'s
+contradiction/overdue/undocumented-acceptance logic, or `rhino run --track-remediation`'s
+output needs to change for this to slot in — an execution-sourced event is indistinguishable
+from a human's mark to every consumer except `source`/`source_detail`, which exist precisely so
+a reader can tell the two apart when they want to.
+
+### Open questions this design does not yet answer
+
+- **Which system of record wins when they disagree.** The target system reports the change
+  succeeded (a `remediation_events` row goes to `remediated`), but the next scan's
+  `classify_remediation` still detects the finding — which is exactly the REOPENED case above,
+  automatically surfaced. What isn't decided is which fact a human (or a future automated
+  reconciliation) should trust first when this happens: the patch-management system's own
+  install-success report, or the vulnerability scanner's own re-detection. They are different
+  kinds of evidence (one claims the action was taken, the other claims the condition still
+  exists) and this design has no rule for which one governs the finding's status pending
+  investigation, only that the disagreement itself must never be silently resolved by picking
+  one side by default.
+- **What happens to an accepted-but-undispatched proposal when the underlying finding changes
+  in a later scan.** Accept happens before a job runs, and a job's own submission can lag
+  further behind that (the single-job-at-a-time queue, a transient failure awaiting retry by a
+  human). In that window, a fresh `rhino run` can change the very thing the proposal was built
+  against — the CVE's own severity gets revised, an asset-scoped constraint changes its patch
+  window, the asset's role or criticality changes, or the finding_id itself stops appearing in
+  the scan at all. Nothing here says whether an already-accepted proposal is re-validated
+  against the new scan before dispatch, dispatched as originally accepted regardless, or
+  invalidated and returned to a human for re-review — each is defensible, and picking one
+  silently would mean an operator's "accept" from an hour ago either goes stale without anyone
+  noticing or executes against facts that are no longer true.
