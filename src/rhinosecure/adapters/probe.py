@@ -208,7 +208,20 @@ class ColumnProfile:
     exact only while `not distinct_overflow`; past the cap they are a
     verified lower bound and a first-seen subset, never a guess presented
     as complete. `looks_like` is empty whenever `non_blank == 0` -- a
-    pattern with no evidence for or against it is not "matched"."""
+    pattern with no evidence for or against it is not "matched".
+
+    `distinct_values` is the same (value -> occurrence count) mapping the
+    accumulator already builds to compute `distinct_count`/`sample_values` --
+    exposed in full here rather than discarded, so a caller that needs to
+    check every value a column actually takes (Slice 8's grounding pass,
+    `agents/schema_inference.check_grounding`: is every key a proposed
+    vocabulary table declares one this column really contains?) doesn't have
+    to re-scan the file to get past `MAX_SAMPLE_VALUES`. No new pass over
+    the data -- this is exactly the dict `observe` was already retaining;
+    only the truncation to 8 entries for human display is skipped. Subject
+    to the identical `distinct_overflow` caveat as `distinct_count`: past
+    `MAX_DISTINCT_TRACKED`, this is a lower bound (the first values seen,
+    not necessarily all of them), never a guess presented as complete."""
 
     name: str
     non_blank: int
@@ -219,6 +232,7 @@ class ColumnProfile:
     max_length: int | None
     sample_values: list[str]
     looks_like: list[str]
+    distinct_values: dict[str, int]
 
 
 class _ColumnAccumulator:
@@ -278,6 +292,7 @@ class _ColumnAccumulator:
             max_length=self.max_length,
             sample_values=list(self.distinct)[:MAX_SAMPLE_VALUES],
             looks_like=tags,
+            distinct_values=dict(self.distinct),
         )
 
 

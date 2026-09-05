@@ -152,6 +152,10 @@ import textwrap
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from rhinosecure.agents.schema_inference import ProposeResult
 
 from rhinosecure.adapters import (
     DEFAULT_FORMAT,
@@ -875,6 +879,118 @@ def _print_probe_report(data_dir: Path, profiles: list[FileProfile]) -> None:
             print("\n  No observations.")
 
 
+def _describe_mapping(mapping) -> str:
+    """One line per mapping kind, for the propose report's slot table --
+    condensed, not the full `model_dump`; a human reading the table wants
+    to scan 40-some rows at a glance, not re-parse JSON per row."""
+    kind = mapping.kind
+    if kind == "column":
+        return f"column={mapping.column}"
+    if kind == "vocabulary":
+        return f"vocabulary={mapping.column} ({len(mapping.table)} token(s) proposed)"
+    if kind == "parsed":
+        return f"parsed={mapping.column} (parser={mapping.parser})"
+    if kind == "literal":
+        return f"literal={mapping.value!r}"
+    if kind == "composed":
+        return f"composed({len(mapping.parts)} part(s))"
+    if kind == "not_collected":
+        return "not_collected"
+    if kind == "derived":
+        return f"derived={mapping.from_}.{mapping.output}"
+    if kind == "default_by":
+        return f"default_by={mapping.table}"
+    if kind == "content_address":
+        return f"content_address({', '.join(mapping.columns)})"
+    return kind
+
+
+_PROPOSE_DETAIL_CHARS = 70
+
+
+def _truncated(text: str, limit: int = _PROPOSE_DETAIL_CHARS) -> str:
+    text = " ".join(text.split())  # collapse embedded newlines/whitespace to keep one table row one line
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _print_propose_slots(label: str, slots: dict) -> None:
+    print(f"\nSlot mapping -- {label} ({len(slots)} target field(s)):")
+    headers = ("field", "status", "detail", "conf")
+    rows = []
+    for target in sorted(slots):
+        sp = slots[target]
+        if sp.status == "mapped":
+            rows.append((target, sp.status, _truncated(_describe_mapping(sp.mapping)), f"{sp.confidence:.2f}"))
+        else:
+            rows.append((target, sp.status, _truncated(sp.reason), "--"))
+    _print_rows(headers, rows)
+
+
+def _print_propose_grounding(grounding) -> None:
+    """Caveats print FIRST and get their own labeled section -- a
+    distinct_overflow caveat is the one case grounding is knowingly
+    incomplete, and a human is being asked to cover for it by hand; it
+    must never read as a trailing footnote under the pass/fail list."""
+    print("\nEvidence grounding (LLM-free, checked against the real file):")
+    if grounding.caveats:
+        print(
+            f"  ! {len(grounding.caveats)} caveat(s) -- grounding could not be exhaustive here; "
+            "verify these by hand:"
+        )
+        for issue in grounding.caveats:
+            print(_wrap(f"{issue.slot}: {issue.message}", indent="    ! ", continuation_indent="      "))
+    if grounding.failures:
+        print(f"  {len(grounding.failures)} failure(s):")
+        for issue in grounding.failures:
+            print(_wrap(f"{issue.slot}: {issue.message}", indent="    - ", continuation_indent="      "))
+    if not grounding.caveats and not grounding.failures:
+        print("  clean -- every cited column and table entry was verified against the real file.")
+
+
+def _print_propose_report(data_dir: Path, name: str, result: "ProposeResult") -> None:
+    from rhinosecure.agents.schema_inference import unresolved_slots
+
+    proposal = result.proposal
+    print(
+        f"Proposing a contract for {name!r} from {data_dir} "
+        f"({len(result.profiles)} file(s), {proposal.meta.source_layout})"
+    )
+
+    _print_propose_slots("asset", proposal.asset)
+    _print_propose_slots("finding", proposal.finding)
+    _print_propose_grounding(result.grounding)
+
+    if proposal.unmapped_columns:
+        print("\nColumns this proposal does not read:")
+        for filename, entries in proposal.unmapped_columns.items():
+            print(f"  {filename}")
+            for column, entry in sorted(entries.items()):
+                print(
+                    _wrap(
+                        f"[{entry.disposition}] {entry.reason}",
+                        indent=f"    {column}: ", continuation_indent="        ",
+                    )
+                )
+
+    unresolved = unresolved_slots(proposal)
+    print()
+    if result.contract is not None:
+        print("Result: every slot mapped and grounded, every column accounted for.")
+    else:
+        blocking = sorted(set(unresolved) | result.grounding.failed_slots)
+        print(
+            f"Result: {len(unresolved)} slot(s) unresolved, "
+            f"{len(result.grounding.failed_slots)} slot(s)/reference(s) failed grounding -- NOT written."
+        )
+        print(_wrap(f"Blocking: {blocking}", indent="  ", continuation_indent="    "))
+
+    g = result.generator
+    print(
+        f"\nGenerator: {g.model}, {g.attempts} attempt(s), ~{g.prompt_tokens:,} prompt + "
+        f"{g.completion_tokens:,} completion tokens, est. ${g.estimated_cost_usd:.2f}"
+    )
+
+
 def _utc_now_iso() -> str:
     """The one place `rhino adapt confirm` reads the clock. `config_io.py`'s
     module docstring reserves this for the CLI on purpose ("The caller (a
@@ -1224,6 +1340,44 @@ def main(argv: list[str] | None = None) -> int:
     )
     adapt_probe_parser.add_argument("name", help="dataset name under data/, or a path (same resolution as --data)")
 
+    adapt_propose_parser = adapt_subparsers.add_parser(
+        "propose",
+        help="LLM-assisted: draft a candidate ingest contract for a new source (docs/adapter-generation.md Slice 8)",
+    )
+    adapt_propose_parser.add_argument(
+        "name", help="the new contract's format name -- resolves the output to data/adapters/<name>.json"
+    )
+    adapt_propose_parser.add_argument(
+        "--data", required=True, help="dataset name under data/, or a path, to profile and propose a mapping for"
+    )
+    adapt_propose_parser.add_argument(
+        "--assets-file", default=None, metavar="NAME",
+        help="which file is the asset side, when --data has more than one .csv (required together with --findings-file in that case)",
+    )
+    adapt_propose_parser.add_argument(
+        "--findings-file", default=None, metavar="NAME",
+        help="which file is the finding side, when --data has more than one .csv (required together with --assets-file in that case)",
+    )
+    adapt_propose_parser.add_argument(
+        "--max-attempts", type=int, default=3,
+        help="re-dispatch the model this many times if its output doesn't parse or disagrees with the requested facts (default: 3)",
+    )
+    adapt_propose_parser.add_argument(
+        "--sample-rows", type=int, default=20,
+        help="literal example rows shown to the model on top of the full-file column profile (default: 20)",
+    )
+    adapt_propose_parser.add_argument(
+        "--from-proposal", default=None, metavar="PATH",
+        help="skip the LLM call; re-run grounding and assembly on an already-produced (optionally hand-corrected) saved proposal file",
+    )
+    adapt_propose_parser.add_argument(
+        "--report-out", default=None, metavar="PATH", help="also save the human-readable report here (always prints to stdout too)"
+    )
+    adapt_propose_parser.add_argument(
+        "--overwrite-confirmed", action="store_true",
+        help="required to re-run propose over a name whose data/adapters/<name>.json already holds a CONFIRMED contract",
+    )
+
     adapt_confirm_parser = adapt_subparsers.add_parser(
         "confirm", help="measure a contract against real files, then sign it -- the only verb that writes"
     )
@@ -1476,6 +1630,99 @@ def main(argv: list[str] | None = None) -> int:
             print(f"probe error: {exc}", file=sys.stderr)
             return 1
         _print_probe_report(data_dir, profiles)
+        return 0
+
+    if args.command == "adapt" and args.adapt_command == "propose":
+        import contextlib
+        import io
+
+        from pydantic import ValidationError
+
+        from rhinosecure.adapters.config_io import ContractIOError, read_contract, write_contract
+        from rhinosecure.llm import LLMConfigError
+
+        try:
+            from rhinosecure.agents.schema_inference import (
+                ProposalGenerationError,
+                SavedProposal,
+                SchemaInferenceError,
+                dump_saved_proposal,
+                load_saved_proposal,
+                propose_contract,
+            )
+        except ImportError as exc:  # crewai only imports on the .venv312 interpreter -- CLAUDE.md Section 11
+            print(f"propose error: this command needs the crewai-capable interpreter -- {exc}", file=sys.stderr)
+            return 1
+
+        data_dir = _resolve_data_dir(args.data)
+        output_path = resolve_config_path(args.name)
+
+        if output_path.exists() and not args.overwrite_confirmed:
+            try:
+                existing = read_contract(output_path)
+            except (ContractIOError, IngestError, ValidationError):
+                existing = None
+            if existing is not None and existing.review.state == "confirmed":
+                print(
+                    f"propose refused: {output_path} already holds a CONFIRMED contract (signed "
+                    f"{existing.review.confirmed_at} by {existing.review.confirmed_by}). Re-running propose "
+                    "would silently overwrite that signature. Pass --overwrite-confirmed if you really mean "
+                    "to replace it.",
+                    file=sys.stderr,
+                )
+                return 1
+
+        from_proposal = None
+        if args.from_proposal:
+            try:
+                from_proposal = load_saved_proposal(Path(args.from_proposal))
+            except SchemaInferenceError as exc:
+                print(f"propose error: {exc}", file=sys.stderr)
+                return 1
+
+        try:
+            result = propose_contract(
+                data_dir,
+                args.name,
+                generated_at=_utc_now_iso(),
+                assets_filename=args.assets_file,
+                findings_filename=args.findings_file,
+                max_attempts=args.max_attempts,
+                sample_rows=args.sample_rows,
+                from_proposal=from_proposal,
+            )
+        except ProbeError as exc:
+            print(f"probe error: {exc}", file=sys.stderr)
+            return 1
+        except (SchemaInferenceError, ProposalGenerationError) as exc:
+            print(f"propose error: {exc}", file=sys.stderr)
+            return 1
+        except LLMConfigError as exc:
+            print(f"LLM config error: {exc}", file=sys.stderr)
+            return 1
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _print_propose_report(data_dir, args.name, result)
+        report_text = buf.getvalue()
+        print(report_text, end="")
+        if args.report_out:
+            Path(args.report_out).write_text(report_text, encoding="utf-8")
+
+        saved_path = REPO_ROOT / "out" / f"propose_{args.name}.json"
+        saved_path.parent.mkdir(parents=True, exist_ok=True)
+        saved_path.write_text(
+            json.dumps(dump_saved_proposal(SavedProposal(result.proposal, result.generator)), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(f"Proposal saved to {saved_path} -- hand-correct it and re-run with --from-proposal if incomplete.")
+
+        if result.contract is None:
+            return 1
+
+        written = write_contract(output_path, result.contract)
+        print(f"Wrote {output_path} (v{written.version}, review.state=proposed).")
+        print(f'Next: rhino adapt confirm {args.name} --data {args.data} --by "<you>"')
         return 0
 
     if args.command == "adapt" and args.adapt_command in ("confirm", "rereview"):

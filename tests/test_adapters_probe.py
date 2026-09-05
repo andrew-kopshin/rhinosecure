@@ -92,6 +92,38 @@ def test_sample_values_are_first_seen_order_and_bounded(tmp_path):
     assert col.sample_values == [str(i) for i in range(8)]  # MAX_SAMPLE_VALUES, first-seen order
 
 
+def test_distinct_values_holds_every_distinct_value_past_the_8_sample_cap(tmp_path):
+    """Slice 8's grounding pass (agents/schema_inference.check_grounding)
+    needs the full (bounded) distinct set, not just the 8-entry human-display
+    sample -- this is the same dict `sample_values` is truncated from, not a
+    second scan."""
+    path = tmp_path / "data.csv"
+    rows = [["v"]] + [[str(i)] for i in range(20)]
+    _write_csv(path, rows)
+    col = profile_csv(path).columns["v"]
+    assert col.distinct_values == {str(i): 1 for i in range(20)}
+
+
+def test_distinct_values_counts_repeated_occurrences(tmp_path):
+    path = tmp_path / "data.csv"
+    _write_csv(path, [["v"], ["a"], ["a"], ["b"]])
+    col = profile_csv(path).columns["v"]
+    assert col.distinct_values == {"a": 2, "b": 1}
+
+
+def test_distinct_values_is_a_lower_bound_once_overflowed(tmp_path):
+    from rhinosecure.adapters.probe import MAX_DISTINCT_TRACKED
+
+    path = tmp_path / "data.csv"
+    rows = [["v"]] + [[f"val-{i}"] for i in range(MAX_DISTINCT_TRACKED + 5)]
+    _write_csv(path, rows)
+    col = profile_csv(path).columns["v"]
+    assert col.distinct_overflow
+    assert len(col.distinct_values) == MAX_DISTINCT_TRACKED
+    assert "val-0" in col.distinct_values  # first-seen values are what's retained
+    assert f"val-{MAX_DISTINCT_TRACKED + 4}" not in col.distinct_values
+
+
 # --- profile_csv: looks_like pattern hints ----------------------------------
 
 

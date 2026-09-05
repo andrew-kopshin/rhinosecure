@@ -1646,3 +1646,89 @@ described, since defect 4 (`profile_csv` blind to the contract's own delimiter/e
 row) was a correctness bug in exactly that feature, and Slice 8's own reporting posture is
 expected to inherit it: an LLM proposal's own low-confidence column is the same shape of thing as
 a declared-ignored one.
+
+**Slice 8 built: `agents/schema_inference.py`, the phase-1 inference agent, and `rhino adapt
+propose`.** The model's structured output is `AdapterProposal`, not a `Contract` -- `Contract`
+requires every `asset`/`finding` slot mapped to something, which would force a guessed mapping for
+any field the model isn't confident about. Every target is `SlotMapped` (a real `config_model
+.Mapping` node -- the identical 9-kind discriminated union `configured.py` executes, imported not
+restated, so an LLM can only *select* a kind/parser from the closed catalog, never author one) or
+`SlotUnresolved` (an honest non-answer, never auto-filled -- not even into a legal `not_collected`,
+since "the source has no such column" and "I'm not confident" are different claims and conflating
+them would itself be a guess). No `output_pydantic`: the same `expected_output`-JSON-plus-
+`parsing.parse_structured_output` convention `agents/constraint_intake.py` already established
+for the identical reason, with a bounded retry loop (`max_attempts`) on a parse failure or a
+proposal that disagrees with the source facts it was actually handed.
+
+`check_grounding` is the LLM-free gate that decides whether a proposal is trustworthy enough to
+assemble: every cited column must be real; a `vocabulary`/`derived` table's keys must be among a
+column's actually measured values (`probe.ColumnProfile.distinct_values` -- Slice 6's profiler
+already tracked this internally, capped at `MAX_DISTINCT_TRACKED`, but only exposed 8 truncated
+samples; now exposed in full, no new scan); a `literal` must cite a column the profiler tagged
+`constant` and match its one observed value. `assemble_contract` refuses (never raises --
+`ProposeResult.contract is None`, a normal reportable outcome) unless every slot is mapped and
+grounding reports zero failures, then builds a real `Contract` (`review.state="proposed"`).
+`rhino adapt propose` always saves the raw proposal (`out/propose_<name>.json`, paired with its
+`Generator` provenance) regardless of completeness, so an incomplete one can be hand-corrected and
+resumed via `--from-proposal` without re-spending an LLM call.
+
+**An adversarial review of the first version (8 parallel finder angles, the same discipline as
+Slice 7's hardening round) found and fixed eight real defects before this slice's first commit --
+none of them shipped.** Two were found independently by more than one angle, and one was confirmed
+by the shipped test suite itself asserting the wrong thing:
+
+1. **Grounding ignored the mapping's own `case` transform.** A vocabulary/derived table's keys were
+   checked against the RAW, un-cased measured values, but `configured.py`'s real engine applies
+   `_apply_case(raw, mapping.case)` before ever consulting the table. A correct, working
+   `case:"lower"` mapping over a column containing `"SRV"`/`"WKS"` was reported as a hard grounding
+   failure -- confirmed by two independent review angles, one of which reproduced it directly.
+   Fixed: `_ground_table` now cases the observed values the same way before comparing.
+2. **`assemble_contract` never ran `validate_contract`.** Grounding only checks that a table's
+   KEYS were observed and that cited columns exist -- it has no opinion on whether a table's VALUE
+   is legal for its target's own vocabulary, or on `asset_grouping.union_fields`/`finding_dedup
+   .content_targets`' own structural legality, both real checks `validate_contract` already
+   performs. A proposal mapping `asset.environment` to `"cloud"` (not a legal value) passed
+   grounding cleanly and would have assembled and been reported "every slot mapped and grounded,
+   every column accounted for" -- confirmed by reproducing exactly that. Fixed: `assemble_contract`
+   now runs the real, already-exhaustive `validate_contract` before ever returning, and a failure
+   there refuses assembly the same way an unresolved slot does.
+3. **A `literal` mapping's value was never checked against the column it cited.** `_ground_literal`
+   confirmed only that SOME cited column was tagged `constant`, never that the literal's declared
+   value matched that column's one true observed value -- confirmed by the shipped test suite
+   itself, which had a passing test asserting a `literal(value="prod")` citing a column whose only
+   observed value was `"srv"` was correctly grounded. Fixed: the cited column's actual value must
+   now match.
+4. **`optional` columns were treated as hard failures when absent.** `_check_column_exists` had no
+   `optional` parameter, so a slot legitimately marked optional for a column this export doesn't
+   have (`config_model._compute_not_collected`'s own documented escape hatch) was blocked exactly
+   like a hallucinated column. Fixed: an absent optional column is no longer a grounding failure.
+5. **`check_grounding` never touched `proposal.enrichment` at all.** A hallucinated
+   `enrichment.severity_score.column` sailed through unreported on a BluePeak-shaped proposal.
+   Fixed: enrichment's three column-reading sub-mappings are now grounded explicitly (on top of the
+   `validate_contract` safety net from defect 2, which would also have caught this).
+6. **`composed`/`content_address` grounding hardcoded the findings file regardless of which side a
+   slot was on, and didn't distinguish a placeholder absent from both files (legal -- it simply
+   never contributes) from one that exists only in the OTHER file (the real, no-cross-file-join
+   mistake `validate_contract` itself flags).** Fixed both: an asset-side `composed`/
+   `content_address` proposal is now refused directly rather than checked against the wrong file,
+   and a composed placeholder is only a failure when it exists in the other file.
+7. **The retry loop under-reported cost.** `Generator.prompt_tokens`/`completion_tokens`/
+   `estimated_cost_usd` were read only from the FINAL (successful) dispatch's `usage_metrics`,
+   silently dropping every earlier failed attempt's real, billed spend from the audit trail. Fixed:
+   usage now accumulates across every attempt via `UsageMetrics.add_usage_metrics`, and
+   `call_log_digest` hashes every attempt's prompt+response, not just the last.
+8. **A hand-edited `--from-proposal` file with a schema typo crashed instead of refusing cleanly.**
+   `load_saved_proposal` let a raw `pydantic.ValidationError` escape, and `cli.py`'s dispatch only
+   caught `SchemaInferenceError` -- the exact pattern the block already guards against ten lines
+   above, for `read_contract`, just not applied here too. Fixed: wrapped into `SchemaInferenceError`.
+
+**Verification.** 68 new tests (862 total, up from 794): 55 in `tests/test_schema_inference.py`
+(new), 10 in `tests/test_cli_adapt_propose.py` (new), 3 added to `tests/test_adapters_probe.py`
+for `distinct_values`. Coverage added specifically to close what the review's own test-coverage
+angle found missing: a genuine two-file layout exercised end to end through `check_grounding`/
+`assemble_contract` (every prior fixture used `single_file`, where `assets_profile is
+findings_profile`, unable to prove `is_asset` selects the right side at all), `derived`/
+`default_by`/`composed`/`content_address` mapping-kind grounding, and `assemble_contract`'s new
+`validate_contract` safety net against an illegal vocabulary value and an illegal `union_fields`
+entry. Full suite: 861 passed, 1 skipped. `git status` confirmed clean of any stray write outside
+the intended files throughout.

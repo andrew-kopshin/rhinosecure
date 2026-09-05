@@ -997,8 +997,8 @@ RhinoSecure at an arbitrary CSV and get a working format without writing Python 
 That file is authoritative for every mechanism named below; this section exists so the
 split and its two rules don't depend on a reader following the link.
 
-**Two phases, and the split is the whole design.** Phase 1 (`rhino adapt propose`, not
-built — Slice 8): an LLM inspects a source's headers and rows and proposes a mapping onto
+**Two phases, and the split is the whole design.** Phase 1 (`rhino adapt propose`, built —
+Slice 8): an LLM inspects a source's headers and rows and proposes a mapping onto
 `Asset`/`Finding`; a human reviews and confirms it (`rhino adapt confirm`, built). This
 runs once per source, ever — again only if the source's shape changes. Phase 2
 (`ConfiguredAdapter`, built): every subsequent run reads the confirmed mapping — a JSON
@@ -1010,18 +1010,67 @@ contract resolves through `rhino run --adapter-config <name>` / `rhino constrain
 scoring, enrichment, and the agents never know a run came from a contract instead of a
 built-in `--format`.
 
-**Status.** Slices 1–7 are built: the contract schema and validator, the phase-2 engine
+**Status.** Slices 1–8 are built: the contract schema and validator, the phase-2 engine
 (proven differentially identical to the hand-written BluePeak and Defender adapters on
 real data), the confirmation-digest gate, `--adapter-config` on the CLI, pre-enriched-
-source support, a non-raising column profiler (`rhino adapt probe`/`list`), and the
+source support, a non-raising column profiler (`rhino adapt probe`/`list`), the
 confirm/re-review workflow itself (`rhino adapt confirm`/`rereview`) with its attestation
-gate. Two contracts are confirmed and committed: `data/adapters/bluepeak-gen.json`,
-`data/adapters/mdvm-gen.json` — both hand-authored, since Slice 8 doesn't exist yet to
-author one from an LLM call. Slice 7 was hardened by an adversarial review round spanning
+gate, and now the phase-1 inference agent (`agents/schema_inference.py`, `rhino adapt
+propose`) itself. Two contracts are confirmed and committed: `data/adapters/bluepeak-gen.json`,
+`data/adapters/mdvm-gen.json` — both hand-authored, from before Slice 8 existed to author
+one from an LLM call. Slice 7 was hardened by an adversarial review round spanning
 commits `48ac821` and `309b9a1` that found and fixed six defects — PROGRESS.md is
-authoritative for what they were and how each was verified. Not built: Slice 8, the
-phase-1 inference agent behind `rhino adapt propose`; and Slice 9, surfacing contract
-provenance in `export.py`/`rhino web`.
+authoritative for what they were and how each was verified. Not built: Slice 9, surfacing
+contract provenance in `export.py`/`rhino web`.
+
+**Slice 8, built.** `rhino adapt propose NAME --data DIR [--assets-file/--findings-file]
+[--from-proposal PATH] [--report-out PATH] [--max-attempts N] [--sample-rows N]
+[--overwrite-confirmed]`. The model's structured output is `AdapterProposal`
+(`agents/schema_inference.py`), not a `Contract` itself — every `asset.*`/`finding.*`
+target is either `SlotMapped` (a real, code-owned `Mapping` node — the identical 9-kind
+union `configured.py` executes, imported not restated, so Rule 2 below is enforced by
+type rather than by prompt wording) or `SlotUnresolved` (an honest "I don't know," never
+auto-filled — not even into a legal `not_collected`, since "the source doesn't have this"
+and "I'm not confident" are different claims). No `output_pydantic`: the same
+`expected_output`-JSON-plus-`parsing.parse_structured_output` convention every other
+agent in this codebase uses, for the identical reason (`agents/parsing.py`'s own
+docstring), with a bounded, code-owned retry loop (`max_attempts`) on a parse failure or a
+proposal that disagrees with the source facts it was actually given.
+
+A proposal is never trusted at face value. `check_grounding` is an LLM-free pass, checked
+against the real file: every cited column must exist; a `vocabulary`/`derived` table's
+keys must be among the column's actually measured values (`probe.ColumnProfile
+.distinct_values`, exposed in full for exactly this — Slice 6's profiler previously
+truncated to 8 samples for human display), through the SAME case transform
+(`configured._apply_case`) the engine applies before its own table lookup, so a correct
+case-normalizing mapping is never penalized for the raw casing grounding happens to see; a
+`literal` must cite a column the profiler tagged `constant` AND match that column's one
+observed value, not merely cite some constant column while asserting an unrelated value.
+The one case grounding is knowingly incomplete — a column whose distinct-value tracking
+overflowed its cap — is a `"caveat"`, never a `"fail"`: reported prominently, ahead of the
+pass/fail list, not as a trailing footnote, but never blocking assembly by itself.
+
+`assemble_contract` refuses (a normal, reportable outcome — `ProposeResult.contract is
+None`, never an exception) unless every slot is mapped and grounding reports zero
+failures, then builds a real `Contract` (`review.state="proposed"`) and, before ever
+calling that "assembled," runs it through the real `validate_contract` — the same
+authoritative check `rhino adapt confirm` would run. This closes a gap an adversarial
+review of the first version of this slice found: grounding only checks that a table's
+*keys* were observed, never that a table's *value* is legal for its target, and has no way
+to see a structural mistake (an illegal `asset_grouping.union_fields` entry, an enrichment
+column grounding never touched) at all — without the `validate_contract` safety net, a
+contract could be assembled and reported "clean" while already failing the very rules
+`rhino adapt confirm` would refuse it on. That review (three finder angles surfacing
+correctness bugs, cross-confirmed independently on the case-transform gap and the missing
+validator call) found and fixed eight real defects in the first version of this slice —
+the case-transform gap and the missing `validate_contract` call above among them, plus a
+literal mapping that was never checked against its cited column's actual value, an
+`optional` column wrongly treated as a hard grounding failure, `enrichment`'s own columns
+never grounded at all, `composed`/`content_address` grounding the wrong file, a retry loop
+that silently dropped token/cost accounting for every failed attempt before the one that
+succeeded, and a hand-edited `--from-proposal` file's schema error crashing instead of
+refusing cleanly. Same discipline as Slice 7's own hardening round, applied before this
+slice's first commit rather than across two.
 
 **Rule 1 — `exclude` is legal only for a check feeding `Asset.role`, and only the
 validator gets to decide that, never a config key.** The mapping grammar has no
