@@ -82,6 +82,8 @@ broken `--export` path.
 from __future__ import annotations
 
 import json
+import os
+import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -621,8 +623,16 @@ def _build_agents_export(
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    """Writes to a PID-and-random-suffixed sibling, then `Path.replace`s
+    it into place -- not a bare `<path>.tmp`. Two writers targeting the
+    same `path` at once (a live `rhino web --enable-jobs` job substrate
+    plus a stray `rhino run --export <same path>` from another terminal,
+    say) used to be able to collide on one shared tmp name; each writer
+    now gets its own, so the only remaining race is over which finished
+    `Path.replace` lands last -- an ordinary last-write-wins, not
+    corruption from two processes writing the same file concurrently."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
     with tmp_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=False)
         f.write("\n")

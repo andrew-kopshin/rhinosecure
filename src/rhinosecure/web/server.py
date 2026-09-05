@@ -1,16 +1,29 @@
-"""Read-only FastAPI viewer for one `rhino run --export` JSON file
-(export.py's EXPORT_SCHEMA_VERSION contract) -- the web half of the export
-feature. Launched via `rhino web --export PATH [--port PORT]` (cli.py).
+"""Read-only-by-default FastAPI viewer for one `rhino run --export` JSON
+file (export.py's EXPORT_SCHEMA_VERSION contract). Launched via `rhino web
+--export PATH [--port PORT]` (cli.py).
 
-**The one and only data access this module makes is reading a file off
-disk.** No route here imports `rhinosecure.cli`, `rhinosecure.agents.*`,
-`rhinosecure.memory`, or `crewai` -- there is nothing in this module that
-can start a pipeline run, dispatch an agent, make an LLM call, or write to
-memory.py's SQLite database. Every request against `/api/export` re-reads
-the export file fresh off disk (no in-process cache), so a regenerated
-export shows up on the next browser refresh without restarting the
-server -- still a pure read, never a write, and never anything that
-recomputes what the file says.
+**The one and only data access this module makes, by default, is reading a
+file off disk.** No route here imports `rhinosecure.cli`, `rhinosecure.
+agents.*`, `rhinosecure.memory`, or `crewai` **at module level** -- there is
+nothing this module's own top-level imports can start a pipeline run,
+dispatch an agent, make an LLM call, or write to memory.py's SQLite
+database. Every request against `/api/export` re-reads the export file
+fresh off disk (no in-process cache), so a regenerated export shows up on
+the next browser refresh without restarting the server -- still a pure
+read, never a write, and never anything that recomputes what the file says.
+
+**`jobs_enabled` is the one, explicit, opt-in exception -- and it is
+structural, not a permission check.** `create_app(jobs_enabled=True,
+job_config=...)` is the only way `rhinosecure.web.jobs` (the write-capable
+job substrate -- constraint submission today, a full `--agents` run later,
+both as background jobs with progress polling) is ever imported, and that
+import happens *inside* `create_app`'s own body, conditionally -- never at
+this module's top level. `create_app()`/`create_app(jobs_enabled=False)`
+(the default) never imports it and never mounts `POST /api/jobs`; a
+request to that route against a default app is a plain 404 (the route was
+never registered), not a route that exists and refuses. `rhino web`'s
+`--enable-jobs` flag is the only thing that can turn this on -- see
+`web/jobs.py`'s own module docstring for what it does once enabled.
 
 **One export file per server process.** The file path is resolved once,
 at `create_app()` time, from (in order) an explicit `export_path`
@@ -22,7 +35,10 @@ there is no route that accepts a path from a client, so nothing served
 here can be pointed at an arbitrary file by a browser. A missing or
 unreadable file is a 404/500 on `/api/export`, not a startup failure: the
 server should come up (and the frontend should render its honest empty
-states) even before a real export exists at that path.
+states) even before a real export exists at that path. When jobs are
+enabled, this is also the one path the job substrate writes to after a
+successful constraint submission -- `web/jobs.py`'s `PlanState` is handed
+this exact resolved path, never a second, independently-configured one.
 
 Static assets (`static/index.html`, `styles.css`, `app.js` -- vanilla JS,
 no build step, no framework dependency) are served as-is; `/` serves
@@ -36,11 +52,14 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+
+if TYPE_CHECKING:  # never imported at runtime unless jobs_enabled=True -- see create_app
+    from rhinosecure.web.jobs import JobConfig
 
 _WEB_DIR = Path(__file__).resolve().parent
 _STATIC_DIR = _WEB_DIR / "static"
@@ -83,12 +102,28 @@ def _load_export(path: Path) -> Any:
         raise HTTPException(status_code=500, detail=f"export file {path} is not valid JSON: {exc}")
 
 
-def create_app(export_path: Path | str | None = None) -> FastAPI:
+def create_app(
+    export_path: Path | str | None = None,
+    *,
+    jobs_enabled: bool = False,
+    job_config: "JobConfig | None" = None,
+) -> FastAPI:
     """Build the FastAPI app for one export file. `export_path` overrides
     the environment variable and the default (see module docstring for
     the resolution order). The resolved path is stashed on
     `app.state.export_path` so a caller (cli.py's `rhino web`) can print
-    exactly what's being served without re-deriving the same logic."""
+    exactly what's being served without re-deriving the same logic.
+
+    `jobs_enabled=False` (the default) mounts no new routes and imports
+    `rhinosecure.web.jobs` not at all -- the two existing GET routes and
+    static serving are unchanged; `/api/health`'s response gains one
+    field (`"jobs_enabled": false`) so a frontend can tell whether to
+    show constraint-submission UI at all, without a route it would need
+    to probe with a POST. `jobs_enabled=True` requires `job_config`
+    (a `web.jobs.JobConfig`) and additionally mounts `POST /api/jobs`,
+    `GET /api/jobs/{id}`, and `GET /api/jobs` -- see `web/jobs.py`'s
+    module docstring for what those do and why the read-only claim above
+    still holds for every caller that doesn't pass this."""
     resolved = _resolve_export_path(export_path)
 
     app = FastAPI(title="RhinoSecure Plan Viewer", docs_url=None, redoc_url=None)
@@ -105,7 +140,15 @@ def create_app(export_path: Path | str | None = None) -> FastAPI:
             "status": "ok",
             "export_filename": path.name,
             "export_exists": path.exists(),
+            "jobs_enabled": jobs_enabled,
         }
+
+    if jobs_enabled:
+        if job_config is None:
+            raise ValueError("create_app(jobs_enabled=True) requires job_config=")
+        from rhinosecure.web.jobs import mount_job_routes
+
+        mount_job_routes(app, job_config)
 
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 

@@ -45,9 +45,14 @@ Once resolved, `submit_constraint`: persists via `self.memory.add_constraint`
 *before* re-planning (Environment's and Risk's tools only ever see an
 active constraint by querying `self.memory` themselves -- see
 `_dispatch_environment`/`_dispatch_risk` below -- so the constraint has to
-already be on file for the targeted `run()` that follows to pick it up);
-re-plans only the resolved `affected_finding_ids` (a fresh, scoped `run()`,
-not the whole fleet -- `rhino constraint add` stays cheap); computes a
+already be on file for the targeted re-plan that follows to pick it up);
+re-plans only the resolved `affected_finding_ids`, never the whole fleet
+(`rhino constraint add` stays cheap -- this is a dispatch-cost property,
+identical whether the re-plan below is a `run()` or a `replan()`, not to
+be confused with the separate question of whether the rest of the fleet's
+state survives the call, which the two differ on -- see `run`/`replan`'s
+own docstrings and the branch a few lines below `interpret_constraint`);
+computes a
 per-finding diff against a "before" score computed from the exact same
 Research-enriched inputs the targeted run itself produced, just without the
 constraint overlay (`agents/risk.py`'s `merge_research_into_enriched` +
@@ -186,6 +191,30 @@ class CoordinatorError(RuntimeError):
     """Raised for misuse of this class -- `replan` before any `run`, or
     naming a finding_id `run` never saw. Never raised for one finding's
     processing failure; see the module docstring."""
+
+
+class ConstraintReplanFailedError(RuntimeError):
+    """Raised by `submit_constraint` when the asset-scoped effect was
+    already persisted to `memory.py` (`constraint_id` is real) but the
+    re-plan that followed (`run`/`replan`) raised before producing any
+    `runs`/`decisions`/`feedback` trail -- e.g. an LLM transport error
+    escaping `crew.kickoff()` uncaught, the one class of failure
+    `_resolve_output`'s own retry-then-skip loop doesn't cover. There is
+    no rollback: the constraint is durably active on `asset_id` and will
+    apply on the next successful run or replan regardless of this
+    exception. `constraint_id`/`asset_id` are carried explicitly so a
+    caller (the web job substrate) can tell a human what is actually on
+    file, rather than losing that fact along with the original
+    exception -- `submit_constraint` itself has no other way to surface
+    it, since the underlying transport error carries no such context."""
+
+    def __init__(self, constraint_id: int, asset_id: str, cause: BaseException):
+        super().__init__(
+            f"constraint #{constraint_id} for asset {asset_id} was recorded, but "
+            f"re-scoring the affected finding(s) failed: {cause}"
+        )
+        self.constraint_id = constraint_id
+        self.asset_id = asset_id
 
 
 @dataclass
@@ -477,25 +506,53 @@ class Coordinator:
         self._asset_index = assets if assets is not None else load_asset_index(data_dir / "assets.csv")
         self.state: RunState | None = None
 
-    def run(self, findings: list[EnrichedFinding]) -> list[RiskRecommendation]:
+    def run(
+        self,
+        findings: list[EnrichedFinding],
+        *,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> list[RiskRecommendation]:
         """Primary path: dispatch Research, then Environment, then Risk,
         for every finding in `findings`. Replaces any prior state -- this
-        is a fresh run, not an incremental one; see `replan` for that."""
+        is a fresh run, not an incremental one; see `replan` for that.
+
+        `on_stage`, if given, is called with a short stage name right
+        after each dispatch stage completes: `"research"`, `"environment"`,
+        `"risk"`, and `"tot:i/n"` once per contested finding processed by
+        `_dispatch_tot` (never called at all if nothing was contested).
+        This is the only progress signal this class offers -- each stage
+        batches every finding into one blocking `Crew.kickoff()` call, so
+        there is no per-finding visibility inside Research/Environment/Risk
+        themselves. `on_stage=None` (the default) is a no-op; every
+        existing caller is unaffected."""
         self.state = RunState(enriched_by_id={e.finding.finding_id: e for e in findings})
         self._dispatch_research(findings)
+        if on_stage is not None:
+            on_stage("research")
         self._dispatch_environment(findings)
+        if on_stage is not None:
+            on_stage("environment")
         self._dispatch_risk(findings)
-        self._dispatch_tot(findings)
+        if on_stage is not None:
+            on_stage("risk")
+        self._dispatch_tot(findings, on_stage=on_stage)
         return self.ranked()
 
-    def replan(self, finding_ids: list[str]) -> list[RiskRecommendation]:
+    def replan(
+        self,
+        finding_ids: list[str],
+        *,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> list[RiskRecommendation]:
         """Re-plan path (Section 5's Flow: "Human submits a constraint ->
         Coordinator -> re-plan from Environment onward"). Re-dispatches
         Environment and Risk for `finding_ids` only, reusing the Research
         output already held in state -- Research is CVE-keyed and doesn't
         depend on operational constraints, so it has no reason to re-run.
         Requires a prior `run` -- there is no state to re-plan from otherwise.
-        """
+
+        `on_stage`: see `run`'s docstring -- same callback, same stage
+        names, minus `"research"` (this method never dispatches it)."""
         if self.state is None:
             raise CoordinatorError("replan called with no prior run -- call run() first")
         missing = [fid for fid in finding_ids if fid not in self.state.enriched_by_id]
@@ -503,8 +560,12 @@ class Coordinator:
             raise CoordinatorError(f"replan: unknown finding_id(s) never seen by run(): {missing}")
         findings = [self.state.enriched_by_id[fid] for fid in finding_ids]
         self._dispatch_environment(findings)
+        if on_stage is not None:
+            on_stage("environment")
         self._dispatch_risk(findings)
-        self._dispatch_tot(findings)
+        if on_stage is not None:
+            on_stage("risk")
+        self._dispatch_tot(findings, on_stage=on_stage)
         return self.ranked()
 
     def interpret_constraint(
@@ -549,7 +610,12 @@ class Coordinator:
         ) from last_error
 
     def submit_constraint(
-        self, text: str, findings: list[EnrichedFinding], *, seed: int = 42
+        self,
+        text: str,
+        findings: list[EnrichedFinding],
+        *,
+        seed: int = 42,
+        on_stage: Callable[[str], None] | None = None,
     ) -> ConstraintSubmissionResult | CapacitySubmissionResult:
         """The full "Human submits a constraint" flow (Section 5's Flow,
         Section 7's worked example): interpret, then dispatch to one of
@@ -561,6 +627,15 @@ class Coordinator:
         (CLAUDE.md Section 10's "only five patches fit this window").
         `seed` is recorded on the resulting `runs` row only (scoring has
         no sampling to seed -- same no-op `cli.run` itself documents).
+
+        `on_stage`, if given, is called with `"interpreting"` right before
+        the one Constraint Interpreter dispatch, `"persisting"` right
+        after the constraint is written to `self.memory` (for the asset
+        path only -- capacity has no equivalent persist-then-plan gap),
+        and is threaded through to whichever of `run`/`replan` this method
+        calls, so the caller sees the same `"environment"`/`"risk"`/
+        `"tot:i/n"` markers those emit. See this class's `run` docstring
+        for the full vocabulary. `on_stage=None` (the default) is a no-op.
         """
         if self.memory is None:
             raise CoordinatorError(
@@ -568,10 +643,14 @@ class Coordinator:
                 "Coordinator(..., memory=Memory(...))"
             )
 
+        if on_stage is not None:
+            on_stage("interpreting")
         interpretation = self.interpret_constraint(text, findings)
 
         if interpretation.constraint_kind == ConstraintKind.CAPACITY.value:
-            return self._submit_capacity_constraint(text, findings, interpretation, seed=seed)
+            return self._submit_capacity_constraint(
+                text, findings, interpretation, seed=seed, on_stage=on_stage
+            )
 
         if interpretation.constraint_kind != ConstraintKind.ASSET.value or interpretation.asset_id is None:
             # A refusal (constraint_kind=None), or -- defensively -- any
@@ -598,6 +677,8 @@ class Coordinator:
                 unresolved_finding_ids=unresolved,
             )
 
+        if on_stage is not None:
+            on_stage("persisting")
         constraint_id = self.memory.add_constraint(
             interpretation.asset_id,
             text,
@@ -605,9 +686,35 @@ class Coordinator:
             effect_value=interpretation.effect_value,
         )
 
-        # Fresh, scoped run -- Risk's score_finding tool applies the
-        # constraint just persisted above by querying self.memory itself.
-        self.run(affected)
+        affected_ids = [e.finding.finding_id for e in affected]
+        if self.state is not None and all(fid in self.state.enriched_by_id for fid in affected_ids):
+            # A full (or at least prior) plan already exists on this
+            # Coordinator -- e.g. the web job substrate's long-lived,
+            # per-plan instance. `replan` re-scores exactly `affected_ids`
+            # (the same dispatch cost `run(affected)` would have paid) but
+            # -- unlike `run`, which always replaces `self.state` wholesale
+            # -- leaves every other finding's state untouched, so a caller
+            # can regenerate a whole-fleet-consistent export afterward
+            # instead of one collapsed to just this constraint's findings.
+            # `cli.py`'s Coordinator always starts with `state=None`, so
+            # this branch is never taken there -- `run(affected)` below is
+            # unchanged for every existing caller.
+            try:
+                self.replan(affected_ids, on_stage=on_stage)
+            except Exception as exc:
+                # constraint_id is already committed above with no
+                # rollback -- see ConstraintReplanFailedError's own
+                # docstring. Anything from a genuine CoordinatorError
+                # (shouldn't happen; affected_ids was just checked above)
+                # to an uncaught LLM transport error lands here.
+                raise ConstraintReplanFailedError(constraint_id, interpretation.asset_id, exc) from exc
+        else:
+            # Fresh, scoped run -- Risk's score_finding tool applies the
+            # constraint just persisted above by querying self.memory itself.
+            try:
+                self.run(affected, on_stage=on_stage)
+            except Exception as exc:
+                raise ConstraintReplanFailedError(constraint_id, interpretation.asset_id, exc) from exc
 
         deltas = []
         for e in affected:
@@ -620,6 +727,12 @@ class Coordinator:
             deltas.append(_build_finding_delta(before, after))
         deltas = tuple(deltas)
 
+        # Scoped to `affected` explicitly, never `self.state.risk_by_id`
+        # wholesale -- under `run(affected)` those are the same set, but
+        # under `replan` `self.state.risk_by_id` is the WHOLE plan, and
+        # reading it directly here would persist a self-contradictory row
+        # (e.g. total_findings=1, contested_total=50).
+        affected_risk = [self.state.risk_by_id[fid] for fid in affected_ids if fid in self.state.risk_by_id]
         run_id = self.memory.record_run(
             data_dir=str(self.data_dir),
             ingest_format=self.ingest_format,
@@ -627,10 +740,8 @@ class Coordinator:
             offline=self.cache.offline,
             agents=True,
             total_findings=len(affected),
-            contested_count=sum(
-                1 for r in self.state.risk_by_id.values() if r.bucket == Bucket.CONTESTED.value
-            ),
-            contested_total=len(self.state.risk_by_id),
+            contested_count=sum(1 for r in affected_risk if r.bucket == Bucket.CONTESTED.value),
+            contested_total=len(affected_risk),
             research_usage=_usage_dict(self.state.research_usage),
             environment_usage=_usage_dict(self.state.environment_usage),
             risk_usage=_usage_dict(self.state.risk_usage),
@@ -667,6 +778,7 @@ class Coordinator:
         interpretation: ConstraintInterpretation,
         *,
         seed: int,
+        on_stage: Callable[[str], None] | None = None,
     ) -> CapacitySubmissionResult:
         """CLAUDE.md Section 10's "only five patches fit this window" --
         fleet-wide, not asset-scoped, so there is no one asset's findings
@@ -702,12 +814,21 @@ class Coordinator:
         capacity (or wrongly be excluded, if a constraint moved it out of
         `contested`) against the fleet's raw, un-overlaid CSV state
         instead of what a person would actually see right now.
+
+        `on_stage`, if given, is called with `"computing"` right before
+        the deterministic re-score/reallocation pass and `"persisting"`
+        right before the `runs`/`capacity_constraints`/`decisions`/
+        `feedback` writes -- there is no `"environment"`/`"risk"`/`"tot"`
+        here, since this path never dispatches an agent. `on_stage=None`
+        (the default) is a no-op.
         """
         if interpretation.patch_limit is None:
             return CapacitySubmissionResult(
                 interpretation=interpretation, capacity_constraint_id=None, run_id=None, deltas=()
             )
 
+        if on_stage is not None:
+            on_stage("computing")
         kev_catalog = load_kev_catalog(self.cache)
         attack_index = load_attack_index(self.cache)
         scored = []
@@ -742,6 +863,8 @@ class Coordinator:
         )
         deferred_count = sum(1 for d in deltas if d.changed)
 
+        if on_stage is not None:
+            on_stage("persisting")
         rate = contested_rate(s.bucket.value for s in scored)
         run_id = self.memory.record_run(
             data_dir=str(self.data_dir),
@@ -940,7 +1063,12 @@ class Coordinator:
             if result is not None:
                 self.state.risk_by_id[fid] = result
 
-    def _dispatch_tot(self, findings: list[EnrichedFinding]) -> None:
+    def _dispatch_tot(
+        self,
+        findings: list[EnrichedFinding],
+        *,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> None:
         """CLAUDE.md Section 6's gate: any finding in `findings` whose
         just-dispatched RiskRecommendation is bucket="contested" gets a
         tot.ToTRoot built from this run's own Research/Environment/Risk
@@ -954,7 +1082,14 @@ class Coordinator:
         risk_usage, which likewise reflect their most recent dispatch,
         not a running session total). A finding that fails still
         contributes whatever it spent before giving up
-        (ToTDispatchError.usage) -- real API calls happened either way."""
+        (ToTDispatchError.usage) -- real API calls happened either way.
+
+        `on_stage`, if given, is called once per contested finding
+        processed (`"tot:i/n"`, 1-indexed) right after that finding's
+        search resolves or fails -- this is the one stage with real
+        per-finding progress, since it's a plain Python loop rather than
+        one batched `Crew.kickoff()` call. Never called at all if
+        `contested` is empty."""
         contested = [
             e
             for e in findings
@@ -967,7 +1102,8 @@ class Coordinator:
         strategist = build_strategist_agent()
         critic = build_critic_agent()
         total_usage = UsageMetrics()
-        for e in contested:
+        n = len(contested)
+        for i, e in enumerate(contested, start=1):
             fid = e.finding.finding_id
             root = ToTRoot(
                 enriched=e,
@@ -990,4 +1126,6 @@ class Coordinator:
                 if exc.raw is not None:
                     self.state.last_raw_output[fid] = exc.raw
                 total_usage.add_usage_metrics(exc.usage)
+            if on_stage is not None:
+                on_stage(f"tot:{i}/{n}")
         self.state.tot_usage = total_usage

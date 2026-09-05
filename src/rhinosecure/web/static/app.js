@@ -58,6 +58,30 @@ const TERMINATION_LABELS = {
   exhausted_evidence: "exhausted evidence",
 };
 
+/* job substrate (web/jobs.py) -- vocabulary is per job kind; this is
+ * constraint_submit's. "seeding" only ever appears on the very first job
+ * against a fresh server process (web/jobs.py's PlanState.seed). */
+const JOB_STAGE_LABELS = {
+  seeding: "Seeding the plan (first run only)",
+  interpreting: "Interpreting your constraint",
+  persisting: "Recording the constraint",
+  research: "Researching CVE evidence",
+  environment: "Mapping to the fleet",
+  risk: "Scoring",
+  replanning: "Re-scoring the affected finding(s)",
+  computing: "Recomputing capacity allocation",
+  exporting: "Refreshing the plan",
+};
+
+function jobStageLabel(stage) {
+  if (!stage) return "Starting";
+  if (stage.startsWith("tot:")) {
+    const frac = stage.split(":")[1];
+    return `Resolving contested finding(s) via Tree-of-Thought (${esc(frac)})`;
+  }
+  return JOB_STAGE_LABELS[stage] || esc(stage);
+}
+
 function esc(value) {
   if (value === null || value === undefined) return "";
   return String(value).replace(/[&<>"']/g, (c) => (
@@ -67,6 +91,25 @@ function esc(value) {
 
 function bucketLabel(b) {
   return BUCKET_LABELS[b] || esc(b);
+}
+
+/* One line for a FindingDelta or CapacityDelta whose `changed` flag is
+ * true -- always shows the risk score alongside the bucket, since a
+ * bucket can stay identical while the score moves (a compensating
+ * control decaying impact without crossing a threshold, say) and a
+ * bucket-only summary would then read as if nothing happened. */
+function deltaSummary(d) {
+  const before = d.before_bucket || d.original_bucket;
+  const after = d.after_bucket || d.effective_bucket;
+  const beforeLabel =
+    d.before_risk_score != null ? `${bucketLabel(before)} (${d.before_risk_score.toFixed(1)})` : bucketLabel(before);
+  const afterLabel =
+    d.after_risk_score != null
+      ? `${bucketLabel(after)} (${d.after_risk_score.toFixed(1)})`
+      : d.risk_score != null
+      ? `${bucketLabel(after)} (${d.risk_score.toFixed(1)})`
+      : bucketLabel(after);
+  return `${esc(d.finding_id)}: ${beforeLabel} → ${afterLabel}`;
 }
 
 function strategyLabel(s) {
@@ -484,6 +527,8 @@ function renderConstraints(data) {
   const el = document.getElementById("tab-constraints");
   const { asset_scoped: assetScoped, capacity } = data.constraints;
 
+  const submitHtml = jobsEnabled ? constraintSubmitFormHtml() : "";
+
   const assetHtml = assetScoped.length
     ? assetScoped.map(assetConstraintHtml).join("")
     : `<p class="empty-note">No asset-scoped constraints on file.</p>`;
@@ -493,6 +538,7 @@ function renderConstraints(data) {
     : `<p class="empty-note">No capacity constraints on file.</p>`;
 
   el.innerHTML = `
+    ${submitHtml}
     <div class="constraints-section">
       <h3>Asset-scoped constraints</h3>
       ${assetHtml}
@@ -502,6 +548,148 @@ function renderConstraints(data) {
       ${capacityHtml}
     </div>
   `;
+
+  if (jobsEnabled) {
+    document.getElementById("constraint-submit-form").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const input = document.getElementById("constraint-text-input");
+      const text = input.value.trim();
+      if (text) submitConstraint(text, input);
+    });
+  }
+}
+
+function constraintSubmitFormHtml() {
+  return `
+    <div class="card constraint-submit-card">
+      <h3>Submit a constraint</h3>
+      <p class="hint">
+        Plain English -- e.g. &ldquo;the finance workstation can only be rebooted on Sundays
+        between 02:00 and 06:00&rdquo;, or a fleet-wide &ldquo;only five patches fit this
+        window&rdquo;. Runs as a background job -- this page keeps working while it does.
+      </p>
+      <form id="constraint-submit-form">
+        <textarea id="constraint-text-input" rows="2" placeholder="Describe the operational constraint..."></textarea>
+        <button type="submit" id="constraint-submit-btn">Submit</button>
+      </form>
+    </div>
+  `;
+}
+
+/* ---------------- job submission + polling ---------------- */
+
+let jobsEnabled = false;
+let jobPollTimer = null;
+
+function setJobStatus(kind, html) {
+  const el = document.getElementById("job-status");
+  el.className = `job-status ${kind}`;
+  el.innerHTML = html;
+  el.hidden = false;
+}
+
+async function submitConstraint(text, input) {
+  clearTimeout(jobPollTimer);
+  const btn = document.getElementById("constraint-submit-btn");
+  if (btn) btn.disabled = true;
+  setJobStatus("progress", `<span class="spinner"></span> Submitting…`);
+
+  let jobId;
+  try {
+    const res = await fetch("/api/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "constraint_submit", input: { text } }),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+    jobId = body.job_id;
+  } catch (err) {
+    setJobStatus("error", `Could not submit: ${esc(err.message)}`);
+    if (btn) btn.disabled = false;
+    return;
+  }
+
+  pollJob(jobId, input);
+}
+
+function pollJob(jobId, input) {
+  const tick = async () => {
+    let body;
+    try {
+      const res = await fetch(`/api/jobs/${jobId}`);
+      body = await res.json();
+    } catch (err) {
+      jobPollTimer = setTimeout(tick, 1500); // transient network hiccup -- keep polling the same job
+      return;
+    }
+
+    if (body.status === "pending" || body.status === "running") {
+      setJobStatus("progress", `<span class="spinner"></span> ${jobStageLabel(body.stage)}…`);
+      jobPollTimer = setTimeout(tick, 1200);
+      return;
+    }
+
+    const btn = document.getElementById("constraint-submit-btn");
+    if (btn) btn.disabled = false;
+
+    if (body.status === "succeeded") {
+      handleJobSucceeded(body, input);
+    } else {
+      handleJobFailed(body);
+    }
+  };
+  tick();
+}
+
+function handleJobSucceeded(job, input) {
+  const r = job.result || {};
+  if (!r.persisted) {
+    const rationale =
+      (r.interpretation && r.interpretation.rationale) ||
+      "it didn't resolve to one asset or a recognizable capacity limit.";
+    setJobStatus("info", `Nothing to apply — ${esc(rationale)}`);
+    return;
+  }
+
+  if (input) input.value = "";
+  const deltas = r.deltas || [];
+  const changed = deltas.filter((d) => d.changed);
+  const summary = changed.length
+    ? changed.map(deltaSummary).join("; ")
+    : `${deltas.length} finding(s) re-evaluated — no bucket or risk score changed`;
+
+  let html = `Applied — ${summary}.`;
+  let kind = "success";
+  if (job.export_warning) {
+    kind = "warning";
+    html += `<br>${esc(job.export_warning)}`;
+  }
+  setJobStatus(kind, html);
+
+  if (job.export_written) refreshExportAfterJob();
+}
+
+function handleJobFailed(job) {
+  const e = job.error || {};
+  let message = `${esc(e.type || "Error")} while ${jobStageLabel(e.stage)}: ${esc(e.message || "unknown error")}`;
+  if (e.constraint_id != null) {
+    message +=
+      ` Constraint #${esc(e.constraint_id)} for asset ${esc(e.asset_id)} was recorded and is ` +
+      `still active — it will apply the next time the plan is refreshed.`;
+  }
+  setJobStatus("error", message);
+}
+
+async function refreshExportAfterJob() {
+  try {
+    const res = await fetch("/api/export");
+    if (!res.ok) return;
+    renderAll(await res.json());
+  } catch (err) {
+    // the constraint DID apply -- a transient refresh failure here isn't
+    // worth turning into a hard error on top of a successful submission.
+  }
 }
 
 function assetConstraintHtml(c) {
@@ -581,6 +769,14 @@ function renderAll(data) {
 
 async function boot() {
   setupTabs();
+
+  try {
+    const health = await fetch("/api/health").then((r) => r.json());
+    jobsEnabled = Boolean(health.jobs_enabled);
+  } catch (err) {
+    jobsEnabled = false; // health check itself failing is not fatal to the read-only view below
+  }
+
   try {
     const res = await fetch("/api/export");
     if (!res.ok) {

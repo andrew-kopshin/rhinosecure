@@ -656,6 +656,101 @@ def test_submit_constraint_happy_path_persists_replans_and_diffs(data_dir, findi
     assert "F02" in feedback.change_description
 
 
+def test_submit_constraint_replans_in_place_when_a_full_plan_already_exists(data_dir, findings, tmp_path):
+    """If this Coordinator already holds a full-fleet plan (the shape a
+    long-lived, per-plan Coordinator produces -- e.g. the web job
+    substrate, which seeds one via `run()` once and then submits
+    constraints against it repeatedly), submit_constraint must preserve
+    every OTHER finding's state via `replan()` rather than collapsing to
+    just the affected finding via `run()`. The CLI's own Coordinator never
+    exercises this branch -- it always starts `state=None` (see
+    test_submit_constraint_happy_path_persists_replans_and_diffs above),
+    so `self.run(affected)` there is unchanged."""
+    from rhinosecure.memory import Memory
+
+    memory = Memory(tmp_path / "mem.db")
+    coordinator = Coordinator(data_dir, memory=memory)
+
+    # Phase 1: a real, full-fleet run over both findings.
+    _queue_happy_path(["F01", "F02"])
+    coordinator.run(findings)
+    original_f01 = coordinator.state.risk_by_id["F01"]
+    assert set(coordinator.state.enriched_by_id) == {"F01", "F02"}
+
+    # Phase 2: a constraint targeting only F02's asset (A02). If this used
+    # `run(affected)` instead of `replan`, F01 would vanish from state
+    # entirely and the queue below (which has no F01 research/environment
+    # entries) would starve on the wrong stage.
+    _QueuedFakeCrew.queue = [
+        _constraint_interpretation_json(
+            asset_id="A02", effect_kind="compensating_control", effect_value="WAF rule enabled",
+            affected_finding_ids=["F02"],
+        ),
+        _environment_json("F02", "CVE-2018-8410", "A02", "WKS01"),
+        "F02",
+    ]
+    stages_seen = []
+    result = coordinator.submit_constraint(
+        "the finance workstation now sits behind a WAF", findings, on_stage=stages_seen.append
+    )
+
+    assert result.persisted is True
+    assert len(result.deltas) == 1
+    assert result.deltas[0].finding_id == "F02"
+    assert stages_seen == ["interpreting", "persisting", "environment", "risk"]
+
+    # replan(), not run(): F01's state survives untouched, by identity --
+    # nothing re-dispatched a Crew for it in phase 2 (the queue above has
+    # no F01 entries at all, so a stray dispatch would raise IndexError).
+    assert set(coordinator.state.enriched_by_id) == {"F01", "F02"}
+    assert coordinator.state.risk_by_id["F01"] is original_f01
+
+    # The persisted runs row is scoped to the AFFECTED finding only, never
+    # to self.state.risk_by_id wholesale (which now holds both F01 and
+    # F02) -- the contested_count/contested_total bug this branch could
+    # otherwise reintroduce if it read the whole-plan state directly.
+    run = memory.get_run(result.run_id)
+    assert run.total_findings == 1
+    assert run.contested_total == 1
+    assert run.contested_count == 0
+
+
+def test_submit_constraint_wraps_a_replan_failure_but_the_constraint_stays_persisted(
+    data_dir, findings, tmp_path
+):
+    """If the re-plan that follows persistence throws (a transport-level
+    failure `_resolve_output`'s own retry loop doesn't cover -- simulated
+    here by leaving the targeted run's Crew queue empty, so its first
+    kickoff() raises IndexError), the constraint itself is NOT rolled
+    back: submit_constraint has no rollback by design (see
+    ConstraintReplanFailedError's own docstring). The exception must
+    carry constraint_id/asset_id so a caller isn't left guessing what's
+    actually on file."""
+    from rhinosecure.memory import Memory
+
+    memory = Memory(tmp_path / "mem.db")
+    _QueuedFakeCrew.queue = [
+        _constraint_interpretation_json(
+            asset_id="A02", effect_kind="compensating_control", effect_value="WAF rule enabled",
+            affected_finding_ids=["F02"],
+        ),
+        # Nothing queued for the targeted run that follows -- its first
+        # Crew.kickoff() pops from an empty queue and raises IndexError.
+    ]
+
+    coordinator = Coordinator(data_dir, memory=memory)
+    with pytest.raises(coordinator_module.ConstraintReplanFailedError) as excinfo:
+        coordinator.submit_constraint("the finance workstation now sits behind a WAF", findings)
+
+    exc = excinfo.value
+    assert isinstance(exc.__cause__, IndexError)
+    assert exc.asset_id == "A02"
+
+    [stored] = memory.constraints_for_asset("A02")
+    assert stored.id == exc.constraint_id
+    assert stored.constraint_text == "the finance workstation now sits behind a WAF"
+
+
 def test_submit_constraint_when_interpreter_declines_persists_nothing(data_dir, findings, tmp_path):
     """A statement that is neither asset-scoped nor capacity-shaped (e.g.
     ungrounded or unrelated to any asset/window) -- the Interpreter is

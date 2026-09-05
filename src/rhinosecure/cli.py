@@ -1341,6 +1341,45 @@ def main(argv: list[str] | None = None) -> int:
     )
     web_parser.add_argument("--port", type=int, default=8420)
     web_parser.add_argument("--host", default="127.0.0.1", help="bind address (default: localhost only)")
+    web_parser.add_argument(
+        "--enable-jobs",
+        action="store_true",
+        help=(
+            "opt-in write mode: mount POST /api/jobs so the browser can submit a constraint as a "
+            "background job (agents/coordinator.py's submit_constraint, the same operation `rhino "
+            "constraint add` runs). Off by default -- without this flag the server is byte-for-byte "
+            "the read-only viewer described above, with zero import of rhinosecure.agents/memory/"
+            "crewai. The flags below are only meaningful together with this one."
+        ),
+    )
+    web_parser.add_argument(
+        "--data", default="demo", help="dataset the job substrate reasons about (only with --enable-jobs)"
+    )
+    web_parser.add_argument("--seed", type=int, default=42, help="only meaningful with --enable-jobs")
+    web_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="forbid network fetches while seeding the job substrate's plan (only with --enable-jobs)",
+    )
+    web_parser.add_argument(
+        "--db",
+        default=None,
+        help="path to the memory.py SQLite file for the job substrate (default: memory.DEFAULT_DB_PATH); "
+        "only meaningful with --enable-jobs",
+    )
+    web_format_group = web_parser.add_mutually_exclusive_group()
+    web_format_group.add_argument(
+        "--format",
+        default=DEFAULT_FORMAT,
+        choices=sorted(FORMATS),
+        help="ingest adapter for --data, same as `rhino run --format` (only with --enable-jobs)",
+    )
+    web_format_group.add_argument(
+        "--adapter-config",
+        default=None,
+        metavar="NAME_OR_PATH",
+        help="use a declarative ingest contract instead of a built-in --format (only with --enable-jobs)",
+    )
 
     adapt_parser = subparsers.add_parser(
         "adapt", help="tools for building a declarative ingest contract for a new source (docs/adapter-generation.md)"
@@ -1621,11 +1660,32 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
 
-        app = create_app(args.export)
+        job_config = None
+        db_path = None
+        if args.enable_jobs:
+            from rhinosecure.memory import DEFAULT_DB_PATH
+            from rhinosecure.web.jobs import JobConfig
+
+            db_path = Path(args.db) if args.db else DEFAULT_DB_PATH
+            job_config = JobConfig(
+                data_dir=_resolve_data_dir(args.data),
+                fmt=args.format,
+                adapter_config=args.adapter_config,
+                seed=args.seed,
+                offline=args.offline,
+                db_path=db_path,
+            )
+
+        app = create_app(args.export, jobs_enabled=args.enable_jobs, job_config=job_config)
         resolved = app.state.export_path
         if not resolved.exists():
             print(f"warning: export file does not exist yet: {resolved}", file=sys.stderr)
         print(f"RhinoSecure web viewer -- serving {resolved}")
+        if args.enable_jobs:
+            print(
+                f"  write mode enabled -- jobs will run agent code (dataset: {job_config.data_dir}, "
+                f"format: {job_config.fmt}) and persist to {db_path}"
+            )
         print(f"  http://{args.host}:{args.port}/")
         uvicorn.run(app, host=args.host, port=args.port)
         return 0

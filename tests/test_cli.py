@@ -899,6 +899,66 @@ def test_constraint_add_capacity_decline_when_limit_not_extracted_exits_1(monkey
     assert "Nothing computed or persisted." in captured.err
 
 
+# --- rhino web ---------------------------------------------------------------
+
+
+def test_web_without_enable_jobs_never_builds_a_job_config(monkeypatch, tmp_path):
+    from rhinosecure.web import server as server_module
+
+    captured = {}
+
+    def fake_create_app(export_path, *, jobs_enabled=False, job_config=None):
+        captured["jobs_enabled"] = jobs_enabled
+        captured["job_config"] = job_config
+        return SimpleNamespace(state=SimpleNamespace(export_path=Path(export_path)))
+
+    monkeypatch.setattr(server_module, "create_app", fake_create_app)
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+
+    exit_code = main(["web", "--export", str(tmp_path / "export.json")])
+
+    assert exit_code == 0
+    assert captured["jobs_enabled"] is False
+    assert captured["job_config"] is None
+
+
+def test_web_enable_jobs_wires_a_job_config_from_the_cli_flags(monkeypatch, tmp_path):
+    from rhinosecure.web import server as server_module
+
+    captured = {}
+
+    def fake_create_app(export_path, *, jobs_enabled=False, job_config=None):
+        captured["jobs_enabled"] = jobs_enabled
+        captured["job_config"] = job_config
+        return SimpleNamespace(state=SimpleNamespace(export_path=Path(export_path)))
+
+    monkeypatch.setattr(server_module, "create_app", fake_create_app)
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+
+    db_path = tmp_path / "mem.db"
+    exit_code = main(
+        [
+            "web",
+            "--export", str(tmp_path / "export.json"),
+            "--enable-jobs",
+            "--data", "demo",
+            "--seed", "7",
+            "--offline",
+            "--db", str(db_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["jobs_enabled"] is True
+    job_config = captured["job_config"]
+    assert job_config.fmt == "native"
+    assert job_config.adapter_config is None
+    assert job_config.seed == 7
+    assert job_config.offline is True
+    assert job_config.db_path == db_path
+    assert job_config.data_dir == DEMO_DIR
+
+
 # --- _ensure_utf8_stdio ------------------------------------------------------
 
 
