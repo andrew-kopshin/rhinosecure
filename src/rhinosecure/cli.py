@@ -1380,6 +1380,18 @@ def main(argv: list[str] | None = None) -> int:
         metavar="NAME_OR_PATH",
         help="use a declarative ingest contract instead of a built-in --format (only with --enable-jobs)",
     )
+    web_parser.add_argument(
+        "--enable-chat",
+        action="store_true",
+        help=(
+            "opt-in: mount POST /api/chat, a read-only, LLM-backed Q&A over the currently-served "
+            "export file (agents/chat.py). Off by default -- without this flag the server never "
+            "imports rhinosecure.agents.chat or crewai for this purpose. Independent of "
+            "--enable-jobs: chat never writes to memory.py or re-plans anything, so it needs "
+            "neither --data/--format/--seed/--db nor the job substrate's single-job-at-a-time "
+            "lock -- every request just reads the export file already being served."
+        ),
+    )
 
     adapt_parser = subparsers.add_parser(
         "adapt", help="tools for building a declarative ingest contract for a new source (docs/adapter-generation.md)"
@@ -1676,7 +1688,12 @@ def main(argv: list[str] | None = None) -> int:
                 db_path=db_path,
             )
 
-        app = create_app(args.export, jobs_enabled=args.enable_jobs, job_config=job_config)
+        app = create_app(
+            args.export,
+            jobs_enabled=args.enable_jobs,
+            job_config=job_config,
+            chat_enabled=args.enable_chat,
+        )
         resolved = app.state.export_path
         if not resolved.exists():
             print(f"warning: export file does not exist yet: {resolved}", file=sys.stderr)
@@ -1686,6 +1703,8 @@ def main(argv: list[str] | None = None) -> int:
                 f"  write mode enabled -- jobs will run agent code (dataset: {job_config.data_dir}, "
                 f"format: {job_config.fmt}) and persist to {db_path}"
             )
+        if args.enable_chat:
+            print("  chat enabled -- POST /api/chat calls the LLM seam per question (reads only, no writes)")
         print(f"  http://{args.host}:{args.port}/")
         uvicorn.run(app, host=args.host, port=args.port)
         return 0

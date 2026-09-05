@@ -907,9 +907,10 @@ def test_web_without_enable_jobs_never_builds_a_job_config(monkeypatch, tmp_path
 
     captured = {}
 
-    def fake_create_app(export_path, *, jobs_enabled=False, job_config=None):
+    def fake_create_app(export_path, *, jobs_enabled=False, job_config=None, chat_enabled=False):
         captured["jobs_enabled"] = jobs_enabled
         captured["job_config"] = job_config
+        captured["chat_enabled"] = chat_enabled
         return SimpleNamespace(state=SimpleNamespace(export_path=Path(export_path)))
 
     monkeypatch.setattr(server_module, "create_app", fake_create_app)
@@ -920,6 +921,25 @@ def test_web_without_enable_jobs_never_builds_a_job_config(monkeypatch, tmp_path
     assert exit_code == 0
     assert captured["jobs_enabled"] is False
     assert captured["job_config"] is None
+    assert captured["chat_enabled"] is False
+
+
+def test_web_enable_chat_passes_chat_enabled_through(monkeypatch, tmp_path):
+    from rhinosecure.web import server as server_module
+
+    captured = {}
+
+    def fake_create_app(export_path, *, jobs_enabled=False, job_config=None, chat_enabled=False):
+        captured["chat_enabled"] = chat_enabled
+        return SimpleNamespace(state=SimpleNamespace(export_path=Path(export_path)))
+
+    monkeypatch.setattr(server_module, "create_app", fake_create_app)
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+
+    exit_code = main(["web", "--export", str(tmp_path / "export.json"), "--enable-chat"])
+
+    assert exit_code == 0
+    assert captured["chat_enabled"] is True
 
 
 def test_web_enable_jobs_wires_a_job_config_from_the_cli_flags(monkeypatch, tmp_path):
@@ -927,7 +947,7 @@ def test_web_enable_jobs_wires_a_job_config_from_the_cli_flags(monkeypatch, tmp_
 
     captured = {}
 
-    def fake_create_app(export_path, *, jobs_enabled=False, job_config=None):
+    def fake_create_app(export_path, *, jobs_enabled=False, job_config=None, chat_enabled=False):
         captured["jobs_enabled"] = jobs_enabled
         captured["job_config"] = job_config
         return SimpleNamespace(state=SimpleNamespace(export_path=Path(export_path)))

@@ -12,18 +12,23 @@ fresh off disk (no in-process cache), so a regenerated export shows up on
 the next browser refresh without restarting the server -- still a pure
 read, never a write, and never anything that recomputes what the file says.
 
-**`jobs_enabled` is the one, explicit, opt-in exception -- and it is
-structural, not a permission check.** `create_app(jobs_enabled=True,
-job_config=...)` is the only way `rhinosecure.web.jobs` (the write-capable
-job substrate -- constraint submission today, a full `--agents` run later,
-both as background jobs with progress polling) is ever imported, and that
-import happens *inside* `create_app`'s own body, conditionally -- never at
-this module's top level. `create_app()`/`create_app(jobs_enabled=False)`
-(the default) never imports it and never mounts `POST /api/jobs`; a
-request to that route against a default app is a plain 404 (the route was
-never registered), not a route that exists and refuses. `rhino web`'s
-`--enable-jobs` flag is the only thing that can turn this on -- see
-`web/jobs.py`'s own module docstring for what it does once enabled.
+**`jobs_enabled` and `chat_enabled` are the two, explicit, opt-in
+exceptions -- and both are structural, not a permission check.**
+`create_app(jobs_enabled=True, job_config=...)` is the only way
+`rhinosecure.web.jobs` (the write-capable job substrate -- constraint
+submission today, a full `--agents` run later, both as background jobs
+with progress polling) is ever imported, and `create_app(chat_enabled=
+True)` is the only way `rhinosecure.web.chat` (read-only, LLM-backed Q&A
+over the currently-served export -- never a write, never memory.py or
+agents.coordinator) is ever imported. Both imports happen *inside*
+`create_app`'s own body, conditionally -- never at this module's top
+level. `create_app()` (the default: both flags `False`) never imports
+either and never mounts `POST /api/jobs` or `POST /api/chat`; a request to
+either route against a default app is a plain 404 (the route was never
+registered), not a route that exists and refuses. `rhino web`'s
+`--enable-jobs`/`--enable-chat` flags are the only things that can turn
+these on, independently of each other -- see `web/jobs.py`'s and
+`web/chat.py`'s own module docstrings for what each does once enabled.
 
 **One export file per server process.** The file path is resolved once,
 at `create_app()` time, from (in order) an explicit `export_path`
@@ -81,11 +86,14 @@ def _resolve_export_path(export_path: Path | str | None) -> Path:
     return DEFAULT_EXPORT_PATH
 
 
-def _load_export(path: Path) -> Any:
+def load_export(path: Path) -> Any:
     """Read and parse `path` fresh off disk -- the server's only data
-    access. Raises `HTTPException` (never a bare exception) so FastAPI
-    turns a missing or corrupt export file into a real, informative HTTP
-    error instead of an unhandled-exception 500."""
+    access, and (unprefixed, unlike this module's other helpers) the one
+    piece of it `web/chat.py` also calls, so a chat answer and `GET
+    /api/export` can never read two different copies of the same file.
+    Raises `HTTPException` (never a bare exception) so FastAPI turns a
+    missing or corrupt export file into a real, informative HTTP error
+    instead of an unhandled-exception 500."""
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -107,6 +115,7 @@ def create_app(
     *,
     jobs_enabled: bool = False,
     job_config: "JobConfig | None" = None,
+    chat_enabled: bool = False,
 ) -> FastAPI:
     """Build the FastAPI app for one export file. `export_path` overrides
     the environment variable and the default (see module docstring for
@@ -114,16 +123,18 @@ def create_app(
     `app.state.export_path` so a caller (cli.py's `rhino web`) can print
     exactly what's being served without re-deriving the same logic.
 
-    `jobs_enabled=False` (the default) mounts no new routes and imports
-    `rhinosecure.web.jobs` not at all -- the two existing GET routes and
-    static serving are unchanged; `/api/health`'s response gains one
-    field (`"jobs_enabled": false`) so a frontend can tell whether to
-    show constraint-submission UI at all, without a route it would need
-    to probe with a POST. `jobs_enabled=True` requires `job_config`
+    `jobs_enabled=False`/`chat_enabled=False` (both default) mount no new
+    routes and import `rhinosecure.web.jobs`/`rhinosecure.web.chat` not
+    at all -- the two existing GET routes and static serving are
+    unchanged; `/api/health`'s response gains two fields (`"jobs_enabled"`,
+    `"chat_enabled"`, both `false`) so a frontend can tell whether to show
+    constraint-submission or chat UI at all, without a route it would
+    need to probe with a POST. `jobs_enabled=True` requires `job_config`
     (a `web.jobs.JobConfig`) and additionally mounts `POST /api/jobs`,
-    `GET /api/jobs/{id}`, and `GET /api/jobs` -- see `web/jobs.py`'s
-    module docstring for what those do and why the read-only claim above
-    still holds for every caller that doesn't pass this."""
+    `GET /api/jobs/{id}`, and `GET /api/jobs`. `chat_enabled=True` needs
+    no config object -- chat has nothing to seed, see `web/chat.py`'s
+    module docstring -- and additionally mounts `POST /api/chat`. The two
+    flags are independent; either, both, or neither may be set."""
     resolved = _resolve_export_path(export_path)
 
     app = FastAPI(title="RhinoSecure Plan Viewer", docs_url=None, redoc_url=None)
@@ -131,7 +142,7 @@ def create_app(
 
     @app.get("/api/export")
     def get_export() -> Any:
-        return _load_export(app.state.export_path)
+        return load_export(app.state.export_path)
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
@@ -141,6 +152,7 @@ def create_app(
             "export_filename": path.name,
             "export_exists": path.exists(),
             "jobs_enabled": jobs_enabled,
+            "chat_enabled": chat_enabled,
         }
 
     if jobs_enabled:
@@ -149,6 +161,11 @@ def create_app(
         from rhinosecure.web.jobs import mount_job_routes
 
         mount_job_routes(app, job_config)
+
+    if chat_enabled:
+        from rhinosecure.web.chat import mount_chat_routes
+
+        mount_chat_routes(app)
 
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 

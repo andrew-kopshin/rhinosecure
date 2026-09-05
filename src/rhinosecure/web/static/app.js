@@ -755,9 +755,151 @@ function capacityConstraintHtml(c) {
   `;
 }
 
+/* ---------------- chat ---------------- */
+
+/* Chat is the one place this file deliberately deviates from "never cache
+ * the export payload" (see the top-of-file note) -- a citation chip needs
+ * to jump to and open the exact finding row it names, which means knowing
+ * that finding's index in the currently-rendered table. `lastExportData`
+ * exists ONLY for that cross-link; nothing renders from it directly. */
+let lastExportData = null;
+let chatEnabled = false;
+let chatHistory = []; // [{role: "user"|"assistant", content: string}, ...]
+const MAX_CLIENT_CHAT_HISTORY = 20;
+
+function citationChipHtml(c) {
+  return `
+    <button type="button" class="citation-chip" data-finding-id="${esc(c.finding_id)}"
+            title="${esc(c.cve_id)} on ${esc(c.hostname)} — jump to this finding">
+      <code>${esc(c.finding_id)}</code>
+      <span class="bucket-pill bucket-${esc(c.bucket)}">${bucketLabel(c.bucket)}</span>
+      <span class="citation-score">${c.risk_score.toFixed(1)}</span>
+    </button>
+  `;
+}
+
+function appendChatMessage(role, content, opts) {
+  opts = opts || {};
+  const citations = opts.citations || [];
+  const insufficient = Boolean(opts.insufficientData);
+
+  const container = document.getElementById("chat-messages");
+  const bubble = document.createElement("div");
+  bubble.className = `chat-msg chat-msg-${role}${insufficient ? " insufficient" : ""}`;
+
+  const insufficientHtml = insufficient
+    ? `<p class="chat-insufficient">Not answerable from this plan${opts.insufficientReason ? `: ${esc(opts.insufficientReason)}` : "."}</p>`
+    : "";
+  const chipsHtml = citations.length
+    ? `<div class="citation-chips">${citations.map(citationChipHtml).join("")}</div>`
+    : "";
+
+  bubble.innerHTML = `
+    <p class="chat-msg-content">${esc(content).replace(/\n/g, "<br>")}</p>
+    ${insufficientHtml}
+    ${chipsHtml}
+  `;
+  container.appendChild(bubble);
+  container.scrollTop = container.scrollHeight;
+
+  bubble.querySelectorAll(".citation-chip").forEach((btn) => {
+    btn.addEventListener("click", () => jumpToFinding(btn.dataset.findingId));
+  });
+  return bubble;
+}
+
+function setChatTyping(on) {
+  const existing = document.getElementById("chat-typing");
+  if (existing) existing.remove();
+  if (!on) return;
+  const container = document.getElementById("chat-messages");
+  const el = document.createElement("div");
+  el.id = "chat-typing";
+  el.className = "chat-typing";
+  el.innerHTML = `<span class="spinner"></span> Thinking…`;
+  container.appendChild(el);
+  container.scrollTop = container.scrollHeight;
+}
+
+function jumpToFinding(findingId) {
+  if (!lastExportData) return;
+  const idx = lastExportData.findings.findIndex((f) => f.finding_id === findingId);
+  if (idx === -1) return;
+  switchTab("findings");
+  requestAnimationFrame(() => {
+    const row = document.querySelector(`.finding-row[data-idx="${idx}"]`);
+    if (!row) return;
+    row.scrollIntoView({ behavior: "smooth", block: "center" });
+    if (!row.classList.contains("open")) {
+      toggleFindingDetail(row, lastExportData.findings[idx]);
+    }
+  });
+}
+
+async function submitChatMessage(text) {
+  const sendBtn = document.getElementById("chat-send-btn");
+  const priorHistory = chatHistory.slice(-MAX_CLIENT_CHAT_HISTORY);
+
+  appendChatMessage("user", text);
+  chatHistory.push({ role: "user", content: text });
+  if (sendBtn) sendBtn.disabled = true;
+  setChatTyping(true);
+
+  try {
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text, history: priorHistory }),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+
+    appendChatMessage("assistant", body.answer, {
+      citations: body.citations,
+      insufficientData: body.insufficient_data,
+      insufficientReason: body.insufficient_reason,
+    });
+    chatHistory.push({ role: "assistant", content: body.answer });
+  } catch (err) {
+    const bubble = appendChatMessage("assistant", `Could not answer: ${err.message}`);
+    bubble.classList.add("chat-msg-error");
+  } finally {
+    setChatTyping(false);
+    if (sendBtn) sendBtn.disabled = false;
+  }
+}
+
+function openChatPanel() {
+  document.getElementById("chat-panel").hidden = false;
+  document.getElementById("chat-input").focus();
+}
+
+function closeChatPanel() {
+  document.getElementById("chat-panel").hidden = true;
+}
+
+function setupChat() {
+  document.getElementById("chat-toggle-btn").hidden = false;
+  document.getElementById("chat-toggle-btn").addEventListener("click", () => {
+    const panel = document.getElementById("chat-panel");
+    if (panel.hidden) openChatPanel();
+    else closeChatPanel();
+  });
+  document.getElementById("chat-close-btn").addEventListener("click", closeChatPanel);
+  document.getElementById("chat-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const input = document.getElementById("chat-input");
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    submitChatMessage(text);
+  });
+}
+
 /* ---------------- boot ---------------- */
 
 function renderAll(data) {
+  lastExportData = data;
   document.title = `RhinoSecure — ${baseName(data.run.data_dir)} (${data.run.agents ? "agents" : "deterministic"})`;
   renderRunMeta(data);
   renderPipeline(data);
@@ -773,9 +915,13 @@ async function boot() {
   try {
     const health = await fetch("/api/health").then((r) => r.json());
     jobsEnabled = Boolean(health.jobs_enabled);
+    chatEnabled = Boolean(health.chat_enabled);
   } catch (err) {
     jobsEnabled = false; // health check itself failing is not fatal to the read-only view below
+    chatEnabled = false;
   }
+
+  if (chatEnabled) setupChat();
 
   try {
     const res = await fetch("/api/export");

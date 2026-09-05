@@ -15,6 +15,7 @@
         <span class="brand-sub">read-only plan viewer</span>
       </div>
       <div id="run-meta" class="run-meta"></div>
+      <button id="chat-toggle-btn" class="chat-toggle-btn" type="button" hidden>Chat</button>
     </header>
 
     <div class="layout">
@@ -36,6 +37,23 @@
         <section id="tab-contested" class="tab-panel"></section>
         <section id="tab-constraints" class="tab-panel"></section>
       </main>
+
+      <aside id="chat-panel" class="chat-panel" hidden>
+        <div class="chat-panel-head">
+          <h2>Chat — this plan only</h2>
+          <button id="chat-close-btn" class="chat-close-btn" type="button" aria-label="Close chat">&times;</button>
+        </div>
+        <p class="chat-panel-hint">
+          Answers are grounded in this export only — no CVE knowledge, no live lookups. Every
+          citation shows the finding's real score and bucket, taken from the export, never from
+          the model.
+        </p>
+        <div id="chat-messages" class="chat-messages"></div>
+        <form id="chat-form" class="chat-form">
+          <textarea id="chat-input" rows="2" placeholder="Ask about this plan..."></textarea>
+          <button id="chat-send-btn" type="submit">Send</button>
+        </form>
+      </aside>
     </div>
   </div>
 

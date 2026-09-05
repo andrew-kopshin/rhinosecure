@@ -1793,3 +1793,93 @@ scoring -- unconfirmed ATT&CK candidates are never used in it.
 check, not a named human maintainer) is left uncommitted pending a decision on whether to keep it
 as a third example contract or discard it -- unlike `bluepeak-gen.json`/`mdvm-gen.json`, it is the
 first ever produced by the actual phase-1 agent rather than hand-authored.
+
+## 2026-09-05
+
+**Chat layer for the web UI: read-only Q&A over one run's export file, proposed and approved
+before any code was written, then built.** Not a CLAUDE.md-numbered slice -- a web UI addition
+scoped in conversation: "reads the plan and changes nothing. Mutation comes later through the
+existing job substrate." The design was written up and agreed first (context-fitting strategy,
+citation mechanism, grounding enforcement, UI placement, and whether the job substrate applies),
+matching this project's own "propose representation before building" discipline, then implemented
+against that agreed shape rather than improvised during the build.
+
+**`agents/chat.py`, a new, deliberately toolless agent.** Every other agent in this codebase
+(`research.py`/`environment.py`/`risk.py`/`constraint_intake.py`) gets tools because its job is to
+gather or act on evidence beyond one prompt. Chat gets none: the entire export JSON is serialized
+into the task prompt every turn (full-context-stuffing, no retrieval, no chunking), which at this
+fixture's scale (~13.5K tokens deterministic, measured; ~34K extrapolated agents-path) fits a
+context window with wide margin. A tool that could fetch anything else -- even something already
+in this codebase, like `lookup_nvd` -- would be exactly the escape hatch "no enrichment lookups, no
+outside CVE knowledge" is supposed to close. `ChatAnswer`'s `insufficient_data`/`insufficient_reason`
+pair (a `model_validator` requires a non-empty reason whenever `insufficient_data` is true) makes
+"not in this plan" a legal, structured answer rather than something the model has to improvise
+honestly on its own. `build_chat_task` also wraps the export JSON in explicit data-not-instructions
+delimiters -- CLAUDE.md's still-open prompt-injection item names scanner/NVD-derived free text as a
+risk, and chat is the first place that text reaches an LLM prompt a human actively reads answers
+from; the delimiter is a stated mitigation, not a claim that item is now closed.
+
+**Citations are code-verified, never model-trusted -- the same discipline `risk_score` and
+`tot.CriticScores.aggregate` already enforce elsewhere in this codebase, applied to chat.**
+`ChatCitation` carries only `finding_id`/`fields_used`; the model is never asked for, and never
+supplies, a cited finding's score or bucket. `_validate_citations` checks every cited `finding_id`
+against the export's real `findings[]` (the same shape of check as `agents/risk.py`'s
+`verify_scoring_matches_tool` and `agents/schema_inference.py`'s `check_grounding` -- ground truth
+from data, not from the model's retelling) and fails the response, bounded-retrying up to
+`DEFAULT_MAX_ATTEMPTS=3` fresh dispatches, on any citation that doesn't exist. `enrich_citations`
+then attaches the REAL `risk_score`/`bucket`/`cve_id`/`hostname` server-side, from the export, after
+grounding passes -- so a citation the UI shows can never be a number the model was in a position to
+misreport. This directly answers a requirement stated when the design was approved: citation chips
+show the cited finding's real score and bucket inline, not just its id, so a wrong claim is visible
+without clicking through. What this checks and what it can't: real finding_id membership is a
+mechanical, code-enforced fact; the truth of the surrounding prose is not (no tool-call log to check
+it against, unlike `score_finding`) -- named as a limitation chat inherits, not one it solves,
+matching CLAUDE.md Safety and guardrails' still-open general "grounding validation" item.
+
+**`web/chat.py`, mounted only by `rhino web --enable-chat` -- independent of `--enable-jobs`, on
+purpose.** `web/jobs.py`'s `JobRegistry`/`PlanState`/single-job-at-a-time lock exist to serialize
+access to shared mutable state (`Coordinator.state`, `memory.py`'s SQLite) that a constraint
+submission actually writes to. Chat writes to neither: every request is a pure function of (the
+export file's current contents, the question), so it needs none of that -- no `--data`/`--format`/
+`--seed`/`--db`, no lock, no `PlanState`. `create_app()`'s existing import-boundary discipline
+(`web/jobs.py` imported only inside `create_app`'s body, only when enabled) is extended the same way
+for `web/chat.py`; `/api/health` gained `chat_enabled` alongside `jobs_enabled`. Confirmed nowhere
+else in this codebase either: no auth, no rate limiting, no request-size limit on any existing
+route -- `--enable-chat` is the only gate this route ever exists at all, and `ChatRequest.message`'s
+`max_length=2000` (plus a 20-turn cap on client-supplied history) is the only per-request cost
+control, since unlike every other LLM path here, chat has no `--offline` equivalent: every request
+calls the seam for real. `web/server.py`'s `_load_export` was renamed to `load_export` (unprefixed)
+specifically so `web/chat.py` reads through the exact same function `GET /api/export` does, rather
+than a second, independently-loaded copy of the file.
+
+**Persistent right-hand panel, not a fifth tab -- the UX call made when the design was approved.**
+A tab would hide the Findings/Contested table exactly when a citation chip's whole value is
+glancing at the row it names. `index.html` gained `#chat-panel` as a third flex child of `.layout`
+(sibling to `.sidebar`/`.main`), toggled by a topbar button that only appears once `/api/health`
+reports `chat_enabled` -- same `jobsEnabled`-gates-optional-UI convention `renderConstraints`
+already uses for the constraint form. Real bug caught testing this in a browser, not by any test:
+`.chat-panel`'s own `display: flex` beat the browser's native `[hidden] { display: none }` UA rule
+at equal specificity by cascade order, so the panel rendered OPEN on first load regardless of the
+`hidden` attribute in the HTML -- fixed with an explicit `.chat-panel[hidden] { display: none; }`
+override. `app.js` deliberately breaks its own "never cache the export payload" convention in
+exactly one place (`lastExportData`, set in `renderAll`) so a citation chip's click can jump to and
+open the exact Findings-tab row it names (`jumpToFinding`) -- the same cross-link idiom
+`findingDetailHtml`'s existing `jump-to-contested` link already established, extended to a second
+purpose. At <=900px the existing responsive breakpoint now also collapses the chat panel to full
+width below the main content instead of a fixed 360px column.
+
+**Verified against a real, live LLM call in the browser, not just mocked tests.** `rhino web
+--export out/export_demo.json --enable-chat` (real `ANTHROPIC_API_KEY`, `.venv312`), asked "what
+should i do about the 3 that are contested?" against the 24-finding deterministic fixture. The
+model correctly refused to invent a remediation recommendation (`insufficient_data=true`) because
+this export's `pipeline.tot.status` is `"not_run"` and every finding's `has_tot` is `false` -- a
+deterministic-path export has no ToT branches to recommend from, and the model said exactly that,
+naming which pipeline fields told it so, rather than fabricating a plausible-sounding action. It
+correctly cited F11/F14/F07 (the fixture's actual three contested findings) with their real
+risk_scores (25.9/25.5/18.7) -- server-injected, not model-reported. Citation-chip click-through
+confirmed switching to the Findings tab and opening the named row's detail accordion. Toggle
+open/close and the <=900px responsive stack were also confirmed in-browser. New test coverage:
+`tests/test_agents_chat.py` (parsing/grounding/retry/enrichment, `_FakeCrew`-faked LLM dispatch,
+same convention as `test_coordinator.py`/`test_web_jobs.py`) and `tests/test_web_chat.py`
+(HTTP-level: route gating, `chat_enabled` health field, request validation, reads the live export
+off disk). Full suite: 905 passed, 1 skipped (was 861/1 skipped before this addition).

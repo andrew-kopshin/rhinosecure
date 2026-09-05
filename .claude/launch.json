@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "rhino-web-chat",
+      "runtimeExecutable": ".venv312/Scripts/rhino.exe",
+      "runtimeArgs": ["web", "--export", "out/export_demo.json", "--enable-chat", "--port", "8420"],
+      "port": 8420
+    }
+  ]
+}
