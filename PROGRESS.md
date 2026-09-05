@@ -1543,11 +1543,62 @@ reproduced before fixing:
    PROVABLY unchanged", which closes all three at once, with wording that distinguishes "known to
    have changed" from "cannot be determined from this file".
 
-**Verification.** 60 new tests (783 total, up from 723): `tests/test_adapters_review.py` (41 -- the
+**The review finished in a second pass, and the dimensions that had been cut short found four more
+defects.** The first run lost its regression and test-quality reviewers, and most verifiers, to a
+session limit; those were completed afterwards. Four more real defects, all fixed:
+
+3. **`rereview` reported "No drift and no problems." and exited 0 on exactly the drift it exists to
+   catch.** A requirement can appear without the contract changing at all: the source starts
+   excluding records, so V18 demands `exclusions` where it did not before. Every digest still
+   matched and the measurement was clean, so the summary went green while `confirm --reconfirm`
+   refused the identical input -- a CI drift check passing on a contract that can no longer be
+   signed. `still_missing` was computed and never printed, either. Both now flow from one
+   `ReviewOutcome.rereview_clean` property, so the printed line and the exit code cannot disagree
+   (they briefly did, mid-fix, which is why it is one property rather than two expressions). It also
+   now covers a moved slot, which had the same print-says-NEEDS-REVIEW / summary-says-clean split.
+4. **The "columns this contract does not read" section vanished in silence for any source with a
+   non-comma delimiter or a banner row**, because `_unmapped_profiles` re-read the file through
+   `probe.profile_csv`, which knows nothing of `Source.delimiter`/`quotechar`/`encoding`/
+   `first_data_row`. The file parsed as one giant column, every declared name missed, and the
+   section simply disappeared -- the worst failure mode for the part of the report whose job is to
+   show what a mapping ignores. `profile_csv` now takes those four as optional arguments defaulting
+   to today's behavior, and the review passes the contract's own.
+5. **`_print_contract_state` raised `IndexError` on a slot-digest key with no `.` in it.**
+   `slot_digests` lives under `review`, which sits outside both digests, so its keys are unsigned
+   and a hand-edited file can carry any shape. A printer must not raise on one.
+6. **The value distribution silently truncated to four values per field**, with no ellipsis and no
+   count, so the numbers shown simply did not add up to `assets_loaded` and a reader had no way to
+   know the list was partial. Now says `+N more`.
+
+**Regression checked by byte-diffing against the previous commit, after the first attempt at it was
+itself wrong.** Running the old code from a `git worktree` looked convincing and proved nothing: the
+editable install shadows the worktree, so both sides imported the same current source. With
+`PYTHONPATH` actually pinned, `run` on the demo fixture, `--format bluepeak`, `--format defender`,
+`--adapter-config`, and `adapt list` are byte-identical pre- and post-slice, and `adapt probe`
+differs only in the absolute path of the worktree it ran from. V18's attestation messages are
+byte-identical across the extraction, checked branch by branch; the only deliberate difference is
+the non-int exclusion count, where the old code raised `TypeError: unsupported operand type(s) for
++: 'dict' and 'int'` out of the validator and the new one refuses -- reproduced against the real
+pre-slice code rather than argued.
+
+**Mutation testing on the new tests, which found one vacuous claim and one hazard.** Eight
+load-bearing behaviors were each broken in turn to confirm a test caught it. Seven did. The
+survivor was `_provisional` clearing `observed` -- a property this module's own docstring calls
+"load-bearing, not cosmetic" and which nothing tested, because every fixture either had no
+`observed` or had one with a matching attestation; now covered by a test built on the real case (a
+previous run's exclusion counts with no `exclusions` sentence on file). The hazard was worse and
+was found by the mutation rather than by the test: with the `--reconfirm` guard removed,
+`test_the_committed_contracts_are_never_written_by_a_review` -- the one test that deliberately
+points the WRITING verb at a real committed artifact -- rewrote `data/adapters/bluepeak-gen.json`
+and took the pinned differential test down with it. The guard regressing should produce a red test,
+not a corrupted repository, so that test now restores the bytes in a `finally`. Both mutations are
+caught now, and the repository is verified clean afterwards.
+
+**Verification.** 68 new tests (791 total, up from 723): `tests/test_adapters_review.py` (46 -- the
 measurement against real committed data including that its numbers equal what `rhino run` reports,
 every refusal path, the C3 two-shot loop, carry-forward under three drift shapes, `--attest`
-parsing, the two review findings above, and that the committed contracts are byte-identical after
-both verbs run) and a confirm/rereview section in `tests/test_cli_adapt.py` (19 -- flag wiring, exit
+parsing, all six review findings above, and that the committed contracts are byte-identical after
+both verbs run) and a confirm/rereview section in `tests/test_cli_adapt.py` (21 -- flag wiring, exit
 codes, output ordering, and the banner notice). Plus 4 in `tests/test_adapters_config_io.py` for the
-alias fix. All 783 pass; the two pinned differential tests and every `rhino run` byte-identical test are
+alias fix and 3 in `tests/test_adapters_probe.py` for the dialect arguments. All 791 pass; the two pinned differential tests and every `rhino run` byte-identical test are
 untouched, and `git status data/adapters/` is clean after the whole suite.

@@ -919,7 +919,10 @@ def _print_value_distribution(m: Measurement) -> None:
     print("\nValues produced for the scoring inputs (Impact axis):")
     rows = []
     for target, counts in m.value_distribution.items():
-        shown = ", ".join(f"{value} x{count}" for value, count in list(counts.items())[:4])
+        head = list(counts.items())[:4]
+        shown = ", ".join(f"{value} x{count}" for value, count in head)
+        if len(counts) > len(head):
+            shown += f", +{len(counts) - len(head)} more"
         gap = m.asset_gaps.get(target, 0)
         note = f"{gap}/{m.assets_loaded} not collected -- documented default" if gap else ""
         rows.append((target, shown, note))
@@ -993,8 +996,15 @@ def _print_contract_state(outcome: ReviewOutcome) -> None:
         print(f"  slots: {len(slots.unchanged)} unchanged, {len(slots.changed)} changed, "
               f"{len(slots.new)} new, {len(slots.orphaned)} orphaned")
         for name in slots.moved:
-            node = outcome.contract.asset.get(name.split(".", 1)[1]) if name.startswith("asset.") else \
-                outcome.contract.finding.get(name.split(".", 1)[1])
+            # `slot_digests` lives under `review`, which sits outside both
+            # digests -- its keys are unsigned, so a hand-edited file can carry
+            # a name in any shape. A printer must not raise on one.
+            block, _dot, target = name.partition(".")
+            node = (
+                outcome.contract.asset.get(target)
+                if block == "asset"
+                else outcome.contract.finding.get(target) if block == "finding" else None
+            )
             rendered = json.dumps(node.model_dump(mode="json", by_alias=True), sort_keys=True) if node else "(removed)"
             print(_wrap(f"{name} -> {rendered}", indent="    NEEDS REVIEW ", continuation_indent="      "))
         if slots.moved:
@@ -1009,6 +1019,16 @@ def _print_attestations(outcome: ReviewOutcome) -> None:
         print(_wrap(f"{item} -- required because {reason}", indent="  required: ", continuation_indent="    "))
     if not outcome.required:
         print("  none required by this contract's shape or this measurement")
+    if outcome.still_missing:
+        print(
+            _wrap(
+                f"MISSING {outcome.still_missing} -- `rhino adapt confirm` will refuse until each is "
+                "supplied with --attest ITEM=\"...\". A requirement can appear without the contract "
+                "changing at all: the source started excluding records.",
+                indent="  ! ",
+                continuation_indent="    ",
+            )
+        )
     for reason in outcome.attestations_dropped:
         print(_wrap(f"no longer carries forward -- {reason}", indent="  - ", continuation_indent="    "))
     for previous, new in outcome.attestations_replaced:
@@ -1052,8 +1072,13 @@ def _print_review(outcome: ReviewOutcome, data_dir: Path, *, verb: str) -> None:
             print(_wrap(refusal, indent="  - ", continuation_indent="    "), file=sys.stderr)
         return
     if verb == "rereview":
-        clean = outcome.measurement.is_clean and outcome.drift.content_matches and outcome.drift.decision_matches
-        print(f"\nNo drift and no problems." if clean else "\nReviewed. See above; nothing was written.")
+        # Same property the exit code uses, so the line and the status can
+        # never disagree -- see ReviewOutcome.rereview_clean.
+        print(
+            "\nNo drift and no problems."
+            if outcome.rereview_clean
+            else "\nReviewed. See above; nothing was written."
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1492,7 +1517,7 @@ def main(argv: list[str] | None = None) -> int:
         _print_review(outcome, data_dir, verb=args.adapt_command)
         if sign:
             return 0 if outcome.written else 1
-        return 0 if outcome.ok and outcome.drift.content_matches and outcome.drift.decision_matches else 1
+        return 0 if outcome.rereview_clean else 1
 
     return 1
 

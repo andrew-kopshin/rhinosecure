@@ -298,6 +298,33 @@ def test_many_ragged_rows_are_capped_with_a_trailer(tmp_path):
 # --- profile_csv: encoding -----------------------------------------------
 
 
+def test_a_non_comma_delimiter_can_be_declared(tmp_path):
+    """Found reviewing slice 7. `adapters/review.py` profiles the columns a
+    contract declares it ignores, and that contract states its own dialect --
+    without these arguments a semicolon-delimited source parsed as one giant
+    column and the whole section vanished from the review in silence."""
+    path = tmp_path / "data.csv"
+    path.write_text("a;b\n1;2\n3;4\n", encoding="utf-8")
+    assert profile_csv(path).header == ["a;b"]  # the default assumption, unchanged
+    profile = profile_csv(path, delimiter=";")
+    assert profile.header == ["a", "b"]
+    assert profile.columns["b"].sample_values == ["2", "4"]
+
+
+def test_a_banner_row_above_the_header_can_be_skipped(tmp_path):
+    path = tmp_path / "data.csv"
+    path.write_text("Exported by SomeTool v3\na,b\n1,2\n", encoding="utf-8")
+    profile = profile_csv(path, skip_lines=1)
+    assert profile.header == ["a", "b"]
+    assert profile.row_count == 1
+
+
+def test_an_explicit_encoding_overrides_bom_sniffing(tmp_path):
+    path = tmp_path / "data.csv"
+    path.write_bytes("a,b\r\n1,2\r\n".encode("utf-16"))
+    assert profile_csv(path, encoding="utf-16").header == ["a", "b"]
+
+
 def test_utf16_bom_is_detected_via_ingest_detect_encoding(tmp_path):
     path = tmp_path / "data.csv"
     text = "a,b\r\n1,2\r\n"

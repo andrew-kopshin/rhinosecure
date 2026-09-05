@@ -253,6 +253,27 @@ class ReviewOutcome:
     def ok(self) -> bool:
         return not self.refusals and self.measurement.is_clean
 
+    @property
+    def rereview_clean(self) -> bool:
+        """Whether `rhino adapt rereview` should report nothing to do, and
+        exit 0. Deliberately includes `still_missing`, which is NOT part of
+        `ok`: an attestation requirement can appear without the contract
+        changing at all -- the source starts excluding records, so V18 now
+        demands `exclusions` where it did not before. That leaves every
+        digest matching and the measurement clean while `confirm` refuses,
+        which is exactly the drift a re-review exists to surface. Reporting
+        it clean would send a CI drift check green on a contract that can no
+        longer be signed. One property so the printed line and the exit code
+        cannot disagree."""
+        return (
+            self.measurement.is_clean
+            and self.drift.content_matches
+            and self.drift.decision_matches
+            and not self.drift.slots.moved
+            and not self.still_missing
+            and not self.refusals
+        )
+
 
 def _provisional(contract: Contract) -> Contract:
     """See the module docstring's "Measuring a contract the engine refuses
@@ -306,7 +327,18 @@ def _unmapped_profiles(contract: Contract, data_dir: Path) -> dict[str, dict[str
         path = data_dir / filename
         if not path.is_file():
             continue
-        file_profile = profile_csv(path)
+        # The contract's OWN dialect, not the profiler's defaults. A
+        # semicolon-delimited or banner-prefixed source otherwise parses as
+        # one giant column, every declared name misses, and this whole
+        # section disappears from the review without saying so.
+        source = contract.source
+        file_profile = profile_csv(
+            path,
+            delimiter=source.delimiter,
+            quotechar=source.quotechar,
+            encoding=None if source.encoding == "auto" else source.encoding,
+            skip_lines=source.first_data_row - 2,
+        )
         for column, entry in declared.items():
             column_profile = file_profile.columns.get(column)
             if column_profile is None:

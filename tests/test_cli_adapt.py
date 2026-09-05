@@ -374,6 +374,32 @@ def test_the_run_banner_notices_a_size_mismatch_against_what_was_signed(tmp_path
     assert "was confirmed against 3 asset(s)" in capsys.readouterr().out
 
 
+def test_a_malformed_slot_digest_key_does_not_crash_the_printer(tmp_path, capsys):
+    """Found by review. `slot_digests` lives under `review`, which sits
+    outside both digests -- so its keys are unsigned and a hand-edited file
+    can carry a name with no `.` in it, which the node lookup split on."""
+    path = _scratch_contract(tmp_path)
+    main(["adapt", "confirm", str(path), "--data", BLUEPEAK_DATA, "--by", "r@example.com"])
+    capsys.readouterr()
+    edited = _json.loads(path.read_text(encoding="utf-8"))
+    edited["review"]["slot_digests"]["bogus-no-dot"] = "sha256:" + "0" * 64
+    path.write_text(_json.dumps(edited, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    assert main(["adapt", "rereview", str(path), "--data", BLUEPEAK_DATA]) == 1  # must not raise
+    out = capsys.readouterr().out
+    assert "bogus-no-dot" in out
+    assert "(removed)" in out
+
+
+def test_a_truncated_value_list_says_how_many_it_dropped(tmp_path, capsys):
+    """Found by review. The distribution showed only the top 4 values with no
+    ellipsis, so the counts silently failed to add up to assets_loaded."""
+    main(["adapt", "rereview", "bluepeak-gen", "--data", "bluepeak"])
+    out = capsys.readouterr().out
+    role_line = next(line for line in out.splitlines() if line.startswith("role "))
+    assert "more" in role_line  # bluepeak's fleet spans more than four roles
+
+
 def test_the_banner_says_nothing_when_the_contract_has_no_measurement(capsys):
     """Both committed contracts predate `observed` being written at all --
     their output must not change."""

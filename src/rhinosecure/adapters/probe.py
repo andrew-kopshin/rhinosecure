@@ -304,18 +304,36 @@ class FileProfile:
     problems: list[str]
 
 
-def profile_csv(path: Path) -> FileProfile:
+def profile_csv(
+    path: Path,
+    *,
+    delimiter: str = ",",
+    quotechar: str = '"',
+    encoding: str | None = None,
+    skip_lines: int = 0,
+) -> FileProfile:
     """Profile one CSV file, streaming, in a single pass. Never raises for
     a messy file -- a duplicate header name, a ragged row, or a mid-file
     decode failure is recorded on a `NonRaisingProblemCollector` and
     scanning either continues (ragged rows) or stops early with
     `truncated=True` (a decode failure, since nothing after an undecodable
     byte can be trusted). Only raises `ProbeError` when there is nothing at
-    all to profile: the path is not a file, or it has no header row."""
+    all to profile: the path is not a file, or it has no header row.
+
+    The dialect arguments all default to what `rhino adapt probe` assumes
+    for a source nobody has described yet -- a comma-delimited file whose
+    first line is the header. They exist for a caller that DOES know
+    better: `adapters/review.py` profiles the columns a confirmed contract
+    declares it ignores, and that contract states its own `delimiter` /
+    `quotechar` / `encoding` / `first_data_row`. Without them a
+    semicolon-delimited or banner-prefixed source parses as one giant
+    column, every declared name is missed, and the section vanishes from
+    the review in silence -- the worst failure mode for a report whose job
+    is to show what a mapping does not read."""
     if not path.is_file():
         raise ProbeError(f"{path}: not a file")
 
-    encoding = detect_encoding(path)
+    encoding = encoding or detect_encoding(path)
     problems = NonRaisingProblemCollector(path)
 
     try:
@@ -324,7 +342,9 @@ def profile_csv(path: Path) -> FileProfile:
         raise ProbeError(f"{path}: could not be opened -- {exc}") from exc
 
     with f:
-        reader = csv.reader(f)
+        for _ in range(skip_lines):
+            f.readline()  # a banner above the real header, if one is declared
+        reader = csv.reader(f, delimiter=delimiter, quotechar=quotechar)
         try:
             header = next(reader)
         except StopIteration:

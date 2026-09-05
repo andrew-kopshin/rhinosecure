@@ -114,6 +114,29 @@ def test_measure_matches_what_a_real_run_reports(tmp_path):
     assert m.asset_gaps == result.report.asset_gaps
 
 
+def test_a_stale_observed_does_not_make_the_fresh_measurement_refuse_itself(tmp_path):
+    """`_provisional` clears `observed`, and the module docstring calls that
+    load-bearing. It is: `ConfiguredAdapter.load_assets` runs
+    `validate_contract` on every load, and V18 reads the STORED exclusion
+    count -- so a contract carrying a previous run's exclusions without a
+    matching attestation would refuse to measure, which is exactly the
+    contract most in need of re-measuring. Added after a mutation run showed
+    removing the clearing broke nothing."""
+    on_disk = read_contract(_bluepeak(tmp_path))
+    assert "exclusions" not in {a.item for a in on_disk.attestations}
+    contract = on_disk.model_copy(
+        # A previous run's exclusion counts, with no `exclusions` sentence to
+        # match. Its own enrichment/union attestations stay, so this isolates
+        # the stale-`observed` path rather than tripping V18's structural
+        # requirements for an unrelated reason.
+        update={"observed": {"excluded_assets": 5, "excluded_findings": 2}}
+    )
+    m = measure(contract, BLUEPEAK_DIR)
+    assert m.halted_by is None, m.halted_by
+    assert m.is_clean
+    assert m.assets_loaded > 0
+
+
 def test_measure_never_writes_and_never_returns_the_provisional_contract(tmp_path):
     path = _bluepeak(tmp_path)
     before = path.read_bytes()
@@ -566,6 +589,44 @@ def test_deleting_the_identity_slot_digest_does_not_get_past_the_freeze(tmp_path
     assert any("memory.decisions" in r for r in outcome.refusals)
 
 
+def test_rereview_is_not_clean_when_a_new_attestation_became_required(tmp_path):
+    """Found by review. A requirement can appear with the contract untouched:
+    the source starts excluding records, so V18 demands `exclusions` where it
+    did not before. Every digest still matches and the measurement is clean,
+    so rereview called it "No drift and no problems." and exited 0 -- sending
+    a CI drift check green on a contract `confirm` refuses."""
+    clean_source = _bluepeak_source(tmp_path, mutate=None)
+    path = _bluepeak(tmp_path)
+    signed = review_contract(path, read_contract(path), clean_source, at=AT, by=BY, sign=True)
+    assert signed.written
+
+    def unmappable(rows):
+        rows[0]["Asset_Type"] = "Quantum Toaster"
+
+    drifted_root = tmp_path / "drifted"
+    drifted_root.mkdir()
+    drifted = _bluepeak_source(drifted_root, mutate=unmappable)
+    outcome = review_contract(path, read_contract(path), drifted, at=AT, sign=False)
+    assert outcome.drift.content_matches and outcome.drift.decision_matches  # the file did not move
+    assert outcome.measurement.is_clean  # an exclusion is not a data-quality problem
+    assert outcome.still_missing == ["exclusions"]
+    assert outcome.rereview_clean is False
+
+    # And the same input really is refused by confirm -- the two must agree.
+    refused = review_contract(path, read_contract(path), drifted, at=AT, by=BY, sign=True, reconfirm=True)
+    assert not refused.written
+
+
+def test_rereview_is_clean_when_nothing_moved(tmp_path):
+    """Guard on the above: the stricter check must not make every re-review
+    dirty."""
+    source = _bluepeak_source(tmp_path, mutate=None)
+    path = _bluepeak(tmp_path)
+    review_contract(path, read_contract(path), source, at=AT, by=BY, sign=True)
+    outcome = review_contract(path, read_contract(path), source, at=AT, sign=False)
+    assert outcome.rereview_clean is True
+
+
 def test_an_unchanged_confirmed_contract_never_hits_the_identity_gate(tmp_path):
     """Guard on the fix above: the no-slot_digests refusal must fire only
     when a decision actually moved, or every re-confirm of the two committed
@@ -580,11 +641,23 @@ def test_an_unchanged_confirmed_contract_never_hits_the_identity_gate(tmp_path):
 def test_the_committed_contracts_are_never_written_by_a_review(tmp_path):
     """They are pinned byte-for-byte by the differential suite. rereview
     cannot write at all, and confirm refuses a confirmed contract without
-    --reconfirm -- so this holds mechanically, not by discipline."""
+    --reconfirm -- so this holds mechanically, not by discipline.
+
+    The `finally` restore is not belt-and-braces: this is the one test that
+    deliberately points the WRITING verb at a real committed artifact, so if
+    the guard it checks ever regresses, the failure must be a red test and
+    not a corrupted repository. A mutation run proved that necessary -- with
+    the `--reconfirm` guard removed, this test rewrote
+    data/adapters/bluepeak-gen.json and took the pinned differential test
+    down with it."""
     for name, data_dir in (("bluepeak-gen", BLUEPEAK_DIR), ("mdvm-gen", DEFENDER_DIR)):
         path = COMMITTED / f"{name}.json"
         before = path.read_bytes()
-        review_contract(path, read_contract(path), data_dir, at=AT, sign=False)
-        outcome = review_contract(path, read_contract(path), data_dir, at=AT, by=BY, sign=True)
-        assert not outcome.written
-        assert path.read_bytes() == before
+        try:
+            review_contract(path, read_contract(path), data_dir, at=AT, sign=False)
+            outcome = review_contract(path, read_contract(path), data_dir, at=AT, by=BY, sign=True)
+            assert not outcome.written
+            assert path.read_bytes() == before
+        finally:
+            if path.read_bytes() != before:
+                path.write_bytes(before)
