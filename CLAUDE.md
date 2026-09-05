@@ -989,6 +989,73 @@ not mark any of these done until there's a specific module and test to point to.
 
 ---
 
+## Adapter generation (LLM-assisted contract authoring)
+
+Section 1's adapter seam (`adapters/`) means a new source format needs a hand-written
+Python adapter. `docs/adapter-generation.md` is a second, later way to add one: point
+RhinoSecure at an arbitrary CSV and get a working format without writing Python at all.
+That file is authoritative for every mechanism named below; this section exists so the
+split and its two rules don't depend on a reader following the link.
+
+**Two phases, and the split is the whole design.** Phase 1 (`rhino adapt propose`, not
+built — Slice 8): an LLM inspects a source's headers and rows and proposes a mapping onto
+`Asset`/`Finding`; a human reviews and confirms it (`rhino adapt confirm`, built). This
+runs once per source, ever — again only if the source's shape changes. Phase 2
+(`ConfiguredAdapter`, built): every subsequent run reads the confirmed mapping — a JSON
+**contract** — with zero LLM involvement, exactly like a hand-written adapter. This is the
+same discipline Section 8 rules 2–3 already require of scoring: if the mapping were
+re-derived per run, the same file could score differently on different days. A confirmed
+contract resolves through `rhino run --adapter-config <name>` / `rhino constraint add
+... --adapter-config <name>` into the same `ingest.load_batch` every other adapter uses;
+scoring, enrichment, and the agents never know a run came from a contract instead of a
+built-in `--format`.
+
+**Status.** Slices 1–7 are built: the contract schema and validator, the phase-2 engine
+(proven differentially identical to the hand-written BluePeak and Defender adapters on
+real data), the confirmation-digest gate, `--adapter-config` on the CLI, pre-enriched-
+source support, a non-raising column profiler (`rhino adapt probe`/`list`), and the
+confirm/re-review workflow itself (`rhino adapt confirm`/`rereview`) with its attestation
+gate. Two contracts are confirmed and committed: `data/adapters/bluepeak-gen.json`,
+`data/adapters/mdvm-gen.json` — both hand-authored, since Slice 8 doesn't exist yet to
+author one from an LLM call. Slice 7 was hardened by an adversarial review round (commit
+`309b9a1`) that found and fixed six defects after the initial build — PROGRESS.md is
+authoritative for what they were and how each was verified. Not built: Slice 8, the
+phase-1 inference agent behind `rhino adapt propose`; and Slice 9, surfacing contract
+provenance in `export.py`/`rhino web`.
+
+**Rule 1 — `exclude` is legal only for a check feeding `Asset.role`, and only the
+validator gets to decide that, never a config key.** The mapping grammar has no
+`on_unmapped` field. Making a value's disposition (fatal — refuse the whole batch — vs.
+scope-exclude the one record) a contract setting would let either the model or a human
+reclassify an inconvenient refusal as "exclude" to make it disappear — the exact silent-
+absorption failure the not-collected/refuse-rather-than-guess discipline (Section 1)
+exists to prevent. Instead the engine decides structurally: `ConfiguredAdapter
+._role_reference()` inspects how `contract.asset["role"]` is itself mapped — a direct
+`VocabularyMapping`, or a `DefaultByMapping` keyed off a `derived` table — and forward-
+traces which vocabulary or derivation-table lookup actually feeds that field. Only a miss
+at *that specific* lookup becomes `problems.exclude(...)`, a scope-boundary skip that's
+reported but not fatal (a Kubernetes cluster with no honest blast-radius role, say).
+Every other vocabulary or derivation-table miss anywhere else in the contract is always
+`problems.add(...)`, a fatal, whole-batch refusal.
+
+**Rule 2 — every pattern a contract can invoke is a closed, code-owned catalog; nothing
+lets an LLM author or select a regex at runtime.** `ParsedMapping.parser` is a fixed
+`Literal["bool", "float", "date", "timestamp", "cve_id"]` — pydantic rejects anything
+else — and the actual regexes behind each are hard-coded module constants, never built
+from contract text. The one "degrade" field (an ATT&CK-technique pattern match) can only
+*select* one pre-existing named pattern, never supply its own. `VocabularyMapping`/
+`Derivation` tables are plain JSON dicts read only via `dict.get(...)` — never `eval`,
+never `re.compile` on contract data, no code generation anywhere. `Contract.generator`
+records that an LLM authored the *contract itself* in phase 1 (tool, model, token counts,
+cost, a call-log digest) purely as audit trail — its own docstring: never read by the
+phase-2 engine, never input to any decision it makes. Together with Rule 1, this is what
+makes "confirmed once, deterministic forever" actually true: the engine's every runtime
+decision — including its one qualitative judgment call, fatal vs. exclude — resolves
+against fixed code and a frozen, hashed contract, never a live model call or a
+model-chosen pattern.
+
+---
+
 ## 9. Repository layout
 
 ```
@@ -1007,16 +1074,23 @@ rhinosecure/
     full/                    # generated, seed 42
       assets.csv
       findings.csv
+    adapters/                # confirmed ingest contracts (Adapter generation, above)
+      bluepeak-gen.json
+      mdvm-gen.json
     snapshots/
       kev.json                 # bulk catalog, one file
       epss/                    # per-CVE, queried live against api.first.org
       nvd/
       attack/
+  docs/
+    adapter-generation.md    # LLM-assisted adapter generation -- authoritative for detail (above)
   src/rhinosecure/
     schema.py                # dataclasses + CSV validation
     ingest.py
     adapters/                # ingest adapters -- the format seam (Section 1)
       base.py  native.py  defender.py
+      config_model.py  config_io.py  configured.py  # LLM-assisted adapter generation (above)
+      probe.py  review.py                           #   contract profiling + the confirm/rereview gate
     scoring.py               # deterministic, no LLM
     tot.py
     memory.py                # sqlite
