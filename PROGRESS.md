@@ -1883,3 +1883,31 @@ open/close and the <=900px responsive stack were also confirmed in-browser. New 
 same convention as `test_coordinator.py`/`test_web_jobs.py`) and `tests/test_web_chat.py`
 (HTTP-level: route gating, `chat_enabled` health field, request validation, reads the live export
 off disk). Full suite: 905 passed, 1 skipped (was 861/1 skipped before this addition).
+
+**A local-model swap test against the chat layer specifically (`qwen2.5:14b`, via Ollama) surfaced
+a failure mode `_validate_citations` cannot catch -- fabricated prose anchored to a real
+citation.** This is a different probe than 2026-09-04's local-model test, which exercised
+`llama3.1:8b` against the Research/Environment/Risk agent pipeline and found outright structured-
+output/grounding failures (0/3 findings scored) -- a failure the existing machinery already catches
+and reports as a failure. `qwen2.5:14b` against `agents/chat.py` did not fail that way: asked about
+`F14`, it returned schema-valid `ChatAnswer` JSON citing `finding_id="F14"` -- a real finding_id,
+so `_validate_citations` passed it, the response was accepted on the first attempt, and it was
+returned to the caller as a grounded answer. The prose itself was not grounded: it stated F14 is
+contested "due to incomplete data collection on a scoped asset." The export's real rationale for
+`F14` says nothing of the kind -- `bucket=contested: is_kev=True with no compensating control and
+no patch window -- not accept (confirmed exploitation), not mitigate_monitor (no control to point
+to), not next_window (nothing scheduled)`. `not_collected`/`asset_not_collected` are both empty for
+this finding (native fixture, no data gaps at all per this run's own `summary.data_gaps`) -- the
+model didn't misread a real gap, it invented one that isn't in the export.
+
+This is exactly the limitation `agents/chat.py`'s own module docstring already names rather than
+claims to solve ("What this checks, and what it can't... It does NOT verify that every sentence of
+prose is true -- there is no ground-truth log to check free text against"), and the concrete case
+CLAUDE.md Safety and guardrails' still-open "Grounding validation" item is about -- now with a real,
+reproduced instance against this specific agent rather than only a theoretical gap. It's a more
+dangerous failure than `llama3.1:8b`'s: a schema/grounding failure is loud -- `ChatAnswerError`,
+a 502, nothing shown to the user as an answer. This one is quiet -- a real finding_id, a plausible-
+sounding sentence, a citation chip that renders normally with F14's real score/bucket next to a
+claim about F14 that is simply false, indistinguishable in the UI from a correct answer without a
+human separately knowing the real rationale. Not yet fixed or mitigated beyond what's already
+documented; recorded here so the gap is measured, not just asserted.
