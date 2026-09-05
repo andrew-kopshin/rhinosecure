@@ -6,17 +6,48 @@ export JSON already being served; changes nothing, persists nothing, and
 is deliberately decoupled from agents/coordinator.py and memory.py -- a
 chat answer is a pure function of (export_data, message, history).
 
-**Full-context-stuffing, no retrieval.** The entire export JSON is
-serialized into the task prompt every turn -- no chunking, no vector
-search, no partial fetch. At the fixture scale this project runs at
-(~13.5K tokens deterministic, ~34K tokens extrapolated agents-path, see
-the chat-layer design conversation), that fits a single context window
-with wide margin. CLAUDE.md's "nothing may assume the dataset is small
-enough to fetch in one pass" (Section 1) is knowingly not honored here:
-if a real fleet's export ever grows past what fits in context, the fix is
-a code-driven pre-filter over `findings[]` before the prompt is built --
-not tool-calling that would let the model retrieve on its own. That's
-future work, not built here.
+**Full-context-stuffing by default, narrowed by a deterministic pre-filter
+when the question names something specific.** The whole export still goes
+into the prompt every turn -- no vector search, no embeddings, no
+tool-calling that would let the model retrieve on its own (that would be
+exactly the escape hatch grounding is supposed to close, see "No tools"
+below). What changed: `build_scoped_export` checks the question's own text
+-- deterministically, with substring/regex matching, never a model call --
+for a real finding_id, cve_id, or hostname already present in this export.
+When it finds one, every OTHER finding is projected down to
+`COMPACT_FINDING_FIELDS` (id/cve/asset/host/bucket/risk_score/has_tot,
+identical field names to the full entry -- nothing is dropped from the
+`findings[]` array, only detail past those fields), while every finding
+that matched keeps its full rationale/sources/etc. When nothing is named,
+`build_scoped_export` returns `export_data` completely unchanged -- full
+context stays the default, not a fallback.
+
+**Why this exists: a real, reproduced failure mode, not the token-budget
+concern the previous version of this docstring anticipated.** A
+`qwen2.5:14b` local-model test asked about `F14` returned a schema-valid,
+citation-grounded answer whose PROSE was fabricated (see PROGRESS.md
+2026-09-05). A follow-up test with a larger 32B local model was worse in a
+specific way: it invented a CVE ID, asset ID, and hostname for `F14` and
+then claimed `F14`'s real rationale -- present verbatim in
+the very JSON blob it was given -- wasn't in the export at all. That
+reads as a long-context retrieval failure (losing track of one record
+inside a large single JSON blob), not a capability ceiling -- a bigger
+model failing a way a smaller one didn't is the signature of "lost in the
+middle," not "too dumb." Narrowing the context so a named finding is one
+of very few full-detail entries, surrounded only by compact rows with
+nothing to confuse it with, is a direct, deterministic countermeasure for
+exactly that failure shape. It does not, and cannot, fix the *other*
+failure mode PROGRESS.md 2026-09-05 recorded (fabricated prose anchored to
+a real, correctly-cited finding) -- that one is a truthfulness problem
+`_validate_citations` was never built to catch (see "What this checks, and
+what it can't" below); this pre-filter is a countermeasure for a different
+problem that happens to have shown up in the same round of local-model
+testing.
+
+This also, incidentally, is the CLAUDE.md Section 1 "nothing may assume
+the dataset is small enough to fetch in one pass" concern's actual fix,
+should a real fleet's export ever grow past a single context window --
+the same mechanism, triggered by the same condition, addresses both.
 
 **No tools.** Every other agent in this codebase (research.py,
 environment.py, risk.py, constraint_intake.py) gets tools because its job
@@ -68,6 +99,7 @@ returning an ungrounded answer to a caller.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from crewai import Agent, Crew, Process, Task
@@ -80,6 +112,30 @@ from rhinosecure.llm import get_llm
 ROLE = "Plan Analyst"
 
 DEFAULT_MAX_ATTEMPTS = 3
+
+# Same pattern configured.py's own _CVE_ID_PATTERN checks a CSV cell
+# against (a real external identifier format, MITRE's -- not a
+# RhinoSecure- or fixture-specific pattern), unanchored here to find a
+# mention anywhere inside free-form question text instead of validating
+# one whole field.
+_CVE_MENTION_PATTERN = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
+
+# What a COMPACT (non-matched) finding keeps -- identical field names to a
+# full finding entry, so _known_findings()/enrich_citations() need no
+# awareness that compaction happened at all: every finding, full or
+# compact, still carries these five real facts.
+COMPACT_FINDING_FIELDS = ("finding_id", "cve_id", "asset_id", "hostname", "bucket", "risk_score", "has_tot")
+
+COMPACT_CONTESTED_FIELDS = (
+    "finding_id",
+    "cve_id",
+    "hostname",
+    "status",
+    "termination_reason",
+    "near_tie",
+    "winner_strategy",
+    "failure_reason",
+)
 
 
 class ChatCitation(BaseModel):
@@ -139,6 +195,81 @@ def _known_findings(export_data: dict[str, Any]) -> dict[str, dict[str, Any]]:
     }
 
 
+def _mentioned_known_values(message: str, values: set[str]) -> set[str]:
+    """Case-insensitive substring match -- the same convention
+    `agents/constraint_intake.py`'s own `_matches()` already uses for
+    resolving a human's free text against real identifiers. Imprecise for
+    a very short id (a two-character finding_id could false-positive
+    against unrelated text, and a short id can itself substring-match
+    inside a longer one that happens to share a prefix) -- a bounded,
+    deterministic decision instead of guessing which mentions are "close
+    enough", the same tradeoff `_matches()` already accepts."""
+    lowered = message.lower()
+    return {v for v in values if v and v.lower() in lowered}
+
+
+def _matched_finding_ids(message: str, findings: list[dict[str, Any]]) -> tuple[set[str], bool]:
+    """Returns (finding_ids whose finding_id/cve_id/hostname was named in
+    `message`, whether ANYTHING was named at all). The second value can be
+    True with an empty first value -- e.g. a CVE mentioned in the question
+    that isn't in this export at all -- and that's still "named": scoping
+    to zero full findings plus the compact summary is the honest minimum
+    context for a question about something this plan doesn't contain,
+    exactly the shape an insufficient_data answer needs."""
+    cve_mentions = {m.group(0).upper() for m in _CVE_MENTION_PATTERN.finditer(message)}
+    known_hostnames = {f["hostname"] for f in findings if f.get("hostname")}
+    known_finding_ids = {f["finding_id"] for f in findings if f.get("finding_id")}
+    mentioned_hostnames = _mentioned_known_values(message, known_hostnames)
+    mentioned_finding_ids = _mentioned_known_values(message, known_finding_ids)
+
+    named = bool(cve_mentions or mentioned_hostnames or mentioned_finding_ids)
+    matched = {
+        f["finding_id"]
+        for f in findings
+        if f.get("finding_id") in mentioned_finding_ids
+        or (f.get("cve_id") or "").upper() in cve_mentions
+        or f.get("hostname") in mentioned_hostnames
+    }
+    return matched, named
+
+
+def _compact(record: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    return {k: record.get(k) for k in fields}
+
+
+def build_scoped_export(export_data: dict[str, Any], message: str) -> tuple[dict[str, Any], bool]:
+    """The deterministic pre-filter: when `message` names a real
+    finding_id, cve_id, or hostname already in this export, every OTHER
+    finding (and OTHER contested entry) is projected down to
+    COMPACT_FINDING_FIELDS/COMPACT_CONTESTED_FIELDS -- full detail stays
+    only for what was actually named. Nothing is removed from `findings`/
+    `contested`, so `_known_findings` sees the identical set of
+    finding_id/cve_id/hostname/bucket/risk_score whether or not scoping
+    happened; every other export section (run/pipeline/summary/
+    constraints/usage) is untouched.
+
+    Returns `(export_data, False)` UNCHANGED -- same object, not a copy --
+    when nothing was named: full-context-stuffing is the default, not a
+    fallback path. See the module docstring for why this exists (a
+    reproduced long-context retrieval failure on a 32B local model, not a
+    token-budget worry) and what it cannot fix (fabricated prose anchored
+    to a correctly-cited finding -- a different, truthfulness problem).
+    """
+    findings = export_data.get("findings", [])
+    matched_ids, named = _matched_finding_ids(message, findings)
+    if not named:
+        return export_data, False
+
+    scoped_findings = [
+        f if f.get("finding_id") in matched_ids else _compact(f, COMPACT_FINDING_FIELDS) for f in findings
+    ]
+    scoped_contested = [
+        c if c.get("finding_id") in matched_ids else _compact(c, COMPACT_CONTESTED_FIELDS)
+        for c in export_data.get("contested", [])
+    ]
+    return {**export_data, "findings": scoped_findings, "contested": scoped_contested}, True
+
+
 def build_chat_agent(llm: BaseLLM | None = None) -> Agent:
     """`llm` defaults to the trust-boundary seam's `get_llm()` -- pass one
     explicitly (as tests do) to avoid depending on real `.env` state."""
@@ -167,20 +298,44 @@ def build_chat_task(
     message: str,
     history: list[dict[str, str]],
     agent: Agent,
+    *,
+    scoped: bool = False,
 ) -> Task:
+    """`scoped=True` means `export_data` already went through
+    `build_scoped_export` and some finding/contested entries are compact
+    projections, not full detail -- the prompt says so explicitly so the
+    model is told, not left to infer, which entries it has full evidence
+    for. Never pass `scoped=True` for an unscoped `export_data`, or vice
+    versa -- `answer_question` is the only caller and always passes the
+    real value `build_scoped_export` returned."""
     history_block = (
         "\n".join(f"{h['role']}: {h['content']}" for h in history) if history else "(none)"
     )
     export_json = json.dumps(export_data, separators=(",", ":"))
 
+    scoping_note = (
+        "\n\nYour question named a specific finding, CVE, or host, so the export below has "
+        "been narrowed: any finding or contested entry that matches what you asked about "
+        "keeps its FULL detail (rationale, sources, narrative, ToT branches, everything). "
+        "Every OTHER finding/contested entry -- because it wasn't what the question was "
+        "about -- is shown only in COMPACT form: finding_id, cve_id, asset_id, hostname, "
+        "bucket, risk_score, has_tot, and (for a contested entry) status/near_tie/"
+        "winner_strategy/termination_reason. A compact entry has NO rationale, sources, "
+        "narrative, or ToT branch detail available to you at all -- if the question needs "
+        "that level of detail about a compact entry, set insufficient_data to true and say "
+        "so, rather than inventing what a full entry would have said."
+        if scoped
+        else ""
+    )
+
     return Task(
         description=(
             "You are answering questions about ONE remediation plan, given below as the "
-            "COMPLETE export JSON for this run. This is the entire universe of facts you "
-            "have -- findings, risk scores, buckets, rationale, cited sources with retrieval "
+            "export JSON for this run. This is the entire universe of facts you have -- "
+            "findings, risk scores, buckets, rationale, cited sources with retrieval "
             "timestamps, Tree-of-Thought branches and critic scores for contested findings, "
             "constraints on file, and data-gap notes. You have no tools and no other source "
-            "of truth.\n\n"
+            f"of truth.{scoping_note}\n\n"
             "Do NOT use outside knowledge about any CVE, vendor, or vulnerability -- even if "
             "you recognize a CVE ID, answer only from what THIS export says about it, which "
             "may differ from what you recall (a scanner's own severity call, why it landed "
@@ -258,14 +413,26 @@ def answer_question(
     Returns a plain dict: {answer, citations (score/bucket-enriched),
     insufficient_data, insufficient_reason}. Raises ChatAnswerError if no
     attempt produces a grounded response.
+
+    `build_scoped_export` runs once here, before the retry loop -- it
+    depends only on (export_data, message), never on anything the model
+    returns, so there's nothing to recompute between attempts. `known` is
+    built from the ORIGINAL `export_data`, not the scoped one, on purpose:
+    a compact finding still carries the exact same finding_id/cve_id/
+    hostname/bucket/risk_score fields a full one does (see
+    COMPACT_FINDING_FIELDS), so the two are equivalent for grounding --
+    but reading from the original keeps that guarantee true even if a
+    future change to compaction ever drops one of those fields, rather
+    than depending on it silently.
     """
     history = history or []
     known = _known_findings(export_data)
+    scoped_export, scoped = build_scoped_export(export_data, message)
     agent = build_chat_agent(llm)
 
     last_error: Exception | None = None
     for attempt in range(1, max_attempts + 1):
-        task = build_chat_task(export_data, message, history, agent)
+        task = build_chat_task(scoped_export, message, history, agent, scoped=scoped)
         Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=verbose).kickoff()
 
         try:

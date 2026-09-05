@@ -13,7 +13,12 @@ from types import SimpleNamespace
 import pytest
 
 from rhinosecure.agents import chat as chat_module
-from rhinosecure.agents.chat import ChatAnswerError, answer_question
+from rhinosecure.agents.chat import (
+    COMPACT_FINDING_FIELDS,
+    ChatAnswerError,
+    answer_question,
+    build_scoped_export,
+)
 from rhinosecure.agents.parsing import AgentOutputParseError
 
 EXPORT_DATA = {
@@ -39,6 +44,60 @@ EXPORT_DATA = {
         },
     ],
     "contested": [],
+    "constraints": {"asset_scoped": [], "capacity": []},
+}
+
+# A second fixture for the pre-filter tests: F07/F14 share a hostname
+# (WKS-FIN12), mirroring the real demo fixture's own F07/F14 shape, and
+# F14 is contested with a full ToT branch -- exercises both the
+# multiple-findings-per-hostname match and contested-entry compaction.
+SCOPING_EXPORT_DATA = {
+    "export_schema_version": "1.0.0",
+    "findings": [
+        {
+            "finding_id": "F07",
+            "cve_id": "CVE-2022-30190",
+            "asset_id": "A09",
+            "hostname": "WKS-FIN12",
+            "bucket": "contested",
+            "risk_score": 18.7,
+            "has_tot": False,
+            "rationale": ["F07's own real rationale text -- contested, KEV, no control, no window"],
+        },
+        {
+            "finding_id": "F14",
+            "cve_id": "CVE-2023-23397",
+            "asset_id": "A09",
+            "hostname": "WKS-FIN12",
+            "bucket": "contested",
+            "risk_score": 25.5,
+            "has_tot": False,
+            "rationale": ["F14's own real rationale text -- contested, KEV, no control, no window"],
+        },
+        {
+            "finding_id": "F01",
+            "cve_id": "CVE-2021-26855",
+            "asset_id": "A01",
+            "hostname": "EXCH01",
+            "bucket": "patch_now",
+            "risk_score": 88.5,
+            "has_tot": False,
+            "rationale": ["F01's own real rationale text -- unrelated to F07/F14"],
+        },
+    ],
+    "contested": [
+        {
+            "finding_id": "F14",
+            "cve_id": "CVE-2023-23397",
+            "hostname": "WKS-FIN12",
+            "status": "resolved",
+            "termination_reason": "clear_winner",
+            "near_tie": False,
+            "winner_strategy": "emergency_change",
+            "failure_reason": None,
+            "branches": [{"strategy": "emergency_change", "proposal": "F14's full ToT proposal text"}],
+        }
+    ],
     "constraints": {"asset_scoped": [], "capacity": []},
 }
 
@@ -187,3 +246,144 @@ def test_history_is_threaded_into_the_prompt():
     )
     assert "why did F01 land in patch_now?" in task.description
     assert "and the other one?" in task.description
+
+
+# ---------------- build_scoped_export (the deterministic pre-filter) ----------------
+
+
+def test_build_scoped_export_returns_the_same_object_when_nothing_named():
+    scoped_data, was_scoped = build_scoped_export(SCOPING_EXPORT_DATA, "what's the overall bucket distribution?")
+    assert was_scoped is False
+    assert scoped_data is SCOPING_EXPORT_DATA  # identity, not just equality -- no copy made
+
+
+def test_build_scoped_export_narrows_to_a_named_finding_id():
+    scoped_data, was_scoped = build_scoped_export(SCOPING_EXPORT_DATA, "why is F14 contested?")
+    assert was_scoped is True
+
+    by_id = {f["finding_id"]: f for f in scoped_data["findings"]}
+    assert "rationale" in by_id["F14"]  # matched -- kept full
+    assert "rationale" not in by_id["F01"]  # not matched -- compacted
+    assert "rationale" not in by_id["F07"]  # shares nothing with the question -- compacted
+    assert set(by_id["F01"].keys()) == set(COMPACT_FINDING_FIELDS)
+
+
+def test_build_scoped_export_narrows_to_a_named_cve_case_insensitively():
+    scoped_data, was_scoped = build_scoped_export(SCOPING_EXPORT_DATA, "tell me about cve-2023-23397")
+    assert was_scoped is True
+    by_id = {f["finding_id"]: f for f in scoped_data["findings"]}
+    assert "rationale" in by_id["F14"]
+    assert "rationale" not in by_id["F01"]
+
+
+def test_build_scoped_export_narrows_to_a_named_hostname_matches_every_finding_on_it():
+    """WKS-FIN12 hosts both F07 and F14 -- naming the host should keep
+    BOTH full, not just one, matching the literal instruction to narrow
+    to everything the question named."""
+    scoped_data, was_scoped = build_scoped_export(SCOPING_EXPORT_DATA, "what's going on with WKS-FIN12?")
+    assert was_scoped is True
+    by_id = {f["finding_id"]: f for f in scoped_data["findings"]}
+    assert "rationale" in by_id["F07"]
+    assert "rationale" in by_id["F14"]
+    assert "rationale" not in by_id["F01"]
+
+
+def test_build_scoped_export_compacts_non_matching_contested_entries():
+    scoped_data, was_scoped = build_scoped_export(SCOPING_EXPORT_DATA, "what about F01?")
+    assert was_scoped is True
+    # F01 isn't contested, so the one contested entry (F14) isn't named --
+    # it should be compacted, dropping its full ToT branch detail.
+    assert scoped_data["contested"][0]["finding_id"] == "F14"
+    assert "branches" not in scoped_data["contested"][0]
+    assert scoped_data["contested"][0]["winner_strategy"] == "emergency_change"
+
+
+def test_build_scoped_export_keeps_contested_full_when_its_own_finding_is_named():
+    scoped_data, was_scoped = build_scoped_export(SCOPING_EXPORT_DATA, "why is F14 contested?")
+    assert was_scoped is True
+    assert "branches" in scoped_data["contested"][0]
+
+
+def test_build_scoped_export_named_cve_not_in_export_still_scopes_to_all_compact():
+    """A CVE mentioned in the question that this export doesn't contain is
+    still 'named' -- scoping to zero full findings plus the compact
+    summary is the honest minimum context for a question about something
+    this plan doesn't have, not a reason to fall back to full context."""
+    scoped_data, was_scoped = build_scoped_export(SCOPING_EXPORT_DATA, "what about CVE-9999-00000?")
+    assert was_scoped is True
+    assert all("rationale" not in f for f in scoped_data["findings"])
+
+
+def test_answer_question_prompt_reflects_scoping_and_hides_unrelated_rationale():
+    """End-to-end wiring check: a question naming F14 builds a task whose
+    prompt contains F14's real rationale text but not F01's, and states
+    the scoping note -- not just that build_scoped_export works in
+    isolation."""
+    _FakeCrew.queue = [
+        json.dumps(
+            {
+                "answer": "F14 is contested because it's KEV-listed with no control and no window.",
+                "citations": [{"finding_id": "F14", "fields_used": ["rationale"]}],
+                "insufficient_data": False,
+                "insufficient_reason": None,
+            }
+        )
+    ]
+
+    result = answer_question(SCOPING_EXPORT_DATA, "why is F14 contested?")
+
+    assert result["citations"][0]["finding_id"] == "F14"
+    assert result["citations"][0]["risk_score"] == 25.5  # still enriched correctly
+
+
+def test_answer_question_citation_to_a_compacted_finding_still_enriches_correctly():
+    """A citation naming F01 -- compacted because the question was about
+    F14 -- must still enrich with F01's real score/bucket. known is built
+    from the ORIGINAL export_data, precisely so this can't regress."""
+    _FakeCrew.queue = [
+        json.dumps(
+            {
+                "answer": "By contrast, F01 (unrelated) is patch_now.",
+                "citations": [{"finding_id": "F01", "fields_used": ["bucket"]}],
+                "insufficient_data": False,
+                "insufficient_reason": None,
+            }
+        )
+    ]
+
+    result = answer_question(SCOPING_EXPORT_DATA, "why is F14 contested, compared to F01?")
+
+    assert result["citations"] == [
+        {
+            "finding_id": "F01",
+            "fields_used": ["bucket"],
+            "risk_score": 88.5,
+            "bucket": "patch_now",
+            "cve_id": "CVE-2021-26855",
+            "hostname": "EXCH01",
+        }
+    ]
+
+
+def test_build_chat_task_scoped_prompt_names_compact_vs_full():
+    from rhinosecure.agents.chat import build_chat_agent, build_chat_task
+
+    scoped_data, was_scoped = build_scoped_export(SCOPING_EXPORT_DATA, "why is F14 contested?")
+    assert was_scoped is True
+    agent = build_chat_agent()
+
+    task = build_chat_task(scoped_data, "why is F14 contested?", [], agent, scoped=was_scoped)
+
+    assert "F14's own real rationale text" in task.description
+    assert "F01's own real rationale text" not in task.description
+    assert "COMPACT form" in task.description
+
+
+def test_build_chat_task_unscoped_prompt_has_no_scoping_note():
+    from rhinosecure.agents.chat import build_chat_agent, build_chat_task
+
+    agent = build_chat_agent()
+    task = build_chat_task(SCOPING_EXPORT_DATA, "what's the bucket distribution?", [], agent, scoped=False)
+
+    assert "COMPACT form" not in task.description
+    assert "F01's own real rationale text" in task.description  # full context, unscoped

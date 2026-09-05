@@ -1911,3 +1911,54 @@ sounding sentence, a citation chip that renders normally with F14's real score/b
 claim about F14 that is simply false, indistinguishable in the UI from a correct answer without a
 human separately knowing the real rationale. Not yet fixed or mitigated beyond what's already
 documented; recorded here so the gap is measured, not just asserted.
+
+**A follow-up 32B local model test failed worse than qwen2.5:14b did, and differently -- read as a
+long-context retrieval failure, not a capability ceiling, and it prompted a real fix.** Asked about
+`F14` against the same 24-finding demo export, the 32B model invented a CVE ID, asset ID, and
+hostname for `F14`, then claimed `F14`'s real rationale wasn't in the export at all -- even though
+it's present verbatim in the ~42KB JSON blob the model was actually given. A bigger local model
+failing a way the smaller one didn't is the signature of losing track of one record inside a large
+single blob, not insufficient capability -- and unlike the qwen2.5:14b prose-fabrication case above,
+this one is addressable deterministically: give the model less to lose track of.
+
+**Built: `agents/chat.py`'s deterministic pre-filter, `build_scoped_export`.** No embeddings, no
+retrieval, no model call to decide anything -- when the question's own text names a real
+`finding_id`, `cve_id` (matched via a real, unanchored regex mirroring `configured.py`'s own
+`_CVE_ID_PATTERN`, MITRE's actual identifier format), or `hostname` already present in this export
+(matched via the same case-insensitive substring convention `agents/constraint_intake.py`'s own
+`_matches()` already uses), every finding that WASN'T named is projected down to
+`COMPACT_FINDING_FIELDS` -- `finding_id`/`cve_id`/`asset_id`/`hostname`/`bucket`/`risk_score`/
+`has_tot`, identical field names to a full entry, so `_known_findings`/`enrich_citations` need zero
+awareness that compaction happened; only rationale/sources/narrative/ToT-branch detail is dropped.
+`contested[]` entries get the same treatment (`COMPACT_CONTESTED_FIELDS`, dropping full ToT branches
+and critic scores for anything not named). Full context stays the exact default it was: when nothing
+is named, `build_scoped_export` returns the same object, unchanged, not a smaller copy. Multiple
+findings sharing a named hostname (`F07`/`F14` both on `WKS-FIN12` in the real fixture) all stay
+full, not just one -- matches the literal instruction to narrow to everything the question named,
+not just the first match. A named CVE/finding_id that ISN'T in this export still counts as "named"
+and scopes everything down to compact -- the honest minimum context for a question about something
+this plan doesn't have, not a reason to fall back to full context. `build_chat_task` gained a
+`scoped` flag: when true, the prompt explicitly tells the model which entries are full vs. compact
+and instructs it to say `insufficient_data` rather than invent detail for a compact one -- addressing
+the exact failure shape (fabricating fields for an entry it should have had, or should have known it
+didn't have, full detail on) directly, not just shrinking the blob and hoping.
+
+**Measured on the real 24-finding fixture, not just asserted:** naming `F14` shrinks the export JSON
+from 42,390 bytes to 7,253 bytes -- an 82.9% reduction -- to 1 full finding plus 23 compact ones.
+Verified live against the real server with real Sonnet calls: asked "Why is F14 contested? Give me
+its CVE, hostname, and exact rationale," it returned the correct CVE (`CVE-2023-23397`), hostname
+(`WKS-FIN12`), and the finding's full, real rationale text verbatim, cited and enriched correctly
+(`risk_score=25.52`, `bucket=contested`). Asked "How many findings are in each bucket overall?" (no
+identifier named), it answered from `summary.bucket_distribution` correctly (1/8/3/9/3/0, sums to
+24) -- confirming the full-context default path is genuinely untouched by this change, not merely
+unbroken by luck. New tests in `tests/test_agents_chat.py` cover: identity-preserving no-op when
+nothing is named, narrowing on each of finding_id/CVE/hostname, multiple findings sharing a named
+host, contested-entry compaction (both directions -- compacted when its finding isn't named, full
+when it is), a named-but-absent CVE still scoping to all-compact, the prompt actually omitting an
+unrelated finding's rationale text while including the named one's, and a citation to a *compacted*
+finding still enriching correctly (proving grounding stays correct regardless of compaction, since
+`known` is read from the original export, never the scoped one). Full suite: 916 passed, 1 skipped
+(was 905/1 skipped before this addition). This does NOT fix the qwen2.5:14b fabricated-prose case
+recorded above -- that's a truthfulness problem in the prose itself, and narrowing the context
+doesn't make a model that already passed grounding tell the truth about what it was given. Different
+failure, different fix; both are now recorded against the same feature.
