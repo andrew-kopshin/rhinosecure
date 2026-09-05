@@ -1581,3 +1581,258 @@ a reader can tell the two apart when they want to.
   invalidated and returned to a human for re-review — each is defensible, and picking one
   silently would mean an operator's "accept" from an hour ago either goes stale without anyone
   noticing or executes against facts that are no longer true.
+
+---
+
+## Future direction: a conversational front end (recorded, not built)
+
+**This section records a design, agreed in discussion before any code was written. Nothing in
+it is built** — no route, agent, schema, or job kind named below exists yet. Same convention as
+"Future direction: remediation execution," above: written so a later build has something
+concrete to build against or explicitly deviate from, not assumed into existence by being
+described. Produced by three independently-drafted design proposals judged against this
+project's own mechanisms, then synthesized into the one recorded here.
+
+**The problem this answers.** Today, using RhinoSecure interactively requires already knowing
+the CLI: place a file under `data/`, run `rhino adapt propose`, review and run `rhino adapt
+confirm`, run `rhino run --export`, separately launch `rhino web`. Four to five commands, each
+requiring the operator to already know the exact vocabulary, before anything is visible in a
+browser. The goal: open the app, upload a file, say what's wanted — "analyze this," "just show
+me what needs patching now" — and the system drives the rest.
+
+**The constraint every subsection below is checked against.** One new agent, the **Router**,
+sitting in front of mechanisms that already exist and already do the work: the job substrate
+(`web/jobs.py`), the propose/confirm gate (`agents/schema_inference.py`, `adapters/review.py`),
+constraint intake (`agents/constraint_intake.py`), the Scenario views, and the existing chat
+agent (`agents/chat.py`). The Router's only output is a small, closed, code-validated
+structure — it never computes a risk score, never decides a bucket, never authors a schema
+mapping or a filter predicate from scratch. Same split constraint intake already proved: the
+model interprets, code allocates — applied one layer up, to *which operation to run* rather
+than *which finding a constraint affects*.
+
+### 1. Upload mechanics
+
+A new route, `POST /api/uploads`, multipart/form-data, a sibling module `web/uploads.py` next
+to `web/jobs.py`/`web/chat.py`, imported conditionally inside `create_app()` like both. Gated
+by `--enable-jobs` at the flag level — an upload with nothing to ingest it has no purpose on a
+chat-only deployment — but the write itself never touches `PlanState`/`Coordinator`/`Memory`;
+it's a filesystem operation, not a job, so it never competes for `JobRegistry`'s single
+in-flight slot.
+
+Files land at `data/uploads/<upload_id>/<sanitized-original-filename>`, `upload_id =
+uuid.uuid4().hex` — the identical call `Job.id` already uses. Content-derived ids were
+considered and rejected: two different users uploading byte-identical files (trivially, the
+demo fixture) would silently share one directory with no session scoping. Retry-safety for a
+dropped connection is a standard `Idempotency-Key` header instead, not identity derived from
+content. Sanitization takes `Path(original_filename).name` only, discarding any client-claimed
+directory component.
+
+**The load-bearing decision: an upload directory is structurally nothing but another `--data`
+directory.** `ingest.load_batch`, `_require_adapter_files`, every adapter's own validation runs
+unchanged against it. Upload adds no new ingest code path — its only job is getting bytes onto
+disk in the shape the ingest layer already understands.
+
+Streaming: fixed 1 MiB chunks written to a `.part` file, atomically renamed on completion; a
+`RHINO_MAX_UPLOAD_BYTES` ceiling aborts (deletes the partial, 413) mid-stream, never after the
+whole body is already in memory — the one place "no interface may assume demo scale" bites new
+code directly. `await file.read()` with no size bound is exactly the shape that works at a
+fixture and falls over on a real export.
+
+Single- vs. two-file sources are never inferred. A batch of one file is a BluePeak-shaped
+candidate (`assets_filename == findings_filename`, the exact case `_require_adapter_files`'s
+dedup already allows). A batch of two requires an explicit human label per file ("Inventory" /
+"Findings") before the set is `ready` — a UI control, not a model call: a wrong guess here
+corrupts everything downstream with no `check_grounding`-shaped mechanism able to catch a
+*plausible but wrong* file-role assignment the way it catches a bad column mapping. An
+incomplete two-file set reports `_require_adapter_files`'s own existing "one expected file
+present, one missing" message verbatim, not new wording invented for "you're not done
+uploading."
+
+### 2. The confirmation gate
+
+**A known shape doesn't have to pretend to be unknown.** Once a set is `ready`, a purely
+mechanical, LLM-free check asks whether the labeled files match a built-in format's expected
+filenames *exactly*. A match skips straight to running — the same fast path `--format defender`
+already gets today, not a bypass of the gate, because a byte-shape-identical file isn't
+"unfamiliar" in any sense the gate exists to catch. Filename-exact only, deliberately never
+content-sniffed: falling through to propose/confirm on a near-miss only ever *adds* scrutiny,
+while a wrong content-sniffed guess would be exactly the wrong-but-plausible inference the
+not-collected/refuse-rather-than-guess discipline exists to prevent.
+
+No match goes through propose, then confirm, unchanged. A new job kind, `ingest_propose`, wraps
+`schema_inference.propose_contract` verbatim against the upload directory — same
+`AdapterProposal` (`SlotMapped`/`SlotUnresolved`, never auto-filled), same `check_grounding`
+against the real uploaded rows, same `assemble_contract` refusal-as-normal-outcome, same
+`review.state="proposed"` — structurally not yet usable. The chat surface renders this
+proposal as a card: a viewer for existing JSON, not a new report format.
+
+**`INGEST_CONFIRM` is not a member of the Router's operation enum — not discouraged, absent.**
+`rhino adapt confirm` requires a real identity and itemized attestations for specific risky
+conditions the measurement found; it's a *signature*, not an approval of a summary. "Yes,
+looks good, confirm it" typed into a chat box cannot honestly stand in for a human having read
+the actual grounding report and exclusion list an attestation is supposed to cover — the
+Router classifying this as confirmation would be technically trivial and exactly wrong,
+laundering a signature requirement through a natural-language shortcut. Confirmation stays a
+dedicated, non-conversational form (identity field, one checkbox per attestation
+`required_attestations` actually reports as missing for *this* proposal) that calls
+`review.confirm(...)` unchanged. Chat walks a human up to that form. It is never the form.
+
+**Where the refusal actually lives, independent of anything above being right.**
+`ConfiguredAdapter.__init__` calls `assert_confirmed` and refuses construction against any
+contract that isn't `state="confirmed"` with matching digests. A Router bug, a hand-crafted API
+call skipping the Router entirely — doesn't matter; every path this design opens still
+terminates at the same constructor with the same refusal. The one concrete code change needed
+to make this backstop surface cleanly rather than as a generic 500: `_execute_job`'s caught-
+exception tuple needs `ContractError`/`ReviewError` added to it, so a run attempted against an
+unconfirmed contract fails as a named, honest job failure.
+
+### 3. Request decomposition
+
+```
+OperationKind: INGEST_PROPOSE | RUN_DETERMINISTIC | RUN_AGENTS | CONSTRAINT_SUBMIT
+             | REMEDIATION_MARK | VIEW_SCENARIO (not a job) | QA_QUESTION
+
+RouterOperation: { op: OperationKind, params: <fixed closed shape per op>, depends_on: int|None }
+RouterDecision:  { operations: list[RouterOperation], clarify: str|None }
+```
+
+`CONSTRAINT_SUBMIT`'s param type is a bare `{raw_text: str}` — no `asset_id`/`patch_limit`
+field exists for the Router to fill in even if it tried. It recognizes *that* an utterance is
+constraint language; the Constraint Interpreter, unchanged, still owns classifying and
+extracting from it. A second, Router-level extractor for the same input would create two
+independently-tuned interpretations of one sentence with no code arbitrating a disagreement —
+the exact two-interfaces-that-drift failure this whole design exists to avoid, one layer
+earlier than the CLI/UI question that motivated it. The Router's entire callable surface *is*
+`JOB_HANDLERS` (extended by `ingest_propose`, `run_deterministic`/`run_agents` — finally
+consuming the slot the job substrate's own code comment already reserves — and
+`remediation_mark`) plus the Scenario tab's one client-side action for `VIEW_SCENARIO`. It can
+select a key. It cannot supply a query, a predicate, or code outside that key's fixed
+parameters.
+
+Cross-step data flow is `depends_on`, an integer index resolved by the **dispatcher**, never
+asserted by the model. Worked example, "analyze this and show me the critical ones":
+
+```
+[{op: RUN_DETERMINISTIC, params: {source_ref: "<upload_id>"}},
+ {op: VIEW_SCENARIO,     params: {mode: "recommended"}, depends_on: 0}]
+```
+
+"Analyze," unqualified, resolves to the deterministic path — the cheaper, LLM-free default,
+matching `rhino run`'s own unqualified behavior; `RUN_AGENTS` requires an explicit signal
+("explain why," "give me the reasoning"). "The critical ones" maps onto the Scenario tab's
+existing, non-editable **Recommended** mode (`bucket ∈ {patch_now, contested}`) — the Router
+never originates a new definition of "critical"; a phrasing Recommended doesn't cover falls
+through to Selection mode's own already-existing filter dimensions, never a free-form
+predicate. The dispatcher — code — waits for operation 0's job to reach `succeeded`, reads its
+real, persisted export path, and injects that into operation 1; the Router can't supply that
+path itself, since it doesn't exist yet at the moment the Router runs. `VIEW_SCENARIO` is the
+one step that isn't a job: zero model calls, zero job-substrate involvement, a synchronous read
+over an export a just-completed job guarantees isn't concurrently being rewritten. Progress
+reuses `Job.stage` exactly — no new progress mechanism; `JobRegistry`'s existing one-in-flight
+rule already serializes multi-step dispatch for free.
+
+### 4. The model/deterministic boundary
+
+**No field on `RouterOperation`/`RouterDecision` exists for a risk score, bucket, or severity
+value.** The same trick `ChatCitation` (no score/bucket field) and `tot.CritiqueOutput` (no
+aggregate field) already use — a hallucinating Router has nowhere to put a wrong number,
+because the schema never asks for one. Two independent, LLM-free backstops run before anything
+dispatches:
+
+- **`ground_router_decision`**, mirroring `check_grounding`'s role for `AdapterProposal`: every
+  id must be a value a real tool call actually returned this turn; every enum value a genuine
+  member of the imported type; every `op` a **currently registered** handler for *this server
+  instance* (a chat-only deployment with no `--enable-jobs` structurally cannot dispatch to
+  `run_deterministic`, because that handler was never mounted); unexpected `params` fields are
+  rejected, never silently dropped. A step failing this is removed and folded into a `clarify`
+  response — `assemble_contract`'s "refuses, a normal reportable outcome, never an exception"
+  posture, applied to routing.
+- **`verify_step_summary`**, mirroring `verify_scoring_matches_tool`: a step's human-readable
+  display text is checked against its own `params` before rendering, so the Router's prose
+  can't describe one thing while dispatching another.
+
+**`assert_plan_approved`**, mirroring `assert_confirmed`'s "refuses to construct itself"
+posture: a mandatory human click before *every* step, not just the first. Editing an earlier
+step clears approval for everything after it. Already-applied effects of completed steps are
+not undone by this — the same no-rollback honesty `ConstraintReplanFailedError` already states
+elsewhere.
+
+### 5. Relationship to the existing chat panel
+
+One input box. Every message goes to the Router first; `QA_QUESTION` is one of its own closed
+operation kinds, not a fallback outside the vocabulary. A pure question decomposes to a
+one-step decision dispatching, unchanged, to `agents.chat.answer_question` — same toolless
+agent, same code-verified citations, same "pure function of (export, question, history)."
+Fusing the Router and the QA agent into one model was considered and rejected: an agent trusted
+to both classify intent *and* answer content questions is one bad turn away from also being
+asked to just state a risk number from memory instead of taking the citation-verified path —
+the exact failure this feature exists to prevent, one level removed.
+
+**Folding read-only chat into the job substrate was considered and rejected.** It would trade a
+working, already-lock-free, always-available mechanism for a new queued/polled one, to close a
+correctness concern that's already closed: [`export.py`](src/rhinosecure/export.py)'s
+`_write_json_atomic` already writes to a temp file and does an atomic `Path.replace()`, so a
+concurrent chat read sees the fully-old file or the fully-new file, never a torn one. What's
+left is staleness (answering from a version about to be superseded), which `web/chat.py`'s own
+"no cache, re-read every turn" design already tolerates as an accepted property. `POST
+/api/chat` is retired by nothing in this design.
+
+**A gap this design surfaced in the existing chat agent, fixed here rather than left for
+later, and buildable independently of everything else in this section.** `agents/chat.py`'s
+`build_scoped_export` narrows context only when the message names a real finding_id, CVE, or
+hostname (`_matched_finding_ids`); when nothing is named, it returns the export **unchanged —
+the full export goes into the prompt.** That default was deliberately chosen so a genuine
+fleet-wide question with no specific target ("how many are contested overall?") still gets
+real data to answer from. But it means a message that isn't a plan question *at all* — "hello,"
+"thanks" — pays the same full-export cost as a real question, making it the single slowest and
+most expensive message the agent can receive for zero benefit. **Decided:** a new, narrow,
+code-owned check, `is_plan_unrelated(message)` — an exact (not substring) match, case-folded
+and stripped of trailing punctuation, against a small, closed list of greetings and courtesies
+("hi," "hello," "hey," "thanks," "thank you," "bye," and similar) — runs *before*
+`build_scoped_export` is ever called. When it matches, the export is not attached to the prompt
+at all — not narrowed, not summarized, omitted entirely — and the agent responds from a short,
+export-free instruction to reply naturally and invite a real question. This is deliberately
+**not** a keyword search for plan-related vocabulary (a positive "does this mention findings/
+risk/CVEs" classifier would be exactly the kind of fuzzy, ever-growing heuristic this codebase
+avoids elsewhere); it is a narrow, closed, exact-match list, so a false negative (an
+unrecognized greeting falls through) costs nothing beyond today's existing behavior, and a
+false positive — the only outcome this design actually has to guard against, since it would
+silently withhold context from a real question — is what the exact-match (never substring)
+rule is built to prevent. Deliberately excludes bare acknowledgments ("yes," "no," "ok") from
+the list: those can legitimately be a contextual reply to a real prior question, where full
+export access might still matter. Detected in code, not by a model call — the same reason
+`_matched_finding_ids` is regex/substring matching rather than an LLM classification: asking a
+model "should I even see the export" is circular and defeats the purpose.
+
+### 6. What becomes redundant
+
+**Shrinks to a fallback, kept, not removed:** the Constraints-tab form. It posts to the
+identical `constraint_submit` job a routed `CONSTRAINT_SUBMIT` step also calls — functionally a
+strict subset. What it keeps that a text box can't match by construction: zero classification
+risk. Its role moves from "the way to submit a constraint" to "the fast, unambiguous path when
+you don't want a classifier in the loop at all."
+
+**Stops being the primary interactive path:** the manual sequence — place files, `rhino adapt
+propose`, `rhino adapt confirm`, `rhino run --export`, separately launch `rhino web` — collapses
+to starting the server once (`PlanState` already seeds lazily on the first job, not at startup,
+so this requires no change) and doing everything else in the browser. `rhino run --format X`
+typed interactively also goes away, for the same reason — the Router's known-format fast path
+(above) reaches the identical call.
+
+**Not redundant, and must not become redundant:** `rhino adapt confirm`, in every form,
+permanently — the one conclusion with no disagreement anywhere in this design's drafting: a
+signature requirement is not a natural-language-shortcut-able act. `rhino run` as a bare,
+scriptable, no-LLM-in-the-loop command — Section 8's determinism guarantee and anything built
+against it (CI, a graded run, a reproducible `--seed 42` audit trail) depends on a path with no
+Router, no classification, no model anywhere near it. Headless/scheduled ingestion of a real
+export needs a pre-confirmed contract or a built-in `--format`, never propose/confirm, which is
+irreducibly human regardless of front end. `rhino remediation mark` — no `OperationKind` covers
+it in this design; a plausible, low-risk future vocabulary addition (remediation status already
+never feeds back into scoring, so a routing mistake here can't corrupt anything the way one on
+`RUN_AGENTS` could), not decided or half-built by naming it.
+
+**Left open, deliberately:** whether an approved multi-step decision needs its own persisted
+record. Resolved lighter than it might seem to need: it doesn't, for now — `JobRegistry`'s
+existing bounded history and `GET /api/jobs` already make every dispatched step durably
+recoverable; only the *grouping* of steps into one decision is ephemeral. If a browser tab
+closes mid-sequence, re-asking is cheap and safe — the export from step one already exists.
