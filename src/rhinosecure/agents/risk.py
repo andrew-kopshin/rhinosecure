@@ -82,6 +82,7 @@ from pydantic import BaseModel
 
 from rhinosecure.agents.constraint_intake import apply_constraints
 from rhinosecure.agents.environment import EnvironmentAssessment
+from rhinosecure.agents.prompt_safety import UNTRUSTED_TEXT_NOTICE, fence
 from rhinosecure.agents.research import ResearchFinding
 from rhinosecure.llm import get_llm
 from rhinosecure.memory import Memory
@@ -245,19 +246,20 @@ def build_risk_task(
     finding = enriched.finding
     return Task(
         description=(
+            f"{UNTRUSTED_TEXT_NOTICE}\n\n"
             f"Write the risk recommendation for finding {finding.finding_id}: "
             f"CVE {finding.cve_id} on {environment.hostname} ({environment.asset_id}).\n\n"
             "From Vulnerability Research: NVD severity "
             f"{research.nvd_severity or 'unknown'} (base score {research.nvd_base_score}), "
-            f"KEV-listed: {research.is_kev}, EPSS: {research.epss_score}. "
-            f"{research.exploitation_summary}\n\n"
+            f"KEV-listed: {research.is_kev}, EPSS: {research.epss_score}.\n"
+            f"{fence('RESEARCH EXPLOITATION SUMMARY', research.exploitation_summary)}\n\n"
             "From Environment Analysis: OS "
             f"{environment.os} (build {environment.os_build}), role {environment.role}, "
             f"environment {environment.environment}, internet_exposed: "
-            f"{environment.internet_exposed}, compensating_controls: "
-            f"{environment.compensating_controls}, has_patch_window: "
-            f"{environment.has_patch_window} ({environment.patch_window!r}). "
-            f"{environment.applicability_summary}\n\n"
+            f"{environment.internet_exposed}, has_patch_window: {environment.has_patch_window}.\n"
+            f"{fence('ENVIRONMENT COMPENSATING_CONTROLS', str(environment.compensating_controls))}\n"
+            f"{fence('ENVIRONMENT PATCH_WINDOW', environment.patch_window)}\n"
+            f"{fence('ENVIRONMENT APPLICABILITY_SUMMARY', environment.applicability_summary)}\n\n"
             f"Call score_finding with finding_id={finding.finding_id!r} exactly once "
             "and copy its risk_score, bucket, rationale, and constraints_applied "
             "into your output verbatim -- do not adjust, round, or reinterpret "

@@ -96,9 +96,10 @@ from that:
    needing a retry at all.
 2. `_resolve_output` below is this module's own retry loop, capped at
    `max_parse_attempts` (default 3) fresh re-dispatches -- not CrewAI's.
-   If a finding still won't parse (or, for Risk, still disagrees with
-   `verify_scoring_matches_tool`) after the cap, it is recorded in the
-   relevant `RunState.*_failures` dict and excluded from that stage's
+   If a finding still won't parse (or disagrees with `verify_scoring_
+   matches_tool` for Risk, or `verify_research_matches_tool` for
+   Research) after the cap, it is recorded in the relevant
+   `RunState.*_failures` dict and excluded from that stage's
    `*_by_id` -- never raised, never left retrying. A finding missing from
    an upstream stage (because it failed there) is skipped at every stage
    after that, recorded again at each one, rather than treated as a
@@ -143,9 +144,11 @@ from rhinosecure.agents.environment import (
 from rhinosecure.agents.parsing import AgentOutputParseError, parse_structured_output
 from rhinosecure.agents.research import (
     ResearchFinding,
+    ResearchMismatchError,
     build_research_agent,
     build_research_task,
     build_research_tools,
+    verify_research_matches_tool,
 )
 from rhinosecure.agents.risk import (
     RiskRecommendation,
@@ -944,7 +947,7 @@ class Coordinator:
                 if extra_validate is not None:
                     extra_validate(result)
                 return result
-            except (AgentOutputParseError, ScoringMismatchError) as exc:
+            except (AgentOutputParseError, ScoringMismatchError, ResearchMismatchError) as exc:
                 last_error = exc
                 if attempt == self.max_parse_attempts:
                     break
@@ -974,6 +977,7 @@ class Coordinator:
                 lambda e=finding, a=agent: build_research_task(e, a),
                 agent,
                 self.state.research_failures,
+                extra_validate=lambda r: verify_research_matches_tool(r, self.state.research_call_log),
             )
             if result is not None:
                 self.state.research_by_id[fid] = result
