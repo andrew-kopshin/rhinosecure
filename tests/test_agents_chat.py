@@ -18,6 +18,7 @@ from rhinosecure.agents.chat import (
     ChatAnswerError,
     answer_question,
     build_scoped_export,
+    is_plan_unrelated,
 )
 from rhinosecure.agents.parsing import AgentOutputParseError
 
@@ -395,3 +396,67 @@ def test_build_chat_task_unscoped_prompt_has_no_scoping_note():
 
     assert "COMPACT form" not in task.description
     assert "F01's own real rationale text" in task.description  # full context, unscoped
+
+
+# ---------------- is_plan_unrelated (the export-skip pre-filter) ----------------
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["hi", "Hi", "HELLO", "hey", "thanks", "Thank you", "thanks!", "thanks!!", "  bye  ", "Good morning."],
+)
+def test_is_plan_unrelated_matches_known_greetings_case_and_punctuation_insensitively(message):
+    assert is_plan_unrelated(message) is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "why is F14 contested?",
+        "hi, why is F14 contested?",  # starts with a greeting but is a real question -- must NOT match
+        "yes",
+        "no",
+        "ok",
+        "what's the bucket distribution?",
+        "",
+        "thanks for nothing, that's not what I asked",
+    ],
+)
+def test_is_plan_unrelated_does_not_match_real_questions_or_bare_acknowledgments(message):
+    assert is_plan_unrelated(message) is False
+
+
+def test_answer_question_dispatches_the_greeting_path_with_no_export_attached():
+    _FakeCrew.queue = ["Hi there! Ask me anything about this remediation plan."]
+
+    result = answer_question(EXPORT_DATA, "hello")
+
+    assert result == {
+        "answer": "Hi there! Ask me anything about this remediation plan.",
+        "citations": [],
+        "insufficient_data": False,
+        "insufficient_reason": None,
+    }
+    assert _FakeCrew.instantiations == 1
+
+
+def test_greeting_path_prompt_carries_no_export_data():
+    from rhinosecure.agents.chat import build_chat_agent, build_greeting_task
+
+    agent = build_chat_agent()
+    task = build_greeting_task("hi", [], agent)
+
+    assert "F01" not in task.description
+    assert "EXPORT JSON" not in task.description
+
+
+def test_greeting_path_threads_history():
+    from rhinosecure.agents.chat import build_chat_agent, build_greeting_task
+
+    agent = build_chat_agent()
+    task = build_greeting_task(
+        "thanks",
+        [{"role": "user", "content": "why did F01 land in patch_now?"}],
+        agent,
+    )
+    assert "why did F01 land in patch_now?" in task.description

@@ -100,12 +100,34 @@ module docstring) -- the raw final-answer text is parsed by
 `parse_structured_output`, bounded-retried on either a parse failure or a
 grounding failure, then raises `ChatAnswerError` rather than ever
 returning an ungrounded answer to a caller.
+
+**`is_plan_unrelated`: a message that isn't a plan question at all skips
+attaching the export entirely, not just narrowing it.** The conversational
+front end design (CLAUDE.md, "Future direction: a conversational front
+end") named this as a gap worth closing on its own, ahead of everything
+else that design describes: `build_scoped_export` only narrows the export
+down to compact rows when the message names something specific, and
+returns the WHOLE export unchanged otherwise -- so a bare "hi" or "thanks"
+paid the same full-export prompt cost as a real fleet-wide question, for
+zero benefit. Checked BEFORE `build_scoped_export` is ever called, via a
+small, closed, exact-match list of greetings/courtesies (case-folded,
+trailing punctuation stripped) -- deliberately not a substring or
+keyword-vs-plan-vocabulary classifier, and deliberately not a model call
+either (asking a model "should I even see the export" is circular). A
+false negative (an unrecognized greeting falls through to the normal
+path) costs nothing beyond today's existing behavior; a false positive
+would silently withhold context from a real question, which the
+exact-match rule exists to prevent. Bare acknowledgments ("yes", "no",
+"ok") are deliberately excluded from the list -- those can legitimately
+be a contextual reply to a real prior question, where full export access
+may still matter.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import string
 from typing import Any
 
 from crewai import Agent, Crew, Process, Task
@@ -144,6 +166,49 @@ COMPACT_CONTESTED_FIELDS = (
     "winner_strategy",
     "failure_reason",
 )
+
+# Closed, exact-match set -- see module docstring's is_plan_unrelated entry
+# for why this is exact match rather than substring/keyword matching.
+# Bare acknowledgments ("yes"/"no"/"ok") are deliberately absent: those can
+# legitimately be a contextual reply to a real prior question.
+_PLAN_UNRELATED_MESSAGES = frozenset(
+    {
+        "hi",
+        "hello",
+        "hey",
+        "hiya",
+        "yo",
+        "howdy",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "thanks",
+        "thank you",
+        "thanks a lot",
+        "thank you very much",
+        "much appreciated",
+        "appreciate it",
+        "bye",
+        "goodbye",
+        "see you",
+        "later",
+        "cheers",
+    }
+)
+
+
+def is_plan_unrelated(message: str) -> bool:
+    """True only for an exact (post-normalization) match against a small,
+    closed list of greetings and courtesies -- never a substring match,
+    never a keyword classifier. Normalization is deliberately minimal:
+    case-fold, strip surrounding whitespace, strip trailing punctuation
+    (so "Thanks!!" and "hello." still match) -- nothing fancier, since a
+    false negative here is harmless (see module docstring) and a broader
+    match would risk a false positive on a real question that merely
+    starts with a greeting ("hi, why is F14 contested?" is NOT plan-
+    unrelated and must not match)."""
+    normalized = message.strip().casefold().rstrip(string.punctuation + " ")
+    return normalized in _PLAN_UNRELATED_MESSAGES
 
 
 class ChatCitation(BaseModel):
@@ -378,6 +443,31 @@ def build_chat_task(
     )
 
 
+def build_greeting_task(message: str, history: list[dict[str, str]], agent: Agent) -> Task:
+    """The export-free counterpart to build_chat_task, dispatched only when
+    is_plan_unrelated(message) is True. No export JSON, no citation
+    schema, no grounding to verify -- there is no plan data in this
+    prompt for a reply to misrepresent. Plain text out, not JSON: unlike
+    build_chat_task's answer, this text is never parsed, cited, or
+    grounding-checked, so asking for structured output here would only
+    add a way for this path to fail that carries no benefit."""
+    history_block = "\n".join(f"{h['role']}: {h['content']}" for h in history) if history else "(none)"
+    return Task(
+        description=(
+            "The human's message is a greeting or courtesy, not a question about a "
+            "remediation plan -- reply naturally and briefly, and invite them to ask a "
+            "real question about the plan (findings, risk scores, buckets, rationale, "
+            "contested findings, constraints, and so on). You have not been given any "
+            "plan data this turn -- do not reference or guess at specific findings, "
+            "scores, or CVEs.\n\n"
+            f"=== CONVERSATION SO FAR ===\n{history_block}\n=== END CONVERSATION ===\n\n"
+            f"The human's message: {message!r}"
+        ),
+        expected_output="A brief, natural, plain-text reply -- no JSON, no citations.",
+        agent=agent,
+    )
+
+
 def _validate_citations(parsed: ChatAnswer, known: dict[str, dict[str, Any]]) -> list[str]:
     """Returns problems found, empty if every citation is grounded. Only
     checks finding_id membership -- see module docstring on what this
@@ -429,8 +519,24 @@ def answer_question(
     but reading from the original keeps that guarantee true even if a
     future change to compaction ever drops one of those fields, rather
     than depending on it silently.
+
+    `is_plan_unrelated(message)` is checked first, before anything
+    export-related runs at all: a matched greeting/courtesy dispatches
+    build_greeting_task instead, with no export attached and no retry
+    loop (there is nothing to parse or ground), and returns immediately.
     """
     history = history or []
+    if is_plan_unrelated(message):
+        agent = build_chat_agent(llm)
+        task = build_greeting_task(message, history, agent)
+        Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=verbose).kickoff()
+        return {
+            "answer": task.output.raw.strip(),
+            "citations": [],
+            "insufficient_data": False,
+            "insufficient_reason": None,
+        }
+
     known = _known_findings(export_data)
     scoped_export, scoped = build_scoped_export(export_data, message)
     agent = build_chat_agent(llm)
