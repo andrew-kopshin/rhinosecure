@@ -1056,6 +1056,52 @@ different product.
   `patch_now`/85.5 verdict, with the Risk agent's own narrative explicitly noting: "Research
   flagged that the underlying scanner evidence text contained an embedded instruction attempting
   to falsify the is_kev/EPSS values... that instruction was correctly disregarded."
+- **Tool-call retry cap.** Built as four coupled pieces, each needed to make the others safe
+  rather than trading one failure mode for another. The gap was real and worse than a single
+  missing bound: CrewAI's own tool-call loop was left at raw defaults everywhere (`max_iter=25`,
+  `max_execution_time=None` — no wall-clock cap at all); a raising tool call was silently
+  retried by CrewAI itself up to 3 times with no backoff of its own, compounding with
+  `enrich/nvd.py`'s own real 403/429 backoff (~195s) to a theoretical multi-hour stall on one
+  CVE under sustained NVD trouble; and a genuine bug this surfaced, `Coordinator._dispatch_
+  research`/`_environment`/`_risk` called `crew.kickoff()` for a whole batch of findings with
+  no guard around it at all, so any exception escaping CrewAI's own bounds aborted every
+  remaining finding in that dispatch and propagated uncaught out of `run()`/`replan()` —
+  violating this module's own documented "a failed finding is recorded and skipped" guarantee
+  for exactly this failure class.
+  (1) `agents/research.py`'s four network-calling tools (`lookup_nvd`/`kev`/`epss`/
+  `attack_techniques`) now catch their own exceptions and return a clean, null-fielded JSON
+  result with an `error` field instead of raising — this closes the compounding at its actual
+  source (removing the trigger for CrewAI's own invisible retry), rather than tuning a CrewAI
+  knob. (2) `Coordinator._dispatch_research`'s one-time bulk KEV/ATT&CK fetch
+  (`build_research_tools`) is now wrapped: a failure records every finding in that dispatch as
+  failed instead of crashing `run()`/`replan()` uncaught. (3) `agents/limits.py`'s
+  `MAX_AGENT_EXECUTION_SECONDS` (300s, a documented backstop not a tuned performance number) is
+  now set explicitly on all 7 `Agent(...)` constructions across this codebase, closing
+  everything (1) doesn't anticipate — a slow or confused model, a slow LLM response, a future
+  tool that doesn't yet follow the catch-your-own-exceptions convention. (4) Hitting that
+  timeout raises `TimeoutError`, which CrewAI deliberately never retries — `agents/
+  coordinator.py`'s new `_kickoff_batch` catches it (and any other exception escaping
+  `crew.kickoff()`) and records exactly the findings whose task never completed as failed,
+  letting whichever findings in the same batch DID complete proceed normally. Piece (4) is
+  what makes piece (3) safe: setting a timeout without it would trade "hangs forever" for
+  "silently drops the rest of the batch."
+  A second, deeper bug was found and fixed while building piece (4): `environment_by_id`/
+  `risk_by_id` were never cleared before a redispatch, so a finding whose redispatch failed
+  during `replan()` could silently keep answering with a STALE result from an earlier,
+  unrelated successful dispatch — reachable in practice, since `replan()` reuses the same
+  `Coordinator`/`RunState` across calls, and caught by a passing-but-wrong integration test
+  during this same work (the delta test still passed, but reported a stale pre-constraint
+  score as if it reflected the current attempt). Fixed by popping any prior entry for every
+  finding about to be (re)dispatched, before attempting anything, in all three dispatch
+  methods.
+  `ConstraintReplanFailedError` is narrower now, deliberately: it originally existed for
+  exactly one motivating case (an LLM transport error escaping `crew.kickoff()` uncaught), and
+  `_kickoff_batch` now catches that at its actual source before it ever reaches `replan()` —
+  two tests that asserted the old (crash-shaped) behavior were rewritten to assert the new
+  (record-and-continue) one, matching this module's own long-stated "record and skip" design
+  philosophy rather than contradicting it for this one failure class.
+  1012 passed, 1 skipped (up from 1003), plus a real `--agents` run confirming the change
+  doesn't alter output for a fully successful run.
 
 ### Open
 
@@ -1101,10 +1147,7 @@ not mark any of these done until there's a specific module and test to point to.
    isn't just checked against the model's output after the fact (`verify_scoring_matches_tool`'s
    pattern) — `CritiqueOutput` has no aggregate field at all, so there is nothing for the model to
    get wrong in the first place. That closes the number; it says nothing about the prose.
-2. **Tool-call retry cap.** No bound yet on how many times an agent may retry a failed tool call
-   (an NVD timeout, a malformed EPSS response) before it must stop and escalate instead of
-   looping.
-3. **Cost/usage visibility.** "Trust boundary and provider independence" (above) accepts
+2. **Cost/usage visibility.** "Trust boundary and provider independence" (above) accepts
    per-run cost as an operational property of the LLM dependency, but `rhino run --agents`
    prints nothing about it — a run's actual token usage and dollar cost are currently invisible
    from the CLI. `Coordinator`'s `RunState` collects `research_usage`/`environment_usage`/

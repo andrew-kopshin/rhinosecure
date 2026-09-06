@@ -200,16 +200,30 @@ class ConstraintReplanFailedError(RuntimeError):
     """Raised by `submit_constraint` when the asset-scoped effect was
     already persisted to `memory.py` (`constraint_id` is real) but the
     re-plan that followed (`run`/`replan`) raised before producing any
-    `runs`/`decisions`/`feedback` trail -- e.g. an LLM transport error
+    `runs`/`decisions`/`feedback` trail. There is no rollback: the
+    constraint is durably active on `asset_id` and will apply on the next
+    successful run or replan regardless of this exception.
+    `constraint_id`/`asset_id` are carried explicitly so a caller (the
+    web job substrate) can tell a human what is actually on file, rather
+    than losing that fact along with the original exception --
+    `submit_constraint` itself has no other way to surface it, since the
+    underlying exception carries no such context.
+
+    **Narrower than it used to be, and deliberately so.** This originally
+    existed for exactly one motivating case: an LLM transport error
     escaping `crew.kickoff()` uncaught, the one class of failure
-    `_resolve_output`'s own retry-then-skip loop doesn't cover. There is
-    no rollback: the constraint is durably active on `asset_id` and will
-    apply on the next successful run or replan regardless of this
-    exception. `constraint_id`/`asset_id` are carried explicitly so a
-    caller (the web job substrate) can tell a human what is actually on
-    file, rather than losing that fact along with the original
-    exception -- `submit_constraint` itself has no other way to surface
-    it, since the underlying transport error carries no such context."""
+    `_resolve_output`'s own retry-then-skip loop didn't cover. `_kickoff_
+    batch` now catches that failure class at its actual source -- inside
+    `_dispatch_environment`/`_dispatch_risk` themselves, before it ever
+    reaches `replan()` -- and records the affected finding into
+    `environment_failures`/`risk_failures` the same "record and skip" way
+    every other per-finding failure in this module already works (the
+    `if after is None: continue` line below is where that shows up: a
+    constraint can be persisted and its replan can "succeed" while still
+    carrying zero deltas, precisely because the one finding it affected
+    couldn't be re-scored). This exception is still reachable for
+    anything else genuinely unexpected during `run`/`replan` -- it just no
+    longer fires for the specific scenario it was built to name."""
 
     def __init__(self, constraint_id: int, asset_id: str, cause: BaseException):
         super().__init__(
@@ -457,6 +471,49 @@ class CapacitySubmissionResult:
     @property
     def changed_deltas(self) -> tuple[CapacityDelta, ...]:
         return tuple(d for d in self.deltas if d.changed)
+
+
+def _kickoff_batch(
+    crew: Crew, findings: list[EnrichedFinding], tasks: list[Task], failures: dict[str, str]
+) -> list[tuple[EnrichedFinding, Task]]:
+    """Runs `crew.kickoff()` over one `Process.sequential` batch of
+    `tasks` (index-aligned with `findings`). Returns only the `(finding,
+    task)` pairs that actually completed; every other one is recorded
+    into `failures` with a clear reason, never left for the caller to
+    discover via a bare `AttributeError` on `task.output`.
+
+    Restores this module's own documented "a failed finding is recorded
+    and skipped, never left to block the whole run" guarantee for the one
+    failure class `_resolve_output` doesn't cover: an exception escaping
+    `crew.kickoff()` itself -- a CrewAI-level `TimeoutError` (from
+    `agents/limits.py`'s `max_execution_time`, CLAUDE.md Safety and
+    guardrails' tool-call retry cap item), an exhausted `Agent
+    .max_retry_limit`, or a `litellm`-sourced error -- rather than a parse
+    or grounding-verification failure on output the crew already produced
+    (which `_resolve_output`'s own retry loop already handles). Before
+    this existed, such an exception propagated straight out of
+    `crew.kickoff()` uncaught, aborting every finding batched into the
+    same dispatch -- not just the one whose task actually failed -- since
+    CrewAI has no built-in per-task isolation within one `Crew`, and
+    `_dispatch_research`/`_dispatch_environment`/`_dispatch_risk` called
+    `crew.kickoff()` with no guard of their own around it at all.
+
+    Deliberately not full per-finding isolation: `Process.sequential`
+    still means a finding whose task never even started (because an
+    earlier finding's task in the same batch raised first) is recorded as
+    failed here too, not retried on its own. Restructuring to one
+    `Crew`/`kickoff()` per finding would close that gap fully; this is
+    the smaller fix that stops a stuck finding from crashing the run or
+    silently dropping every finding after it with no record at all."""
+    try:
+        crew.kickoff()
+    except Exception as exc:
+        for finding, task in zip(findings, tasks):
+            if getattr(task, "output", None) is None:
+                failures[finding.finding.finding_id] = (
+                    f"agent dispatch for this batch did not complete: {exc}"
+                )
+    return [(f, t) for f, t in zip(findings, tasks) if getattr(t, "output", None) is not None]
 
 
 class Coordinator:
@@ -962,13 +1019,37 @@ class Coordinator:
         return None
 
     def _dispatch_research(self, findings: list[EnrichedFinding]) -> None:
-        tools = build_research_tools(self.cache, self.state.research_call_log)
+        # Invalidate any stale prior result for every finding about to be
+        # (re)dispatched, BEFORE attempting anything -- `replan()` reuses
+        # this same Coordinator/RunState across calls, and without this a
+        # finding whose dispatch fails here would silently keep whatever
+        # value a PRIOR successful dispatch left in *_by_id, read back
+        # later as if it reflected this attempt. Harmless on a fresh run
+        # (nothing to pop yet).
+        for finding in findings:
+            self.state.research_by_id.pop(finding.finding.finding_id, None)
+        try:
+            tools = build_research_tools(self.cache, self.state.research_call_log)
+        except Exception as exc:
+            # load_kev_catalog/load_attack_index -- a one-time bulk fetch,
+            # outside any Crew/tool wrapper and before crew.kickoff() even
+            # exists, so nothing else in this codebase retries or catches
+            # it. A real, network-shaped failure here previously crashed
+            # run()/replan() entirely, uncaught -- now every finding in
+            # this dispatch is honestly recorded as failed instead (the
+            # same "record and skip" contract every other failure in this
+            # module already gets).
+            for finding in findings:
+                self.state.research_failures[finding.finding.finding_id] = (
+                    f"could not load bulk KEV/ATT&CK enrichment for this dispatch: {exc}"
+                )
+            return
         agent = build_research_agent(tools)
         tasks = [build_research_task(e, agent) for e in findings]
         crew = Crew(agents=[agent], tasks=tasks, process=Process.sequential, verbose=self.verbose)
-        crew.kickoff()
+        completed = _kickoff_batch(crew, findings, tasks, self.state.research_failures)
         self.state.research_usage = crew.usage_metrics
-        for finding, task in zip(findings, tasks):
+        for finding, task in completed:
             fid = finding.finding.finding_id
             result = self._resolve_output(
                 fid,
@@ -983,6 +1064,18 @@ class Coordinator:
                 self.state.research_by_id[fid] = result
 
     def _dispatch_environment(self, findings: list[EnrichedFinding]) -> None:
+        # Invalidate any stale prior EnvironmentAssessment for EVERY
+        # finding this call was asked to (re)plan -- not just the ones
+        # that survive the upstream-failure check below. `replan()` reuses
+        # this same Coordinator/RunState across calls: without this, a
+        # finding whose Research stage failed THIS attempt (so it's
+        # skipped here, never even dispatched) would leave a PRIOR,
+        # unrelated dispatch's EnvironmentAssessment sitting in
+        # environment_by_id -- which _dispatch_risk's own "is there an
+        # EnvironmentAssessment" check would then treat as current.
+        # Harmless on a fresh run (nothing to pop yet).
+        for e in findings:
+            self.state.environment_by_id.pop(e.finding.finding_id, None)
         survivors = []
         for e in findings:
             fid = e.finding.finding_id
@@ -1002,9 +1095,9 @@ class Coordinator:
             for e in survivors
         ]
         crew = Crew(agents=[agent], tasks=tasks, process=Process.sequential, verbose=self.verbose)
-        crew.kickoff()
+        completed = _kickoff_batch(crew, survivors, tasks, self.state.environment_failures)
         self.state.environment_usage = crew.usage_metrics
-        for finding, task in zip(survivors, tasks):
+        for finding, task in completed:
             fid = finding.finding.finding_id
             research = self.state.research_by_id[fid]
             result = self._resolve_output(
@@ -1019,6 +1112,17 @@ class Coordinator:
                 self.state.environment_by_id[fid] = result
 
     def _dispatch_risk(self, findings: list[EnrichedFinding]) -> None:
+        # See _dispatch_environment's identical note: invalidate any stale
+        # prior RiskRecommendation for EVERY finding this call was asked
+        # to (re)plan -- not just the ones that survive the checks below
+        # -- so a finding skipped here (no fresh Research/Environment this
+        # attempt) is genuinely absent from risk_by_id, the field
+        # submit_constraint's own delta-building loop reads as "did this
+        # finding get re-scored." Without this, a finding whose upstream
+        # stage failed during a replan could silently keep answering with
+        # a PRIOR, unrelated dispatch's RiskRecommendation.
+        for e in findings:
+            self.state.risk_by_id.pop(e.finding.finding_id, None)
         survivors = []
         for e in findings:
             fid = e.finding.finding_id
@@ -1049,9 +1153,9 @@ class Coordinator:
             for e in survivors
         ]
         crew = Crew(agents=[agent], tasks=tasks, process=Process.sequential, verbose=self.verbose)
-        crew.kickoff()
+        completed = _kickoff_batch(crew, survivors, tasks, self.state.risk_failures)
         self.state.risk_usage = crew.usage_metrics
-        for finding, task in zip(survivors, tasks):
+        for finding, task in completed:
             fid = finding.finding.finding_id
             research = self.state.research_by_id[fid]
             environment = self.state.environment_by_id[fid]

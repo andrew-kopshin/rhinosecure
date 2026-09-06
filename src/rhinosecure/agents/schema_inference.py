@@ -104,6 +104,7 @@ from rhinosecure.adapters.config_model import (
     validate_contract,
 )
 from rhinosecure.adapters.configured import _apply_case  # the exact case transform applied before any table lookup
+from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.parsing import AgentOutputParseError, parse_structured_output
 from rhinosecure.adapters.probe import ColumnProfile, FileProfile, profile_source
 from rhinosecure.llm import DEFAULT_MODEL, get_llm
@@ -922,6 +923,7 @@ def build_propose_agent(llm: BaseLLM | None = None) -> Agent:
         tools=[],
         llm=llm or get_llm(),
         verbose=True,
+        max_execution_time=MAX_AGENT_EXECUTION_SECONDS,
     )
 
 

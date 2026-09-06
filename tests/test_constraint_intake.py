@@ -207,6 +207,8 @@ def test_build_constraint_agent_has_role_and_both_tools():
     agent = build_constraint_agent(list(tools.values()), llm=_fake_llm())
     assert agent.role == "Constraint Interpreter"
     assert {t.name for t in agent.tools} == {"search_assets", "list_findings_for_asset"}
+    from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
+    assert agent.max_execution_time == MAX_AGENT_EXECUTION_SECONDS
 
 
 def test_build_constraint_task_embeds_the_constraint_text_and_effect_menu():

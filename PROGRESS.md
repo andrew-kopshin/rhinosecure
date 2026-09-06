@@ -2397,3 +2397,115 @@ through `parse_structured_output`'s existing `AgentOutputParseError` path). Full
 item #1 moved to Implemented with the corrected scope recorded in place (not just marked done);
 Open item #2 (Grounding validation) updated to describe the second, now-two-agent enforcement
 mechanism and to stop claiming Research's fields are unchecked.
+
+**Safety and guardrails, Open item #3: the tool-call retry cap -- mapped first (three parallel
+readers: CrewAI's own internals, this project's agent construction, and the enrichment fetchers'
+retry/backoff behavior), and the gap turned out to be four unsynchronized retry/iteration layers
+stacked on top of each other, not a single missing number.**
+
+**What was actually true.** CrewAI 1.15.18's own tool/reasoning loop was left at raw defaults
+everywhere in this codebase: `max_iter=25` per task, `max_execution_time=None` (no wall-clock cap
+at all), `max_retry_limit=2` (each retry granting a FRESH `max_iter` budget, so it compounds
+multiplicatively rather than sharing a ceiling). When a tool function raises, CrewAI's own
+`ToolUsage._use` silently retries the identical call up to 3 times with no backoff of its own,
+invisible to this project -- and `enrich/nvd.py`'s own real 403/429 backoff (5 attempts,
+~195s worst case including per-request timeouts) sat underneath that, so a single agent-initiated
+NVD lookup under sustained throttling could cost up to 3 x ~195s (~10 minutes) before the agent
+even saw a failure string, with nothing stopping the model from then calling the same failing
+tool again on a later ReAct iteration (the anti-repeat guard only fires on a SUCCESSFUL call).
+`epss.py`/`kev.py`/`attack.py` had zero retry of their own -- immediate raise on any failure.
+Theoretical worst case for one CVE lookup under a persistent outage: hours, each iteration a
+billed LLM call. A second, separate and more fragile gap: `load_kev_catalog`/`load_attack_index`
+run ONCE per Research dispatch, outside any Crew/tool wrapper and before `crew.kickoff()` even
+exists -- a failure there was not retried or caught by anything and crashed `run()`/`replan()`
+immediately, uncaught.
+
+**A genuine bug the investigation surfaced, not just a missing bound: `Coordinator._dispatch_
+research`/`_environment`/`_risk` called `crew.kickoff()` for a whole BATCH of findings with no
+try/except around it at all** -- only the post-hoc parse+grounding step (`_resolve_output`) was
+guarded. Any exception escaping CrewAI's own bounds (a `TimeoutError`, an exhausted `max_retry_
+limit`, a `litellm`-sourced error) aborted every remaining finding batched into that one
+`Process.sequential` dispatch and propagated uncaught out of `Coordinator.run()`/`replan()` --
+directly contradicting this module's own documented "a failed finding is recorded and skipped,
+never left to block the whole run" invariant, for exactly this one failure class. This meant a
+proposed fix (setting a real wall-clock timeout) would have been unsafe on its own: hitting that
+timeout raises `TimeoutError`, which CrewAI's own `Agent.execute_task` deliberately never
+retries, so setting the timeout without also closing this gap would trade "hangs forever" for
+"silently drops the rest of the batch" -- not progress.
+
+**Proposed before implementing** (per this session's own working agreement), with a genuine scope
+choice: full per-finding Crew isolation (restructuring one-Crew-per-batch into one-Crew-per-
+finding, so a stuck finding structurally cannot affect any other) versus a smaller, coupled
+4-piece fix that gets most of the practical benefit without the larger dispatch-loop
+restructuring. Chose the smaller fix.
+
+**The four pieces, in the order they depend on each other.** (1) `agents/research.py`'s four
+network-calling tools (`lookup_nvd`/`lookup_kev`/`lookup_epss`/`lookup_attack_techniques`) now
+catch their own exceptions and return a clean, null-fielded JSON result with a new `error` field,
+instead of letting the exception reach CrewAI's tool layer at all -- this is the actual fix, since
+it removes the TRIGGER for CrewAI's own invisible 3x retry, closing the worst compounding at its
+source in this project's own code rather than tuning an external knob. `verify_research_matches_
+tool`'s existing grounding check still works unchanged against the error-shaped result (a model
+that reports `nvd_base_score=None` after an error is correctly grounded; one that fabricates a
+value despite the error is still caught). (2) `Coordinator._dispatch_research`'s bulk KEV/ATT&CK
+fetch is now wrapped: a failure records every finding in that dispatch as a research failure
+instead of crashing `run()`/`replan()` uncaught. (3) New `agents/limits.py`, one shared constant
+`MAX_AGENT_EXECUTION_SECONDS = 300` -- a documented backstop, explicitly NOT a tuned performance
+number -- set on all 7 `Agent(...)` constructions across the codebase (research/environment/
+risk/constraint_intake/chat/tot's strategist+critic/schema_inference), closing everything piece
+(1) doesn't anticipate. (4) New `Coordinator._kickoff_batch`: wraps `crew.kickoff()` for each of
+the three dispatch methods, and on ANY exception, records exactly the findings whose `task.output`
+never got set as failed (index-aligned with the batch's tasks), then returns only the
+`(finding, task)` pairs that DID complete for the caller's normal per-task `_resolve_output` loop
+to process as usual. This is the piece that makes (3) safe, and it directly restores the "record
+and skip" guarantee for the one failure class that used to bypass it entirely.
+
+**Deliberately not done:** adding retry/backoff to `epss.py`/`kev.py`/`attack.py` -- an immediate
+failure is the RIGHT behavior for a cost-bounding goal, not a gap (it hands control back to the
+already-fixed tool wrapper fastest); a new CLI flag for the timeout value -- a sensible, documented
+constant was judged sufficient, matching the "don't add a knob before there's a demonstrated need"
+instinct; and full per-finding Crew isolation (see the scope decision above) -- `_kickoff_batch`'s
+wrap-and-record gets most of the practical benefit (a stuck finding no longer crashes the run or
+takes an unrelated stage down) without restructuring the dispatch loop.
+
+**A second, deeper bug found and fixed while building piece (4), not anticipated in the proposal:
+`environment_by_id`/`risk_by_id` were never cleared before a redispatch.** `replan()` reuses the
+same `Coordinator`/`RunState` across calls (that's the whole point -- Research's output is
+reused, only Environment/Risk redispatch), so a finding whose redispatch fails this attempt could
+silently keep answering with a STALE entry from an earlier, unrelated successful dispatch, since
+nothing ever removed it. Caught by two existing integration tests (`test_coordinator.py`,
+`test_web_jobs.py`) that were DELIBERATELY constructed around an empty fake-crew queue to simulate
+an uncaught transport failure -- both started passing again after piece (4) alone, but with a
+wrong-looking result (a `delta` for the "failed" finding showing a stale pre-constraint score, not
+an empty delta list). Root cause traced to `_dispatch_risk`'s own read: `after = self.state.
+risk_by_id.get(fid)` returning the stale value instead of `None`. Fixed by popping any existing
+entry for EVERY finding about to be (re)dispatched -- not just the ones that survive each stage's
+own upstream-failure check, which was the first, insufficient version of this fix -- at the top
+of all three `_dispatch_*` methods, before attempting anything. Confirmed harmless on a fresh
+`run()` (nothing to pop yet, since the dicts start empty).
+
+**`ConstraintReplanFailedError` is narrower now, deliberately, not silently.** It originally
+existed for exactly one motivating case, stated in its own docstring: "an LLM transport error
+escaping `crew.kickoff()` uncaught, the one class of failure `_resolve_output`'s own retry-then-
+skip loop doesn't cover." `_kickoff_batch` now catches that failure class at its actual source --
+inside `_dispatch_environment`/`_dispatch_risk` themselves -- before it ever reaches `replan()`,
+so `submit_constraint` no longer raises this exception for that scenario. Two tests
+(`test_submit_constraint_wraps_a_replan_failure_but_the_constraint_stays_persisted`,
+`test_a_replan_failure_leaves_the_constraint_persisted_and_names_it_in_the_error`) asserted the
+old, crash-shaped behavior and were rewritten (renamed to describe the new behavior) rather than
+deleted, since the underlying scenario -- a transport failure during replan -- is still worth a
+regression test, just with a different, better outcome now: the constraint stays persisted, the
+job succeeds, and the affected finding correctly has no delta. The exception's own docstring was
+rewritten to record this narrowing explicitly rather than leave it silently stale (it remains
+reachable for anything else genuinely unexpected during `run`/`replan`).
+
+**Verification.** New `agents/limits.py` module. `tests/test_research_agent.py` (+6 -- one tool-
+exception test per tool, confirming `error` is populated and the call is still logged, not
+swallowed). `max_execution_time` assertions added to the existing agent-construction test in each
+of `test_research_agent.py`/`test_environment_agent.py`/`test_risk_agent.py`/
+`test_constraint_intake.py`/`test_tot.py` (both agents)/`test_agents_chat.py` (new, standalone)/
+`test_schema_inference.py` (new, standalone -- this agent had no prior direct construction test).
+`tests/test_coordinator.py` (+3 -- `_kickoff_batch`'s partial-batch-completion behavior directly,
+the bulk-fetch-failure graceful degradation, and the stale-entry-clearing fix directly against
+`_dispatch_risk`) plus the 2 rewritten replan tests described above; `tests/test_web_jobs.py`'s
+counterpart rewritten the same way. Full suite: `.venv312` 1012 passed, 1 skipped (up from 1003).

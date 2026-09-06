@@ -172,6 +172,8 @@ def test_build_environment_agent_has_role_and_the_tool():
 
     assert agent.role == "Environment Analysis"
     assert {t.name for t in agent.tools} == {"lookup_asset_context"}
+    from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
+    assert agent.max_execution_time == MAX_AGENT_EXECUTION_SECONDS
 
 
 def test_build_environment_task_embeds_finding_and_upstream_research_context():

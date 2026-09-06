@@ -359,7 +359,19 @@ def test_interpretation_that_never_parses_fails_with_nothing_persisted(app_and_c
     assert app.state.plan_state.memory.all_active_constraints() == []
 
 
-def test_a_replan_failure_leaves_the_constraint_persisted_and_names_it_in_the_error(app_and_client):
+def test_a_replan_dispatch_failure_still_persists_the_constraint_and_succeeds(app_and_client):
+    """A transport-level failure during the targeted replan (simulated by
+    an empty Crew queue, so its first kickoff() raises IndexError) is now
+    caught inside `agents/coordinator.py`'s `_kickoff_batch` at the point
+    `crew.kickoff()` actually raises -- the same "record and skip"
+    contract every other per-finding failure already gets, rather than
+    escaping `replan()` uncaught and getting wrapped into
+    `ConstraintReplanFailedError` (this test's own prior name for itself).
+    The job now succeeds: the constraint is persisted and the export is
+    written normally; the affected finding just has no delta, since
+    Environment -- dispatched first by `replan()` -- never produced
+    output for it (see `test_coordinator.py`'s own direct test of that
+    per-finding failure recording)."""
     app, client, export_path = app_and_client
     _queue_full_seed_run()
     _QueuedFakeCrew.queue.append(
@@ -371,8 +383,8 @@ def test_a_replan_failure_leaves_the_constraint_persisted_and_names_it_in_the_er
         )
     )
     # Nothing queued for the targeted replan that follows -- its first
-    # Crew.kickoff() pops from an empty queue and raises IndexError,
-    # standing in for an uncaught transport-level failure.
+    # Crew.kickoff() (Environment) pops from an empty queue and raises
+    # IndexError, now caught by _kickoff_batch rather than escaping.
 
     resp = client.post(
         "/api/jobs",
@@ -380,17 +392,14 @@ def test_a_replan_failure_leaves_the_constraint_persisted_and_names_it_in_the_er
     )
     body = _wait_for_terminal(client, resp.json()["job_id"])
 
-    assert body["status"] == "failed"
-    assert body["error"]["stage"] == "replanning"
-    assert body["error"]["type"] == "ConstraintReplanFailedError"
-    assert body["error"]["asset_id"] == "A02"
-    assert isinstance(body["error"]["constraint_id"], int)
-    assert body["export_written"] is False
-    assert not export_path.exists()
+    assert body["status"] == "succeeded"
+    assert body["export_written"] is True
+    assert body["result"]["deltas"] == []
+    assert export_path.exists()
 
-    # No rollback: the constraint really is on file despite the failure.
+    # Persisted regardless -- unaffected by the dispatch failure either way.
     [stored] = app.state.plan_state.memory.constraints_for_asset("A02")
-    assert stored.id == body["error"]["constraint_id"]
+    assert stored.constraint_text == "the finance workstation now sits behind a WAF"
 
 
 def test_export_write_failure_is_a_warning_not_an_error(app_and_client, monkeypatch):

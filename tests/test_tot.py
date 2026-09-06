@@ -273,15 +273,21 @@ def test_tot_dispatch_error_carries_the_raw_output_it_was_given():
 
 
 def test_build_strategist_agent_has_role_and_no_tools():
+    from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
+
     agent = build_strategist_agent(llm=_fake_llm())
     assert agent.role == "Tree-of-Thought Strategist"
     assert not agent.tools
+    assert agent.max_execution_time == MAX_AGENT_EXECUTION_SECONDS
 
 
 def test_build_critic_agent_has_role_and_no_tools():
+    from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
+
     agent = build_critic_agent(llm=_fake_llm())
     assert agent.role == "Tree-of-Thought Critic"
     assert not agent.tools
+    assert agent.max_execution_time == MAX_AGENT_EXECUTION_SECONDS
 
 
 def test_build_propose_task_embeds_root_evidence_and_strategy_guidance():

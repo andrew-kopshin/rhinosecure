@@ -231,6 +231,14 @@ def test_insufficient_data_answer_needs_no_citations():
     assert result["citations"] == []
 
 
+def test_build_chat_agent_has_a_max_execution_time():
+    from rhinosecure.agents.chat import build_chat_agent
+    from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
+
+    agent = build_chat_agent()
+    assert agent.max_execution_time == MAX_AGENT_EXECUTION_SECONDS
+
+
 def test_history_is_threaded_into_the_prompt():
     """Not a behavioral assertion about the model (there is none here) --
     confirms build_chat_task actually includes prior turns, so a

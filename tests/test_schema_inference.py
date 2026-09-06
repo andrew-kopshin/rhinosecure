@@ -860,3 +860,15 @@ def test_load_saved_proposal_wraps_a_pydantic_error_from_a_hand_edited_file(tmp_
     path.write_text(json.dumps({"proposal": data, "generator": _generator().model_dump(mode="json")}), encoding="utf-8")
     with pytest.raises(SchemaInferenceError, match="does not match the saved-proposal shape"):
         load_saved_proposal(path)
+
+
+# --- build_propose_agent: the tool-call retry cap item -----------------------
+
+
+def test_build_propose_agent_has_a_max_execution_time():
+    from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
+    from rhinosecure.agents.schema_inference import build_propose_agent
+    from rhinosecure.llm import LLMConfig, get_llm
+
+    agent = build_propose_agent(llm=get_llm(LLMConfig(model="claude-sonnet-5", api_key="sk-test-key")))
+    assert agent.max_execution_time == MAX_AGENT_EXECUTION_SECONDS

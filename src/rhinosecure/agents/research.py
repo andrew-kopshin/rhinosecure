@@ -66,6 +66,7 @@ from crewai.llms.base_llm import BaseLLM
 from crewai.tools import BaseTool, tool
 from pydantic import BaseModel
 
+from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.prompt_safety import UNTRUSTED_TEXT_NOTICE, fence
 from rhinosecure.enrich.attack import load_index as load_attack_index
 from rhinosecure.enrich.cache import SnapshotCache
@@ -130,9 +131,20 @@ def build_research_tools(
     @tool("lookup_nvd")
     def lookup_nvd(cve_id: str) -> str:
         """Authoritative CVSS base score and severity for a CVE, from NVD.
-        Fields are null if NVD has no CVSS record for this CVE yet."""
-        cvss = nvd_lookup(cve_id, cache)
-        entry = cache.read("nvd", cve_id)
+        Fields are null if NVD has no CVSS record for this CVE yet, OR if
+        the lookup itself failed -- `error` distinguishes the two. Never
+        raises: an uncaught exception here would trigger CrewAI's own
+        invisible same-call retry (up to 3x, no backoff of its own) on top
+        of this fetcher's already-real 403/429 backoff, compounding into a
+        multi-minute stall for one CVE (CLAUDE.md Safety and guardrails'
+        tool-call retry cap item -- see `agents/limits.py`'s docstring for
+        the full mechanism this closes)."""
+        try:
+            cvss = nvd_lookup(cve_id, cache)
+            entry = cache.read("nvd", cve_id)
+            error = None
+        except Exception as exc:
+            cvss, entry, error = None, None, f"lookup_nvd failed: {exc}"
         result = {
             "cve_id": cve_id,
             "base_score": cvss.base_score if cvss else None,
@@ -140,6 +152,7 @@ def build_research_tools(
             "vector_string": cvss.vector_string if cvss else None,
             "source": "nvd",
             "retrieved_at": entry.retrieved_at if entry else None,
+            "error": error,
         }
         call_log.append({"tool": "lookup_nvd", "args": {"cve_id": cve_id}, "result": result})
         return json.dumps(result)
@@ -147,16 +160,22 @@ def build_research_tools(
     @tool("lookup_kev")
     def lookup_kev(cve_id: str) -> str:
         """Whether a CVE is on the CISA Known Exploited Vulnerabilities
-        catalog -- confirmed real-world exploitation, not a prediction."""
-        status = kev_catalog.status(cve_id)
-        entry = cache.read("kev", None)
+        catalog -- confirmed real-world exploitation, not a prediction.
+        Never raises -- see lookup_nvd's docstring for why."""
+        try:
+            status = kev_catalog.status(cve_id)
+            entry = cache.read("kev", None)
+            error = None
+        except Exception as exc:
+            status, entry, error = None, None, f"lookup_kev failed: {exc}"
         result = {
             "cve_id": cve_id,
-            "is_listed": status.is_listed,
-            "date_added": status.date_added,
-            "due_date": status.due_date,
+            "is_listed": status.is_listed if status else None,
+            "date_added": status.date_added if status else None,
+            "due_date": status.due_date if status else None,
             "source": "kev",
             "retrieved_at": entry.retrieved_at if entry else None,
+            "error": error,
         }
         call_log.append({"tool": "lookup_kev", "args": {"cve_id": cve_id}, "result": result})
         return json.dumps(result)
@@ -165,16 +184,23 @@ def build_research_tools(
     def lookup_epss(cve_id: str) -> str:
         """FIRST EPSS exploitation-probability score and percentile for a
         CVE -- a model's predicted likelihood, distinct from KEV's confirmed
-        record. Fields are null if FIRST has no EPSS entry for this CVE."""
-        score = epss_lookup(cve_id, cache)
-        entry = cache.read("epss", cve_id)
+        record. Fields are null if FIRST has no EPSS entry for this CVE, OR
+        if the lookup itself failed -- `error` distinguishes the two. Never
+        raises -- see lookup_nvd's docstring for why."""
+        try:
+            score = epss_lookup(cve_id, cache)
+            entry = cache.read("epss", cve_id)
+            error = None
+        except Exception as exc:
+            score, entry, error = None, None, f"lookup_epss failed: {exc}"
         result = {
             "cve_id": cve_id,
-            "score": score.score,
-            "percentile": score.percentile,
-            "score_date": score.score_date,
+            "score": score.score if score else None,
+            "percentile": score.percentile if score else None,
+            "score_date": score.score_date if score else None,
             "source": "epss",
             "retrieved_at": entry.retrieved_at if entry else None,
+            "error": error,
         }
         call_log.append({"tool": "lookup_epss", "args": {"cve_id": cve_id}, "result": result})
         return json.dumps(result)
@@ -186,11 +212,19 @@ def build_research_tools(
         example documentation; otherwise semantically similar "candidate"
         techniques matched against `product`/`evidence` text. Never both
         tiers in one result -- pass the finding's product and evidence text
-        so the candidate tier has something to match against."""
-        matches = attack_index.lookup(cve_id, product, evidence)
-        entry = cache.read("attack", "enterprise-windows")
+        so the candidate tier has something to match against. Never
+        raises -- see lookup_nvd's docstring for why; an empty `techniques`
+        list plus a non-null `error` means the lookup itself failed, not
+        that no techniques matched."""
+        try:
+            matches = attack_index.lookup(cve_id, product, evidence)
+            entry = cache.read("attack", "enterprise-windows")
+            error = None
+        except Exception as exc:
+            matches, entry, error = [], None, f"lookup_attack_techniques failed: {exc}"
         result = {
             "cve_id": cve_id,
+            "error": error,
             "techniques": [
                 {
                     "technique_id": m.technique.technique_id,
@@ -237,6 +271,7 @@ def build_research_agent(tools: list[BaseTool], llm: BaseLLM | None = None) -> A
         tools=tools,
         llm=llm or get_llm(),
         verbose=True,
+        max_execution_time=MAX_AGENT_EXECUTION_SECONDS,
     )
 
 

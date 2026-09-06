@@ -209,6 +209,96 @@ def test_multiple_calls_all_land_in_the_shared_call_log(tmp_path: Path):
     ]
 
 
+# --- the four tools never raise (CLAUDE.md's tool-call retry cap item) ------
+#
+# An uncaught exception here would trigger CrewAI's own invisible same-
+# call retry (up to 3x, no backoff of its own) on top of whatever the
+# underlying fetcher already did -- see agents/limits.py's module
+# docstring for the full compounding this closes. Each tool must instead
+# return a clean, null-fielded JSON result with `error` populated.
+
+
+def test_lookup_nvd_never_raises_returns_error_shaped_result_on_failure(tmp_path: Path, monkeypatch):
+    import rhinosecure.agents.research as research_module
+
+    cache = _seeded_cache(tmp_path)
+    call_log: list[dict] = []
+    tools = {t.name: t for t in build_research_tools(cache, call_log)}
+    monkeypatch.setattr(
+        research_module, "nvd_lookup",
+        lambda cve_id, cache: (_ for _ in ()).throw(ConnectionError("simulated network failure")),
+    )
+
+    raw = tools["lookup_nvd"].run(cve_id="CVE-2021-26855")  # must not raise
+    result = json.loads(raw)
+
+    assert result["base_score"] is None
+    assert result["base_severity"] is None
+    assert result["error"] is not None
+    assert "simulated network failure" in result["error"]
+    assert call_log[0]["result"]["error"] == result["error"]  # the failure is logged too, not swallowed
+
+
+def test_lookup_epss_never_raises_returns_error_shaped_result_on_failure(tmp_path: Path, monkeypatch):
+    import rhinosecure.agents.research as research_module
+
+    cache = _seeded_cache(tmp_path)
+    tools = {t.name: t for t in build_research_tools(cache, [])}
+    monkeypatch.setattr(
+        research_module, "epss_lookup",
+        lambda cve_id, cache: (_ for _ in ()).throw(TimeoutError("simulated timeout")),
+    )
+
+    raw = tools["lookup_epss"].run(cve_id="CVE-2021-26855")  # must not raise
+    result = json.loads(raw)
+
+    assert result["score"] is None
+    assert result["percentile"] is None
+    assert result["error"] is not None
+    assert "simulated timeout" in result["error"]
+
+
+def test_lookup_kev_never_raises_returns_error_shaped_result_on_failure(tmp_path: Path, monkeypatch):
+    from rhinosecure.enrich.kev import KevCatalog
+
+    cache = _seeded_cache(tmp_path)
+    tools = {t.name: t for t in build_research_tools(cache, [])}
+
+    def _raise(self, cve_id):
+        raise RuntimeError("simulated catalog failure")
+
+    monkeypatch.setattr(KevCatalog, "status", _raise)
+
+    raw = tools["lookup_kev"].run(cve_id="CVE-2021-26855")  # must not raise
+    result = json.loads(raw)
+
+    assert result["is_listed"] is None
+    assert result["date_added"] is None
+    assert result["error"] is not None
+    assert "simulated catalog failure" in result["error"]
+
+
+def test_lookup_attack_techniques_never_raises_returns_error_shaped_result_on_failure(
+    tmp_path: Path, monkeypatch
+):
+    from rhinosecure.enrich.attack import TechniqueIndex
+
+    cache = _seeded_cache(tmp_path)
+    tools = {t.name: t for t in build_research_tools(cache, [])}
+
+    def _raise(self, cve_id, product="", evidence=""):
+        raise RuntimeError("simulated index failure")
+
+    monkeypatch.setattr(TechniqueIndex, "lookup", _raise)
+
+    raw = tools["lookup_attack_techniques"].run(cve_id="CVE-2021-26855")  # must not raise
+    result = json.loads(raw)
+
+    assert result["techniques"] == []
+    assert result["error"] is not None
+    assert "simulated index failure" in result["error"]
+
+
 # --- agent/task construction (no network, no LLM call) ----------------------
 
 
@@ -228,6 +318,8 @@ def test_build_research_agent_has_role_and_all_four_tools(tmp_path: Path):
         "lookup_epss",
         "lookup_attack_techniques",
     }
+    from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
+    assert agent.max_execution_time == MAX_AGENT_EXECUTION_SECONDS
 
 
 def test_build_research_task_embeds_finding_fields_and_targets_research_output(tmp_path: Path):

@@ -106,6 +106,7 @@ from crewai.types.usage_metrics import UsageMetrics
 from pydantic import BaseModel, Field
 
 from rhinosecure.agents.environment import EnvironmentAssessment
+from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.parsing import AgentOutputParseError, parse_structured_output
 from rhinosecure.agents.research import ResearchFinding
 from rhinosecure.agents.risk import RiskRecommendation
@@ -343,6 +344,7 @@ def build_strategist_agent(llm: BaseLLM | None = None) -> Agent:
         ),
         llm=llm or get_llm(),
         verbose=True,
+        max_execution_time=MAX_AGENT_EXECUTION_SECONDS,
     )
 
 
@@ -365,6 +367,7 @@ def build_critic_agent(llm: BaseLLM | None = None) -> Agent:
         ),
         llm=llm or get_llm(),
         verbose=True,
+        max_execution_time=MAX_AGENT_EXECUTION_SECONDS,
     )
 
 

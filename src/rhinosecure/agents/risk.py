@@ -82,6 +82,7 @@ from pydantic import BaseModel
 
 from rhinosecure.agents.constraint_intake import apply_constraints
 from rhinosecure.agents.environment import EnvironmentAssessment
+from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.prompt_safety import UNTRUSTED_TEXT_NOTICE, fence
 from rhinosecure.agents.research import ResearchFinding
 from rhinosecure.llm import get_llm
@@ -234,6 +235,7 @@ def build_risk_agent(tools: list[BaseTool], llm: BaseLLM | None = None) -> Agent
         tools=tools,
         llm=llm or get_llm(),
         verbose=True,
+        max_execution_time=MAX_AGENT_EXECUTION_SECONDS,
     )
 
 

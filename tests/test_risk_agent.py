@@ -253,6 +253,8 @@ def test_build_risk_agent_has_role_and_the_tool():
 
     assert agent.role == "Risk & Recommendation"
     assert {t.name for t in agent.tools} == {"score_finding"}
+    from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
+    assert agent.max_execution_time == MAX_AGENT_EXECUTION_SECONDS
 
 
 def test_build_risk_task_embeds_finding_research_and_environment_context():

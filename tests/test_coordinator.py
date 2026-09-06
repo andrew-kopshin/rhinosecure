@@ -270,6 +270,94 @@ def test_persistently_unparseable_finding_is_recorded_and_skipped_not_blocking(d
     assert [r.finding_id for r in ranked] == ["F02"]
 
 
+def test_kickoff_batch_records_only_the_finding_whose_task_never_completed(data_dir, findings):
+    """A batched Crew's kickoff() raising PARTWAY through (simulated by an
+    empty queue after F01's task already got its output) is caught by
+    `_kickoff_batch`: F01, whose `task.output` was already set before the
+    exception, is NOT treated as failed -- only F02, whose task never got
+    output at all, is recorded. Before `_kickoff_batch` existed, the
+    IndexError would have propagated straight out of `_dispatch_research`
+    uncaught, losing F01's already-produced result along with F02's, and
+    aborting `run()` entirely."""
+    _QueuedFakeCrew.queue = [_research_json("F01", "CVE-2021-26855")]
+    # Nothing queued for F02's task -- the fake crew's second .pop(0) call,
+    # inside the SAME kickoff(), raises IndexError.
+
+    coordinator = Coordinator(data_dir)
+    coordinator.state = coordinator_module.RunState(
+        enriched_by_id={e.finding.finding_id: e for e in findings}
+    )
+    coordinator._dispatch_research(findings)
+
+    assert "F01" in coordinator.state.research_by_id
+    assert "F02" not in coordinator.state.research_by_id
+    assert "F02" in coordinator.state.research_failures
+    assert "did not complete" in coordinator.state.research_failures["F02"]
+
+
+def test_bulk_enrichment_fetch_failure_fails_every_finding_gracefully_not_a_crash(
+    data_dir, findings, monkeypatch
+):
+    """load_kev_catalog/load_attack_index (build_research_tools) run ONCE
+    per dispatch, before any Crew exists at all -- previously, a failure
+    there propagated straight out of run()/replan() uncaught (a real gap:
+    this is a categorically different, MORE fragile failure mode than a
+    per-CVE tool-call failure, since it happens outside any per-finding
+    boundary). Now every finding in the dispatch is recorded as a research
+    failure instead, and run() completes (nothing ranked) rather than
+    raising."""
+    def _raise(cache, call_log):
+        raise ConnectionError("simulated KEV/ATT&CK bulk fetch failure")
+
+    monkeypatch.setattr(coordinator_module, "build_research_tools", _raise)
+
+    coordinator = Coordinator(data_dir)
+    ranked = coordinator.run(findings)  # must not raise
+
+    assert ranked == []
+    for e in findings:
+        fid = e.finding.finding_id
+        assert fid in coordinator.state.research_failures
+        assert "bulk KEV/ATT&CK" in coordinator.state.research_failures[fid]
+        assert "simulated KEV/ATT&CK bulk fetch failure" in coordinator.state.research_failures[fid]
+
+
+def test_dispatch_risk_clears_a_stale_prior_result_when_skipped_this_time(data_dir, findings):
+    """A finding with a STALE risk_by_id entry from an earlier successful
+    dispatch must not silently keep answering with it if THIS dispatch
+    can't even attempt it (no EnvironmentAssessment on file this time,
+    simulating a redispatch whose Environment stage just failed). Without
+    the fix, `after = self.state.risk_by_id.get(fid)` in
+    `submit_constraint`'s delta-building loop would read this stale value
+    back as if it reflected the current attempt -- exactly the bug a
+    passing-but-wrong `test_a_replan_dispatch_failure_...` integration
+    test surfaced while building the retry-cap fix."""
+    from rhinosecure.agents.research import ResearchFinding
+    from rhinosecure.agents.risk import RiskRecommendation
+
+    coordinator = Coordinator(data_dir)
+    coordinator.state = coordinator_module.RunState(
+        enriched_by_id={e.finding.finding_id: e for e in findings}
+    )
+    coordinator.state.research_by_id["F02"] = ResearchFinding(
+        finding_id="F02", cve_id="CVE-2018-8410", scanner_severity="high",
+        exploitation_summary="fake", sources=["fake"],
+    )
+    coordinator.state.risk_by_id["F02"] = RiskRecommendation(
+        finding_id="F02", cve_id="CVE-2018-8410", asset_id="A02", hostname="WKS01",
+        risk_score=9.5, bucket="accept", scoring_rationale=["fake"],
+        verdict_summary="fake", narrative="fake", sources=["fake"],
+    )
+    # environment_by_id deliberately left empty for F02 -- this dispatch's
+    # Environment stage is being simulated as already having failed.
+
+    coordinator._dispatch_risk(findings)
+
+    assert "F02" not in coordinator.state.risk_by_id
+    assert "F02" in coordinator.state.risk_failures
+    assert "no EnvironmentAssessment" in coordinator.state.risk_failures["F02"]
+
+
 def test_retry_cap_is_respected_exactly(data_dir, findings):
     """With max_parse_attempts=2, an always-unparseable finding must be
     retried exactly once (2 total attempts: 1 initial + 1 retry) and no
@@ -715,17 +803,24 @@ def test_submit_constraint_replans_in_place_when_a_full_plan_already_exists(data
     assert run.contested_count == 0
 
 
-def test_submit_constraint_wraps_a_replan_failure_but_the_constraint_stays_persisted(
+def test_a_replan_dispatch_failure_is_recorded_per_finding_not_raised(
     data_dir, findings, tmp_path
 ):
-    """If the re-plan that follows persistence throws (a transport-level
-    failure `_resolve_output`'s own retry loop doesn't cover -- simulated
+    """A transport-level failure during the targeted replan (simulated
     here by leaving the targeted run's Crew queue empty, so its first
-    kickoff() raises IndexError), the constraint itself is NOT rolled
-    back: submit_constraint has no rollback by design (see
-    ConstraintReplanFailedError's own docstring). The exception must
-    carry constraint_id/asset_id so a caller isn't left guessing what's
-    actually on file."""
+    kickoff() raises IndexError) is now caught by `_kickoff_batch`
+    (agents/coordinator.py) at the point `crew.kickoff()` actually raises
+    -- the same "record and skip" contract every other per-finding
+    failure in this module already gets. It no longer escapes `replan()`
+    uncaught, so `submit_constraint` no longer needs to wrap it into
+    `ConstraintReplanFailedError` -- that exception's own docstring
+    originally cited exactly this scenario as its motivating example; see
+    its updated docstring for why that's no longer the live path. The
+    constraint is still persisted (no rollback either way); the affected
+    finding just ends up with no delta because this Coordinator has no
+    prior `run()`, so `submit_constraint` takes the "fresh, scoped run"
+    branch (`self.run(affected)`), and Research -- dispatched first --
+    never produced output for it."""
     from rhinosecure.memory import Memory
 
     memory = Memory(tmp_path / "mem.db")
@@ -735,19 +830,20 @@ def test_submit_constraint_wraps_a_replan_failure_but_the_constraint_stays_persi
             affected_finding_ids=["F02"],
         ),
         # Nothing queued for the targeted run that follows -- its first
-        # Crew.kickoff() pops from an empty queue and raises IndexError.
+        # Crew.kickoff() (Research) pops from an empty queue and raises
+        # IndexError, now caught by _kickoff_batch rather than escaping.
     ]
 
     coordinator = Coordinator(data_dir, memory=memory)
-    with pytest.raises(coordinator_module.ConstraintReplanFailedError) as excinfo:
-        coordinator.submit_constraint("the finance workstation now sits behind a WAF", findings)
+    result = coordinator.submit_constraint("the finance workstation now sits behind a WAF", findings)
 
-    exc = excinfo.value
-    assert isinstance(exc.__cause__, IndexError)
-    assert exc.asset_id == "A02"
+    assert result.persisted is True
+    assert result.deltas == ()
+    assert "F02" in coordinator.state.research_failures
+    assert "did not complete" in coordinator.state.research_failures["F02"]
 
     [stored] = memory.constraints_for_asset("A02")
-    assert stored.id == exc.constraint_id
+    assert stored.id == result.constraint_id
     assert stored.constraint_text == "the finance workstation now sits behind a WAF"
 
 

@@ -112,6 +112,7 @@ from crewai import Agent, Crew, Process, Task
 from crewai.llms.base_llm import BaseLLM
 from pydantic import BaseModel, model_validator
 
+from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.parsing import AgentOutputParseError, parse_structured_output
 from rhinosecure.agents.prompt_safety import UNTRUSTED_TEXT_NOTICE, fence
 from rhinosecure.llm import get_llm
@@ -297,6 +298,7 @@ def build_chat_agent(llm: BaseLLM | None = None) -> Agent:
         tools=[],
         llm=llm or get_llm(),
         verbose=False,
+        max_execution_time=MAX_AGENT_EXECUTION_SECONDS,
     )
 
 

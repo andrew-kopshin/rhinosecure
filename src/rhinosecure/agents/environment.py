@@ -71,6 +71,7 @@ from crewai.llms.base_llm import BaseLLM
 from crewai.tools import BaseTool, tool
 from pydantic import BaseModel
 
+from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.prompt_safety import UNTRUSTED_TEXT_NOTICE, fence
 from rhinosecure.agents.research import ResearchFinding
 from rhinosecure.llm import get_llm
@@ -221,6 +222,7 @@ def build_environment_agent(tools: list[BaseTool], llm: BaseLLM | None = None) -
         tools=tools,
         llm=llm or get_llm(),
         verbose=True,
+        max_execution_time=MAX_AGENT_EXECUTION_SECONDS,
     )
 
 
