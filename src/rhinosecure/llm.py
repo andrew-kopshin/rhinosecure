@@ -60,13 +60,25 @@ def _config_from_env() -> LLMConfig:
     )
 
 
-def get_llm(config: LLMConfig | None = None) -> BaseLLM:
+def get_llm(config: LLMConfig | None = None, *, max_tokens: int | None = None) -> BaseLLM:
     """Construct the object every CrewAI `Agent`'s `llm=` field receives.
 
     No request is made here -- this only builds the client. A missing
     `api_key` is only an error when there is also no `base_url`: a
     self-hosted swap may need no real key at all, so the hosted-Anthropic
     default is the one path this refuses to construct silently broken.
+
+    `max_tokens` is left unset by every caller except `agents/schema_inference
+    .py`'s propose agent. Left unset, `crewai`'s Anthropic provider defaults
+    to the model's full Messages API ceiling (128,000 tokens for
+    `claude-sonnet-5`) -- the right choice for an agent whose output shape is
+    open-ended. A caller whose task has a small, well-understood output size
+    can pass a tight cap instead, so a wayward call fails fast and cheap
+    (a truncated response, a quick parse error) rather than silently
+    generating tens of thousands of unneeded completion tokens before an
+    unrelated failure discards all of it (PROGRESS.md 2026-09-06: a 5-row,
+    20-column ingest_propose job spent ~50k completion tokens on at least one
+    of its three attempts when the accepted proposal needed ~8k).
     """
     cfg = config or _config_from_env()
     if not cfg.api_key and not cfg.base_url:
@@ -75,9 +87,11 @@ def get_llm(config: LLMConfig | None = None) -> BaseLLM:
             ".env) and no RHINO_LLM_BASE_URL configured for a self-hosted model."
         )
 
-    kwargs: dict[str, str] = {"model": cfg.model}
+    kwargs: dict[str, str | int] = {"model": cfg.model}
     if cfg.api_key:
         kwargs["api_key"] = cfg.api_key
     if cfg.base_url:
         kwargs["base_url"] = cfg.base_url
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
     return LLM(**kwargs)

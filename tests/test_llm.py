@@ -31,6 +31,20 @@ def test_base_url_alone_is_sufficient_for_a_self_hosted_swap():
     assert llm.base_url == "http://localhost:11434/v1"
 
 
+def test_max_tokens_is_unset_by_default():
+    """Every agent except schema_inference's propose agent leaves this
+    unset, so `crewai`'s Anthropic provider falls back to claude-sonnet-5's
+    own documented 128,000-token ceiling rather than a value this seam
+    invented."""
+    llm = get_llm(LLMConfig(model="claude-sonnet-5", api_key="sk-test-key"))
+    assert llm.max_tokens == 128_000
+
+
+def test_max_tokens_override_reaches_the_constructed_llm():
+    llm = get_llm(LLMConfig(model="claude-sonnet-5", api_key="sk-test-key"), max_tokens=24_000)
+    assert llm.max_tokens == 24_000
+
+
 def test_returned_object_is_accepted_by_crewai_agent_llm():
     """Locks in the finding from PROGRESS.md 2026-09-02: Agent.llm accepts a
     BaseLLM instance, not a raw langchain client."""

@@ -85,15 +85,26 @@ def _full_proposal_dict(name: str = "my-test-format") -> dict:
 
 
 class _QueuedFakeCrew:
+    """`kickoff()` increments the real `agent.llm`'s own cumulative usage
+    counter (crewai's `_track_token_usage_internal`) rather than only
+    setting a per-instance `usage_metrics` -- production code reads
+    per-attempt usage via `agent.llm.get_token_usage_summary().delta_since
+    (baseline)` (schema_inference.py's own note on why `crew.usage_metrics`
+    is documented as cumulative for the LLM's lifetime, not per-kickoff,
+    and this suite's agent is reused across every retry attempt)."""
+
     queue: list = []
     instantiations: int = 0
 
     def __init__(self, agents, tasks, process=None, verbose=False):
+        self.agents = agents
         self.tasks = tasks
         self.usage_metrics = UsageMetrics(prompt_tokens=10, completion_tokens=5, total_tokens=15)
         type(self).instantiations += 1
 
     def kickoff(self):
+        for agent in self.agents:
+            agent.llm._track_token_usage_internal({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
         for task in self.tasks:
             task.output = SimpleNamespace(raw=_QueuedFakeCrew.queue.pop(0))
         return None
@@ -142,6 +153,22 @@ def test_propose_writes_a_contract_when_the_proposal_is_complete(data_dir, isola
     written = json.loads((isolated_repo_root / "my-test-format.json").read_text(encoding="utf-8"))
     assert written["review"]["state"] == "proposed"
     assert written["format"] == "my-test-format"
+
+
+def test_propose_reports_per_attempt_cost_on_total_failure(data_dir, isolated_repo_root, capsys):
+    """The real gap found running this exact path live against a real
+    source (PROGRESS.md 2026-09-06): giving up after every attempt used to
+    print only the last attempt's parse error, discarding what every
+    discarded attempt actually cost -- exactly the run a human is most
+    likely to ask about, since nothing got written for it."""
+    _QueuedFakeCrew.queue = ["not json", "still not json"]
+    code = main(["adapt", "propose", "my-test-format", "--data", str(data_dir), "--max-attempts", "2"])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "gave up after 2 attempt" in err
+    assert "attempt 1:" in err and "attempt 2:" in err
+    assert "parse_error" in err
+    assert "spent before giving up" in err
 
 
 def test_propose_does_not_write_when_the_proposal_is_incomplete(data_dir, isolated_repo_root, capsys):

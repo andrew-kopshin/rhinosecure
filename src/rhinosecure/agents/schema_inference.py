@@ -114,6 +114,24 @@ ROLE = "Schema Inference"
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_SAMPLE_ROWS = 20
 
+#: Measured against the real accepted proposal for a 20-column source
+#: (~8,200 tokens -- PROGRESS.md 2026-09-06): generous headroom for a larger
+#: real source with more columns/candidates, while still capping a wayward
+#: attempt at roughly a fifth of claude-sonnet-5's 128,000-token default --
+#: turning "burn tens of thousands of unneeded completion tokens before
+#: failing to parse" into "hit the cap and fail fast." Passed to
+#: `get_llm(max_tokens=...)` -- see that function's own docstring for why no
+#: other agent in this codebase sets this.
+PROPOSE_MAX_OUTPUT_TOKENS = 24_000
+
+#: A previous attempt's failure, embedded verbatim in the next attempt's
+#: retry prompt (see `build_propose_task`'s `previous_error`). Both
+#: `AgentOutputParseError.__str__` and `_check_meta_matches`' `ValueError`
+#: are already short, bounded summaries -- this is a second, defensive cap
+#: against a hypothetical future failure mode with an unbounded message,
+#: not evidence either currently produces one.
+_MAX_RETRY_ERROR_CHARS = 2000
+
 #: Claude Sonnet 5's first-party API rate (CLAUDE.md Section 11 pins this
 #: model for every agent call). Sourced from Anthropic's published pricing,
 #: not recalled -- re-check before changing either number. Cost estimation
@@ -148,7 +166,22 @@ class ProposalGenerationError(RuntimeError):
     disagreeing with the source facts it was handed) within `max_attempts`
     -- mirrors `ConstraintInterpretationError` (agents/constraint_intake.py):
     there is nothing sensible to fall back to, so the whole propose call
-    aborts rather than writing anything."""
+    aborts rather than writing anything.
+
+    `attempt_usage` carries every attempt's real token spend regardless --
+    a real gap found running this exact path live (PROGRESS.md 2026-09-06):
+    every other outcome (`ProposeResult`) reports per-attempt usage, but a
+    TOTAL failure -- arguably the case a human is most confused about cost
+    for, since nothing got written for it -- used to raise before that data
+    was ever attached to anything, discarding it along with the exception's
+    local variables. `estimated_cost_usd` is precomputed rather than left
+    for a caller to derive from `attempt_usage`, since a caller reporting a
+    failure has no reason to also re-implement `_estimate_cost_usd`."""
+
+    def __init__(self, message: str, *, attempt_usage: tuple[dict[str, object], ...] = (), estimated_cost_usd: float = 0.0):
+        super().__init__(message)
+        self.attempt_usage = attempt_usage
+        self.estimated_cost_usd = estimated_cost_usd
 
 
 class ProposalIncompleteError(RuntimeError):
@@ -267,17 +300,62 @@ class SavedProposal:
     """The on-disk shape a human hand-corrects between propose runs.
     `generator` is carried alongside `proposal`, never inside it -- the
     model never reports its own cost (module docstring); a human editing a
-    saved proposal to fill in an unresolved slot touches only `proposal`."""
+    saved proposal to fill in an unresolved slot touches only `proposal`.
+
+    `attempt_usage` is a THIRD, separate thing from `generator`'s summed
+    totals: one entry per attempt actually made (`{attempt, prompt_tokens,
+    completion_tokens, outcome}`), in order, including discarded ones --
+    `generator.call_log_digest` proves a discarded attempt happened without
+    revealing what it said; this says how expensive it was, without needing
+    to reproduce or store the raw text. Deliberately NOT part of `Generator`
+    itself: that type is also `Contract.generator` (config_model.py), a
+    field on a git-committed, digest-verified artifact two hand-authored
+    contracts already carry without this data -- keeping it here instead
+    avoids touching that shared, `extra="forbid"` schema for something that
+    is audit trail about audit trail, one level removed. Empty for a
+    `from_proposal` reuse that made no new attempts, or for a file saved
+    before this field existed."""
 
     proposal: AdapterProposal
     generator: Generator
+    attempt_usage: tuple[dict[str, object], ...] = ()
 
 
 def dump_saved_proposal(saved: SavedProposal) -> dict:
-    return {
+    dumped: dict = {
         "proposal": saved.proposal.model_dump(mode="json", by_alias=True),
         "generator": saved.generator.model_dump(mode="json"),
     }
+    if saved.attempt_usage:
+        dumped["attempt_usage"] = list(saved.attempt_usage)
+    return dumped
+
+
+def saved_proposal_from_dict(data: Any) -> SavedProposal:
+    """The shared validator behind `load_saved_proposal` (a file on disk,
+    `rhino adapt propose --from-proposal`) and a browser's resubmitted,
+    slot-edited proposal (`_run_ingest_propose`'s `edited_saved_proposal`
+    job input, web/jobs.py) -- one place decides whether a dict has the
+    saved-proposal shape, so a hand-edited file and a form-submitted edit
+    are held to the identical standard, and neither can silently diverge
+    from what the other accepts."""
+    if not isinstance(data, dict) or "proposal" not in data or "generator" not in data:
+        raise SchemaInferenceError(
+            "expected a saved proposal with top-level 'proposal' and 'generator' keys "
+            "(the shape rhino adapt propose writes) -- edit only the 'proposal' half by hand"
+        )
+    try:
+        return SavedProposal(
+            proposal=AdapterProposal.model_validate(data["proposal"]),
+            generator=Generator.model_validate(data["generator"]),
+            attempt_usage=tuple(data.get("attempt_usage") or ()),
+        )
+    except ValidationError as exc:
+        # A hand-edited proposal is exactly where a typo (a bad `kind`,
+        # `parser`, or `case` literal, a missing required field) is likely --
+        # wrapped so a caller's existing `except SchemaInferenceError` prints
+        # a clean message instead of a raw pydantic traceback.
+        raise SchemaInferenceError(f"does not match the saved-proposal shape -- {exc}") from exc
 
 
 def load_saved_proposal(path: Path) -> SavedProposal:
@@ -291,22 +369,10 @@ def load_saved_proposal(path: Path) -> SavedProposal:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
         raise SchemaInferenceError(f"{path}: not valid JSON -- {exc}") from exc
-    if not isinstance(data, dict) or "proposal" not in data or "generator" not in data:
-        raise SchemaInferenceError(
-            f"{path}: expected a saved proposal with top-level 'proposal' and 'generator' keys "
-            "(the shape rhino adapt propose writes) -- edit only the 'proposal' half by hand"
-        )
     try:
-        return SavedProposal(
-            proposal=AdapterProposal.model_validate(data["proposal"]),
-            generator=Generator.model_validate(data["generator"]),
-        )
-    except ValidationError as exc:
-        # A hand-edited proposal is exactly where a typo (a bad `kind`,
-        # `parser`, or `case` literal, a missing required field) is likely --
-        # wrapped so the CLI's existing `except SchemaInferenceError` prints
-        # a clean message instead of a raw pydantic traceback.
-        raise SchemaInferenceError(f"{path}: does not match the saved-proposal shape -- {exc}") from exc
+        return saved_proposal_from_dict(data)
+    except SchemaInferenceError as exc:
+        raise SchemaInferenceError(f"{path}: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -921,15 +987,43 @@ def build_propose_agent(llm: BaseLLM | None = None) -> Agent:
             "that leaves gaps honestly marked is more useful than one that looks complete but lies."
         ),
         tools=[],
-        llm=llm or get_llm(),
+        llm=llm or get_llm(max_tokens=PROPOSE_MAX_OUTPUT_TOKENS),
         verbose=True,
         max_execution_time=MAX_AGENT_EXECUTION_SECONDS,
     )
 
 
-def build_propose_task(name: str, layout: str, assets_filename: str, findings_filename: str, profiles: dict[str, FileProfile], sample_rows: int, agent: Agent) -> Task:
+def build_propose_task(
+    name: str,
+    layout: str,
+    assets_filename: str,
+    findings_filename: str,
+    profiles: dict[str, FileProfile],
+    sample_rows: int,
+    agent: Agent,
+    *,
+    previous_error: str | None = None,
+) -> Task:
+    """`previous_error` is `str(exc)` from the prior attempt's
+    `AgentOutputParseError`/`_check_meta_matches` `ValueError` -- never
+    `.raw` (`AgentOutputParseError`'s own docstring: that is untrusted,
+    unbounded model text, deliberately kept out of anywhere it could be
+    printed or re-embedded without a caller's explicit choice). Reflecting
+    the model's own prior words back to the SAME model in the SAME retry
+    loop is not the cross-agent/cross-human trust boundary `agents/
+    prompt_safety.py`'s fencing exists for -- it gains the model no
+    instructing power over anything it did not already have by generating
+    the text once -- so this is appended plainly, just capped defensively."""
+    description = _build_task_description(name, layout, assets_filename, findings_filename, profiles, sample_rows)
+    if previous_error is not None:
+        description += (
+            "\n\n---\nYour previous attempt at this exact task failed, and was discarded:\n"
+            f"{previous_error[:_MAX_RETRY_ERROR_CHARS]}\n\n"
+            "Correct ONLY what caused that failure. Return the complete, corrected JSON in full -- "
+            "still exactly the shape described above -- not a diff or an explanation."
+        )
     return Task(
-        description=_build_task_description(name, layout, assets_filename, findings_filename, profiles, sample_rows),
+        description=description,
         expected_output=(
             "Return ONLY a single JSON object matching AdapterProposal -- not wrapped in any container "
             "key, no markdown code fences, no prose before or after it. Top-level keys: meta, asset, "
@@ -954,6 +1048,10 @@ class ProposeResult:
     #: entry, etc.). Without this, a human sees "0 unresolved, 0 grounding
     #: failures -- NOT written" with no way to tell why.
     incomplete_reason: str | None = None
+    #: See `SavedProposal.attempt_usage` -- carried through unchanged from
+    #: `from_proposal` when reusing one (no new attempts were made), built
+    #: fresh from the real retry loop otherwise.
+    attempt_usage: tuple[dict[str, object], ...] = ()
 
 
 def _check_meta_matches(proposal: AdapterProposal, name: str, layout: str, assets_filename: str, findings_filename: str) -> None:
@@ -1011,35 +1109,87 @@ def propose_contract(
 
     if from_proposal is not None:
         proposal, generator = from_proposal.proposal, from_proposal.generator
+        attempt_usage = from_proposal.attempt_usage
         try:
             _check_meta_matches(proposal, name, layout, resolved_assets, resolved_findings)
         except ValueError as exc:
             raise SchemaInferenceError(f"--from-proposal file does not match the requested facts: {exc}") from exc
     else:
         agent = build_propose_agent(llm)
-        total_usage = UsageMetrics()
         call_log_parts: list[str] = []
+        attempt_usage_list: list[dict[str, object]] = []
         last_error: Exception | None = None
         proposal = None
         task: Task | None = None
+        # `agent` (and so `agent.llm`) is deliberately built ONCE and reused
+        # across every attempt below, but `crew.usage_metrics` is NOT a
+        # per-kickoff figure -- `Crew.calculate_usage_metrics()` (crewai's
+        # own crew.py) reads `agent.llm.get_token_usage_summary()` directly,
+        # and that summary is explicitly documented as "cumulative for the
+        # lifetime of this [LLM] instance" (base_llm.py). Reading `crew
+        # .usage_metrics` naively on attempt 2 therefore double-counts
+        # attempt 1's tokens, and attempt 3 triple-counts them -- confirmed
+        # live (PROGRESS.md 2026-09-06): a real 3-attempt run reported a
+        # THIRD attempt alone costing more completion tokens than the
+        # entire run's real total. `UsageMetrics.delta_since` (crewai's own
+        # documented fix for exactly this reuse pattern) turns the running
+        # snapshot into a true per-attempt figure.
+        usage_baseline = agent.llm.get_token_usage_summary() if isinstance(agent.llm, BaseLLM) else UsageMetrics()
 
         for attempt in range(1, max_attempts + 1):
-            task = build_propose_task(name, layout, resolved_assets, resolved_findings, profiles, sample_rows, agent)
+            task = build_propose_task(
+                name, layout, resolved_assets, resolved_findings, profiles, sample_rows, agent,
+                previous_error=str(last_error) if last_error is not None else None,
+            )
             crew = Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=verbose)
             crew.kickoff()
-            if crew.usage_metrics is not None:
-                total_usage.add_usage_metrics(crew.usage_metrics)
+            attempt_prompt_tokens = 0
+            attempt_completion_tokens = 0
+            if isinstance(agent.llm, BaseLLM):
+                usage_now = agent.llm.get_token_usage_summary()
+                attempt_delta = usage_now.delta_since(usage_baseline)
+                attempt_prompt_tokens = attempt_delta.prompt_tokens
+                attempt_completion_tokens = attempt_delta.completion_tokens
+                usage_baseline = usage_now
             call_log_parts.append(task.description + "\n---\n" + task.output.raw)
             try:
                 candidate = parse_structured_output(task.output.raw, AdapterProposal)
                 _check_meta_matches(candidate, name, layout, resolved_assets, resolved_findings)
                 proposal = candidate
+                attempt_usage_list.append(
+                    {
+                        "attempt": attempt,
+                        "prompt_tokens": attempt_prompt_tokens,
+                        "completion_tokens": attempt_completion_tokens,
+                        "outcome": "parsed",
+                    }
+                )
                 break
             except (AgentOutputParseError, ValueError) as exc:
                 last_error = exc
+                attempt_usage_list.append(
+                    {
+                        "attempt": attempt,
+                        "prompt_tokens": attempt_prompt_tokens,
+                        "completion_tokens": attempt_completion_tokens,
+                        "outcome": "parse_error" if isinstance(exc, AgentOutputParseError) else "meta_mismatch",
+                    }
+                )
+
+        attempt_usage = tuple(attempt_usage_list)
+        # `usage_baseline` is updated to the LLM's cumulative summary at the
+        # end of every attempt above, so once the loop ends it already IS
+        # the true total across every attempt made -- not re-summed here,
+        # for the identical reason a naive re-sum of `crew.usage_metrics`
+        # would have overcounted per attempt.
+        total_usage = usage_baseline
 
         if proposal is None:
-            raise ProposalGenerationError(f"gave up after {max_attempts} attempt(s): {last_error}") from last_error
+            raise ProposalGenerationError(
+                f"gave up after {max_attempts} attempt(s): {last_error}",
+                attempt_usage=attempt_usage,
+                estimated_cost_usd=_estimate_cost_usd(total_usage),
+            ) from last_error
 
         generator = Generator(
             tool="rhino-adapt-propose",
@@ -1063,5 +1213,5 @@ def propose_contract(
 
     return ProposeResult(
         proposal=proposal, grounding=report, contract=contract, generator=generator, profiles=profiles,
-        incomplete_reason=incomplete_reason,
+        incomplete_reason=incomplete_reason, attempt_usage=attempt_usage,
     )

@@ -1121,6 +1121,11 @@ def _print_propose_report(data_dir: Path, name: str, result: "ProposeResult") ->
         f"\nGenerator: {g.model}, {g.attempts} attempt(s), ~{g.prompt_tokens:,} prompt + "
         f"{g.completion_tokens:,} completion tokens, est. ${g.estimated_cost_usd:.2f}"
     )
+    for entry in result.attempt_usage:
+        print(
+            f"  attempt {entry['attempt']}: {entry['prompt_tokens']:,} prompt + "
+            f"{entry['completion_tokens']:,} completion tokens ({entry['outcome']})"
+        )
 
 
 def _utc_now_iso() -> str:
@@ -2020,8 +2025,24 @@ def main(argv: list[str] | None = None) -> int:
         except ProbeError as exc:
             print(f"probe error: {exc}", file=sys.stderr)
             return 1
-        except (SchemaInferenceError, ProposalGenerationError) as exc:
+        except SchemaInferenceError as exc:
             print(f"propose error: {exc}", file=sys.stderr)
+            return 1
+        except ProposalGenerationError as exc:
+            print(f"propose error: {exc}", file=sys.stderr)
+            # A total failure still spent real tokens on every discarded
+            # attempt -- printed here because this exception is the only
+            # place that data exists; propose_contract never returns a
+            # ProposeResult (and so never reaches _print_propose_report)
+            # when every attempt fails.
+            for entry in exc.attempt_usage:
+                print(
+                    f"  attempt {entry['attempt']}: {entry['prompt_tokens']:,} prompt + "
+                    f"{entry['completion_tokens']:,} completion tokens ({entry['outcome']})",
+                    file=sys.stderr,
+                )
+            if exc.attempt_usage:
+                print(f"  est. ${exc.estimated_cost_usd:.2f} spent before giving up", file=sys.stderr)
             return 1
         except LLMConfigError as exc:
             print(f"LLM config error: {exc}", file=sys.stderr)
@@ -2038,7 +2059,10 @@ def main(argv: list[str] | None = None) -> int:
         saved_path = REPO_ROOT / "out" / f"propose_{args.name}.json"
         saved_path.parent.mkdir(parents=True, exist_ok=True)
         saved_path.write_text(
-            json.dumps(dump_saved_proposal(SavedProposal(result.proposal, result.generator)), indent=2, sort_keys=True) + "\n",
+            json.dumps(
+                dump_saved_proposal(SavedProposal(result.proposal, result.generator, result.attempt_usage)),
+                indent=2, sort_keys=True,
+            ) + "\n",
             encoding="utf-8",
         )
         print(f"Proposal saved to {saved_path} -- hand-correct it and re-run with --from-proposal if incomplete.")

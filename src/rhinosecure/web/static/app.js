@@ -1765,6 +1765,7 @@ function renderRouteStep(routeId, step, index, allSteps) {
   const errorHtml = step.error
     ? `<div class="route-step-result" style="color: var(--status-failed)">${esc(step.error.message || "failed")}</div>`
     : "";
+  const actionsHtml = ingestProposeActionsHtml(step);
 
   el.innerHTML = `
     <div class="route-step-head">
@@ -1777,11 +1778,421 @@ function renderRouteStep(routeId, step, index, allSteps) {
     <div class="route-step-body">${bodyHtml}</div>
     ${resultHtml}
     ${errorHtml}
+    ${actionsHtml}
   `;
 
   const approveBtn = el.querySelector(".route-approve-btn");
   if (approveBtn) approveBtn.addEventListener("click", () => approveRouteStep(routeId, index));
+
+  const resolveBtn = el.querySelector(".ingest-resolve-btn");
+  if (resolveBtn) {
+    resolveBtn.addEventListener("click", () =>
+      openResolvePanel(resolveBtn.dataset.name, resolveBtn.dataset.uploadId)
+    );
+  }
+  const confirmBtn = el.querySelector(".ingest-confirm-btn");
+  if (confirmBtn) {
+    confirmBtn.addEventListener("click", () =>
+      openConfirmPanel(confirmBtn.dataset.name, confirmBtn.dataset.uploadId)
+    );
+  }
   return el;
+}
+
+/* Not a Router operation and never will be -- these two buttons are the
+ * ONLY way to reach the slot-resolution/confirmation surfaces, matching
+ * the design's own "confirmation stays a dedicated form, never a chat
+ * shortcut" rule (CLAUDE.md, agents/router.py's own docstring on why
+ * INGEST_CONFIRM is absent from OperationKind entirely). A human clicking
+ * a button on an already-rendered step result is not the model routing to
+ * anything. */
+function ingestProposeActionsHtml(step) {
+  if (step.op !== "ingest_propose" || step.status !== "succeeded" || !step.result) return "";
+  const uploadId = step.params?.upload_id || "";
+  const name = step.result.name || "";
+  if (!uploadId || !name) return "";
+  if (!step.result.contract_written) {
+    return `
+      <div class="route-step-body">
+        <button type="button" class="secondary-btn ingest-resolve-btn" data-name="${esc(name)}" data-upload-id="${esc(uploadId)}">
+          Resolve unresolved slots →
+        </button>
+      </div>
+    `;
+  }
+  return `
+    <div class="route-step-body">
+      <button type="button" class="secondary-btn ingest-confirm-btn" data-name="${esc(name)}" data-upload-id="${esc(uploadId)}">
+        Review &amp; confirm →
+      </button>
+    </div>
+  `;
+}
+
+function appendFollowUpCard(html) {
+  const container = document.getElementById("empty-route-messages");
+  const card = document.createElement("div");
+  card.className = "card follow-up-card";
+  card.innerHTML = html;
+  container.appendChild(card);
+  container.scrollTop = container.scrollHeight;
+  return card;
+}
+
+/* ---------------- slot resolution (GET .../proposal, then POST /api/jobs) ---------------- */
+
+async function openResolvePanel(name, uploadId) {
+  const card = appendFollowUpCard(`<span class="spinner"></span> Loading unresolved slot(s)…`);
+  let data;
+  try {
+    const res = await fetch(`/api/adapters/${encodeURIComponent(name)}/proposal?upload_id=${encodeURIComponent(uploadId)}`);
+    data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+  } catch (err) {
+    card.innerHTML = `<p class="chat-msg-error">Could not load the proposal: ${esc(err.message)}</p>`;
+    return;
+  }
+  card.dataset.name = name;
+  card.dataset.uploadId = uploadId;
+  card.savedProposal = data.saved_proposal;
+  card.resolutions = {}; // slot -> {column, table: {sourceValue: targetValue}} | {notCollected: true}
+  renderResolvePanel(card, data.unresolved);
+}
+
+function resolveSlotRowHtml(slot, cardId) {
+  const vocab = slot.target_vocabulary;
+  const column = slot.candidate_columns[0];
+  const profile = column ? slot.column_profiles[column] : null;
+
+  let valuePickerHtml = `<p class="hint">No candidate column with a known profile -- only "mark not collected" is offered.</p>`;
+  if (column && profile && vocab && (vocab.kind === "enum" || vocab.kind === "range")) {
+    const options =
+      vocab.kind === "enum"
+        ? [`<option value="">(exclude this value)</option>`, ...vocab.values.map((v) => `<option value="${esc(v)}">${esc(v)}</option>`)]
+        : null;
+    const rows = profile.distinct_values
+      .map((value) => {
+        const input =
+          vocab.kind === "enum"
+            ? `<select class="resolve-value-select" data-source-value="${esc(value)}">${options.join("")}</select>`
+            : `<input type="number" class="resolve-value-select" data-source-value="${esc(value)}" min="${vocab.min}" max="${vocab.max}" placeholder="${vocab.min}-${vocab.max}, or blank to exclude" />`;
+        return `<div class="resolve-value-row"><code>${esc(value)}</code> <span class="hint">→</span> ${input}</div>`;
+      })
+      .join("");
+    valuePickerHtml = `
+      <p class="hint">Column <code>${esc(column)}</code> -- map each observed value (leave blank to exclude that value's assets/findings from the plan, per the same rule the engine itself follows):</p>
+      ${rows}
+    `;
+  }
+
+  return `
+    <div class="resolve-slot" data-slot="${esc(slot.slot)}">
+      <h4>${esc(slot.slot)}</h4>
+      <p class="hint">${esc(slot.reason)}</p>
+      ${valuePickerHtml}
+      <label class="resolve-not-collected">
+        <input type="checkbox" class="resolve-not-collected-checkbox" /> This source has no such field at all (mark not collected)
+      </label>
+    </div>
+  `;
+}
+
+function renderResolvePanel(card, unresolved) {
+  card.innerHTML = `
+    <h3>Resolve unresolved slot(s)</h3>
+    <p class="hint">Only values the real file actually contains, and only target values this schema actually accepts -- the same closed grammar the model itself is held to. An illegal or incomplete resolution is refused, not silently accepted.</p>
+    ${unresolved.map((slot) => resolveSlotRowHtml(slot)).join("")}
+    <div class="route-step-result resolve-status" hidden></div>
+    <button type="button" class="secondary-btn resolve-submit-btn">Resubmit</button>
+  `;
+  card.querySelector(".resolve-submit-btn").addEventListener("click", () => submitResolvedProposal(card, unresolved));
+}
+
+function buildResolvedProposal(card, unresolved) {
+  const proposal = JSON.parse(JSON.stringify(card.savedProposal.proposal));
+  for (const slot of unresolved) {
+    const [section, target] = slot.slot.split(".");
+    const row = card.querySelector(`.resolve-slot[data-slot="${CSS.escape(slot.slot)}"]`);
+    const notCollected = row.querySelector(".resolve-not-collected-checkbox").checked;
+    if (notCollected) {
+      proposal[section][target] = {
+        status: "mapped", confidence: 1.0, mapping: { kind: "not_collected" },
+        evidence: { columns_cited: [], sample_values_cited: [], note: "Marked not collected via the browser slot-resolution form." },
+      };
+      continue;
+    }
+    const column = slot.candidate_columns[0];
+    const table = {};
+    row.querySelectorAll(".resolve-value-select").forEach((input) => {
+      const value = input.value.trim();
+      if (value) table[input.dataset.sourceValue] = slot.target_vocabulary.kind === "range" ? Number(value) : value;
+    });
+    proposal[section][target] = {
+      status: "mapped", confidence: 1.0,
+      mapping: { kind: "vocabulary", column, case: "exact", blank: "fatal", table },
+      evidence: {
+        columns_cited: [column], sample_values_cited: [],
+        note: "Resolved via the browser slot-resolution form.",
+      },
+    };
+    // The unresolved slot's candidate column was, by construction, either
+    // never cited by any mapping or explicitly disclaimed in
+    // unmapped_columns (schema_inference.py's own grammar requires every
+    // column end up in exactly one of those two places) -- now that it
+    // feeds a real mapping, it must come out of every file's
+    // unmapped_columns entry, or validate_contract correctly refuses the
+    // contradiction "mapped AND unmapped" (confirmed live against the
+    // real northgate file before this fix existed).
+    for (const entries of Object.values(proposal.unmapped_columns || {})) {
+      delete entries[column];
+    }
+  }
+  return proposal;
+}
+
+async function submitResolvedProposal(card, unresolved) {
+  const statusEl = card.querySelector(".resolve-status");
+  const submitBtn = card.querySelector(".resolve-submit-btn");
+  submitBtn.disabled = true;
+  statusEl.hidden = false;
+  statusEl.innerHTML = `<span class="spinner"></span> Re-checking against the real file…`;
+
+  const editedProposal = buildResolvedProposal(card, unresolved);
+  const editedSavedProposal = {
+    proposal: editedProposal,
+    generator: card.savedProposal.generator,
+    attempt_usage: card.savedProposal.attempt_usage || [],
+  };
+
+  let job;
+  try {
+    const res = await fetch("/api/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        kind: "ingest_propose",
+        input: { upload_id: card.dataset.uploadId, name: card.dataset.name, edited_saved_proposal: editedSavedProposal },
+      }),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+    job = await pollJobOnce(body.job_id);
+  } catch (err) {
+    statusEl.innerHTML = `<span style="color: var(--status-failed)">Could not resubmit: ${esc(err.message)}</span>`;
+    submitBtn.disabled = false;
+    return;
+  }
+
+  if (job.status === "failed") {
+    statusEl.innerHTML = `<span style="color: var(--status-failed)">${esc(job.error?.message || "failed")}</span>`;
+    submitBtn.disabled = false;
+    return;
+  }
+
+  const result = job.result;
+  if (!result.contract_written) {
+    statusEl.innerHTML = `Still not written -- ${result.unresolved_slots.length} slot(s) remain unresolved: ${esc(result.unresolved_slots.join(", "))}.`;
+    submitBtn.disabled = false;
+    return;
+  }
+  statusEl.innerHTML = `Contract written. <button type="button" class="secondary-btn resolve-confirm-btn">Review &amp; confirm →</button>`;
+  statusEl.querySelector(".resolve-confirm-btn").addEventListener("click", () =>
+    openConfirmPanel(card.dataset.name, card.dataset.uploadId)
+  );
+}
+
+/* Polls a bare (non-route) job to a terminal state -- the same shape
+ * `pollJob` already gives the constraint-submit UI, factored out so this
+ * module's own submit function can `await` a result instead of juggling
+ * callbacks for a one-shot action. */
+function pollJobOnce(jobId) {
+  return new Promise((resolve) => {
+    const tick = async () => {
+      let body;
+      try {
+        const res = await fetch(`/api/jobs/${jobId}`);
+        body = await res.json();
+      } catch (err) {
+        setTimeout(tick, 1000);
+        return;
+      }
+      if (body.status === "succeeded" || body.status === "failed") {
+        resolve(body);
+        return;
+      }
+      setTimeout(tick, 800);
+    };
+    tick();
+  });
+}
+
+/* ---------------- confirmation (a dedicated, non-conversational form) ---------------- */
+
+async function openConfirmPanel(name, uploadId) {
+  const card = appendFollowUpCard(`<span class="spinner"></span> Loading measurement…`);
+  let review;
+  try {
+    const res = await fetch(`/api/adapters/${encodeURIComponent(name)}/review?upload_id=${encodeURIComponent(uploadId)}`);
+    review = await res.json();
+    if (!res.ok) throw new Error(review.detail || `HTTP ${res.status}`);
+  } catch (err) {
+    card.innerHTML = `<p class="chat-msg-error">Could not load the review: ${esc(err.message)}</p>`;
+    return;
+  }
+  renderConfirmPanel(card, name, uploadId, review);
+}
+
+function renderConfirmPanel(card, name, uploadId, review) {
+  const m = review.measurement;
+  const attestItems = Object.entries(review.required_attestations);
+  // `measurement` is null when this contract still needs an attestation it
+  // doesn't have yet -- the server can't measure past that gate any more
+  // than `rhino adapt confirm` itself could (web/adapters.py's own note on
+  // why), so there's nothing real to report until the attestations below
+  // are filled in and submitted.
+  const measurementHtml = m
+    ? `
+    <p class="hint">
+      ${m.assets_loaded} asset(s), ${m.findings_loaded} finding(s) loaded
+      ${Object.keys(m.excluded_assets).length || Object.keys(m.excluded_findings).length
+        ? `, ${Object.keys(m.excluded_assets).length} asset(s) / ${Object.keys(m.excluded_findings).length} finding(s) excluded`
+        : ""}
+      -- measured against the real file, not asserted.
+    </p>
+    ${!m.is_clean ? `<p class="chat-msg-error">The mapping hit fatal problems on this source -- fix the mapping (resolve slots again) before confirming.</p>` : ""}
+  `
+    : `<p class="hint">Fill in the attestation(s) below and confirm to see the real measurement.</p>`;
+  const attestHtml = attestItems.length
+    ? `<div class="confirm-attest-list">${attestItems.map(([item, reason]) => confirmAttestRowHtml(item, reason)).join("")}</div>`
+    : `<p class="hint">Nothing this contract's shape requires an attestation for.</p>`;
+
+  card.innerHTML = `
+    <h3>Review &amp; confirm — ${esc(name)}</h3>
+    ${measurementHtml}
+    <label class="confirm-identity-label">Signed by <input type="text" class="confirm-identity-input" placeholder="your name" /></label>
+    ${attestHtml}
+    <div class="route-step-result confirm-status" hidden></div>
+    <button type="button" class="secondary-btn confirm-submit-btn">Confirm</button>
+  `;
+  card.querySelector(".confirm-submit-btn").addEventListener("click", () =>
+    submitConfirm(card, name, uploadId)
+  );
+}
+
+function confirmAttestRowHtml(item, reason) {
+  return `
+    <div class="confirm-attest-row" data-item="${esc(item)}">
+      <label>${esc(item)} <span class="hint">(${esc(reason)})</span></label>
+      <textarea class="confirm-attest-input" data-item="${esc(item)}" rows="2" placeholder="Write your own sentence -- nothing here is auto-filled."></textarea>
+    </div>
+  `;
+}
+
+async function submitConfirm(card, name, uploadId) {
+  const statusEl = card.querySelector(".confirm-status");
+  const submitBtn = card.querySelector(".confirm-submit-btn");
+  const by = card.querySelector(".confirm-identity-input").value.trim();
+  if (!by) {
+    statusEl.hidden = false;
+    statusEl.innerHTML = `<span style="color: var(--status-failed)">Signed by is required.</span>`;
+    return;
+  }
+  const attestations = {};
+  card.querySelectorAll(".confirm-attest-input").forEach((input) => {
+    if (input.value.trim()) attestations[input.dataset.item] = input.value.trim();
+  });
+
+  submitBtn.disabled = true;
+  statusEl.hidden = false;
+  statusEl.innerHTML = `<span class="spinner"></span> Confirming…`;
+
+  let body;
+  try {
+    const res = await fetch(`/api/adapters/${encodeURIComponent(name)}/confirm`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ upload_id: uploadId, by, attestations }),
+    });
+    body = await res.json();
+    if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+  } catch (err) {
+    statusEl.innerHTML = `<span style="color: var(--status-failed)">${esc(err.message)}</span>`;
+    submitBtn.disabled = false;
+    return;
+  }
+
+  if (!body.written) {
+    // `still_missing` can name an item that was never in `required_
+    // attestations` at preview time -- `exclusions` in particular is
+    // computed from `observed`, which does not exist until THIS confirm
+    // attempt's own real measurement runs (web/adapters.py's own note on
+    // why the preview can't know this in advance). Add a row for any such
+    // newly-discovered item rather than just reporting its name with
+    // nowhere to act on it -- the human's already-typed attestations for
+    // the other items stay in the DOM untouched.
+    const list = card.querySelector(".confirm-attest-list") || (() => {
+      const el = document.createElement("div");
+      el.className = "confirm-attest-list";
+      card.querySelector(".confirm-submit-btn").insertAdjacentElement("beforebegin", el);
+      return el;
+    })();
+    for (const item of body.still_missing || []) {
+      if (!list.querySelector(`.confirm-attest-row[data-item="${CSS.escape(item)}"]`)) {
+        list.insertAdjacentHTML("beforeend", confirmAttestRowHtml(item, body.required_attestations[item] || ""));
+      }
+    }
+    const stillMissingMsg = (body.still_missing || []).length
+      ? `fill in: ${esc(body.still_missing.join(", "))}`
+      : "";
+    // A missing attestation and a real mapping defect are different
+    // problems with different fixes -- distinguished here rather than
+    // collapsed into one string, since `fatal_problems` (a mapping issue,
+    // fixable only by resolving slots differently) needs a human to go
+    // back a step, while a missing attestation needs only this same form.
+    const fatalMsg = (body.measurement?.fatal_problems || []).length
+      ? `the mapping itself hit real problems on this file (resolve slots again, not just attestations): ${esc(body.measurement.fatal_problems[0])}`
+      : "";
+    statusEl.innerHTML = `Not confirmed${stillMissingMsg ? " -- " + stillMissingMsg : ""}${fatalMsg ? (stillMissingMsg ? "<br>" : " -- ") + fatalMsg : ""}`;
+    submitBtn.disabled = false;
+    return;
+  }
+
+  statusEl.innerHTML = `Confirmed. <button type="button" class="secondary-btn confirm-run-btn">Run this now →</button>`;
+  statusEl.querySelector(".confirm-run-btn").addEventListener("click", () => runConfirmedSource(statusEl, uploadId));
+}
+
+async function runConfirmedSource(statusEl, uploadId) {
+  statusEl.innerHTML = `<span class="spinner"></span> Running…`;
+  let job;
+  try {
+    const res = await fetch("/api/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "run_deterministic", input: { source_ref: `uploads/${uploadId}` } }),
+    });
+    const submitted = await res.json();
+    if (!res.ok) throw new Error(submitted.detail || `HTTP ${res.status}`);
+    job = await pollJobOnce(submitted.job_id);
+  } catch (err) {
+    statusEl.innerHTML = `<span style="color: var(--status-failed)">Could not run: ${esc(err.message)}</span>`;
+    return;
+  }
+  if (job.status === "failed") {
+    statusEl.innerHTML = `<span style="color: var(--status-failed)">${esc(job.error?.message || "failed")}</span>`;
+    return;
+  }
+  if (job.export_written) {
+    try {
+      const res = await fetch("/api/export");
+      if (res.ok) {
+        hideEmptyWorkspaceShowPlan(await res.json());
+        return;
+      }
+    } catch (err) {
+      // the run DID succeed -- a transient refresh failure isn't worth a hard error here.
+    }
+  }
+  statusEl.innerHTML = `Run complete.`;
 }
 
 function formatStepResult(step) {

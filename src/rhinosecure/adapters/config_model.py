@@ -1011,6 +1011,26 @@ def _target_vocabulary(target: str) -> frozenset[str] | tuple[int, int] | Litera
     return None
 
 
+def describe_target_vocabulary(target: str) -> dict[str, Any] | None:
+    """The public, JSON-serializable form of `_target_vocabulary` -- for a
+    caller that needs to SHOW a target's legal values (a browser slot-
+    resolution form, `web/adapters.py`) rather than check one. Deliberately
+    a read of the same registry `check_grounding`/`validate_contract`
+    already enforce against, not a second, hand-maintained list: a target
+    this function calls an `"enum"` of `{"prod", "staging", "dev"}` is an
+    enum of exactly those values to the engine too, by construction, so a
+    UI built from this can never offer an option the engine would refuse."""
+    vocabulary = _target_vocabulary(target)
+    if vocabulary is None:
+        return None
+    if vocabulary == "bool":
+        return {"kind": "bool"}
+    if isinstance(vocabulary, tuple):
+        low, high = vocabulary
+        return {"kind": "range", "min": low, "max": high}
+    return {"kind": "enum", "values": sorted(vocabulary)}
+
+
 def _check_vocabulary_value(problems: list[str], where: str, target: str, value: Any) -> None:
     vocabulary = _target_vocabulary(target)
     if vocabulary is None:

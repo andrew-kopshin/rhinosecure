@@ -142,6 +142,7 @@ from rhinosecure.agents.schema_inference import (
     SavedProposal,
     dump_saved_proposal,
     propose_contract,
+    saved_proposal_from_dict,
     unresolved_slots,
 )
 from rhinosecure.enrich.cache import OfflineCacheMissError, SnapshotCache
@@ -709,7 +710,22 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
     confirmed`), so nothing this job writes can affect a real run on its
     own -- the same backstop the front-end design leans on for
     deliberately excluding `INGEST_CONFIRM` from the Router's own
-    operation vocabulary."""
+    operation vocabulary.
+
+    `input.edited_saved_proposal`, when present, is a whole saved-proposal
+    dict (`{"proposal", "generator", "attempt_usage"}` -- what `GET
+    /api/adapters/{name}/proposal` (web/adapters.py) hands the browser and
+    what it resubmits after a human fills in an unresolved slot). Routes
+    straight to `propose_contract(..., from_proposal=...)`, the identical
+    LLM-free grounding+assembly path `rhino adapt propose --from-proposal`
+    already uses -- an illegal edit is refused by the same
+    `check_grounding`/`assemble_contract` gate a bad model output already
+    goes through, never a second, browser-specific validator. This is
+    additive: every existing caller (a fresh, LLM-driven propose) has no
+    such key and is unaffected. `agents/router.py`'s `IngestProposeParams`
+    has no field for this, so chat can dispatch a fresh propose but can
+    never smuggle in a slot edit -- only a direct `POST /api/jobs` call
+    from the dedicated resolution form can."""
     upload_id = str(job.input.get("upload_id") or "").strip()
     if not upload_id:
         raise SchemaInferenceError("ingest_propose requires a non-empty input.upload_id")
@@ -734,23 +750,30 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
                 "Pass input.overwrite_confirmed=true if you really mean to replace it."
             )
 
-    on_stage("proposing")
-    result = propose_contract(
-        data_dir,
-        name,
-        generated_at=_now(),
-        assets_filename=job.input.get("assets_filename") or None,
-        findings_filename=job.input.get("findings_filename") or None,
-        max_attempts=int(job.input.get("max_attempts") or PROPOSE_DEFAULT_MAX_ATTEMPTS),
-        sample_rows=int(job.input.get("sample_rows") or DEFAULT_SAMPLE_ROWS),
-    )
+    edited_saved_proposal_data = job.input.get("edited_saved_proposal")
+    if edited_saved_proposal_data is not None:
+        on_stage("re-grounding the edited proposal")
+        from_proposal = saved_proposal_from_dict(edited_saved_proposal_data)
+        result = propose_contract(data_dir, name, generated_at=_now(), from_proposal=from_proposal)
+    else:
+        on_stage("proposing")
+        result = propose_contract(
+            data_dir,
+            name,
+            generated_at=_now(),
+            assets_filename=job.input.get("assets_filename") or None,
+            findings_filename=job.input.get("findings_filename") or None,
+            max_attempts=int(job.input.get("max_attempts") or PROPOSE_DEFAULT_MAX_ATTEMPTS),
+            sample_rows=int(job.input.get("sample_rows") or DEFAULT_SAMPLE_ROWS),
+        )
 
     on_stage("saving proposal")
     saved_path = REPO_ROOT / "out" / f"propose_{name}.json"
     saved_path.parent.mkdir(parents=True, exist_ok=True)
     saved_path.write_text(
         json.dumps(
-            dump_saved_proposal(SavedProposal(result.proposal, result.generator)), indent=2, sort_keys=True
+            dump_saved_proposal(SavedProposal(result.proposal, result.generator, result.attempt_usage)),
+            indent=2, sort_keys=True,
         )
         + "\n",
         encoding="utf-8",
@@ -772,6 +795,10 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
             "prompt_tokens": result.generator.prompt_tokens,
             "completion_tokens": result.generator.completion_tokens,
             "estimated_cost_usd": result.generator.estimated_cost_usd,
+            # One entry per attempt actually made (including discarded
+            # ones) -- see SavedProposal.attempt_usage's own docstring for
+            # why this sits beside, not inside, the summed totals above.
+            "per_attempt": list(result.attempt_usage),
         },
         "contract_written": False,
         "contract_path": None,
@@ -990,7 +1017,25 @@ def _execute_job(job: Job, registry: JobRegistry, plan_state: PlanState) -> None
             },
         )
         return
-    except (SchemaInferenceError, ProposalGenerationError) as exc:
+    except ProposalGenerationError as exc:
+        # `exc.attempt_usage`/`exc.estimated_cost_usd`: every attempt still
+        # spent real tokens even though nothing got written -- the same
+        # gap CLAUDE.md's own "Cost/usage visibility" item (Section 8)
+        # names, closed here the same way cli.py's matching except clause
+        # closes it for the CLI path.
+        registry.finish(
+            job.id,
+            status="failed",
+            error={
+                "stage": "proposing",
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "attempt_usage": list(exc.attempt_usage),
+                "estimated_cost_usd": exc.estimated_cost_usd,
+            },
+        )
+        return
+    except SchemaInferenceError as exc:
         registry.finish(
             job.id,
             status="failed",

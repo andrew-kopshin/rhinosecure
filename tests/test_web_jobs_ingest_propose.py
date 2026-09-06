@@ -121,15 +121,28 @@ _ROWS = [
 
 
 class _QueuedFakeCrew:
+    """`kickoff()` increments the real `agent.llm`'s own cumulative usage
+    counter (crewai's `_track_token_usage_internal`) rather than only
+    setting a per-instance `usage_metrics` -- production code reads
+    per-attempt usage via `agent.llm.get_token_usage_summary().delta_since
+    (baseline)` (schema_inference.py's own note on why `crew.usage_metrics`
+    is documented as cumulative for the LLM's lifetime, not per-kickoff,
+    and this suite's agent is reused across every retry attempt)."""
+
     queue: list = []
     instantiations: int = 0
 
     def __init__(self, agents, tasks, process=None, verbose=False):
+        self.agents = agents
         self.tasks = tasks
         self.usage_metrics = UsageMetrics(prompt_tokens=111, completion_tokens=22, total_tokens=133)
         type(self).instantiations += 1
 
     def kickoff(self):
+        for agent in self.agents:
+            agent.llm._track_token_usage_internal(
+                {"prompt_tokens": 111, "completion_tokens": 22, "total_tokens": 133}
+            )
         for task in self.tasks:
             task.output = SimpleNamespace(raw=_QueuedFakeCrew.queue.pop(0))
         return None
@@ -238,6 +251,25 @@ def test_unknown_upload_id_fails_the_job_cleanly(client: TestClient):
     assert body["status"] == "failed"
     assert body["error"]["stage"] == "proposing"
     assert body["error"]["type"] == "SchemaInferenceError"
+
+
+def test_a_total_generation_failure_still_reports_per_attempt_cost(client: TestClient):
+    """The real gap found running this exact job live against a real
+    source (PROGRESS.md 2026-09-06): every OTHER failure/success path
+    already reported token usage, but exhausting every attempt used to
+    discard it entirely -- exactly the run a human is most likely to ask
+    "where did my money go" about, since nothing got written for it."""
+    upload_id = _upload(client, "inventory.csv", _csv_bytes(_ROWS))["upload_id"]
+    _QueuedFakeCrew.queue = ["not json", "also not json"]
+
+    job = _submit(client, upload_id=upload_id, name="upload-gives-up", max_attempts=2)
+    body = _wait_for_terminal(client, job["job_id"])
+
+    assert body["status"] == "failed"
+    assert body["error"]["type"] == "ProposalGenerationError"
+    assert [entry["attempt"] for entry in body["error"]["attempt_usage"]] == [1, 2]
+    assert all(entry["outcome"] == "parse_error" for entry in body["error"]["attempt_usage"])
+    assert body["error"]["estimated_cost_usd"] > 0
 
 
 # ---------------- ingest_propose: happy path ----------------
@@ -425,6 +457,84 @@ def test_refuses_to_overwrite_an_already_confirmed_contract(client: TestClient, 
     assert body["status"] == "failed"
     assert body["error"]["type"] == "SchemaInferenceError"
     assert "CONFIRMED" in body["error"]["message"]
+
+
+# ---------------- ingest_propose: browser-resolved slots (edited_saved_proposal) ----------------
+
+
+def test_edited_saved_proposal_resolves_without_a_new_llm_call(client: TestClient, isolated_dirs: Path):
+    """The slot-resolution UI slice's own contract: a human filling in an
+    unresolved slot and resubmitting the WHOLE saved proposal must cost
+    zero new LLM tokens -- the same guarantee `--from-proposal` already
+    gives the CLI path."""
+    upload_id = _upload(client, "inventory.csv", _csv_bytes(_ROWS))["upload_id"]
+    incomplete = _full_proposal_dict(name="upload-resolve", overrides_asset={"owner": _unresolved()})
+    _QueuedFakeCrew.queue = [json.dumps(incomplete)]
+
+    job = _submit(client, upload_id=upload_id, name="upload-resolve")
+    body = _wait_for_terminal(client, job["job_id"])
+    assert body["result"]["contract_written"] is False
+
+    fixed = _full_proposal_dict(name="upload-resolve")  # owner resolved to not_collected
+    edited_saved_proposal = {
+        "proposal": fixed,
+        "generator": {
+            "tool": "rhino-adapt-propose", "model": "claude-sonnet-5", "prompt_tokens": 100,
+            "completion_tokens": 50, "estimated_cost_usd": 0.001, "attempts": 1,
+            "call_log_digest": "sha256:" + "a" * 64,
+        },
+    }
+    assert _QueuedFakeCrew.queue == []  # nothing queued -- proves no LLM call happens below
+
+    job2 = _submit(client, upload_id=upload_id, name="upload-resolve", edited_saved_proposal=edited_saved_proposal)
+    body2 = _wait_for_terminal(client, job2["job_id"])
+
+    assert body2["status"] == "succeeded"
+    assert body2["result"]["contract_written"] is True
+    assert _QueuedFakeCrew.instantiations == 1  # only the FIRST (incomplete) submission ever called the LLM
+
+
+def test_edited_saved_proposal_still_refuses_an_illegal_edit(client: TestClient, isolated_dirs: Path):
+    """A human's edit is held to the identical grounding gate a model's
+    output is -- inventing a table entry for a value never observed in the
+    real file is refused exactly like it would be from the LLM path."""
+    upload_id = _upload(client, "inventory.csv", _csv_bytes(_ROWS))["upload_id"]
+    bad = _full_proposal_dict(
+        name="upload-resolve-bad",
+        overrides_asset={
+            "owner": _mapped(
+                {"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "fatal", "table": {"never-seen": "x"}},
+                columns_cited=["Col"],
+            )
+        },
+    )
+    edited_saved_proposal = {
+        "proposal": bad,
+        "generator": {
+            "tool": "rhino-adapt-propose", "model": "claude-sonnet-5", "prompt_tokens": 100,
+            "completion_tokens": 50, "estimated_cost_usd": 0.001, "attempts": 1,
+            "call_log_digest": "sha256:" + "a" * 64,
+        },
+    }
+    job = _submit(
+        client, upload_id=upload_id, name="upload-resolve-bad", edited_saved_proposal=edited_saved_proposal
+    )
+    body = _wait_for_terminal(client, job["job_id"])
+
+    assert body["status"] == "succeeded"  # a refused mapping is an incomplete proposal, not a job failure
+    assert body["result"]["contract_written"] is False
+    assert _QueuedFakeCrew.instantiations == 0
+
+
+def test_malformed_edited_saved_proposal_fails_cleanly(client: TestClient):
+    upload_id = _upload(client, "inventory.csv", _csv_bytes(_ROWS))["upload_id"]
+    job = _submit(client, upload_id=upload_id, name="upload-bad-edit", edited_saved_proposal={"nope": True})
+    body = _wait_for_terminal(client, job["job_id"])
+
+    assert body["status"] == "failed"
+    assert body["error"]["type"] == "SchemaInferenceError"
+    assert "'proposal' and 'generator'" in body["error"]["message"]
+    assert _QueuedFakeCrew.instantiations == 0
 
 
 def test_overwrite_confirmed_flag_allows_replacing_a_signed_contract(client: TestClient, isolated_dirs: Path):

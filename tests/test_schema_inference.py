@@ -418,16 +418,35 @@ def test_load_saved_proposal_rejects_a_file_missing_the_expected_shape(tmp_path)
 
 
 class _QueuedFakeCrew:
+    """`kickoff()` increments the REAL agent's `agent.llm`'s own cumulative
+    usage counter (`_track_token_usage_internal`, crewai's own method) by a
+    fixed 111/22 per call, mirroring exactly what a real Anthropic response
+    would do -- production code now reads per-attempt usage via `agent.llm
+    .get_token_usage_summary().delta_since(baseline)` (schema_inference.py),
+    not `crew.usage_metrics`, because `crew.usage_metrics` is documented as
+    cumulative for the LLM instance's lifetime, and this suite's own agent
+    is deliberately reused across every retry attempt (the identical reuse
+    that made a real 3-attempt run's completion-token count for attempt 3
+    alone exceed the whole run's real total -- PROGRESS.md 2026-09-06).
+    Setting `self.usage_metrics` too, for any future direct caller of it."""
+
     queue: list = []
     instantiations: int = 0
+    descriptions: list = []
 
     def __init__(self, agents, tasks, process=None, verbose=False):
+        self.agents = agents
         self.tasks = tasks
         self.usage_metrics = UsageMetrics(prompt_tokens=111, completion_tokens=22, total_tokens=133)
         type(self).instantiations += 1
 
     def kickoff(self):
+        for agent in self.agents:
+            agent.llm._track_token_usage_internal(
+                {"prompt_tokens": 111, "completion_tokens": 22, "total_tokens": 133}
+            )
         for task in self.tasks:
+            _QueuedFakeCrew.descriptions.append(task.description)
             task.output = SimpleNamespace(raw=_QueuedFakeCrew.queue.pop(0))
         return None
 
@@ -436,6 +455,7 @@ class _QueuedFakeCrew:
 def fake_crew(monkeypatch):
     _QueuedFakeCrew.queue = []
     _QueuedFakeCrew.instantiations = 0
+    _QueuedFakeCrew.descriptions = []
     monkeypatch.setattr(schema_inference_module, "Crew", _QueuedFakeCrew)
     return _QueuedFakeCrew
 
@@ -465,6 +485,25 @@ def test_propose_contract_gives_up_after_max_attempts(data_dir):
     _QueuedFakeCrew.queue = [UNPARSEABLE, UNPARSEABLE]
     with pytest.raises(ProposalGenerationError, match="gave up after 2 attempt"):
         propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, max_attempts=2)
+
+
+def test_a_total_failure_still_reports_what_every_discarded_attempt_cost(data_dir):
+    """The real gap found running this exact path live (PROGRESS.md
+    2026-09-06): a TOTAL failure used to raise before per-attempt usage was
+    attached to anything, discarding the one number a human most needs
+    when nothing got written. Confirmed on the exception itself, not just
+    on a successful `ProposeResult` (`test_propose_contract_records_one_
+    usage_entry_per_attempt`, above)."""
+    _QueuedFakeCrew.queue = [UNPARSEABLE, UNPARSEABLE]
+    with pytest.raises(ProposalGenerationError) as excinfo:
+        propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, max_attempts=2)
+    exc = excinfo.value
+    assert [entry["attempt"] for entry in exc.attempt_usage] == [1, 2]
+    assert all(entry["outcome"] == "parse_error" for entry in exc.attempt_usage)
+    assert all(
+        entry["prompt_tokens"] == 111 and entry["completion_tokens"] == 22 for entry in exc.attempt_usage
+    )
+    assert exc.estimated_cost_usd > 0
 
 
 def test_propose_contract_treats_a_meta_mismatch_as_a_retryable_failure(data_dir):
@@ -872,3 +911,91 @@ def test_build_propose_agent_has_a_max_execution_time():
 
     agent = build_propose_agent(llm=get_llm(LLMConfig(model="claude-sonnet-5", api_key="sk-test-key")))
     assert agent.max_execution_time == MAX_AGENT_EXECUTION_SECONDS
+
+
+def test_build_propose_agent_default_caps_max_tokens(monkeypatch):
+    """The cost-fix item (PROGRESS.md 2026-09-06): left to its own default,
+    claude-sonnet-5 gets a 128,000-token ceiling per call, which let a
+    wayward attempt burn ~50k completion tokens before being discarded. The
+    propose agent's own default `llm` (no explicit override) must cap this."""
+    from rhinosecure.agents.schema_inference import PROPOSE_MAX_OUTPUT_TOKENS, build_propose_agent
+
+    monkeypatch.delenv("RHINO_LLM_MODEL", raising=False)
+    monkeypatch.delenv("RHINO_LLM_BASE_URL", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
+
+    agent = build_propose_agent()
+    assert agent.llm.max_tokens == PROPOSE_MAX_OUTPUT_TOKENS
+
+
+# --- propose_contract: retry feedback and per-attempt usage ------------------
+
+
+def test_propose_contract_feeds_the_previous_failure_into_the_retry_prompt(data_dir):
+    _QueuedFakeCrew.queue = [UNPARSEABLE, json.dumps(_full_proposal_dict())]
+    propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, max_attempts=3)
+    assert len(_QueuedFakeCrew.descriptions) == 2
+    assert "your previous attempt" not in _QueuedFakeCrew.descriptions[0].lower()
+    assert "your previous attempt" in _QueuedFakeCrew.descriptions[1].lower()
+    assert "no valid json object found" in _QueuedFakeCrew.descriptions[1].lower()
+
+
+def test_propose_contract_never_feeds_back_the_raw_agent_output(data_dir):
+    """`AgentOutputParseError.raw` is untrusted, unbounded model text
+    (its own docstring) -- only `str(exc)`, the short bounded summary,
+    may reach the next attempt's prompt."""
+    _QueuedFakeCrew.queue = [UNPARSEABLE, json.dumps(_full_proposal_dict())]
+    propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, max_attempts=3)
+    assert UNPARSEABLE not in _QueuedFakeCrew.descriptions[1]
+
+
+def test_propose_contract_records_one_usage_entry_per_attempt(data_dir):
+    _QueuedFakeCrew.queue = [UNPARSEABLE, json.dumps(_full_proposal_dict())]
+    result = propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, max_attempts=3)
+    assert [entry["attempt"] for entry in result.attempt_usage] == [1, 2]
+    assert [entry["outcome"] for entry in result.attempt_usage] == ["parse_error", "parsed"]
+    assert all(
+        entry["prompt_tokens"] == 111 and entry["completion_tokens"] == 22 for entry in result.attempt_usage
+    )
+
+
+def test_propose_contract_records_a_meta_mismatch_outcome(data_dir):
+    wrong_meta = _full_proposal_dict(name="a-different-name")
+    right_meta = _full_proposal_dict(name="min-test")
+    _QueuedFakeCrew.queue = [json.dumps(wrong_meta), json.dumps(right_meta)]
+    result = propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, max_attempts=3)
+    assert [entry["outcome"] for entry in result.attempt_usage] == ["meta_mismatch", "parsed"]
+
+
+def test_propose_contract_attempt_usage_is_empty_when_from_proposal_skips_the_llm(data_dir):
+    proposal = AdapterProposal.model_validate(_full_proposal_dict())
+    saved = SavedProposal(proposal=proposal, generator=_generator())
+    result = propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, from_proposal=saved)
+    assert result.attempt_usage == ()
+    assert _QueuedFakeCrew.instantiations == 0
+
+
+def test_propose_contract_carries_forward_a_saved_proposals_own_attempt_usage(data_dir):
+    proposal = AdapterProposal.model_validate(_full_proposal_dict())
+    prior_usage = ({"attempt": 1, "prompt_tokens": 10, "completion_tokens": 5, "outcome": "parsed"},)
+    saved = SavedProposal(proposal=proposal, generator=_generator(), attempt_usage=prior_usage)
+    result = propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, from_proposal=saved)
+    assert result.attempt_usage == prior_usage
+
+
+def test_saved_proposal_round_trips_attempt_usage_through_json(tmp_path):
+    proposal = AdapterProposal.model_validate(_full_proposal_dict())
+    usage = ({"attempt": 1, "prompt_tokens": 111, "completion_tokens": 22, "outcome": "parsed"},)
+    saved = SavedProposal(proposal=proposal, generator=_generator(), attempt_usage=usage)
+    path = tmp_path / "saved.json"
+    path.write_text(json.dumps(dump_saved_proposal(saved)), encoding="utf-8")
+    loaded = load_saved_proposal(path)
+    assert loaded.attempt_usage == usage
+
+
+def test_dump_saved_proposal_omits_attempt_usage_key_when_empty():
+    """No trailing empty list cluttering every saved proposal that never
+    retried -- matches `dump_saved_proposal`'s existing minimal-shape style."""
+    proposal = AdapterProposal.model_validate(_full_proposal_dict())
+    saved = SavedProposal(proposal=proposal, generator=_generator())
+    assert "attempt_usage" not in dump_saved_proposal(saved)
