@@ -483,14 +483,21 @@ class _QueuedFakeTotCrew:
     """Stands in for tot.py's own Crew reference -- separate from
     coordinator_module.Crew above, since run_tree_of_thought (tot.py)
     never goes through Coordinator's Crew binding. Same pop-one-per-task
-    contract. usage_metrics scales with task count (1 "request" per
-    task), same convention as test_tot.py's fake, so accumulation into
-    RunState.tot_usage is predictable to assert on."""
+    contract. `kickoff()` increments the REAL agent's `agent.llm`'s own
+    cumulative usage counter (`_track_token_usage_internal`), one call per
+    task, matching test_tot.py's own fake and the reason it needs this:
+    production code (`tot._UsageTracker`) reads per-call usage via
+    `agent.llm.get_token_usage_summary().delta_since(baseline)`, never
+    `crew.usage_metrics` directly, since `_dispatch_tot` builds
+    `strategist`/`critic` once and reuses them across every contested
+    finding in a batch -- exactly what `test_a_contested_finding_is_routed
+    _into_tot_and_recorded` and its multi-finding sibling below exercise."""
 
     queue: list = []
     instantiations: int = 0
 
     def __init__(self, agents, tasks, process=None, verbose=False):
+        self.agents = agents
         self.tasks = tasks
         type(self).instantiations += 1
         self.usage_metrics = UsageMetrics(
@@ -499,6 +506,9 @@ class _QueuedFakeTotCrew:
         )
 
     def kickoff(self):
+        for agent in self.agents:
+            for _ in self.tasks:
+                agent.llm._track_token_usage_internal({"total_tokens": 100, "prompt_tokens": 80, "completion_tokens": 20})
         for task in self.tasks:
             task.output = SimpleNamespace(raw=_QueuedFakeTotCrew.queue.pop(0))
         return None

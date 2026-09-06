@@ -394,14 +394,22 @@ class _QueuedFakeCrew:
     """Stands in for crewai.Crew -- pops one raw JSON text string per task
     off a shared queue, in dispatch order, exactly like
     test_coordinator.py's _QueuedFakeCrew (no tools here, so no
-    score_finding special-casing is needed). usage_metrics scales with
-    task count (1 "request" per task) so accumulation across multiple
-    Crew instantiations is predictable to assert on."""
+    score_finding special-casing is needed). `kickoff()` increments the
+    REAL agent's `agent.llm`'s own cumulative usage counter
+    (`_track_token_usage_internal`, crewai's own method), scaled by task
+    count (1 "request" per task) -- production code
+    (`tot._UsageTracker`) reads per-call usage via `agent.llm
+    .get_token_usage_summary().delta_since(baseline)`, never
+    `crew.usage_metrics` directly, because `crew.usage_metrics` is
+    documented as cumulative for the LLM instance's lifetime and
+    `strategist`/`critic` are deliberately reused across this whole
+    module's entire retry/refinement/depth structure."""
 
     queue: list = []
     instantiations: int = 0
 
     def __init__(self, agents, tasks, process=None, verbose=False):
+        self.agents = agents
         self.tasks = tasks
         type(self).instantiations += 1
         self.usage_metrics = UsageMetrics(
@@ -412,6 +420,17 @@ class _QueuedFakeCrew:
         )
 
     def kickoff(self):
+        # One `_track_token_usage_internal` call per TASK, not per Crew --
+        # `UsageMetrics.from_provider_dict` always stamps `successful_
+        # requests=1` per call, and a batched Process.sequential Crew
+        # dispatches one real LLM call per task under the hood, matching
+        # this fake's own long-standing "successful_requests == task
+        # count" contract (asserted by name in several tests below).
+        for agent in self.agents:
+            for _ in self.tasks:
+                agent.llm._track_token_usage_internal(
+                    {"total_tokens": 100, "prompt_tokens": 80, "completion_tokens": 20}
+                )
         for task in self.tasks:
             task.output = SimpleNamespace(raw=_QueuedFakeCrew.queue.pop(0))
         return None
@@ -481,6 +500,48 @@ def test_clear_winner_terminates_at_depth_one_without_any_refinement():
     # usage sums both Crews' fake metrics: propose (3 tasks) + critique (3 tasks) = 6 "requests".
     assert result.usage.successful_requests == 6
     assert result.usage.total_tokens == 600
+
+
+def test_reusing_the_same_strategist_and_critic_across_findings_does_not_inflate_usage():
+    """The real bug found and fixed the same day as schema_inference.py's
+    propose retry loop (PROGRESS.md 2026-09-06): agents/coordinator.py's
+    `_dispatch_tot` builds ONE `strategist`/`critic` pair and reuses it
+    across EVERY contested finding in a batch, not just within one
+    finding's own search. `crew.usage_metrics` is cumulative for the LLM
+    instance's lifetime (crewai's own `base_llm.py`), so reading it
+    naively on a SECOND finding's search would already include the FIRST
+    finding's entire usage before adding anything new. Simulates that
+    reuse directly: two independent `run_tree_of_thought` calls against
+    the SAME strategist/critic instances (bypassing the per-test `agents`
+    fixture's fresh rebuild by capturing local references), each a
+    clear-winner-at-depth-1 case identical in shape to the test above.
+    Before `_UsageTracker` existed, the second call's usage would have
+    reported 12 requests / 1200 tokens (both calls' totals combined); it
+    must report only its own 6 requests / 600 tokens."""
+    strategist, critic = STRATEGIST, CRITIC
+
+    def _clear_winner_queue() -> list[str]:
+        return [
+            _proposal(Strategy.EMERGENCY_CHANGE, "Patch tonight via emergency change."),
+            _proposal(Strategy.ESTABLISH_WINDOW, "Schedule a Sunday window."),
+            _proposal(Strategy.BUILD_CONTROL, "Isolate the host on the network."),
+            _critique(Strategy.EMERGENCY_CHANGE, risk_reduction=9, operational_cost=3,
+                      constraint_compliance=8, evidence_strength=8, contradicting_evidence=1),
+            _critique(Strategy.ESTABLISH_WINDOW, risk_reduction=3, operational_cost=5,
+                      constraint_compliance=4, evidence_strength=3, contradicting_evidence=6),
+            _critique(Strategy.BUILD_CONTROL, risk_reduction=2, operational_cost=6,
+                      constraint_compliance=3, evidence_strength=2, contradicting_evidence=7),
+        ]
+
+    _QueuedFakeCrew.queue = _clear_winner_queue()
+    first = run_tree_of_thought(ROOT, strategist, critic)
+    assert first.usage.successful_requests == 6
+    assert first.usage.total_tokens == 600
+
+    _QueuedFakeCrew.queue = _clear_winner_queue()
+    second = run_tree_of_thought(ROOT, strategist, critic)  # same agents -- a second "contested finding"
+    assert second.usage.successful_requests == 6
+    assert second.usage.total_tokens == 600
 
 
 def test_depth_limit_with_close_scores_produces_a_near_tie_not_a_forced_winner():

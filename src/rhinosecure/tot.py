@@ -78,20 +78,30 @@ other agents' output types the same way they import each other --
 CLAUDE.md's layout treats this as a distinct reasoning mechanism (beam
 search over thoughts), not one more agent role.
 
-**Usage is tracked per search, not left invisible.** Unlike Research/
-Environment/Risk, which each dispatch exactly one Crew per run (so
-`crew.usage_metrics` is the whole stage's cost), one finding's ToT search
-can dispatch anywhere from 2 Crews (a clear winner at depth 1) to many
-more (deeper rounds, retries). `run_tree_of_thought` sums every Crew's
-`usage_metrics` it triggers into one running `UsageMetrics` (crewai's own
-`add_usage_metrics`) and returns it on `ToTResult.usage` -- and, since
-real API calls still cost real money even when a search ultimately gives
-up, `ToTDispatchError` carries the same running total up to the point of
-failure rather than discarding it. `agents/coordinator.py`'s
-`_dispatch_tot` sums across every contested finding in a batch into
-`RunState.tot_usage`, closing the gap CLAUDE.md's "Cost/usage visibility"
-open item named: `research_usage`/`environment_usage`/`risk_usage`
-already existed, `tot_usage` did not.
+**Usage is tracked per search, not left invisible -- and not the naive
+way.** Unlike Research/Environment/Risk, which each dispatch exactly one
+Crew per run (so `crew.usage_metrics` is the whole stage's cost), one
+finding's ToT search can dispatch anywhere from 2 Crews (a clear winner
+at depth 1) to many more (deeper rounds, retries) -- and `agents
+/coordinator.py`'s `_dispatch_tot` builds `strategist`/`critic` ONCE and
+reuses them across every dispatch in that whole search AND across every
+OTHER contested finding in the same batch. `crew.usage_metrics` is
+documented (crewai's `base_llm.py`) as cumulative for the LLM instance's
+LIFETIME, not per kickoff, so summing it naively across that much reuse
+double-, triple-, or far-worse-counted every dispatch after the first --
+a real bug this module shipped with, found and fixed the same day as its
+smaller sibling in `schema_inference.py`'s propose retry loop
+(PROGRESS.md 2026-09-06). `_UsageTracker` (below) turns each dispatch
+into a true per-call delta instead; `run_tree_of_thought` sums those
+deltas into one running `UsageMetrics` and returns it on `ToTResult
+.usage` -- and, since real API calls still cost real money even when a
+search ultimately gives up, `ToTDispatchError` carries the same running
+total up to the point of failure rather than discarding it.
+`agents/coordinator.py`'s `_dispatch_tot` sums across every contested
+finding in a batch into `RunState.tot_usage`, closing the gap CLAUDE.md's
+"Cost/usage visibility" open item named: `research_usage`/
+`environment_usage`/`risk_usage` already existed, `tot_usage` did not --
+and, until this fix, silently overstated whatever it did report.
 """
 
 from __future__ import annotations
@@ -540,6 +550,43 @@ def _parse_check_strategy_and_cve(
     return result
 
 
+class _UsageTracker:
+    """Turns `crew.usage_metrics` (documented as cumulative for the LLM
+    instance's LIFETIME -- crewai's own `base_llm.py`, not per kickoff --
+    see `schema_inference.py`'s identical fix for the full story) into a
+    true per-call delta, for agents this module reuses far more
+    aggressively than that one does: `strategist`/`critic` are built ONCE
+    by `agents/coordinator.py`'s `_dispatch_tot` and reused across EVERY
+    dispatch within one finding's whole beam search (2 to many Crews --
+    module docstring) AND across every contested finding in the same run,
+    since `_dispatch_tot` builds them outside its own per-finding loop.
+    Reading `crew.usage_metrics` directly, as this module did before this
+    fix, meant a later dispatch's "usage" silently included every earlier
+    dispatch's tokens too -- compounding within a search AND across
+    findings, a substantially worse instance of the exact bug found and
+    fixed in `schema_inference.py`'s retry loop (PROGRESS.md 2026-09-06).
+
+    Baselines are snapshotted at CONSTRUCTION time, not lazily on first
+    use -- `run_tree_of_thought` builds one fresh tracker per finding, so
+    its baseline already captures whatever an EARLIER finding (or an
+    earlier call within this same finding, on a second `delta_for` call)
+    already accrued on the shared agent, and every delta this tracker
+    returns is scoped to just what happened since then."""
+
+    def __init__(self, *agents: Agent) -> None:
+        self._baselines: dict[int, UsageMetrics] = {
+            id(a): a.llm.get_token_usage_summary() for a in agents if isinstance(a.llm, BaseLLM)
+        }
+
+    def delta_for(self, agent: Agent) -> UsageMetrics:
+        if not isinstance(agent.llm, BaseLLM):
+            return UsageMetrics()
+        current = agent.llm.get_token_usage_summary()
+        baseline = self._baselines.get(id(agent), UsageMetrics())
+        self._baselines[id(agent)] = current
+        return current.delta_since(baseline)
+
+
 def _dispatch_batch(
     agent: Agent,
     build_task: Callable[[int], Task],
@@ -549,20 +596,23 @@ def _dispatch_batch(
     max_parse_attempts: int,
     verbose: bool,
     usage: UsageMetrics,
+    tracker: _UsageTracker,
 ) -> list[ModelT]:
     """Batch `count` tasks onto one Crew, then resolve each independently
     -- a stuck task gets its own single-task retry Crew, the same shape
     as agents/coordinator.py's `_resolve_output`, without sharing code
     with it: failure here means abort the whole tree, not skip one of
     many findings (see module docstring). `usage` accumulates every
-    Crew's `usage_metrics` this call dispatches, initial batch and any
-    retries alike -- mutated in place, shared across the whole search by
-    the caller, so it stays accurate even if a later task in this same
-    batch fails after this one already succeeded."""
+    Crew's TRUE per-call usage (`tracker.delta_for(agent)`, never
+    `crew.usage_metrics` directly -- see `_UsageTracker`) this call
+    dispatches, initial batch and any retries alike -- mutated in place,
+    shared across the whole search by the caller, so it stays accurate
+    even if a later task in this same batch fails after this one already
+    succeeded."""
     tasks = [build_task(i) for i in range(count)]
     crew = Crew(agents=[agent], tasks=tasks, process=Process.sequential, verbose=verbose)
     crew.kickoff()
-    usage.add_usage_metrics(crew.usage_metrics)
+    usage.add_usage_metrics(tracker.delta_for(agent))
     return [
         _resolve(
             agent,
@@ -572,6 +622,7 @@ def _dispatch_batch(
             max_parse_attempts,
             verbose,
             usage,
+            tracker,
         )
         for i, task in enumerate(tasks)
     ]
@@ -585,6 +636,7 @@ def _resolve(
     max_parse_attempts: int,
     verbose: bool,
     usage: UsageMetrics,
+    tracker: _UsageTracker,
 ) -> ModelT:
     last_error: Exception | None = None
     for attempt in range(1, max_parse_attempts + 1):
@@ -597,7 +649,7 @@ def _resolve(
             task = rebuild()
             crew = Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=verbose)
             crew.kickoff()
-            usage.add_usage_metrics(crew.usage_metrics)
+            usage.add_usage_metrics(tracker.delta_for(agent))
     raise ToTDispatchError(
         f"gave up after {max_parse_attempts} attempt(s): {last_error}",
         usage=usage,
@@ -606,7 +658,7 @@ def _resolve(
 
 
 def _propose_initial(
-    root: ToTRoot, agent: Agent, *, max_parse_attempts: int, verbose: bool, usage: UsageMetrics
+    root: ToTRoot, agent: Agent, *, max_parse_attempts: int, verbose: bool, usage: UsageMetrics, tracker: _UsageTracker
 ) -> list[_RawThought]:
     strategies = list(Strategy)
     outputs = _dispatch_batch(
@@ -619,6 +671,7 @@ def _propose_initial(
         max_parse_attempts=max_parse_attempts,
         verbose=verbose,
         usage=usage,
+        tracker=tracker,
     )
     return [
         _RawThought(strategy=s, depth=1, proposal=o.proposal) for s, o in zip(strategies, outputs)
@@ -633,6 +686,7 @@ def _critique(
     max_parse_attempts: int,
     verbose: bool,
     usage: UsageMetrics,
+    tracker: _UsageTracker,
 ) -> list[Thought]:
     outputs = _dispatch_batch(
         agent,
@@ -644,6 +698,7 @@ def _critique(
         max_parse_attempts=max_parse_attempts,
         verbose=verbose,
         usage=usage,
+        tracker=tracker,
     )
     return [
         Thought(
@@ -674,6 +729,7 @@ def _refine(
     max_parse_attempts: int,
     verbose: bool,
     usage: UsageMetrics,
+    tracker: _UsageTracker,
 ) -> list[_RawThought]:
     outputs = _dispatch_batch(
         agent,
@@ -685,6 +741,7 @@ def _refine(
         max_parse_attempts=max_parse_attempts,
         verbose=verbose,
         usage=usage,
+        tracker=tracker,
     )
     return [
         _RawThought(
@@ -743,16 +800,26 @@ def run_tree_of_thought(
     full depth. The final beam's top two are always what
     `near_tie`/`winner`/`candidates` are computed from, regardless of
     which of the three reasons stopped the loop -- see ToTResult and the
-    module docstring. `usage` on the result is the sum of every Crew
-    dispatched along the way (see `_dispatch_batch`); on a `ToTDispatchError`
-    (retries exhausted), the same running total up to that point is
-    attached to the exception instead, so a failed search's real spend
-    is never silently dropped.
+    module docstring. `usage` on the result is the sum of every Crew's
+    TRUE per-call usage dispatched along the way (`_UsageTracker`, never
+    `crew.usage_metrics` directly -- see that class's own docstring for
+    why: `strategist`/`critic` are reused across this whole search AND
+    across every other contested finding in the same batch, so reading
+    `crew.usage_metrics` naively would silently include every earlier
+    dispatch's tokens too). `tracker` is built fresh HERE, per finding --
+    its baseline snapshot is taken at this call's start, so it is
+    unaffected by whatever `strategist`/`critic` already accrued from an
+    earlier finding's search. On a `ToTDispatchError` (retries exhausted),
+    the same running total up to that point is attached to the exception
+    instead, so a failed search's real spend is never silently dropped.
     """
     usage = UsageMetrics()
-    raw = _propose_initial(root, strategist, max_parse_attempts=max_parse_attempts, verbose=verbose, usage=usage)
+    tracker = _UsageTracker(strategist, critic)
+    raw = _propose_initial(
+        root, strategist, max_parse_attempts=max_parse_attempts, verbose=verbose, usage=usage, tracker=tracker
+    )
     beam = _prune(
-        _critique(raw, root, critic, max_parse_attempts=max_parse_attempts, verbose=verbose, usage=usage),
+        _critique(raw, root, critic, max_parse_attempts=max_parse_attempts, verbose=verbose, usage=usage, tracker=tracker),
         beam_width,
     )
 
@@ -774,12 +841,14 @@ def run_tree_of_thought(
         refined = _refine(
             [beam[i] for i in active_idx],
             root, strategist, depth, max_parse_attempts=max_parse_attempts, verbose=verbose, usage=usage,
+            tracker=tracker,
         )
         refined_by_idx = dict(zip(active_idx, refined))
         still_active_raw = [r for r in refined if not r.exhausted]
         scored = (
             iter(_critique(
-                still_active_raw, root, critic, max_parse_attempts=max_parse_attempts, verbose=verbose, usage=usage
+                still_active_raw, root, critic, max_parse_attempts=max_parse_attempts, verbose=verbose, usage=usage,
+                tracker=tracker,
             ))
             if still_active_raw
             else iter(())

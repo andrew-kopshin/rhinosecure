@@ -556,14 +556,25 @@ class _QueuedFakeCrew:
 
 
 class _QueuedFakeTotCrew:
+    """`kickoff()` increments the real agent's `agent.llm`'s own cumulative
+    usage counter (`_track_token_usage_internal`), one call per task --
+    production code (`tot._UsageTracker`) reads per-call usage via
+    `agent.llm.get_token_usage_summary().delta_since(baseline)`, never
+    `crew.usage_metrics` directly, since `_dispatch_tot` reuses one
+    strategist/critic pair across every contested finding in a batch."""
+
     queue: list = []
 
     def __init__(self, agents, tasks, process=None, verbose=False):
+        self.agents = agents
         self.tasks = tasks
         from crewai.types.usage_metrics import UsageMetrics
         self.usage_metrics = UsageMetrics(total_tokens=100 * len(tasks), successful_requests=len(tasks))
 
     def kickoff(self):
+        for agent in self.agents:
+            for _ in self.tasks:
+                agent.llm._track_token_usage_internal({"total_tokens": 100, "prompt_tokens": 80, "completion_tokens": 20})
         for task in self.tasks:
             task.output = SimpleNamespace(raw=_QueuedFakeTotCrew.queue.pop(0))
         return None
