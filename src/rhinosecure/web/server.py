@@ -17,18 +17,22 @@ exceptions -- and both are structural, not a permission check.**
 `create_app(jobs_enabled=True, job_config=...)` is the only way
 `rhinosecure.web.jobs` (the write-capable job substrate -- constraint
 submission today, a full `--agents` run later, both as background jobs
-with progress polling) is ever imported, and `create_app(chat_enabled=
-True)` is the only way `rhinosecure.web.chat` (read-only, LLM-backed Q&A
-over the currently-served export -- never a write, never memory.py or
-agents.coordinator) is ever imported. Both imports happen *inside*
-`create_app`'s own body, conditionally -- never at this module's top
-level. `create_app()` (the default: both flags `False`) never imports
-either and never mounts `POST /api/jobs` or `POST /api/chat`; a request to
-either route against a default app is a plain 404 (the route was never
-registered), not a route that exists and refuses. `rhino web`'s
+with progress polling) AND `rhinosecure.web.uploads` (filesystem-only
+upload mechanics for the conversational front end -- never a job, never
+`PlanState`/`Coordinator`/`Memory`, see that module's own docstring) are
+ever imported, and `create_app(chat_enabled=True)` is the only way
+`rhinosecure.web.chat` (read-only, LLM-backed Q&A over the currently-
+served export -- never a write, never memory.py or agents.coordinator) is
+ever imported. All three imports happen *inside* `create_app`'s own body,
+conditionally -- never at this module's top level. `create_app()` (the
+default: both flags `False`) never imports any of them and never mounts
+`POST /api/jobs`, `POST /api/uploads`, or `POST /api/chat`; a request to
+any of those routes against a default app is a plain 404 (the route was
+never registered), not a route that exists and refuses. `rhino web`'s
 `--enable-jobs`/`--enable-chat` flags are the only things that can turn
-these on, independently of each other -- see `web/jobs.py`'s and
-`web/chat.py`'s own module docstrings for what each does once enabled.
+these on, independently of each other -- see `web/jobs.py`'s,
+`web/uploads.py`'s, and `web/chat.py`'s own module docstrings for what
+each does once enabled.
 
 **One export file per server process.** The file path is resolved once,
 at `create_app()` time, from (in order) an explicit `export_path`
@@ -124,14 +128,19 @@ def create_app(
     exactly what's being served without re-deriving the same logic.
 
     `jobs_enabled=False`/`chat_enabled=False` (both default) mount no new
-    routes and import `rhinosecure.web.jobs`/`rhinosecure.web.chat` not
-    at all -- the two existing GET routes and static serving are
-    unchanged; `/api/health`'s response gains two fields (`"jobs_enabled"`,
-    `"chat_enabled"`, both `false`) so a frontend can tell whether to show
-    constraint-submission or chat UI at all, without a route it would
-    need to probe with a POST. `jobs_enabled=True` requires `job_config`
-    (a `web.jobs.JobConfig`) and additionally mounts `POST /api/jobs`,
-    `GET /api/jobs/{id}`, and `GET /api/jobs`. `chat_enabled=True` needs
+    routes and import `rhinosecure.web.jobs`/`rhinosecure.web.uploads`/
+    `rhinosecure.web.chat` not at all -- the two existing GET routes and
+    static serving are unchanged; `/api/health`'s response gains two
+    fields (`"jobs_enabled"`, `"chat_enabled"`, both `false`) so a
+    frontend can tell whether to show constraint-submission/upload or
+    chat UI at all, without a route it would need to probe with a POST.
+    `jobs_enabled=True` requires `job_config` (a `web.jobs.JobConfig`)
+    and additionally mounts `POST /api/jobs`, `GET /api/jobs/{id}`,
+    `GET /api/jobs`, and (from `web/uploads.py`) `POST /api/uploads`,
+    `GET /api/uploads/{id}`, `POST /api/uploads/{id}/label` -- uploads
+    ride on the same flag rather than a third one, since an upload with
+    no job substrate to eventually ingest it has no purpose on its own
+    (`web/uploads.py`'s own module docstring). `chat_enabled=True` needs
     no config object -- chat has nothing to seed, see `web/chat.py`'s
     module docstring -- and additionally mounts `POST /api/chat`. The two
     flags are independent; either, both, or neither may be set."""
@@ -159,8 +168,10 @@ def create_app(
         if job_config is None:
             raise ValueError("create_app(jobs_enabled=True) requires job_config=")
         from rhinosecure.web.jobs import mount_job_routes
+        from rhinosecure.web.uploads import mount_upload_routes
 
         mount_job_routes(app, job_config)
+        mount_upload_routes(app)
 
     if chat_enabled:
         from rhinosecure.web.chat import mount_chat_routes
