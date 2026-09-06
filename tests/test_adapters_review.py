@@ -250,14 +250,20 @@ def test_a_never_confirmed_contract_is_not_reported_as_drifted(tmp_path):
     assert drift.slots.available is False
 
 
-def test_the_committed_contracts_have_no_slot_digests_which_is_legal(tmp_path):
-    """C5 is the state of both committed contracts today, not a
-    hypothetical -- the fallback has to work on real artifacts."""
+def test_the_committed_contracts_have_slot_digests_recorded(tmp_path):
+    """Both committed contracts hit the C5 no-slot_digests fallback once
+    (added a schema field -- Contract.mapping_confidence, PROGRESS.md
+    2026-09-06 -- which bumped content_digest and forced a real
+    --reconfirm of both, since content_digest covers every field except
+    review). That reconfirm recorded slot_digests for the first time --
+    the fallback's own documented "at most once" promise -- so a real
+    re-review of either is now proportional, not "everything in scope,"
+    the opposite of this test's old name."""
     for name in ("bluepeak-gen", "mdvm-gen"):
         drift = compute_drift(read_contract(COMMITTED / f"{name}.json"))
         assert drift.was_confirmed
         assert drift.content_matches and drift.decision_matches
-        assert drift.slots.available is False
+        assert drift.slots.available is True
 
 
 def test_confirming_records_slot_digests_so_the_fallback_is_hit_at_most_once(tmp_path):
@@ -630,10 +636,15 @@ def test_rereview_is_clean_when_nothing_moved(tmp_path):
 def test_an_unchanged_confirmed_contract_never_hits_the_identity_gate(tmp_path):
     """Guard on the fix above: the no-slot_digests refusal must fire only
     when a decision actually moved, or every re-confirm of the two committed
-    contracts would demand --reset-identity."""
+    contracts would demand --reset-identity. Both now carry slot_digests
+    (recorded by the real --reconfirm PROGRESS.md 2026-09-06 describes,
+    once each -- see test_the_committed_contracts_have_slot_digests_
+    recorded); this test's real point -- the identity gate stays quiet on
+    an unchanged contract -- holds regardless of which fallback shape
+    applies, so it's still worth its own guard."""
     for name, data_dir in (("bluepeak-gen", BLUEPEAK_DIR), ("mdvm-gen", DEFENDER_DIR)):
         contract = read_contract(COMMITTED / f"{name}.json")
-        assert contract.review.slot_digests is None
+        assert contract.review.slot_digests is not None
         outcome = review_contract(COMMITTED / f"{name}.json", contract, data_dir, at=AT, sign=False)
         assert not any("reset-identity" in r for r in outcome.refusals)
 

@@ -675,6 +675,20 @@ def assemble_contract(
 
     asset_mappings: dict[str, Mapping] = {t: sp.mapping for t, sp in proposal.asset.items()}
     finding_mappings: dict[str, Mapping] = {t: sp.mapping for t, sp in proposal.finding.items()}
+    # `blocking` above already guarantees every slot is `SlotMapped` (an
+    # unresolved one would have refused already), so `.confidence` is
+    # always present here -- carried into the Contract as audit trail
+    # (Contract.mapping_confidence's own docstring), never read by
+    # configured.py's engine. This is the ONLY place `.confidence` survives
+    # past this function -- assemble_contract's own `asset_mappings`/
+    # `finding_mappings` above already discard everything else `SlotMapped`
+    # carried (`.evidence`), and that discard is deliberate, not an oversight
+    # this line is quietly working around.
+    mapping_confidence = {
+        f"{section}.{t}": sp.confidence
+        for section, slots in (("asset", proposal.asset), ("finding", proposal.finding))
+        for t, sp in slots.items()
+    }
     unmapped_columns = {
         filename: {col: UnmappedColumnEntry(disposition=e.disposition, reason=e.reason) for col, e in entries.items()}
         for filename, entries in proposal.unmapped_columns.items()
@@ -707,6 +721,7 @@ def assemble_contract(
         description=proposal.meta.description,
         generated_at=generated_at,
         generator=generator,
+        mapping_confidence=mapping_confidence,
         source=source,
         header=header,
         derived=proposal.derived,

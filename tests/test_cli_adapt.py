@@ -233,9 +233,28 @@ def test_rereview_prints_each_ignored_columns_measured_shape_beside_its_reason(c
     assert "measured:" in out
 
 
-def test_rereview_says_so_when_no_slot_digests_were_recorded(capsys):
-    """C5: the state both committed contracts are actually in."""
-    main(["adapt", "rereview", "bluepeak-gen", "--data", "bluepeak"])
+def _scratch_confirmed_contract_without_slot_digests(tmp_path):
+    """A stamp-only confirm, matching exactly what both committed
+    contracts looked like before they were for-real `--reconfirm`'d
+    (PROGRESS.md 2026-09-06, adding Contract.mapping_confidence): confirmed,
+    but never measured, so `review.slot_digests` is absent -- the one
+    shape the C5 fallback below exists for. Decoupled from the real
+    committed files on purpose: they now carry real slot_digests (the
+    fallback's own "at most once" promise), so testing this fallback can
+    no longer depend on their current, evolving state."""
+    _sys.path.insert(0, str(REPO_ROOT / "tests"))
+    from test_adapters_config_model import _confirmed, bluepeak_gen_dict
+
+    path = tmp_path / "scratch-gen.json"
+    write_contract(path, Contract.model_validate(_confirmed(bluepeak_gen_dict())))
+    return path
+
+
+def test_rereview_says_so_when_no_slot_digests_were_recorded(capsys, tmp_path):
+    """C5: a confirmed contract that was never measured (stamp-only
+    confirm) has no slot_digests to partition drift by."""
+    path = _scratch_confirmed_contract_without_slot_digests(tmp_path)
+    main(["adapt", "rereview", str(path), "--data", "bluepeak"])
     out = capsys.readouterr().out
     assert "recorded no slot_digests" in out
 

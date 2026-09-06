@@ -325,6 +325,45 @@ def test_assemble_contract_succeeds_and_the_result_validates(profiles):
     validate_contract(contract, {"data.csv": _HEADER})
 
 
+def test_assemble_contract_carries_every_slots_confidence_into_the_contract(profiles):
+    """`asset_mappings`/`finding_mappings` (assemble_contract's own local
+    variables, right above where mapping_confidence is built) keep only
+    `.mapping`, discarding `.confidence`/`.evidence` from every SlotMapped
+    -- mapping_confidence is the ONE place `.confidence` survives past this
+    function, carried forward as Contract audit trail (never read by
+    configured.py's engine) so a browser/CLI reviewer can see it without
+    needing the original proposal file, which a hand-authored contract
+    (bluepeak-gen.json/mdvm-gen.json) never had in the first place."""
+    data = _full_proposal_dict(overrides_asset={
+        "role": _mapped(
+            {"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "fatal", "table": {"srv": "dc"}},
+            confidence=0.55, columns_cited=["Col"],
+        ),
+    })
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles)
+    contract = assemble_contract(proposal, profiles, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract.mapping_confidence["asset.role"] == 0.55
+    assert contract.mapping_confidence["asset.asset_id"] == 0.9  # _mapped's own default
+    assert contract.mapping_confidence["finding.cve_id"] == 0.9
+    assert len(contract.mapping_confidence) == len(ASSET_SLOTS) + len(FINDING_SLOTS)
+
+
+def test_a_low_confidence_scoring_slot_requires_attestation_before_it_can_confirm(profiles):
+    from rhinosecure.adapters.config_model import missing_attestations
+
+    data = _full_proposal_dict(overrides_asset={
+        "role": _mapped(
+            {"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "fatal", "table": {"srv": "dc"}},
+            confidence=0.5, columns_cited=["Col"],
+        ),
+    })
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles)
+    contract = assemble_contract(proposal, profiles, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert "low_confidence_mappings" in missing_attestations(contract)
+
+
 def test_assemble_contract_a_caveat_alone_does_not_block(tmp_path):
     from rhinosecure.adapters.probe import MAX_DISTINCT_TRACKED
 

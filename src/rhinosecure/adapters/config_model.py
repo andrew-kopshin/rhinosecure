@@ -663,7 +663,38 @@ class ValidatorOverride(BaseModel):
     rule: str
 
 
-ATTESTATION_ITEMS: frozenset[str] = frozenset({"enrichment", "union", "finding_id.synthesized", "exclusions"})
+ATTESTATION_ITEMS: frozenset[str] = frozenset(
+    {"enrichment", "union", "finding_id.synthesized", "exclusions", "low_confidence_mappings"}
+)
+
+#: Targets whose value space is closed and code-owned, so showing the values
+#: a mapping actually produced is schema information rather than fleet data
+#: (`adapters/review.py`'s own `_value_distribution`, moved here so
+#: `required_attestations` below can share the identical list rather than
+#: keep a second, driftable copy of "which targets feed scoring"). Free text
+#: (`hostname`, `owner`, `business_function`, `product`, `evidence`) is
+#: never tallied and never leaves the terminal -- CLAUDE.md's trust
+#: boundary calls real vulnerability data a map of where an organization is
+#: weak, and a contract is committed to git. This is also exactly the set a
+#: wrong LOW-CONFIDENCE value silently corrupts a real risk score for,
+#: rather than merely showing up wrong in a report -- see
+#: `LOW_CONFIDENCE_THRESHOLD` below.
+SCORING_ENUM_TARGETS = ("role", "environment", "data_sensitivity", "criticality", "internet_exposed")
+
+#: Below this, a `SlotMapped.confidence` on one of `SCORING_ENUM_TARGETS`
+#: triggers the `low_confidence_mappings` attestation (`required_
+#: attestations`, below) -- `check_grounding` (agents/schema_inference.py)
+#: verifies a vocabulary table's KEYS are real observed source tokens, but
+#: has no way to check whether the table's VALUES are semantically right
+#: (a scale the model guessed at 0.50 confidence passes grounding cleanly
+#: even if it's inverted). A named constant, not a bare literal, for the
+#: same reason as scoring.py's PATCH_NOW_THRESHOLD/ACTIONABLE_THRESHOLD:
+#: picked from the confidence values two real propose runs against the
+#: same real source actually produced (correct mappings clustered
+#: 0.85-0.98; guessed enum scales clustered 0.50-0.65 -- PROGRESS.md
+#: 2026-09-06), not calibrated against a larger sample. Retuning this
+#: against more real runs is a separate, open decision, same as those two.
+LOW_CONFIDENCE_THRESHOLD = 0.7
 
 
 def _observed_exclusion_count(observed: "dict[str, Any] | None") -> tuple[int, list[str]]:
@@ -695,6 +726,23 @@ def _observed_exclusion_count(observed: "dict[str, Any] | None") -> tuple[int, l
     return total, problems
 
 
+def low_confidence_scoring_slots(contract: Contract) -> dict[str, float]:
+    """`"asset.<target>"` -> confidence, for every `SCORING_ENUM_TARGETS`
+    slot mapped at or below `LOW_CONFIDENCE_THRESHOLD`. Empty for a
+    contract with no `mapping_confidence` at all (never proposed, or
+    proposed before this field existed) -- there is nothing to flag, not a
+    reason to assume every slot is risky. Public (not `_`-prefixed) for the
+    same reason `required_attestations` itself is: a caller (`adapters
+    /review.py`, `web/adapters.py`) needs to show WHICH slots and at what
+    confidence, not just whether the attestation item is required."""
+    confidence = contract.mapping_confidence or {}
+    return {
+        f"asset.{target}": confidence[f"asset.{target}"]
+        for target in SCORING_ENUM_TARGETS
+        if f"asset.{target}" in confidence and confidence[f"asset.{target}"] < LOW_CONFIDENCE_THRESHOLD
+    }
+
+
 def required_attestations(contract: Contract) -> dict[str, str]:
     """Which attestation items this contract's own shape demands, mapped to
     the reason each is demanded (V18).
@@ -708,7 +756,8 @@ def required_attestations(contract: Contract) -> dict[str, str]:
 
     Insertion order is V18's own emission order, so `validate_contract`'s
     messages stay byte-identical to what they were before this was
-    extracted."""
+    extracted -- `low_confidence_mappings` is new and goes last, so it
+    never renumbers or reorders anything V18 already emits."""
     required: dict[str, str] = {}
     if contract.enrichment is not None:
         required["enrichment"] = "the enrichment block is present"
@@ -719,6 +768,13 @@ def required_attestations(contract: Contract) -> dict[str, str]:
     excluded, _problems = _observed_exclusion_count(contract.observed)
     if excluded > 0:
         required["exclusions"] = "observed reports excluded record(s)"
+    low_confidence = low_confidence_scoring_slots(contract)
+    if low_confidence:
+        named = ", ".join(f"{slot} ({conf:.2f})" for slot, conf in sorted(low_confidence.items()))
+        required["low_confidence_mappings"] = (
+            f"{len(low_confidence)} scoring-relevant slot(s) mapped at model confidence below "
+            f"{LOW_CONFIDENCE_THRESHOLD}: {named}"
+        )
     return required
 
 
@@ -809,6 +865,17 @@ class Contract(BaseModel):
     description: str
     generated_at: str
     generator: Generator
+    #: `"asset.<target>"` / `"finding.<target>"` -> the model's own
+    #: self-reported confidence at proposal time (`SlotMapped.confidence`,
+    #: agents/schema_inference.py) -- audit trail, exactly like `generator`,
+    #: never read by `configured.py`'s engine or by `required_attestations`
+    #: for anything but deciding whether to ASK a human to look, never to
+    #: decide anything about the mapping itself. `None` for a contract that
+    #: never went through a proposal (bluepeak-gen.json/mdvm-gen.json,
+    #: hand-authored before this field existed) -- there is no model
+    #: confidence to report for those, so absence is the honest value, not
+    #: a fabricated 1.0.
+    mapping_confidence: dict[str, float] | None = None
     source: Source
     header: Header
     derived: dict[str, Derivation] = Field(default_factory=dict)
@@ -939,8 +1006,8 @@ def assert_confirmed(contract: Contract) -> None:
     but still meaningful signal: whether the edit touched a DECISION
     subtree (content_digest AND decision_digest both mismatch) or only
     provenance/measurement outside it (content_digest mismatches alone --
-    `observed`/`generator`/`generated_at` are the only fields that could
-    have moved)."""
+    `observed`/`generator`/`generated_at`/`mapping_confidence` are the
+    only fields that could have moved)."""
     if contract.review.state != "confirmed":
         raise ContractNotConfirmedError(
             f"contract {contract.format!r} is not confirmed (review.state={contract.review.state!r}). "

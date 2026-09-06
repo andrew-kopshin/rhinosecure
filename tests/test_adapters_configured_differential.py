@@ -23,7 +23,7 @@ import pytest
 from rhinosecure.adapters import get_adapter
 from rhinosecure.adapters.base import AdapterError, IngestStats
 from rhinosecure.adapters.bluepeak import BluePeakAdapter
-from rhinosecure.adapters.config_model import Contract
+from rhinosecure.adapters.config_model import Contract, compute_decision_digest
 from rhinosecure.adapters.configured import ConfiguredAdapter
 from rhinosecure.adapters.defender import DefenderAdapter
 from rhinosecure.ingest import IngestError, load_batch
@@ -87,20 +87,41 @@ FINDING_FIELDS = tuple(Finding.model_fields)
 # =========================================================================
 
 
+def _assert_decision_content_matches_the_builder(committed_path: Path, builder) -> None:
+    """The MAPPING DECISION committed at `committed_path` is exactly what
+    `builder()` would produce today -- catches the file silently drifting
+    from the builder that is supposed to be its source of truth.
+
+    Used to be a raw dict `==` against `_confirmed(builder())`, including
+    `review`/`observed`. Both committed contracts were for real
+    `--reconfirm`'d (PROGRESS.md 2026-09-06, adding `Contract
+    .mapping_confidence` -- a new field content_digest covers, so the old
+    stamp-only `review` no longer matched) -- the real reconfirm measures
+    for real (`review_contract`), so the file now carries a genuine
+    `confirmed_at`/`content_digest`/`observed`/`slot_digests` a static
+    dict builder has no way to replicate byte-for-byte, and was never
+    meant to: those are provenance and measurement, not decision. What
+    this test actually exists to prove -- the mapping DECISION itself
+    hasn't silently drifted from its Python source of truth -- is exactly
+    `compute_decision_digest` equality, checked directly instead of via a
+    raw dict comparison that provenance noise could fail for no decision
+    -relevant reason."""
+    on_disk = Contract.model_validate(json.loads(committed_path.read_text(encoding="utf-8")))
+    built = Contract.model_validate(_confirmed(builder()))
+    assert compute_decision_digest(on_disk) == compute_decision_digest(built)
+    # Everything else in the file must ALSO match the builder, except the
+    # two blocks just established as legitimately real-measurement-derived.
+    on_disk_dict = on_disk.model_dump(mode="json", exclude={"review", "observed"})
+    built_dict = built.model_dump(mode="json", exclude={"review", "observed"})
+    assert on_disk_dict == built_dict
+
+
 def test_bluepeak_gen_json_matches_the_committed_file():
-    """The contract committed at data/adapters/bluepeak-gen.json is exactly
-    what bluepeak_gen_dict()+_confirmed() would produce today -- catches
-    the file silently drifting from the builder that is supposed to be its
-    source of truth."""
-    on_disk = json.loads((DATA_ROOT / "adapters" / "bluepeak-gen.json").read_text(encoding="utf-8"))
-    built = _confirmed(bluepeak_gen_dict())
-    assert on_disk == built
+    _assert_decision_content_matches_the_builder(DATA_ROOT / "adapters" / "bluepeak-gen.json", bluepeak_gen_dict)
 
 
 def test_mdvm_gen_json_matches_the_committed_file():
-    on_disk = json.loads((DATA_ROOT / "adapters" / "mdvm-gen.json").read_text(encoding="utf-8"))
-    built = _confirmed(mdvm_gen_dict())
-    assert on_disk == built
+    _assert_decision_content_matches_the_builder(DATA_ROOT / "adapters" / "mdvm-gen.json", mdvm_gen_dict)
 
 
 def test_bluepeak_gen_matches_bluepeak_adapter_on_the_real_file():

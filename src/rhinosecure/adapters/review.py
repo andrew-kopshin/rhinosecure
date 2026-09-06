@@ -109,6 +109,7 @@ from rhinosecure.adapters.base import ProblemCollector
 from rhinosecure.adapters.config_io import confirm_contract, dump_for_disk, overwrite_contract
 from rhinosecure.adapters.config_model import (
     ATTESTATION_ITEMS,
+    SCORING_ENUM_TARGETS,
     Attestation,
     Contract,
     ContractError,
@@ -286,18 +287,9 @@ def _provisional(contract: Contract) -> Contract:
     )
 
 
-#: Targets whose value space is closed and code-owned, so showing the values
-#: a mapping actually produced is schema information rather than fleet data.
-#: Free text (`hostname`, `owner`, `business_function`, `product`, `evidence`)
-#: is never tallied and never leaves the terminal -- CLAUDE.md's trust
-#: boundary calls real vulnerability data a map of where an organization is
-#: weak, and a contract is committed to git.
-_DISTRIBUTION_TARGETS = ("role", "environment", "data_sensitivity", "criticality", "internet_exposed")
-
-
 def _value_distribution(assets: dict) -> dict[str, dict[str, int]]:
     distribution: dict[str, dict[str, int]] = {}
-    for target in _DISTRIBUTION_TARGETS:
+    for target in SCORING_ENUM_TARGETS:
         counter: Counter[str] = Counter()
         for asset in assets.values():
             counter[str(getattr(asset, target))] += 1

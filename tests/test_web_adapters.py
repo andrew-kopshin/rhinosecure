@@ -30,10 +30,10 @@ _ROWS = [
 ]
 
 
-def _mapped(mapping: dict, *, columns_cited: list[str] | None = None) -> dict:
+def _mapped(mapping: dict, *, confidence: float = 0.9, columns_cited: list[str] | None = None) -> dict:
     return {
-        "status": "mapped", "mapping": mapping, "confidence": 0.9,
-        "evidence": {"columns_cited": columns_cited or [], "sample_values_cited": [], "note": "test"},
+        "status": "mapped", "mapping": mapping, "confidence": confidence,
+        "evidence": {"columns_cited": columns_cited or [], "sample_values_cited": [], "note": "test reasoning"},
     }
 
 
@@ -41,7 +41,10 @@ def _unresolved(reason: str = "no confirmed target vocabulary", candidates: list
     return {"status": "unresolved", "candidate_columns": candidates or [], "reason": reason}
 
 
-def _proposal_dict(*, name: str, environment_status: str = "mapped", content_address_finding_id: bool = False) -> dict:
+def _proposal_dict(
+    *, name: str, environment_status: str = "mapped", content_address_finding_id: bool = False,
+    role_confidence: float = 0.9,
+) -> dict:
     asset: dict = {}
     for slot in ASSET_SLOTS:
         if slot == "asset_id":
@@ -51,7 +54,7 @@ def _proposal_dict(*, name: str, environment_status: str = "mapped", content_add
         elif slot == "role":
             asset[slot] = _mapped(
                 {"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "fatal", "table": {"srv": "dc", "wks": "workstation"}},
-                columns_cited=["Col"],
+                confidence=role_confidence, columns_cited=["Col"],
             )
         elif slot == "environment":
             if environment_status == "unresolved":
@@ -230,6 +233,36 @@ def test_get_proposal_404s_for_an_unknown_upload_id(client: TestClient):
     assert resp.status_code == 404
 
 
+def test_get_proposal_surfaces_a_low_confidence_mapped_slot(client: TestClient):
+    """The real gap check_grounding can't close on its own: role's
+    vocabulary table cites only real observed tokens (srv/wks), so
+    grounding is clean, but confidence is deliberately low -- a human must
+    see it before confirming, not just a clean grounding report."""
+    upload_id = _upload(client)
+    job = _propose(client, upload_id, "upload-low-conf", _proposal_dict(name="upload-low-conf", role_confidence=0.5))
+    assert job["result"]["contract_written"] is True
+
+    resp = client.get("/api/adapters/upload-low-conf/proposal", params={"upload_id": upload_id})
+    assert resp.status_code == 200
+    body = resp.json()
+    low_conf = {entry["slot"]: entry for entry in body["low_confidence"]}
+    assert "asset.role" in low_conf
+    assert low_conf["asset.role"]["confidence"] == 0.5
+    assert low_conf["asset.role"]["candidate_columns"] == ["Col"]
+    assert set(low_conf["asset.role"]["column_profiles"]["Col"]["distinct_values"]) == {"srv", "wks"}
+    assert low_conf["asset.role"]["target_vocabulary"]["kind"] == "enum"
+    assert low_conf["asset.role"]["current_mapping"]["table"] == {"srv": "dc", "wks": "workstation"}
+    # environment is mapped at the default 0.9 confidence -- must not appear.
+    assert "asset.environment" not in low_conf
+
+
+def test_get_proposal_low_confidence_is_empty_when_every_slot_is_confident(client: TestClient):
+    upload_id = _upload(client)
+    _propose(client, upload_id, "upload-confident", _proposal_dict(name="upload-confident"))
+    resp = client.get("/api/adapters/upload-confident/proposal", params={"upload_id": upload_id})
+    assert resp.json()["low_confidence"] == []
+
+
 # ---------------- GET /api/adapters/{name}/review ----------------
 
 
@@ -258,6 +291,43 @@ def test_get_review_names_a_required_attestation(client: TestClient):
     body = resp.json()
     assert "finding_id.synthesized" in body["required_attestations"]
     assert body["still_missing"] == ["finding_id.synthesized"]
+
+
+def test_get_review_names_the_low_confidence_attestation_and_the_slot(client: TestClient):
+    """This one is pure -- computable from Contract.mapping_confidence
+    alone, unlike `exclusions` -- so it shows up at PREVIEW time, before
+    any measurement runs, not only after a first failed confirm attempt."""
+    upload_id = _upload(client)
+    _propose(client, upload_id, "upload-low-conf2", _proposal_dict(name="upload-low-conf2", role_confidence=0.5))
+
+    resp = client.get("/api/adapters/upload-low-conf2/review", params={"upload_id": upload_id})
+    body = resp.json()
+    assert "low_confidence_mappings" in body["required_attestations"]
+    assert "asset.role" in body["required_attestations"]["low_confidence_mappings"]
+    assert "low_confidence_mappings" in body["still_missing"]
+
+
+def test_confirm_succeeds_once_the_low_confidence_attestation_is_supplied(client: TestClient, isolated_dirs: Path):
+    upload_id = _upload(client)
+    _propose(client, upload_id, "upload-low-conf3", _proposal_dict(name="upload-low-conf3", role_confidence=0.5))
+
+    refused = client.post(
+        "/api/adapters/upload-low-conf3/confirm", json={"upload_id": upload_id, "by": "andrew"}
+    ).json()
+    assert refused["written"] is False
+    assert "low_confidence_mappings" in refused["still_missing"]
+
+    confirmed = client.post(
+        "/api/adapters/upload-low-conf3/confirm",
+        json={
+            "upload_id": upload_id, "by": "andrew",
+            "attestations": {
+                "low_confidence_mappings": "Reviewed the role vocabulary table by hand against the real "
+                "Col values (srv/wks) -- srv -> dc and wks -> workstation are correct for this fleet."
+            },
+        },
+    ).json()
+    assert confirmed["written"] is True
 
 
 # ---------------- POST /api/adapters/{name}/confirm ----------------

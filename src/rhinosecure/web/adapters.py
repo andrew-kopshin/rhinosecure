@@ -20,21 +20,39 @@ entry) and confirming a contract (a dedicated, non-conversational
 signature):
 
 - `GET /api/adapters/{name}/proposal?upload_id=...` -- read-only. Returns
-  the saved proposal (`out/propose_<name>.json`) plus, for every currently
-  `unresolved` slot, the real measured profile of its candidate column(s)
-  (`ColumnProfile.distinct_values` -- already computed by `check_grounding`
-  today, just not previously surfaced to a human) and the target field's
-  own closed vocabulary/range (`config_model.describe_target_vocabulary`).
-  A slot is RESOLVED by editing the returned `proposal` JSON client-side
-  (turning a `SlotUnresolved` entry into a `SlotMapped` one, choosing only
-  among what `column_profiles`/`target_vocabulary` actually offer) and
-  resubmitting the WHOLE thing through the EXISTING generic `POST
-  /api/jobs` with `kind="ingest_propose"` and a new, additive job input,
+  the saved proposal (`out/propose_<name>.json`) plus TWO lists needing a
+  human's eyes before this can be confirmed:
+  - `unresolved` -- every `SlotUnresolved` slot, with the real measured
+    profile of its candidate column(s) (`ColumnProfile.distinct_values` --
+    already computed by `check_grounding` today, just not previously
+    surfaced to a human) and the target field's own closed vocabulary/range
+    (`config_model.describe_target_vocabulary`).
+  - `low_confidence` -- every `SCORING_ENUM_TARGETS` slot the model DID map,
+    but at a self-reported confidence below `config_model
+    .LOW_CONFIDENCE_THRESHOLD` (`_low_confidence_detail`, below). This is
+    the real gap `check_grounding` cannot close on its own: it verifies a
+    vocabulary table's cited tokens are real observed source values, never
+    that the table's target-side VALUES are semantically right -- a scale
+    the model guessed at 0.50 confidence (e.g. inventing where
+    Critical/High/Medium/Low falls on a 1-5 integer scale) passes grounding
+    cleanly regardless, because every source token it cited really is in
+    the file. Scoped to `SCORING_ENUM_TARGETS` specifically because that's
+    where a wrong value silently corrupts a real risk score, not just a
+    free-text display field.
+  Both lists share one shape for a reason: a slot is RESOLVED (an
+  unresolved one) or CHANGED (a low-confidence one) the identical way --
+  editing the returned `proposal` JSON client-side and resubmitting the
+  WHOLE thing through the EXISTING generic `POST /api/jobs` with
+  `kind="ingest_propose"` and a new, additive job input,
   `edited_saved_proposal` (`_run_ingest_propose`, web/jobs.py) -- this
-  module mounts no dispatch route of its own for that step. An illegal
-  edit is refused by the identical `check_grounding`/`assemble_contract`
-  gate a bad model output already goes through, never a second validator
-  built for this surface that could disagree with it.
+  module mounts no dispatch route of its own for that step. A human may
+  also leave a low-confidence slot exactly as the model proposed it and
+  simply attest to having reviewed it (below) -- unlike `unresolved`, a
+  low-confidence mapping is not REQUIRED to change, only required to be
+  seen. Either way, an illegal edit is refused by the identical
+  `check_grounding`/`assemble_contract` gate a bad model output already
+  goes through, never a second validator built for this surface that
+  could disagree with it.
 - `GET /api/adapters/{name}/review?upload_id=...` and `POST /api/adapters
   /{name}/confirm` -- the dedicated confirmation form, calling `adapters
   .review.review_contract` with `sign=False`/`sign=True` exactly as `rhino
@@ -95,13 +113,22 @@ from pydantic import BaseModel, ValidationError
 from rhinosecure.adapters import resolve_config_path
 from rhinosecure.adapters.config_io import read_contract
 from rhinosecure.adapters.config_model import (
+    LOW_CONFIDENCE_THRESHOLD,
+    SCORING_ENUM_TARGETS,
     describe_target_vocabulary,
     missing_attestations,
     required_attestations,
 )
 from rhinosecure.adapters.probe import profile_source
 from rhinosecure.adapters.review import Measurement, ReviewError, ReviewOutcome, review_contract
-from rhinosecure.agents.schema_inference import SchemaInferenceError, dump_saved_proposal, load_saved_proposal, unresolved_slots
+from rhinosecure.agents.schema_inference import (
+    AdapterProposal,
+    SchemaInferenceError,
+    SlotMapped,
+    dump_saved_proposal,
+    load_saved_proposal,
+    unresolved_slots,
+)
 from rhinosecure.ingest import IngestError
 from rhinosecure.web import uploads as uploads_module
 
@@ -125,6 +152,65 @@ def _resolve_upload_dir(upload_registry: Any, upload_id: str) -> Path:
     if upload_set is None:
         raise HTTPException(404, f"no such upload set: {upload_id!r}")
     return upload_set.dir_path
+
+
+def _mapping_source_columns(mapping: Any, derived: dict) -> list[str]:
+    """Best-effort: the real CSV column(s) a mapping actually reads, so a
+    low-confidence review can show that column's measured profile next to
+    the mapping the model chose -- `check_grounding` already verifies a
+    vocabulary table's KEYS are real observed tokens, but has no way to
+    check the table's VALUES are semantically right (Contract
+    .mapping_confidence's own docstring); showing the reviewer the same
+    profile the model saw is how a human closes that gap. Returns `[]`
+    rather than guessing for a mapping kind with no single column to point
+    at (`composed`, `content_address`, `literal`, `not_collected`) -- the
+    reviewer still sees the mapping's own shape and confidence, just not a
+    column profile."""
+    kind = getattr(mapping, "kind", None)
+    if kind in ("column", "vocabulary", "parsed"):
+        column = getattr(mapping, "column", None)
+        return [column] if column else []
+    if kind == "derived":
+        deriv = derived.get(mapping.from_)
+        return [deriv.column] if deriv else []
+    if kind == "default_by":
+        deriv = derived.get(mapping.keyed_by.from_)
+        return [deriv.column] if deriv else []
+    return []
+
+
+def _low_confidence_detail(
+    proposal: AdapterProposal, profiles: dict
+) -> list[dict[str, Any]]:
+    """One entry per `SCORING_ENUM_TARGETS` slot mapped below
+    `LOW_CONFIDENCE_THRESHOLD` -- the slots a wrong value silently corrupts
+    a real risk score for, rather than merely showing up wrong in a
+    report (config_model.py's own reasoning for scoping the gate to this
+    set). Always asset-side: every `SCORING_ENUM_TARGETS` member is an
+    asset field."""
+    detail = []
+    for target in SCORING_ENUM_TARGETS:
+        slot = proposal.asset[target]
+        if not isinstance(slot, SlotMapped) or slot.confidence >= LOW_CONFIDENCE_THRESHOLD:
+            continue
+        candidate_columns = _mapping_source_columns(slot.mapping, proposal.derived)
+        column_profiles = {
+            column: profile
+            for column in candidate_columns
+            if (profile := _column_profile_dict(profiles, column)) is not None
+        }
+        detail.append(
+            {
+                "slot": f"asset.{target}",
+                "confidence": slot.confidence,
+                "reason": slot.evidence.note,
+                "current_mapping": slot.mapping.model_dump(mode="json"),
+                "candidate_columns": candidate_columns,
+                "column_profiles": column_profiles,
+                "target_vocabulary": describe_target_vocabulary(target),
+            }
+        )
+    return detail
 
 
 def _column_profile_dict(profiles: dict, column: str) -> dict[str, Any] | None:
@@ -219,6 +305,7 @@ def mount_adapter_routes(app: FastAPI) -> None:
             "name": name,
             "saved_proposal": dump_saved_proposal(saved),
             "unresolved": unresolved_detail,
+            "low_confidence": _low_confidence_detail(saved.proposal, profiles),
         }
 
     @app.get("/api/adapters/{name}/review")

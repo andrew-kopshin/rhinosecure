@@ -4,25 +4,29 @@
       "blank": "fatal",
       "case": "exact",
       "column": "Asset_ID",
-      "kind": "column"
+      "kind": "column",
+      "optional": false
     },
     "business_function": {
       "blank": "absent_fact",
       "case": "exact",
       "column": "Department",
-      "kind": "column"
+      "kind": "column",
+      "optional": false
     },
     "compensating_controls": {
       "blank": "absent_fact",
       "case": "exact",
       "column": "Compensating_Control",
-      "kind": "column"
+      "kind": "column",
+      "optional": false
     },
     "criticality": {
       "blank": "fatal",
       "case": "lower",
       "column": "Asset_Criticality",
       "kind": "vocabulary",
+      "optional": false,
       "table": {
         "critical": 5,
         "high": 4,
@@ -41,6 +45,7 @@
       "case": "lower",
       "column": "Environment",
       "kind": "vocabulary",
+      "optional": false,
       "table": {
         "development": "dev",
         "production": "prod",
@@ -54,13 +59,15 @@
       "blank": "fatal",
       "case": "exact",
       "column": "Asset_Hostname",
-      "kind": "column"
+      "kind": "column",
+      "optional": false
     },
     "internet_exposed": {
       "blank": "fatal",
       "case": "lower",
       "column": "Internet_Exposed",
       "kind": "parsed",
+      "optional": false,
       "params": {
         "false": [
           "no",
@@ -91,13 +98,15 @@
       "blank": "absent_fact",
       "case": "exact",
       "column": "Patch_Window",
-      "kind": "column"
+      "kind": "column",
+      "optional": false
     },
     "role": {
       "blank": "fatal",
       "case": "exact",
       "column": "Asset_Type",
       "kind": "vocabulary",
+      "optional": false,
       "table": {
         "Application Gateway": "network_appliance",
         "Application Server": "file",
@@ -191,6 +200,7 @@
       "case": "lower",
       "column": "Known_Exploited",
       "kind": "parsed",
+      "optional": false,
       "params": {
         "false": [
           "no",
@@ -210,6 +220,7 @@
       "case": "exact",
       "column": "CVSS_Base_Score",
       "kind": "parsed",
+      "optional": false,
       "params": {
         "max": 10.0,
         "min": 0.0
@@ -222,13 +233,16 @@
       "blank": "fatal",
       "case": "exact",
       "column": "Asset_ID",
-      "kind": "column"
+      "kind": "column",
+      "optional": false
     },
     "cve_id": {
       "blank": "fatal",
       "case": "upper",
       "column": "CVE_ID",
       "kind": "parsed",
+      "optional": false,
+      "params": null,
       "parser": "cve_id"
     },
     "detected_date": {
@@ -236,6 +250,7 @@
       "case": "exact",
       "column": "First_Detected",
       "kind": "parsed",
+      "optional": false,
       "params": {
         "format": "iso"
       },
@@ -247,6 +262,7 @@
       "max_chars": 4096,
       "parts": [
         {
+          "emit_if_any": null,
           "fallback_template": "[{Asset_Type}] {Vulnerability_Description}",
           "required_non_blank": [
             "Detection_Source"
@@ -254,18 +270,24 @@
           "template": "[{Asset_Type}] {Detection_Source}: {Vulnerability_Description}"
         },
         {
+          "emit_if_any": null,
+          "fallback_template": null,
           "required_non_blank": [
             "Exploit_Maturity"
           ],
           "template": "exploit maturity (source-reported): {Exploit_Maturity}"
         },
         {
+          "emit_if_any": null,
+          "fallback_template": null,
           "required_non_blank": [
             "Business_Impact"
           ],
           "template": "business impact (source-reported): {Business_Impact}"
         },
         {
+          "emit_if_any": null,
+          "fallback_template": null,
           "required_non_blank": [
             "Assigned_Team"
           ],
@@ -277,7 +299,8 @@
       "blank": "fatal",
       "case": "exact",
       "column": "Record_ID",
-      "kind": "column"
+      "kind": "column",
+      "optional": false
     },
     "port": {
       "kind": "not_collected"
@@ -286,13 +309,15 @@
       "blank": "absent_fact",
       "case": "exact",
       "column": "Affected_Product",
-      "kind": "column"
+      "kind": "column",
+      "optional": false
     },
     "scanner_severity": {
       "blank": "fatal",
       "case": "lower",
       "column": "Severity",
       "kind": "vocabulary",
+      "optional": false,
       "table": {
         "critical": "critical",
         "high": "high",
@@ -311,7 +336,8 @@
       "blank": "absent_fact",
       "case": "exact",
       "column": "Affected_Version",
-      "kind": "column"
+      "kind": "column",
+      "optional": false
     }
   },
   "finding_dedup": {
@@ -377,8 +403,10 @@
       ],
       "sha256": "sha256:094187d066e180adb184ed7120b2e45e6255c1b5ec1908476ee5402e224c92db"
     },
+    "findings": null,
     "mode": "declared"
   },
+  "mapping_confidence": null,
   "not_collected": {
     "always_asset": [
       "data_sensitivity",
@@ -394,13 +422,63 @@
     "per_row_eligible_asset": [],
     "per_row_eligible_finding": []
   },
-  "observed": null,
+  "observed": {
+    "assets_loaded": 47,
+    "contract_version": 2,
+    "duplicate_assets_collapsed": 3,
+    "duplicate_findings_collapsed": 0,
+    "excluded_asset_reasons": {},
+    "excluded_assets": 0,
+    "excluded_findings": 0,
+    "findings_loaded": 50,
+    "header_notices": [],
+    "measured_at": "2026-09-06T23:31:12Z",
+    "measured_by": "andy.kopshin@gmail.com",
+    "measured_by_command": "confirm",
+    "not_collected_assets": {
+      "data_sensitivity": 47,
+      "os": 47,
+      "os_build": 47,
+      "owner": 47,
+      "patch_restrictions": 47
+    },
+    "not_collected_findings": {
+      "port": 50,
+      "service": 50
+    }
+  },
   "review": {
-    "confirmed_at": "2026-09-04T20:00:00Z",
+    "confirmed_at": "2026-09-06T23:31:12Z",
     "confirmed_by": "andy.kopshin@gmail.com",
     "confirmed_version": 2,
-    "content_digest": "sha256:7fd6130285d60c3072b54f56ae79f141d3ef6dcd75599af31425a039ad958c0d",
+    "content_digest": "sha256:c88cd7446bec910a883cf52764322bb98064ad407f9b974e94d767a55ccf7326",
     "decision_digest": "sha256:525f02a99a11229aebe14e6aa3c426e3de18e3a08ad68c9af75eff2a43739e90",
+    "slot_digests": {
+      "asset.asset_id": "sha256:5ee570092987ada4f5804ace98cc88fc9bcefb376528a88f9b15bd2200e5053a",
+      "asset.business_function": "sha256:2f6451569b706fd36ea41b3411501afb38b929dcd5ff8dbb03a50f76830ff0c7",
+      "asset.compensating_controls": "sha256:576f187fff2f28144497e12e0cf93c0d5dd105d2be55db19194a904655c3b01d",
+      "asset.criticality": "sha256:481c59b65b5fbe51178baf52d89f95b6fada5a907df8fbc162a0fab0f3b37e44",
+      "asset.data_sensitivity": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "asset.environment": "sha256:18cefc369ae6e8777ff125cfb2291e46b3c4f1fcf385e98e27ba1437e3f508aa",
+      "asset.hostname": "sha256:caa36c82ae2c02f69f3700aa7cc2c5cfcb257691ece6f9066a5affc1631ddfa5",
+      "asset.internet_exposed": "sha256:7883f31ac5c3fc825d506ca639d207e35bb3f4105d2ba913559ff2318898c44c",
+      "asset.os": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "asset.os_build": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "asset.owner": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "asset.patch_restrictions": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "asset.patch_window": "sha256:0e8e415511894bdcb7639a0d9885e71aa43ab3db3d526229a1ccd3cde8901f23",
+      "asset.role": "sha256:eb6647b5a83563e2bbca3482b8f33012d73603ae86ed1875aa18dd1a07b07207",
+      "finding.asset_id": "sha256:5ee570092987ada4f5804ace98cc88fc9bcefb376528a88f9b15bd2200e5053a",
+      "finding.cve_id": "sha256:be8c847b93142cbf58db8611278f486ad820c100fa0c7690d9d6c5ecf099586e",
+      "finding.detected_date": "sha256:700f36aee61142c0686442426d5572f89fe5a8540ff6319abb9cd79c4e51fd5e",
+      "finding.evidence": "sha256:d90dd4231e78d99a586f3f2b75d498d784e5382eb8fe590371e1962a2d15ba6d",
+      "finding.finding_id": "sha256:97dd498f64f71e5d28c7e142b1a9e200f351591bb8efe6a639144f6f86ae1175",
+      "finding.port": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "finding.product": "sha256:ddf5cbf979139c54a0a504e4e1d8c56e5e019ce99f88eee48bda46bb0e3095bb",
+      "finding.scanner_severity": "sha256:b9832ea8d00c5442838ffb1f8a51f90bb0485e881a082f7ecf79f3b51db0f3b8",
+      "finding.service": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "finding.version": "sha256:1c35c89af9b877227a5241d0f8fdb7a6d727a60d44de639a2ccee6b4bbd78160"
+    },
     "state": "confirmed"
   },
   "source": {

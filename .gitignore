@@ -7,3 +7,4 @@ __pycache__/
 out/
 *.db
 .pytest_cache/
+data/uploads/

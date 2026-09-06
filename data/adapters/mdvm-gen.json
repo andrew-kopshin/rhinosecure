@@ -4,7 +4,8 @@
       "blank": "fatal",
       "case": "exact",
       "column": "DeviceId",
-      "kind": "column"
+      "kind": "column",
+      "optional": false
     },
     "business_function": {
       "kind": "not_collected"
@@ -17,6 +18,7 @@
       "case": "lower",
       "column": "AssetValue",
       "kind": "vocabulary",
+      "optional": false,
       "table": {
         "high": 5,
         "low": 1,
@@ -36,13 +38,15 @@
       "blank": "fatal",
       "case": "exact",
       "column": "DeviceName",
-      "kind": "column"
+      "kind": "column",
+      "optional": false
     },
     "internet_exposed": {
       "blank": "gap",
       "case": "lower",
       "column": "IsInternetFacing",
       "kind": "parsed",
+      "optional": false,
       "params": {
         "false": [
           "false",
@@ -66,7 +70,8 @@
       "blank": "gap",
       "case": "exact",
       "column": "OSBuild",
-      "kind": "column"
+      "kind": "column",
+      "optional": false
     },
     "owner": {
       "kind": "not_collected"
@@ -90,6 +95,7 @@
     "key": "DeviceId",
     "order_by": {
       "column": "Timestamp",
+      "params": null,
       "parser": "timestamp",
       "required": false
     },
@@ -172,18 +178,22 @@
       "what": "finding_id prefix is MDVMC-, not MDVM- -- a contract-driven adapter never mints into the hand-written adapter's id space."
     }
   ],
+  "enrichment": null,
   "finding": {
     "asset_id": {
       "blank": "fatal",
       "case": "exact",
       "column": "DeviceId",
-      "kind": "column"
+      "kind": "column",
+      "optional": false
     },
     "cve_id": {
       "blank": "fatal",
       "case": "upper",
       "column": "CveId",
       "kind": "parsed",
+      "optional": false,
+      "params": null,
       "parser": "cve_id"
     },
     "detected_date": {
@@ -223,12 +233,16 @@
           "template": "recommended update: {RecommendedSecurityUpdate} ({RecommendedSecurityUpdateId})"
         },
         {
+          "emit_if_any": null,
+          "fallback_template": null,
           "required_non_blank": [
             "DiskPaths"
           ],
           "template": "disk: {DiskPaths}"
         },
         {
+          "emit_if_any": null,
+          "fallback_template": null,
           "required_non_blank": [
             "RegistryPaths"
           ],
@@ -259,13 +273,15 @@
       "blank": "fatal",
       "case": "exact",
       "column": "SoftwareName",
-      "kind": "column"
+      "kind": "column",
+      "optional": false
     },
     "scanner_severity": {
       "blank": "fatal",
       "case": "lower",
       "column": "VulnerabilitySeverityLevel",
       "kind": "vocabulary",
+      "optional": false,
       "table": {
         "critical": "critical",
         "high": "high",
@@ -283,7 +299,8 @@
       "blank": "gap",
       "case": "exact",
       "column": "SoftwareVersion",
-      "kind": "column"
+      "kind": "column",
+      "optional": false
     }
   },
   "finding_dedup": {
@@ -341,6 +358,7 @@
     },
     "mode": "declared"
   },
+  "mapping_confidence": null,
   "not_collected": {
     "always_asset": [
       "business_function",
@@ -366,13 +384,68 @@
       "version"
     ]
   },
-  "observed": null,
+  "observed": {
+    "assets_loaded": 5,
+    "contract_version": 1,
+    "duplicate_assets_collapsed": 1,
+    "duplicate_findings_collapsed": 1,
+    "excluded_asset_reasons": {},
+    "excluded_assets": 0,
+    "excluded_findings": 0,
+    "findings_loaded": 9,
+    "header_notices": [],
+    "measured_at": "2026-09-06T23:31:21Z",
+    "measured_by": "andy.kopshin@gmail.com",
+    "measured_by_command": "confirm",
+    "not_collected_assets": {
+      "business_function": 5,
+      "compensating_controls": 5,
+      "criticality": 1,
+      "data_sensitivity": 5,
+      "environment": 5,
+      "owner": 5,
+      "patch_restrictions": 5,
+      "patch_window": 5,
+      "role": 5
+    },
+    "not_collected_findings": {
+      "detected_date": 9,
+      "port": 9,
+      "service": 9
+    }
+  },
   "review": {
-    "confirmed_at": "2026-09-04T20:00:00Z",
+    "confirmed_at": "2026-09-06T23:31:21Z",
     "confirmed_by": "andy.kopshin@gmail.com",
     "confirmed_version": 1,
-    "content_digest": "sha256:df6199c57bdf2107fbcee4908c8b3246fbde7875817a8c5cc0fc446c0b29b43a",
+    "content_digest": "sha256:4254d4a27e2cf3eb99523193f176f195d26a7d34314010e3642710747f26f4b8",
     "decision_digest": "sha256:d7a803d22f93c97c2f0fde07d3a706eee38e9ec02f2087a04ede19a22c3c1ffd",
+    "slot_digests": {
+      "asset.asset_id": "sha256:58b04e0cb4524791ffa2cbe6d830bbfcf4dae493818c014bc532903118cf147d",
+      "asset.business_function": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "asset.compensating_controls": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "asset.criticality": "sha256:c50e8fb83864d4bef19b39e50ff8d5101fcb9550ebfc6354c4839b29a05703dc",
+      "asset.data_sensitivity": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "asset.environment": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "asset.hostname": "sha256:158b20ea465e36ab517223b751ceb82ff7c87848f90ec0d4eb9b7431b475f2e5",
+      "asset.internet_exposed": "sha256:6da8618c8dd24756eb920db725dc93ad77714525c264fae6bf49c0aa3e2e7c37",
+      "asset.os": "sha256:f932a49920ae75a9d7abba5aca73db80c8ecb82995ff76a7af66a5f10b7387fd",
+      "asset.os_build": "sha256:695eb577c35a11c01866f7da88233a67d4c43c6417899560af3a8765b8cefaaf",
+      "asset.owner": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "asset.patch_restrictions": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "asset.patch_window": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "asset.role": "sha256:f168357930bae04d0a9851319a9322216ef9b2e2c524fd867e43c2ba2252782b",
+      "finding.asset_id": "sha256:58b04e0cb4524791ffa2cbe6d830bbfcf4dae493818c014bc532903118cf147d",
+      "finding.cve_id": "sha256:e7398e83572f88c32bcb8e4a3b9efdd9b7b7f3ec5929becdb126b248517e879c",
+      "finding.detected_date": "sha256:56acd2d3488279a46e08c85d9c2a2f82960e7248da206671e3f0fe92dde38369",
+      "finding.evidence": "sha256:6b0113b4ce6575f7b7d40e2e18acc6fee3252b35eecfdeb6cc68f3a064bab70e",
+      "finding.finding_id": "sha256:6806de822217cefd9c3cec5ca13a45c6c748a4a4ecdfa1a091a9182fb55c8852",
+      "finding.port": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "finding.product": "sha256:4bd5cdb8bcf09f452239d3c2f2ac12292193d449485e044583bbc395206fc7de",
+      "finding.scanner_severity": "sha256:e166c9b021549f5a4366fbb339f86b990ff5429178fb221f7530c9b6a30bfcbf",
+      "finding.service": "sha256:52295814d9c773388129dac16b69410f7d011c92ea2789a4dc308b13202f063a",
+      "finding.version": "sha256:7ef0f5545b870ecf2fb9ef8fa16425d0051d3fbab6a81e8d07b476512cf98c62"
+    },
     "state": "confirmed"
   },
   "source": {

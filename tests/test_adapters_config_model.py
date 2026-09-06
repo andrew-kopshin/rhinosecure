@@ -22,10 +22,14 @@ from rhinosecure.adapters.config_model import (
     ASSET_SLOTS,
     FINDING_SLOTS,
     GAP_LEGAL_TARGETS,
+    LOW_CONFIDENCE_THRESHOLD,
+    SCORING_ENUM_TARGETS,
     Contract,
     ContractValidationError,
     compute_content_digest,
     compute_decision_digest,
+    low_confidence_scoring_slots,
+    required_attestations,
     validate_contract,
 )
 
@@ -955,3 +959,71 @@ def test_unknown_kind_is_rejected():
     d["asset"]["business_function"] = {"kind": "regex_extract", "column": "Department", "blank": "gap"}
     with pytest.raises(ValidationError):
         Contract.model_validate(d)
+
+
+# --- mapping_confidence / the low_confidence_mappings attestation gate ------
+#
+# check_grounding (agents/schema_inference.py) verifies a vocabulary table's
+# cited tokens are real observed source values -- it has no way to check
+# that the table's target-side VALUES are semantically right. A scale the
+# model guessed at low confidence passes grounding cleanly regardless. These
+# tests cover the gate that exists for exactly that gap: a low-confidence
+# SCORING_ENUM_TARGETS mapping requires a human attestation before a
+# contract carrying it can be confirmed.
+
+
+def test_low_confidence_scoring_slots_is_empty_with_no_mapping_confidence_at_all():
+    """A contract that never went through a proposal (both real committed
+    contracts, hand-authored) has nothing to flag -- absence is the honest
+    value, not a fabricated "everything is fine" or "everything is risky"."""
+    contract = Contract.model_validate(bluepeak_gen_dict())
+    assert contract.mapping_confidence is None
+    assert low_confidence_scoring_slots(contract) == {}
+    assert "low_confidence_mappings" not in required_attestations(contract)
+
+
+def test_low_confidence_scoring_slots_ignores_targets_outside_scoring_enum_targets():
+    """business_function is real proposal uncertainty (which column is
+    right?) but it's free text scoring.py never reads -- a wrong guess
+    there shows up wrong in a report, not in a risk score. Only
+    SCORING_ENUM_TARGETS should ever trigger this gate."""
+    contract = Contract.model_validate(bluepeak_gen_dict()).model_copy(
+        update={
+            "mapping_confidence": {
+                "asset.criticality": 0.5,
+                "asset.business_function": 0.5,
+                "finding.scanner_severity": 0.5,
+            }
+        }
+    )
+    assert low_confidence_scoring_slots(contract) == {"asset.criticality": 0.5}
+
+
+def test_low_confidence_scoring_slots_uses_strict_less_than_the_threshold():
+    contract = Contract.model_validate(bluepeak_gen_dict()).model_copy(
+        update={"mapping_confidence": {"asset.criticality": LOW_CONFIDENCE_THRESHOLD}}
+    )
+    assert low_confidence_scoring_slots(contract) == {}  # exactly at threshold does not trigger
+    contract = contract.model_copy(
+        update={"mapping_confidence": {"asset.criticality": LOW_CONFIDENCE_THRESHOLD - 0.01}}
+    )
+    assert low_confidence_scoring_slots(contract) == {"asset.criticality": LOW_CONFIDENCE_THRESHOLD - 0.01}
+
+
+def test_required_attestations_names_every_low_confidence_slot():
+    contract = Contract.model_validate(bluepeak_gen_dict()).model_copy(
+        update={"mapping_confidence": {"asset.criticality": 0.5, "asset.role": 0.55}}
+    )
+    required = required_attestations(contract)
+    assert "low_confidence_mappings" in required
+    assert "asset.criticality" in required["low_confidence_mappings"]
+    assert "asset.role" in required["low_confidence_mappings"]
+
+
+def test_scoring_enum_targets_is_exactly_the_five_impact_axis_enums():
+    """Locks in the set review.py's own _value_distribution (moved here,
+    PROGRESS.md 2026-09-06) and this gate both depend on -- a silent change
+    to this tuple would silently widen or narrow both at once."""
+    assert set(SCORING_ENUM_TARGETS) == {
+        "role", "environment", "data_sensitivity", "criticality", "internet_exposed",
+    }
