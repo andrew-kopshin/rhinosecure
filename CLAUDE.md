@@ -1691,14 +1691,25 @@ a reader can tell the two apart when they want to.
 
 ---
 
-## Future direction: a conversational front end (recorded, not built)
+## Future direction: a conversational front end (partially built)
 
-**This section records a design, agreed in discussion before any code was written. Nothing in
-it is built** — no route, agent, schema, or job kind named below exists yet. Same convention as
-"Future direction: remediation execution," above: written so a later build has something
-concrete to build against or explicitly deviate from, not assumed into existence by being
-described. Produced by three independently-drafted design proposals judged against this
+**This section records a design, agreed in discussion before any code was written.** Same
+convention as "Future direction: remediation execution," above: written so a build has
+something concrete to build against or explicitly deviate from, not assumed into existence by
+being described. Produced by three independently-drafted design proposals judged against this
 project's own mechanisms, then synthesized into the one recorded here.
+
+**Status.** Sections 1, 2, and half of 3-4 are built: upload mechanics (`web/uploads.py`), the
+confirmation gate's known-format fast path plus the `ingest_propose` job kind
+(`web/jobs.py`), and the Router agent itself (`agents/router.py`) — `OperationKind`, the
+per-operation params models, `ground_router_decision`, `verify_step_summary`, `route_message`.
+Not yet built, named explicitly so they aren't assumed done by omission: the dispatcher that
+actually resolves `depends_on` across a multi-step decision and extends `JOB_HANDLERS` with
+`run_deterministic`/`run_agents`/`remediation_mark` (Section 3's own "finally consuming the
+slot the job substrate's own code comment already reserves"); `assert_plan_approved` (Section
+4's human-approval gate); the actual `POST /api/route`-shaped wiring of the Router into
+`web/server.py`; and everything in Sections 5-6 (chat-panel fusion, what becomes redundant).
+`INGEST_CONFIRM` remains deliberately absent from `OperationKind`, exactly as designed below.
 
 **The problem this answers.** Today, using RhinoSecure interactively requires already knowing
 the CLI: place a file under `data/`, run `rhino adapt propose`, review and run `rhino adapt

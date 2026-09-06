@@ -2605,3 +2605,153 @@ through ToT -- exercising all three of `_parse_check_strategy_and_cve`'s call si
 exhausting retries; it printed nothing, meaning none of the six new checks (four Track A fields
 plus Track B's entity check on Research/Environment/Risk/ToT) raised a false-positive mismatch
 against real model output, across all 24 findings.
+
+---
+
+**The conversational front end (CLAUDE.md's own "Future direction," recorded the same day this
+session started): three slices built, stopping short of the dispatcher.** Requested directly --
+"build what that section describes" -- with an explicit sequencing choice (chat fix -> uploads ->
+confirmation gate -> the Router, checking in after each major slice) made before writing any
+code, matching this project's own "propose before implementing" convention for a change this
+size.
+
+**Slice 0 -- the chat greeting fix, the one piece the design itself flagged as independently
+buildable and already fully decided.** `agents/chat.py`'s `is_plan_unrelated(message)`: a small,
+closed, exact-match (case-folded, trailing-punctuation-stripped) set of greetings/courtesies,
+checked in `answer_question` BEFORE `build_scoped_export` is ever called. A match dispatches a
+new `build_greeting_task` -- no export attached at all, plain-text answer, no citation schema, no
+retry loop (nothing to parse or ground) -- instead of paying the full-export prompt cost for "hi"
+the way the existing pre-filter still would have. Verified live: `answer_question(export_data,
+"hi")` against the real `out/export_demo.json` returned a natural reply inviting a real question,
+with `citations: []` and no export data referenced. 7 new tests (40 total in
+`test_agents_chat.py`, up from 33).
+
+**Slice 1 -- upload mechanics (`web/uploads.py`, new), mounted alongside `web/jobs.py` under
+`--enable-jobs`.** `POST /api/uploads` (multipart, `UploadFile`), `GET /api/uploads/{id}`, `POST
+/api/uploads/{id}/label`. Matches the design's own invariants: `data/uploads/<upload_id>/
+<sanitized-filename>`, `upload_id = uuid.uuid4().hex` (never content-derived), a `.part`
+intermediate streamed in 1 MiB chunks with a hard `RHINO_MAX_UPLOAD_BYTES` ceiling enforced
+mid-stream (default 200 MiB) and atomically renamed only on a clean finish, an `Idempotency-Key`
+header cached against a bounded in-memory map, and single- vs. two-file layout never inferred (a
+third file is refused; a two-file set needs both files explicitly labeled `"inventory"`/
+`"findings"` before it reports `ready`).
+
+**A real path-escape bug found while testing, not a hypothetical one.** Sanitization was written
+as `Path(original_filename).name`, on the assumption (never checked until a test forced the
+issue) that this neutralizes every dangerous case the way it neutralizes a directory component.
+Confirmed directly: `Path("..").name` returns `".."` unchanged, not `""` -- so a client uploading
+a file literally named `..` would have had `dest_dir / ".."` resolve one level ABOVE the upload
+directory, and the write actually failed with a Windows `PermissionError` when a parametrized
+test exercised exactly this filename (caught because the test existed at all, not because the
+bug announced itself). Fixed by explicitly rejecting a sanitized name that is `""`, `"."`, or
+`".."`, plus a general `except OSError` around the write itself (an illegal-on-this-filesystem
+name that survives sanitization becomes a clean 400, never an unhandled 500). Verified two ways:
+the parametrized unit test, and a live upload against a real `rhino web --enable-jobs` process
+over an actual TCP socket (not just `TestClient`) -- confirmed the file landed inside the upload
+directory with its real content, then cleaned up the real repo's `data/uploads/` afterward since
+that smoke test wrote there deliberately to exercise the real server process end to end. 23 new
+tests (`tests/test_web_uploads.py`).
+
+**Slice 2 -- the confirmation gate's mechanical fast path, and the `ingest_propose` job kind
+(`web/jobs.py`).** `known_format_match(filenames)`: LLM-free, filename-EXACT (never
+content-sniffed) set comparison against every built-in adapter's `(assets_filename,
+findings_filename)` pair -- the Router's future shortcut to skip propose/confirm entirely for an
+upload that already looks like a known format. `_run_ingest_propose` wraps
+`schema_inference.propose_contract` over an uploaded source instead of a `--data` directory named
+on argv, writing an UNCONFIRMED (`review.state == "proposed"`) contract to
+`data/adapters/<name>.json` exactly like `rhino adapt propose` itself does -- inert until a human
+runs the separate `rhino adapt confirm`, since `ConfiguredAdapter.__init__` refuses anything not
+signed. Mirrors the CLI's own refusal to silently overwrite an already-confirmed contract unless
+`overwrite_confirmed` is set. An incomplete proposal (an unresolved slot, a grounding failure) is
+NOT a job failure -- `status="succeeded"`, `result["contract_written"] is False` -- matching `rhino
+adapt propose`'s own "NOT written" outcome; only an unreadable source, an ambiguous two-file
+layout with no explicit filenames, or the model's output never parsing raises. 16 new tests
+(`tests/test_web_jobs_ingest_propose.py`), including a genuinely two-file-shaped source (distinct
+asset/finding columns per file, not two copies of the same CSV) to catch `validate_contract`'s
+real per-file column-accounting behavior rather than a simplified stand-in.
+
+**Slice 3 -- the Router agent itself (`agents/router.py`, new).** `OperationKind` (the seven
+names CLAUDE.md's design lists: `ingest_propose`, `run_deterministic`, `run_agents`,
+`constraint_submit`, `remediation_mark`, `view_scenario`, `qa_question` -- deliberately no
+`INGEST_CONFIRM` member at all, matching the design's own "a signature requirement is not a
+natural-language-shortcut-able act"). Each op has its own fixed, `extra="forbid"` params model
+(`IngestProposeParams`, `RunDeterministicParams`, ..., `PARAM_MODEL_BY_OP`) -- the identical
+"closed shape per kind" discipline `config_model.Mapping`'s 9-kind union already established for
+ingest contracts, applied here to routing instead.
+
+**Two LLM-free backstops, both mirroring a mechanism this codebase already trusts.**
+`ground_router_decision` mirrors `schema_inference.check_grounding`: every step's `op` must be in
+a CALLER-supplied `registered_ops` set (never hardcoded here -- a chat-only deployment with no
+`--enable-jobs` structurally cannot dispatch `run_deterministic`, because assembling which ops are
+"registered" on a given server instance is the caller's job, not this module's), `params` must
+validate against that op's own fixed model with no extra fields, an `ingest_propose` step's
+`upload_id` (and a `remediation_mark` step's `finding_id`) must be in a caller-supplied known-real
+set WHEN one is supplied (empty means the caller chose not to enforce it, not a false claim that
+nothing is real -- same inert-when-not-given shape `verify_research_matches_tool` already uses),
+and `depends_on` must be a real, EARLIER index into the same decision's own operations list --
+structurally checked only, never resolved to a value, since the value doesn't exist yet at
+grounding time. A step failing any check is dropped and folded into `issues`; every other step in
+the same decision is untouched -- confirmed directly by a test pairing one unregistered op next to
+one valid one and checking only the valid one survives.
+
+**`verify_step_summary`, folded INTO `ground_router_decision` rather than run as a separate pass
+-- a real design correction made before shipping, not after.** First version ran it as a second
+pass over already-grounded operations in `route_message`; caught before writing tests that this
+would drop an ENTIRE multi-step decision's worth of otherwise-valid steps the moment any ONE
+step's summary was inconsistent, exactly the "whole batch discarded over one bad item" failure
+mode this whole design exists to avoid elsewhere. Moved the check inside the same per-step loop
+`ground_router_decision` already runs, so a summary/params mismatch drops only that one step.
+Scoped the same narrow way `agents/entity_consistency.py`'s CVE-mention check is scoped: a Router
+step's `summary` is checked for naming a DIFFERENT upload id than the one its own `params`
+actually reference -- `uuid.uuid4().hex` is always exactly 32 lowercase hex characters, the one
+universal, regexable shape among this step's identifiers (matched by VALUE across every param,
+not just a field literally named `upload_id`, so a `run_deterministic` step whose `source_ref`
+happens to be an upload id is checked too). `finding_id`/contract-name mention-checking is
+deliberately NOT built, for the identical reason `entity_consistency.py` already gives for
+deferring hostname/finding_id: neither has one universal shape to regex for.
+
+**A second real gap caught before shipping: `ground_router_decision`'s return type silently
+discarded the model's own `clarify` text.** `RouterGroundingResult` originally carried only
+`grounded_operations`/`issues` -- but the model's `RouterDecision.clarify` (set when nothing, or
+only part of a message, resolves to a real operation) never survived past `ground_router_decision`
+at all, contradicting this module's own docstring promise that a caller should combine `issues`
+with `clarify` to build what a human sees. Fixed by threading `clarify` through onto
+`RouterGroundingResult` itself. Caught by writing the live verification below, not by a unit test
+that would have hand-constructed the expected shape and missed the same omission -- a concrete
+case for why this session's live checks ran BEFORE calling each slice done, not after.
+
+**`route_message` mirrors `Coordinator.interpret_constraint`'s exact retry shape, with one
+deliberate, documented difference: grounding failure is never a retry trigger.** Bounded retry
+(`max_parse_attempts`-equivalent) only on `AgentOutputParseError` -- an ungrounded step is a
+normal, reportable outcome (dropped, folded into `issues`), the identical "grounding failure vs.
+parse failure" distinction `schema_inference.propose_contract` already draws between
+`ProposalGenerationError` (raised) and an incomplete proposal (returned, `contract=None`).
+Confirmed directly: a queued response naming an unregistered op is accepted on the FIRST dispatch
+(one `Crew` instantiation), the bad step dropped, not retried.
+
+**Verified live against a real model, three scenarios, not just against fakes.** (1) "I just
+uploaded a file, can you analyze it?" with one ready upload known to the caller correctly resolved
+to a single `ingest_propose` step naming that real upload_id, zero issues. (2) "only three patches
+fit this window" correctly resolved to `constraint_submit` with the human's own words copied
+verbatim into `raw_text` -- the Router recognizing the SHAPE without attempting to extract
+`patch_limit` itself, exactly as designed (that stays Constraint Interpreter's job). (3) A request
+for `run_agents` against a deployment where only `view_scenario` is registered correctly produced
+ZERO grounded operations and a `clarify` question, rather than proposing the unavailable operation
+and relying on the backstop to catch it -- the prompt's own stated `available_ops` list steering
+the model correctly, with grounding as the backstop it never needed to invoke here.
+
+**Deliberately not built in this pass, named so it isn't assumed done by omission.** The
+dispatcher that actually resolves `depends_on` across steps and extends `JOB_HANDLERS` with
+`run_deterministic`/`run_agents`/`remediation_mark` (`OperationKind` already names all three;
+`ground_router_decision`'s `registered_ops` parameter is exactly how a caller would tell this
+module which are actually mounted, once they exist); `assert_plan_approved` (the human-approval
+gate CLAUDE.md's own design requires before ANY step runs); the web-layer route that would
+actually invoke `route_message` from an HTTP request and wire its result into `JobRegistry`. All
+three are natural next slices, each independently sized about like the ones built here.
+
+**Verification.** 31 new tests (`tests/test_router.py`) plus the 7 (chat)/23 (uploads)/16
+(ingest_propose) above -- 77 new tests this session. Full suite: `.venv312` 1136 passed, 1
+skipped (up from 1045). CLAUDE.md's "Future direction: a conversational front end" section
+retitled from "(recorded, not built)" to "(partially built)" with a Status paragraph naming
+exactly what's built and what remains, mirroring the "Adapter generation" section's own
+Status-paragraph convention rather than inventing a new one.
