@@ -57,6 +57,36 @@
         </form>
       </aside>
     </div>
+
+    <div id="empty-workspace" class="empty-workspace" hidden>
+      <div class="empty-workspace-inner">
+        <h1 class="empty-workspace-title">No plan yet</h1>
+        <p class="hint">Upload a vulnerability scan, or just say what you'd like to do.</p>
+
+        <div class="card empty-upload-card">
+          <h3>Upload a file</h3>
+          <p class="hint">
+            One file (a self-describing export), or two (an inventory file and a findings
+            file — you'll be asked to label which is which).
+          </p>
+          <input type="file" id="empty-upload-input" />
+          <div id="empty-upload-status" class="empty-upload-status"></div>
+        </div>
+
+        <div class="card empty-route-card">
+          <h3>Or just ask</h3>
+          <div id="empty-route-messages" class="chat-messages empty-route-messages"></div>
+          <form id="empty-route-form" class="chat-form">
+            <textarea
+              id="empty-route-input"
+              rows="2"
+              placeholder='e.g. "run the demo plan" or "analyze the file I just uploaded"'
+            ></textarea>
+            <button id="empty-route-send-btn" type="submit">Send</button>
+          </form>
+        </div>
+      </div>
+    </div>
   </div>
 
   <div id="error-banner" class="error-banner" hidden></div>

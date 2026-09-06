@@ -73,6 +73,15 @@ def test_get_export_missing_file_is_a_404_not_a_startup_failure(tmp_path):
     assert resp.status_code == 404
 
 
+def test_default_export_path_is_not_the_demo_fixtures_own_output_file():
+    """The conversational front end's empty-workspace design: a fresh
+    `rhino web` must open empty even on a checkout where `rhino run
+    --data demo --export out/export_demo.json` was already run for
+    testing -- DEFAULT_EXPORT_PATH must never be export_demo.json."""
+    assert server_module.DEFAULT_EXPORT_PATH.name != "export_demo.json"
+    assert server_module.DEFAULT_EXPORT_PATH.name == "export_web.json"
+
+
 def test_get_export_invalid_json_is_a_500_with_a_clear_message(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text("this is not json", encoding="utf-8")

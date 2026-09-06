@@ -1548,6 +1548,324 @@ function setupChat() {
   });
 }
 
+/* ---------------- empty workspace (no plan yet) ---------------- */
+
+/* Two entry points into the SAME mechanism -- an upload just provisions
+ * bytes on disk (web/uploads.py); everything that actually DOES
+ * something (propose a schema, run a plan, answer a question) goes
+ * through the Router (POST /api/route). This screen never calls
+ * POST /api/jobs directly -- the Router decides which job kind, if any,
+ * a message resolves to. */
+
+let currentUploadId = null;
+let emptyWorkspaceSetUp = false;
+let emptyRoutePollTimer = null;
+let emptyRouteHistory = []; // [{role, content}, ...] -- threaded into POST /api/route same as chat
+
+function showEmptyWorkspace() {
+  const layout = document.querySelector(".layout");
+  if (layout) layout.hidden = true;
+  document.getElementById("empty-workspace").hidden = false;
+  setupEmptyWorkspaceOnce();
+}
+
+function hideEmptyWorkspaceShowPlan(data) {
+  document.getElementById("empty-workspace").hidden = true;
+  const layout = document.querySelector(".layout");
+  if (layout) layout.hidden = false;
+  renderAll(data);
+}
+
+function setupEmptyWorkspaceOnce() {
+  if (emptyWorkspaceSetUp) return;
+  emptyWorkspaceSetUp = true;
+  document.getElementById("empty-upload-input").addEventListener("change", handleEmptyUploadChange);
+  document.getElementById("empty-route-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const input = document.getElementById("empty-route-input");
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    sendEmptyRouteMessage(text);
+  });
+}
+
+/* ---- upload entry point ---- */
+
+async function handleEmptyUploadChange(e) {
+  const file = e.target.files[0];
+  e.target.value = ""; // allow re-selecting the same filename for a second upload attempt
+  if (!file) return;
+
+  const statusEl = document.getElementById("empty-upload-status");
+  statusEl.innerHTML = `<span class="spinner"></span> Uploading ${esc(file.name)}…`;
+
+  const formData = new FormData();
+  formData.append("file", file);
+  if (currentUploadId) formData.append("upload_id", currentUploadId);
+
+  try {
+    const res = await fetch("/api/uploads", { method: "POST", body: formData });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+    currentUploadId = body.upload_id;
+    renderUploadStatus(body);
+  } catch (err) {
+    statusEl.textContent = `Upload failed: ${err.message}`;
+  }
+}
+
+function renderUploadStatus(upload) {
+  const statusEl = document.getElementById("empty-upload-status");
+  const isTwoFile = upload.layout === "two_file";
+
+  const filesHtml = upload.files
+    .map((f) => {
+      if (!isTwoFile) return `<div class="empty-upload-file-row">${esc(f.filename)} (${f.size} bytes)</div>`;
+      const label = f.label || "";
+      return `
+        <div class="empty-upload-file-row">
+          <span>${esc(f.filename)}</span>
+          <select data-filename="${esc(f.filename)}" class="empty-upload-label-select">
+            <option value="" ${label === "" ? "selected" : ""}>label…</option>
+            <option value="inventory" ${label === "inventory" ? "selected" : ""}>Inventory</option>
+            <option value="findings" ${label === "findings" ? "selected" : ""}>Findings</option>
+          </select>
+        </div>
+      `;
+    })
+    .join("");
+
+  const readyHtml = upload.ready
+    ? `<p class="hint"><button type="button" id="empty-analyze-btn" class="secondary-btn">Analyze this</button></p>`
+    : `<p class="hint">${isTwoFile ? "Label each file to continue." : "Upload a second file, or wait…"}</p>`;
+
+  statusEl.innerHTML = `${filesHtml}${readyHtml}`;
+
+  statusEl.querySelectorAll(".empty-upload-label-select").forEach((sel) => {
+    sel.addEventListener("change", () => handleUploadLabelChange(upload.upload_id, sel.dataset.filename, sel.value));
+  });
+  const analyzeBtn = document.getElementById("empty-analyze-btn");
+  if (analyzeBtn) {
+    analyzeBtn.addEventListener("click", () =>
+      sendEmptyRouteMessage(`Analyze the file I just uploaded (upload_id ${upload.upload_id}).`)
+    );
+  }
+}
+
+async function handleUploadLabelChange(uploadId, filename, label) {
+  if (!label) return;
+  try {
+    const res = await fetch(`/api/uploads/${uploadId}/label`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename, label }),
+    });
+    const body = await res.json();
+    if (res.ok) renderUploadStatus(body);
+  } catch (err) {
+    // a transient failure here just leaves the label unset -- the select
+    // itself still shows what the human picked, so retrying is obvious.
+  }
+}
+
+/* ---- chat/route entry point ---- */
+
+function appendEmptyRouteMessage(role, text, opts) {
+  opts = opts || {};
+  const container = document.getElementById("empty-route-messages");
+  const bubble = document.createElement("div");
+  bubble.className = `chat-msg chat-msg-${role}${opts.isError ? " chat-msg-error" : ""}`;
+  bubble.innerHTML = `<p class="chat-msg-content">${esc(text)}</p>`;
+  container.appendChild(bubble);
+  container.scrollTop = container.scrollHeight;
+  return bubble;
+}
+
+async function sendEmptyRouteMessage(text) {
+  clearTimeout(emptyRoutePollTimer);
+  const sendBtn = document.getElementById("empty-route-send-btn");
+  const container = document.getElementById("empty-route-messages");
+
+  appendEmptyRouteMessage("user", text);
+  emptyRouteHistory.push({ role: "user", content: text });
+  if (sendBtn) sendBtn.disabled = true;
+
+  const typing = document.createElement("div");
+  typing.className = "chat-typing";
+  typing.id = "empty-route-typing";
+  typing.innerHTML = `<span class="spinner"></span> Thinking…`;
+  container.appendChild(typing);
+  container.scrollTop = container.scrollHeight;
+
+  try {
+    const res = await fetch("/api/route", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text, history: emptyRouteHistory.slice(0, -1) }),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+    renderRoutePlan(body);
+    emptyRouteHistory.push({
+      role: "assistant",
+      content: body.clarify || `Proposed ${body.steps.length} step(s) -- see above.`,
+    });
+  } catch (err) {
+    appendEmptyRouteMessage("assistant", `Could not route that: ${err.message}`, { isError: true });
+  } finally {
+    document.getElementById("empty-route-typing")?.remove();
+    if (sendBtn) sendBtn.disabled = false;
+  }
+}
+
+function renderRoutePlan(plan) {
+  const container = document.getElementById("empty-route-messages");
+  const wrapper = document.createElement("div");
+  wrapper.className = "route-plan";
+  wrapper.dataset.routeId = plan.route_id;
+  fillRoutePlanWrapper(wrapper, plan);
+  container.appendChild(wrapper);
+  container.scrollTop = container.scrollHeight;
+}
+
+function fillRoutePlanWrapper(wrapper, plan) {
+  wrapper.innerHTML = plan.clarify ? `<div class="route-clarify">${esc(plan.clarify)}</div>` : "";
+  plan.steps.forEach((step, index) => wrapper.appendChild(renderRouteStep(plan.route_id, step, index, plan.steps)));
+}
+
+function updateRoutePlanRendering(plan) {
+  const wrapper = document.querySelector(`.route-plan[data-route-id="${plan.route_id}"]`);
+  if (!wrapper) {
+    renderRoutePlan(plan);
+    return;
+  }
+  fillRoutePlanWrapper(wrapper, plan);
+}
+
+function renderRouteStep(routeId, step, index, allSteps) {
+  const el = document.createElement("div");
+  el.className = `route-step status-${esc(step.status)}`;
+
+  const canApprove =
+    step.status === "pending" && !step.approved && allSteps.slice(0, index).every((s) => s.status === "succeeded");
+
+  let bodyHtml = "";
+  if (step.status === "running") {
+    bodyHtml = `<span class="spinner"></span> <span class="hint">Running…</span>`;
+  } else if (step.status === "pending") {
+    bodyHtml = canApprove
+      ? `<button type="button" class="secondary-btn route-approve-btn">Approve &amp; run</button>`
+      : `<span class="hint">Waiting on an earlier step…</span>`;
+  }
+
+  const resultHtml = step.result
+    ? `<div class="route-step-result">${esc(formatStepResult(step))}</div>`
+    : "";
+  const errorHtml = step.error
+    ? `<div class="route-step-result" style="color: var(--status-failed)">${esc(step.error.message || "failed")}</div>`
+    : "";
+
+  el.innerHTML = `
+    <div class="route-step-head">
+      <div>
+        <div class="route-step-op">${esc(step.op)}</div>
+        <div class="route-step-summary">${esc(step.summary)}</div>
+      </div>
+      <span class="route-step-status-pill status-${esc(step.status)}">${esc(step.status)}</span>
+    </div>
+    <div class="route-step-body">${bodyHtml}</div>
+    ${resultHtml}
+    ${errorHtml}
+  `;
+
+  const approveBtn = el.querySelector(".route-approve-btn");
+  if (approveBtn) approveBtn.addEventListener("click", () => approveRouteStep(routeId, index));
+  return el;
+}
+
+function formatStepResult(step) {
+  const r = step.result;
+  if (!r) return "";
+  switch (step.op) {
+    case "qa_question":
+      return r.answer || "";
+    case "view_scenario":
+      return `${r.matched} of ${r.total} finding(s) matched.`;
+    case "run_deterministic":
+    case "run_agents": {
+      const buckets = Object.entries(r.bucket_distribution || {})
+        .map(([k, v]) => `${bucketLabel(k)}: ${v}`)
+        .join(", ");
+      return `${r.total_findings} finding(s) scored. ${buckets}`;
+    }
+    case "ingest_propose":
+      return r.contract_written
+        ? `Contract written to ${esc(baseName(r.contract_path))}. Next: ${r.next_step}`
+        : `Not written yet -- ${(r.unresolved_slots || []).length} slot(s) still unresolved.`;
+    case "constraint_submit":
+      return r.persisted ? "Constraint applied." : "Nothing to apply.";
+    case "remediation_mark":
+      return `${r.finding_id}: ${r.transition}`;
+    default:
+      return JSON.stringify(r);
+  }
+}
+
+async function approveRouteStep(routeId, index) {
+  try {
+    const res = await fetch(`/api/route/${routeId}/steps/${index}/approve`, { method: "POST" });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+    updateRoutePlanRendering(body);
+    if (body.steps[index].status === "running") {
+      pollRoutePlan(routeId);
+    } else {
+      maybeTransitionToPlanView(body.steps[index]);
+    }
+  } catch (err) {
+    appendEmptyRouteMessage("assistant", `Could not approve that step: ${err.message}`, { isError: true });
+  }
+}
+
+function pollRoutePlan(routeId) {
+  const tick = async () => {
+    let body;
+    try {
+      const res = await fetch(`/api/route/${routeId}`);
+      body = await res.json();
+    } catch (err) {
+      emptyRoutePollTimer = setTimeout(tick, 1500); // transient network hiccup -- keep polling
+      return;
+    }
+    updateRoutePlanRendering(body);
+    if (body.steps.some((s) => s.status === "running")) {
+      emptyRoutePollTimer = setTimeout(tick, 1200);
+      return;
+    }
+    body.steps.forEach(maybeTransitionToPlanView);
+  };
+  tick();
+}
+
+/* Once ANY step actually writes the shared export, this screen's job is
+ * done -- the normal tabbed view (Scenarios tab included) is a strictly
+ * richer place to do anything further than this constrained chat ever
+ * was. Any other steps in the same route plan (e.g. a view_scenario that
+ * depended on this one) are simply left behind, unapproved -- nothing
+ * about a pending, never-approved step has any real-world effect. */
+async function maybeTransitionToPlanView(step) {
+  if (!step.export_written) return;
+  try {
+    const res = await fetch("/api/export");
+    if (!res.ok) return;
+    hideEmptyWorkspaceShowPlan(await res.json());
+  } catch (err) {
+    // the run DID succeed -- a transient refresh failure here isn't worth
+    // turning into a hard error; the human can reload.
+  }
+}
+
 /* ---------------- boot ---------------- */
 
 function renderAll(data) {
@@ -1578,6 +1896,12 @@ async function boot() {
 
   try {
     const res = await fetch("/api/export");
+    if (res.status === 404 && jobsEnabled) {
+      // No plan yet, but this deployment can make one -- the
+      // conversational front end's empty-workspace start, not an error.
+      showEmptyWorkspace();
+      return;
+    }
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       throw new Error(body.detail || `HTTP ${res.status}`);

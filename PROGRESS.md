@@ -2755,3 +2755,225 @@ skipped (up from 1045). CLAUDE.md's "Future direction: a conversational front en
 retitled from "(recorded, not built)" to "(partially built)" with a Status paragraph naming
 exactly what's built and what remains, mirroring the "Adapter generation" section's own
 Status-paragraph convention rather than inventing a new one.
+
+---
+
+**The dispatcher: resolving `depends_on`, the three remaining job kinds, per-step human
+approval, and the HTTP wiring -- the three pieces the Router entry named as deliberately not
+built.** Requested directly as a continuation of the same session, in the same sequence
+already used (build, verify live, commit, push, per slice).
+
+**A real design finding, before any dispatcher code was written: `depends_on` does not need a
+generic cross-step value-injection mechanism.** CLAUDE.md's own worked example ("the dispatcher
+... reads its real, persisted export path, and injects that into operation 1") reads as if a
+later step's params need a field filled in from an earlier step's output. Checked against every
+operation actually built: none of their params fields could receive such a value, and the ones
+that read plan state at all (`view_scenario`, and `constraint_submit` via `PlanState`) read the
+ONE shared, fixed `PlanState.export_path`/`.coordinator` regardless of which earlier step wrote
+it. So "wait for the dependency to succeed before dispatching the next step" is the entire
+mechanism this needs -- and the per-step human-approval gate (below) already enforces exactly
+that by construction, since approving step N requires every step before it to have already
+succeeded. `depends_on`'s own structural check (a real, EARLIER index) exists to catch a Router
+mistake, not to resolve a runtime value. CLAUDE.md's own section updated to record this finding
+in place rather than silently building around the original wording.
+
+**`web/jobs.py`: `resolve_source_ref` and the two ingest-and-score job kinds.** `ResolvedSource`
+(a `data_dir`/`fmt`/`adapter_config` triple -- the exact string pair every existing entry point,
+`Coordinator`/`cli.run_with_report`/`cli.run_agents`, already takes, not a new "pass an adapter
+instance around" convention) is what a Router `source_ref` resolves to, two ways: an upload_id
+(`web/uploads.py`'s own 32-hex-character shape) resolves via `known_format_match` first (the
+confirmation gate's own fast path, Section 2), then an already-CONFIRMED contract at that
+upload's default propose name if one exists -- refusing, and naming the exact `rhino adapt
+confirm` command that would finish it, for a PROPOSED-but-unconfirmed one, since confirmation
+stays a dedicated signed act nothing here may resolve around. A bare name resolves as a
+`--data <name>` directory, mirroring `cli._resolve_data_dir`'s own convention (duplicated, not
+imported -- `cli.py` is not a dependency of this module, per `_log_exclusions`'s existing note).
+
+`_run_run_deterministic` calls `cli.run_with_report` directly rather than reimplementing its
+~30-line scoring loop -- a deliberate, documented exception to "`cli.py` is not a dependency of
+this module": `export.py` itself already imports `cli.RunResult` directly as the deterministic
+export's own required shape, so avoiding a second, thin dependency on the exact type export.py
+already requires would only create a second copy of that loop to drift out of sync, not a
+cleaner boundary. `_run_run_agents` reuses `PlanState`'s own existing local reimplementation
+instead (see below) -- an intentional asymmetry, reasoned through rather than accidental.
+
+**`PlanState` generalized from "one FIXED source for the server's whole lifetime" to "one
+CURRENT source, replaceable by a later job" -- the piece the empty-workspace slice (below) and
+the dispatcher both needed, independently arrived at from each one's own requirements.**
+`JobConfig.data_dir` is now `Path | None` (was required); `PlanState.seed()` -- `constraint_
+submit`'s existing fallback -- still seeds from the server's startup `--data` when one was given
+(unchanged behavior for every existing deployment), and now raises a new, clearly-worded
+`PlanNotSeededError` when nothing has run yet AND no startup default exists, rather than crashing
+on `None` three calls deep. `PlanState.run_agents_pipeline(resolved, on_stage)` is `seed()`'s old
+body, generalized to take ANY `ResolvedSource` and REPLACE `self.coordinator`/`.memory`/
+`.findings`/`.active_source` wholesale -- "one current plan," not "one plan per source ever run."
+Confirmed directly, not assumed: a test runs `run_agents` against source A, asserts the plan's
+findings are exactly A's, runs `run_agents` again against a completely different source B, and
+asserts the plan now holds ONLY B's findings -- proving replacement, not accumulation.
+
+**`_run_remediation_mark`** mirrors `rhino remediation mark` field-for-field: the same status
+vocabulary check, the same note-required-only-for-`remediated`-to-`open` transition
+(`remediation.note_required_for_transition`, unchanged), and the same warn-don't-refuse
+treatment of a finding_id no scored run has ever seen (`result["seen_before_in_a_scored_run"]`
+naming the gap instead of blocking the write) -- deliberately the cheapest handler here: no
+ingest, no LLM, no export write, since remediation status is tracking, never scoring.
+
+**`web/route.py` (new): `RoutePlan`, per-step human approval, and the `POST /api/route` family
+of routes -- the HTTP wiring the Router entry named as its third deliberately-unbuilt piece.**
+Per-STEP approval, not one blanket approval for a whole decision, matching CLAUDE.md's own
+"a mandatory human click before *every* step, not just the first" -- `assert_step_approved`
+mirrors `config_io.assert_confirmed`'s refuses-to-proceed posture: a step can only be approved
+and dispatched once every step before it has ALREADY succeeded, and editing a step's params
+(`edit_step`) clears its own approval and every later step's. That "clear every later step"
+rule turned out to need no undo logic at all: by construction, a `"pending"` step can never have
+an already-approved-and-run step after it (approval requires strict in-order completion), so
+there is never an already-applied real-world effect to unwind, only future approvals to
+re-request -- confirmed by a dedicated test that edits step 0 of a two-step plan and checks step
+1's approval was cleared too, never that anything step 1 might have done was rolled back.
+
+**`view_scenario`/`qa_question` are dispatched INLINE, never through `JobRegistry`, on purpose
+-- the one real branch this module has.** `agents/chat.py`'s whole "no lock, nothing here can
+race with itself" design exists specifically because chat never touches `JobRegistry`'s single-
+running-job slot; routing `qa_question` through a job would let a long `run_agents` job block a
+simple question, directly contradicting that design. Every job-BACKED operation instead reuses
+the exact existing dispatch mechanism -- pulled out of `web/jobs.py`'s own `submit_job` route
+into a new public `dispatch_job(kind, input, registry, plan_state)` function specifically so
+`web/route.py` could call the SAME path rather than reaching into a private `_execute_job`
+across a module boundary, or inventing a second way to start a job.
+
+**`view_scenario`'s own scope is deliberately narrow, named rather than silently thin.**
+`"recommended"` mode is the one filter this module computes itself (`bucket in {patch_now,
+contested}`, the same definition the existing Scenarios tab's own Recommended mode already
+uses) -- never a Router-authored predicate, matching CLAUDE.md's "the Router never... writes a
+filter predicate from scratch." `"selection"` mode returns every finding unfiltered rather than
+attempting a richer server-side filter language the Router has no safe way to author; the
+existing Scenarios tab's own client-side filter controls remain the actual selection mechanism
+for now -- a stated scope limit, not a silent gap.
+
+**Verified live against a real server and a real Router LLM call, the full round trip.**
+`rhino web --enable-jobs --enable-chat --data demo` (an ordinary, pre-front-end-shaped startup),
+then `POST /api/route` with "run the demo plan (deterministic, no reasoning needed) and then
+show me what needs patching now": the Router correctly produced a two-step plan --
+`run_deterministic` naming the server's own configured default source (surfaced via `web/
+route.py`'s `_context_note`, which now names `plan_state.config.data_dir` as a usable
+`source_ref` whenever no plan has run yet but a startup default exists -- a real gap this live
+check itself surfaced and fixed before calling the slice done: the first version of `_context_
+note` only ever said "no plan exists yet," giving the model nothing to resolve `source_ref` to
+for a bare "run demo" request), then `view_scenario(mode="recommended")` with `depends_on: 0`.
+Approving step 0 dispatched a real job that reproduced the exact, previously-documented frozen
+demo-fixture distribution (`patch_now=1, next_window=8, contested=3, mitigate_monitor=3,
+accept=9`, 24 total); approving step 1 then read the FRESH export and correctly returned exactly
+the 4 matching findings (F01/F07/F11/F14 -- the one patch_now plus the three known contested
+findings). Server logs showed zero errors across the whole sequence.
+
+**Verification.** 19 new tests (`tests/test_web_jobs_dispatcher.py`: `resolve_source_ref`'s four
+resolution paths including a real proposed-but-unconfirmed-contract refusal built through the
+real `assemble_contract`/`check_grounding` pipeline rather than a hand-typed contract stand-in,
+`run_deterministic`/`run_agents`/`remediation_mark` end to end, the plan-replacement proof, and
+`PlanNotSeededError`'s both raise-directly and through-a-job shapes) plus 27 new tests
+(`tests/test_web_route.py`: `assert_step_approved`/`edit_step`'s full rule set, `_view_scenario`'s
+two modes, `RoutePlanRegistry`'s bounded history, and the full HTTP surface with `route_message`
+faked -- `agents/router.py`'s own grounding/retry behavior already has its own dedicated test
+suite, so these are about what happens to a decision once this module has one, not about
+re-deriving it). 46 new tests this session's dispatcher slice; full suite `.venv312` 1182
+passed, 1 skipped (up from 1136).
+
+---
+
+**The empty workspace: `rhino web` opens with no plan, two entry points (upload, chat/route),
+and the plan view appears once one exists -- the second slice requested in the same
+continuation, after the dispatcher.** The demo fixture stays a frozen test artifact
+(`rhino run --data demo` unchanged); it just stops being what a fresh `rhino web` shows on
+launch.
+
+**Two small, backward-compatible default changes, not a behavior change to anything already
+running.** `cli.py`'s `web` subcommand: `--data` now defaults to `None` instead of `"demo"` --
+omitted, `JobConfig.data_dir` stays `None` and the server starts with no plan and no default
+source (`PlanState.seed()`'s own `PlanNotSeededError`, built in the dispatcher slice above, is
+exactly the backstop this now actually exercises by default rather than only when a human
+explicitly asked for it). Passing `--data demo` explicitly still seeds exactly as before -- a
+real regression test confirms `JobConfig.data_dir is None` when the flag is omitted, alongside
+the existing test confirming an explicit `--data demo` still resolves to the real directory.
+`web/server.py`'s `DEFAULT_EXPORT_PATH` renamed from `out/export_demo.json` to `out/
+export_web.json` -- deliberately NOT the demo fixture's own conventional output path, so a
+fresh `rhino web` opens empty even on a checkout where `rhino run --data demo --export out/
+export_demo.json` was already run for testing. A dedicated test pins the new filename directly
+(`DEFAULT_EXPORT_PATH.name == "export_web.json"`) so this can't silently drift back.
+
+**The frontend gap was exactly what last session's research already found it to be: the
+backend already fully tolerated a missing export (a clean 404, `create_app` never requiring the
+file to exist); `app.js`'s `boot()` just showed a bare error banner over an empty shell instead
+of a real empty-workspace screen.** New markup in `index.html` (`#empty-workspace`, a sibling of
+the existing `.layout`, hidden by default): an upload card (`<input type="file">`) and a
+chat-shaped card reusing the existing `.chat-messages`/`.chat-msg`/`.chat-form` CSS classes
+verbatim rather than inventing a second visual language for what's structurally the same kind
+of message list. `boot()` now branches on `res.status === 404 && jobsEnabled` -- shows the
+empty-workspace screen instead of the error banner for exactly that case (no jobs enabled AND
+no export is still the old error-banner path, unchanged, since there's nothing to bootstrap
+from without the job substrate).
+
+**One input box drives everything past the upload itself -- there is no second, bespoke
+"analyze this file" mechanism.** The upload card only ever provisions bytes
+(`POST /api/uploads`, `POST /api/uploads/{id}/label` for a two-file source, both already built
+in the upload-mechanics slice); its "Analyze this" button (shown once `ready`) sends an
+auto-composed message -- `"Analyze the file I just uploaded (upload_id <id>)."` -- through the
+EXACT SAME `POST /api/route` flow a hand-typed message uses, deliberately embedding the real id
+rather than relying on the model inferring "the" upload from context alone, since an
+auto-generated message costs nothing to make unambiguous. Approving a step reuses the
+dispatcher's own existing job-polling/synchronous-execution split (`POST .../approve`, then
+`GET /api/route/{id}` on a `setTimeout` loop for a job-backed step, mirroring `pollJob`'s
+existing cadence) -- no new backend mechanism, only a second caller of the one that already
+existed.
+
+**A real, small backend gap the frontend work surfaced and closed: a step's `export_written`
+flag didn't exist on `RouteStep` at all.** `_sync_step_from_job` copied `status`/`result`/
+`error` off the underlying `Job` but never `export_written` -- meaning nothing on the wire told
+a caller "this step just changed the shared export file, go re-fetch it," which is exactly the
+signal this new frontend needs to know when to transition off the empty-workspace screen.
+Added `RouteStep.export_written` (copied the same way as the other fields) and a dedicated test
+proving it's `False` for a `remediation_mark` step (never writes an export) and `True` for a
+real `run_deterministic` job against the frozen demo fixture (offline, real committed
+snapshots) -- not just asserted, run to completion.
+
+**A second real gap, found live rather than assumed away: the Router had no way to know an
+upload already matched a known built-in format, so it would default to proposing a schema
+(`ingest_propose`) even for a plain native-format pair that could run directly.** `_context_note`
+(`web/route.py`) now calls the SAME `known_format_match` the confirmation gate's fast path
+itself uses, per ready upload, and tells the model explicitly when a match means `ingest_propose`
+is unnecessary. Confirmed live, not assumed: before this fix, "analyze the file I just uploaded"
+against a real `assets.csv`+`findings.csv` upload would have gone through `ingest_propose`
+first; after it, the Router correctly produced a two-step plan going straight to
+`run_deterministic` naming the upload_id directly, citing "the uploaded native-format source" in
+its own summary.
+
+**Verified live end to end, through the actual browser UI, not just curl or unit tests --
+following this session's own "start the dev server and use the feature" discipline for
+frontend work.** Added a fourth `.claude/launch.json` entry (`rhino-web-empty`,
+`--enable-jobs --enable-chat --offline`, no `--data`) to make this reproducible. Confirmed,
+clicking through the real page: (1) a fresh load with no export shows the empty-workspace
+screen, not an error banner; (2) typing "run the demo plan..." with no ready upload and no
+configured default source correctly produced a `clarify` question rather than guessing a
+`source_ref` -- the Router refusing to invent a value it was never told, exactly as designed;
+(3) uploading `data/demo`'s real `assets.csv`+`findings.csv` (as two files, labeled via the
+existing `/label` endpoint) then asking to analyze it produced a two-step
+`run_deterministic` -> `view_scenario` plan citing the real upload_id; (4) clicking "Approve &
+run" dispatched a real job that reproduced the exact frozen demo-fixture bucket distribution,
+and the page transitioned from the empty-workspace screen to the normal tabbed view
+AUTOMATICALLY, with no reload, the instant `export_written` came back true -- confirmed via
+`document.title` changing and a screenshot showing the full Overview tab; (5) a native
+`<input type="file">` selection (simulated via the DOM `DataTransfer` API, since a real OS file
+dialog can't be driven by browser automation) exercised the actual upload code path end to end,
+not just curl's multipart handling, correctly showing "assets.csv (287 bytes)" and an "Analyze
+this" button; (6) that same single-column file (no findings, not a recognized format) correctly
+produced an `ingest_propose` -> `run_deterministic` plan with the second step showing "Waiting
+on an earlier step…" until the first succeeds -- confirming the dependency-gated rendering
+against a real, not-yet-resolved multi-step plan, independently of the earlier all-synchronous
+test. Console/network logs showed only the expected 404s (the intentional empty-workspace
+detection checks); zero unexpected errors across the whole sequence.
+
+**Verification.** 4 new tests (`tests/test_cli.py`'s empty-workspace default,
+`tests/test_web_server.py`'s `DEFAULT_EXPORT_PATH` pin, and the `RouteStep.export_written`
+pair in `tests/test_web_route.py`) plus the live browser verification above, which exercises
+code no unit test reaches (the actual DOM event wiring, `fetch`/`FormData` from a real page
+context, and the `setTimeout` poll loop's real timing). Full suite: `.venv312` 1185 passed, 1
+skipped (up from 1182).

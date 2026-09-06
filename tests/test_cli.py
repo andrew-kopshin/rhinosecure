@@ -988,6 +988,28 @@ def test_web_enable_jobs_wires_a_job_config_from_the_cli_flags(monkeypatch, tmp_
     assert job_config.data_dir == DEMO_DIR
 
 
+def test_web_enable_jobs_with_no_data_flag_starts_an_empty_workspace(monkeypatch, tmp_path):
+    """The conversational front end's own default: omitting --data must
+    NOT fall back to the demo fixture -- JobConfig.data_dir stays None,
+    so PlanState.seed() has nothing to seed from until a real
+    run_deterministic/run_agents job resolves a source."""
+    from rhinosecure.web import server as server_module
+
+    captured = {}
+
+    def fake_create_app(export_path, *, jobs_enabled=False, job_config=None, chat_enabled=False):
+        captured["job_config"] = job_config
+        return SimpleNamespace(state=SimpleNamespace(export_path=Path(export_path)))
+
+    monkeypatch.setattr(server_module, "create_app", fake_create_app)
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+
+    exit_code = main(["web", "--export", str(tmp_path / "export.json"), "--enable-jobs"])
+
+    assert exit_code == 0
+    assert captured["job_config"].data_dir is None
+
+
 # --- _ensure_utf8_stdio ------------------------------------------------------
 
 

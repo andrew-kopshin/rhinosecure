@@ -1490,7 +1490,10 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=(
             "path to a JSON file written by `rhino run --export` (default: "
-            "out/export_demo.json under the repo root, or $RHINOSECURE_EXPORT_PATH)"
+            "out/export_web.json under the repo root, or $RHINOSECURE_EXPORT_PATH -- "
+            "deliberately not the demo fixture's own output path, so a fresh `rhino web` "
+            "opens empty even if `rhino run --data demo --export out/export_demo.json` was "
+            "run earlier for testing)"
         ),
     )
     web_parser.add_argument("--port", type=int, default=8420)
@@ -1507,7 +1510,15 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     web_parser.add_argument(
-        "--data", default="demo", help="dataset the job substrate reasons about (only with --enable-jobs)"
+        "--data",
+        default=None,
+        help=(
+            "dataset the job substrate reasons about (only with --enable-jobs). Omit for the "
+            "conversational front end's empty-workspace start -- the app opens with no plan and "
+            "no default source; the first run_deterministic/run_agents job (dispatched via chat "
+            "or an upload) is what establishes one. Pass a real name (e.g. `demo`) for the "
+            "pre-front-end behavior: a plan seeded from that source the moment jobs are enabled."
+        ),
     )
     web_parser.add_argument("--seed", type=int, default=42, help="only meaningful with --enable-jobs")
     web_parser.add_argument(
@@ -1893,7 +1904,7 @@ def main(argv: list[str] | None = None) -> int:
 
             db_path = Path(args.db) if args.db else DEFAULT_DB_PATH
             job_config = JobConfig(
-                data_dir=_resolve_data_dir(args.data),
+                data_dir=_resolve_data_dir(args.data) if args.data else None,
                 fmt=args.format,
                 adapter_config=args.adapter_config,
                 seed=args.seed,
@@ -1909,18 +1920,24 @@ def main(argv: list[str] | None = None) -> int:
         )
         resolved = app.state.export_path
         if not resolved.exists():
-            print(f"warning: export file does not exist yet: {resolved}", file=sys.stderr)
+            print(f"no plan yet -- starting empty at {resolved} (upload a file or say what to analyze)")
         print(f"RhinoSecure web viewer -- serving {resolved}")
         if args.enable_jobs:
-            ingest_label = (
-                f"adapter config: {job_config.adapter_config}"
-                if job_config.adapter_config
-                else f"format: {job_config.fmt}"
-            )
-            print(
-                f"  write mode enabled -- jobs will run agent code (dataset: {job_config.data_dir}, "
-                f"{ingest_label}) and persist to {db_path}"
-            )
+            if job_config.data_dir is None:
+                print(
+                    "  write mode enabled -- empty workspace, no default dataset; the first "
+                    f"run_deterministic/run_agents job establishes a plan, persisting to {db_path}"
+                )
+            else:
+                ingest_label = (
+                    f"adapter config: {job_config.adapter_config}"
+                    if job_config.adapter_config
+                    else f"format: {job_config.fmt}"
+                )
+                print(
+                    f"  write mode enabled -- jobs will run agent code (dataset: {job_config.data_dir}, "
+                    f"{ingest_label}) and persist to {db_path}"
+                )
         if args.enable_chat:
             print("  chat enabled -- POST /api/chat calls the LLM seam per question (reads only, no writes)")
         print(f"  http://{args.host}:{args.port}/")

@@ -12,6 +12,18 @@
       "runtimeExecutable": ".venv312/Scripts/rhino.exe",
       "runtimeArgs": ["web", "--export", "out/export_fleet_scale.json", "--port", "8421"],
       "port": 8421
+    },
+    {
+      "name": "rhino-web-empty",
+      "runtimeExecutable": ".venv312/Scripts/rhino.exe",
+      "runtimeArgs": [
+        "web", "--enable-jobs", "--enable-chat",
+        "--export", "out/export_empty_smoke.json",
+        "--db", "out/empty_smoke.db",
+        "--offline",
+        "--port", "8422"
+      ],
+      "port": 8422
     }
   ]
 }

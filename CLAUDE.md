@@ -1699,17 +1699,47 @@ something concrete to build against or explicitly deviate from, not assumed into
 being described. Produced by three independently-drafted design proposals judged against this
 project's own mechanisms, then synthesized into the one recorded here.
 
-**Status.** Sections 1, 2, and half of 3-4 are built: upload mechanics (`web/uploads.py`), the
-confirmation gate's known-format fast path plus the `ingest_propose` job kind
-(`web/jobs.py`), and the Router agent itself (`agents/router.py`) — `OperationKind`, the
-per-operation params models, `ground_router_decision`, `verify_step_summary`, `route_message`.
-Not yet built, named explicitly so they aren't assumed done by omission: the dispatcher that
-actually resolves `depends_on` across a multi-step decision and extends `JOB_HANDLERS` with
-`run_deterministic`/`run_agents`/`remediation_mark` (Section 3's own "finally consuming the
-slot the job substrate's own code comment already reserves"); `assert_plan_approved` (Section
-4's human-approval gate); the actual `POST /api/route`-shaped wiring of the Router into
-`web/server.py`; and everything in Sections 5-6 (chat-panel fusion, what becomes redundant).
-`INGEST_CONFIRM` remains deliberately absent from `OperationKind`, exactly as designed below.
+**Status.** Sections 1-4 are built. Upload mechanics (`web/uploads.py`); the confirmation
+gate's known-format fast path plus the `ingest_propose` job kind (`web/jobs.py`); the Router
+agent (`agents/router.py`) — `OperationKind`, the per-operation params models, `ground_router
+_decision`, `verify_step_summary`, `route_message`; and the dispatcher (`web/jobs.py`'s
+`resolve_source_ref`/`run_deterministic`/`run_agents`/`remediation_mark` handlers, plus
+`web/route.py` — `RoutePlan`/`assert_step_approved`/`edit_step`, and the `POST /api/route`
+family of routes wiring the Router into the web app). `INGEST_CONFIRM` remains deliberately
+absent from `OperationKind`, exactly as designed below.
+
+One real design finding surfaced while building the dispatcher, worth recording since it
+revises what this section originally said: `depends_on` turned out not to need a generic
+cross-step value-injection mechanism at all. Every operation actually built either has no
+params field that could receive an earlier step's output, or reads the one shared, fixed
+`PlanState.export_path` regardless of which earlier step wrote it — so "wait for the
+dependency to succeed before dispatching" (already required by the per-step approval gate,
+which refuses to approve a step until every earlier one has succeeded) is the whole mechanism
+`depends_on` needs today. See `web/route.py`'s own module docstring for the full reasoning; a
+future operation whose params genuinely need an earlier step's computed value is a real,
+not-yet-needed extension point, not a gap in what's built.
+
+The empty-workspace start is also built: `rhino web`'s `--data` now defaults to `None` (was
+`"demo"`) and `DEFAULT_EXPORT_PATH` is `out/export_web.json` (was `out/export_demo.json`), so a
+fresh `rhino web` opens with no plan rather than the demo fixture's own conventional output
+file — the demo fixture itself is unchanged and `rhino run --data demo` still works exactly as
+before, it just stops being what a bare `rhino web` shows on launch. `index.html`/`app.js` gained
+the actual empty-workspace screen this needs: an upload card and a chat-shaped card, both driving
+the SAME `POST /api/route` flow (an upload only ever provisions bytes; the Router still decides
+what happens next), with `boot()` showing this screen instead of the old bare error banner when
+`GET /api/export` 404s and jobs are enabled. Verified live in a real browser, not just unit
+tests — see PROGRESS.md for the full click-through, including the multi-step, dependency-gated
+rendering (`ingest_propose` → `run_deterministic`) for an upload that ISN'T a recognized
+built-in format, and the automatic transition to the normal tabbed view the instant a step
+reports `export_written`.
+
+Not yet built, named explicitly so it isn't assumed done by omission: Sections 5-6's remaining
+piece — fusing this into the EXISTING chat panel as one input box once a plan already exists
+(today the empty-workspace screen and the existing post-plan chat panel are two separate UIs,
+each correct for the state it handles, not yet merged into one that also lets a human keep
+issuing Router-driven operations after the first plan exists) — and retiring the manual CLI
+sequence as the primary path (it remains fully functional and untouched; the web UI is simply
+also now a complete alternative starting point).
 
 **The problem this answers.** Today, using RhinoSecure interactively requires already knowing
 the CLI: place a file under `data/`, run `rhino adapt propose`, review and run `rhino adapt
