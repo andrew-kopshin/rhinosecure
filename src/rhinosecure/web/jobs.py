@@ -12,12 +12,16 @@ the exact same guarantee it already has today.
 status (`pending` -> `running` -> `succeeded`/`failed`), a `stage` string
 whose vocabulary is kind-specific, typed `input`/`result`/`error` dicts, and
 whether it refreshed the export file. Generality lives in exactly one place,
-`JOB_HANDLERS` -- a `kind -> handler` dispatch table. Today it has one entry,
+`JOB_HANDLERS` -- a `kind -> handler` dispatch table. Two entries today:
 `"constraint_submit"` (the CLI's `rhino constraint add`, made async with
-progress). A later `"agent_run"` handler (a full `--agents` run) is a few
-lines reusing the same `PlanState.coordinator.run(...)`/export-write tail
-this module already has -- zero changes to the registry, the routes, or the
-locking below.
+progress) and `"ingest_propose"` (phase 1 of LLM-assisted adapter generation,
+`schema_inference.propose_contract`, dispatched over an uploaded source --
+`web/uploads.py`'s conversational-front-end mechanics -- instead of a
+`--data` directory named on argv; see `_run_ingest_propose`'s own docstring).
+A later `"agent_run"` handler (a full `--agents` run) is a few lines reusing
+the same `PlanState.coordinator.run(...)`/export-write tail this module
+already has -- zero changes to the registry, the routes, or the locking
+below.
 
 **One current plan per server process.** `PlanState` holds one long-lived
 `Coordinator` + `Memory` pair -- mirroring `web/server.py`'s own "one export
@@ -69,10 +73,19 @@ one "failed" bucket:
   non-null `export_warning` rather than `error` -- a different failure
   domain, and conflating the two would misreport a working constraint as a
   failed one.
+- `ingest_propose` has its own third category, distinct from both: a
+  proposal that leaves a slot unresolved or fails grounding is NOT a
+  failure -- `status="succeeded"`, `result["contract_written"] is False`,
+  with `unresolved_slots`/`grounding` naming exactly what a human still
+  needs to fix by hand (mirrors `rhino adapt propose`'s own "NOT written"
+  outcome, never an exception). Only an unreadable/empty source, an
+  ambiguous two-file layout, or the model's output never parsing raises
+  -- `status="failed"`, `error["stage"] == "proposing"`.
 """
 
 from __future__ import annotations
 
+import json
 import random
 import sys
 import threading
@@ -87,13 +100,32 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from rhinosecure import export
-from rhinosecure.adapters import DEFAULT_FORMAT, get_adapter, load_config_adapter
+from rhinosecure.adapters import (
+    DEFAULT_FORMAT,
+    FORMATS,
+    REPO_ROOT,
+    get_adapter,
+    load_config_adapter,
+    resolve_config_path,
+)
+from rhinosecure.adapters.config_io import read_contract, write_contract
 from rhinosecure.agents.constraint_intake import ConstraintInterpretationError
 from rhinosecure.agents.coordinator import Coordinator, CoordinatorError, ConstraintReplanFailedError
+from rhinosecure.agents.schema_inference import (
+    DEFAULT_MAX_ATTEMPTS as PROPOSE_DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_SAMPLE_ROWS,
+    ProposalGenerationError,
+    SchemaInferenceError,
+    SavedProposal,
+    dump_saved_proposal,
+    propose_contract,
+    unresolved_slots,
+)
 from rhinosecure.enrich.cache import OfflineCacheMissError, SnapshotCache
 from rhinosecure.ingest import IngestError, load_batch
 from rhinosecure.llm import LLMConfigError
 from rhinosecure.memory import Memory
+from rhinosecure.web import uploads as uploads_module
 
 if TYPE_CHECKING:
     from rhinosecure.schema import Asset, EnrichedFinding
@@ -379,8 +411,138 @@ def _run_constraint_submit(job: Job, plan_state: PlanState, on_stage: Callable[[
     return JobOutcome(result=result_dict, export_written=True)
 
 
+def known_format_match(filenames: list[str]) -> str | None:
+    """The confirmation-gate design's own "does this already look like a
+    known format" fast path (CLAUDE.md's conversational-front-end
+    section 2) -- purely mechanical and LLM-free. True only when
+    `filenames`, as a SET, exactly matches one built-in adapter's own
+    `(assets_filename, findings_filename)` pair -- filename-exact, never
+    content-sniffed: a wrong content guess would be exactly the
+    wrong-but-plausible inference the not-collected/refuse-rather-than-
+    guess discipline exists to prevent. Returns the matching format name,
+    or None -- a caller (the Router, a later slice) uses a match to skip
+    propose/confirm entirely and dispatch a run with `--format <name>`
+    directly against the upload directory."""
+    uploaded = set(filenames)
+    for name, adapter_cls in FORMATS.items():
+        if {adapter_cls.assets_filename, adapter_cls.findings_filename} == uploaded:
+            return name
+    return None
+
+
+def _default_propose_name(upload_id: str) -> str:
+    # config_model._FORMAT_PATTERN allows at most 32 characters total;
+    # "upload-" (7) plus a 24-character slice of the 32-character hex id
+    # stays inside that with room to spare, and keeps enough of the id
+    # to be recognizable next to it under data/adapters/.
+    return f"upload-{upload_id[:24]}"
+
+
+def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str], None]) -> JobOutcome:
+    """Phase 1 of LLM-assisted adapter generation (docs/adapter-
+    generation.md), dispatched against an uploaded source instead of a
+    `--data` directory a human named on the command line -- the
+    conversational front end's confirmation-gate design (CLAUDE.md).
+    `plan_state` is accepted only to match every other handler in
+    `JOB_HANDLERS`' shared signature and is never touched: schema
+    inference reasons about one source's shape, not a fleet's scoring,
+    and has nothing to do with `Coordinator`/`Memory`.
+
+    Writes an UNCONFIRMED contract (`review.state == "proposed"`) to
+    `data/adapters/<name>.json` when every slot is mapped and grounded --
+    exactly what `rhino adapt propose` itself writes, via the identical
+    `propose_contract`/`write_contract` calls. This is inert until a
+    human runs the separate, dedicated `rhino adapt confirm` signature
+    step: `ConfiguredAdapter.__init__` refuses to construct against
+    anything not `review.state == "confirmed"` (`config_io.assert_
+    confirmed`), so nothing this job writes can affect a real run on its
+    own -- the same backstop the front-end design leans on for
+    deliberately excluding `INGEST_CONFIRM` from the Router's own
+    operation vocabulary."""
+    upload_id = str(job.input.get("upload_id") or "").strip()
+    if not upload_id:
+        raise SchemaInferenceError("ingest_propose requires a non-empty input.upload_id")
+
+    data_dir = uploads_module.DEFAULT_UPLOADS_DIR / upload_id
+    if not data_dir.is_dir():
+        raise SchemaInferenceError(f"no such upload set: {upload_id!r} (looked for {data_dir})")
+
+    name = str(job.input.get("name") or "").strip() or _default_propose_name(upload_id)
+    output_path = resolve_config_path(name)
+    overwrite_confirmed = bool(job.input.get("overwrite_confirmed", False))
+
+    if output_path.exists() and not overwrite_confirmed:
+        try:
+            existing = read_contract(output_path)
+        except Exception:
+            existing = None
+        if existing is not None and existing.review.state == "confirmed":
+            raise SchemaInferenceError(
+                f"{output_path} already holds a CONFIRMED contract (signed {existing.review.confirmed_at} "
+                f"by {existing.review.confirmed_by}) -- re-proposing would silently overwrite that signature. "
+                "Pass input.overwrite_confirmed=true if you really mean to replace it."
+            )
+
+    on_stage("proposing")
+    result = propose_contract(
+        data_dir,
+        name,
+        generated_at=_now(),
+        assets_filename=job.input.get("assets_filename") or None,
+        findings_filename=job.input.get("findings_filename") or None,
+        max_attempts=int(job.input.get("max_attempts") or PROPOSE_DEFAULT_MAX_ATTEMPTS),
+        sample_rows=int(job.input.get("sample_rows") or DEFAULT_SAMPLE_ROWS),
+    )
+
+    on_stage("saving proposal")
+    saved_path = REPO_ROOT / "out" / f"propose_{name}.json"
+    saved_path.parent.mkdir(parents=True, exist_ok=True)
+    saved_path.write_text(
+        json.dumps(
+            dump_saved_proposal(SavedProposal(result.proposal, result.generator)), indent=2, sort_keys=True
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result_dict: dict[str, Any] = {
+        "upload_id": upload_id,
+        "name": name,
+        "layout": result.proposal.meta.source_layout,
+        "proposal_saved_path": str(saved_path),
+        "unresolved_slots": unresolved_slots(result.proposal),
+        "grounding": {
+            "failures": [{"slot": i.slot, "message": i.message} for i in result.grounding.failures],
+            "caveats": [{"slot": i.slot, "message": i.message} for i in result.grounding.caveats],
+        },
+        "generator": {
+            "model": result.generator.model,
+            "attempts": result.generator.attempts,
+            "prompt_tokens": result.generator.prompt_tokens,
+            "completion_tokens": result.generator.completion_tokens,
+            "estimated_cost_usd": result.generator.estimated_cost_usd,
+        },
+        "contract_written": False,
+        "contract_path": None,
+        "incomplete_reason": result.incomplete_reason,
+        "next_step": None,
+    }
+
+    if result.contract is None:
+        return JobOutcome(result=result_dict)
+
+    on_stage("writing contract")
+    written = write_contract(output_path, result.contract)
+    result_dict["contract_written"] = True
+    result_dict["contract_path"] = str(output_path)
+    result_dict["contract_version"] = written.version
+    result_dict["next_step"] = f'rhino adapt confirm {name} --data uploads/{upload_id} --by "<you>"'
+    return JobOutcome(result=result_dict)
+
+
 JOB_HANDLERS: dict[str, Callable[[Job, PlanState, Callable[[str], None]], JobOutcome]] = {
     "constraint_submit": _run_constraint_submit,
+    "ingest_propose": _run_ingest_propose,
     # "agent_run": _run_agent_run,  # added later -- zero changes needed
     # below this line: same registry, same routes, same locking.
 }
@@ -418,6 +580,13 @@ def _execute_job(job: Job, registry: JobRegistry, plan_state: PlanState) -> None
                 "constraint_id": exc.constraint_id,
                 "asset_id": exc.asset_id,
             },
+        )
+        return
+    except (SchemaInferenceError, ProposalGenerationError) as exc:
+        registry.finish(
+            job.id,
+            status="failed",
+            error={"stage": "proposing", "type": type(exc).__name__, "message": str(exc)},
         )
         return
     except (CoordinatorError, IngestError, OfflineCacheMissError, LLMConfigError) as exc:
@@ -471,6 +640,8 @@ def mount_job_routes(app: FastAPI, job_config: JobConfig) -> None:
             raise HTTPException(400, f"unknown job kind: {body.kind!r}")
         if body.kind == "constraint_submit" and not str(body.input.get("text") or "").strip():
             raise HTTPException(400, "constraint_submit requires non-empty input.text")
+        if body.kind == "ingest_propose" and not str(body.input.get("upload_id") or "").strip():
+            raise HTTPException(400, "ingest_propose requires non-empty input.upload_id")
 
         job = registry.create_and_start(body.kind, body.input)
         if job is None:
