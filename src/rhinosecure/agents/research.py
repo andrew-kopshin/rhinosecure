@@ -66,6 +66,7 @@ from crewai.llms.base_llm import BaseLLM
 from crewai.tools import BaseTool, tool
 from pydantic import BaseModel
 
+from rhinosecure.agents.entity_consistency import find_wrong_cve_mentions
 from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.prompt_safety import UNTRUSTED_TEXT_NOTICE, fence
 from rhinosecure.enrich.attack import load_index as load_attack_index
@@ -310,30 +311,45 @@ def build_research_task(enriched: EnrichedFinding, agent: Agent) -> Task:
 
 
 class ResearchMismatchError(RuntimeError):
-    """Raised when a ResearchFinding's is_kev/kev_due_date/epss_score/
-    nvd_base_score/nvd_severity/attack_techniques don't match what this
-    CVE's actual lookup_kev/lookup_epss/lookup_nvd/lookup_attack_techniques
-    tool calls returned -- exactly the failure mode CLAUDE.md's grounding-
-    validation open item describes, extended one hop upstream of
-    `agents/risk.py`'s `ScoringMismatchError` to the fields that reach
-    scoring.py's deterministic input in the first place
-    (`merge_research_into_enriched`). See module docstring for what this
-    checks and, deliberately, does not."""
+    """Raised when a ResearchFinding's is_kev/kev_date_added/kev_due_date/
+    epss_score/epss_percentile/nvd_base_score/nvd_severity/
+    attack_techniques don't match what this CVE's actual lookup_kev/
+    lookup_epss/lookup_nvd/lookup_attack_techniques tool calls returned --
+    exactly the failure mode CLAUDE.md's grounding-validation open item
+    describes, extended one hop upstream of `agents/risk.py`'s
+    `ScoringMismatchError` to the fields that reach scoring.py's
+    deterministic input in the first place (`merge_research_into_
+    enriched`). See module docstring for what this checks and,
+    deliberately, does not."""
 
 
 def verify_research_matches_tool(research: ResearchFinding, call_log: list[dict[str, Any]]) -> None:
     """Raise ResearchMismatchError if `research` contradicts the actual
     result of the last matching lookup_kev/lookup_epss/lookup_nvd/
-    lookup_attack_techniques call for its cve_id. Only checks the fields
-    `agents/risk.py`'s `merge_research_into_enriched` reads into the
-    scoring path -- `kev_date_added`, `epss_percentile`, and
-    `severity_disagreement` are reported but never merged into scoring, so
-    there is nothing at stake in verifying them here.
+    lookup_attack_techniques call for its cve_id.
+
+    **`kev_date_added`/`epss_percentile` ARE checked, even though neither
+    reaches `merge_research_into_enriched`/scoring.py.** An earlier version
+    of this function excluded them on exactly that basis ("nothing at
+    stake"), but both still reach `export.py`/`chat.py`/the web UI as if
+    sourced -- CLAUDE.md's "Grounding validation" item is about a human
+    trusting a citation, not only about protecting the scoring path, so
+    "does this field feed scoring" was never the right gate for whether a
+    field with real, already-fetched ground truth gets verified.
+    `severity_disagreement` is still deliberately excluded, but for a
+    different reason: unlike the two fields above, it has no single tool
+    field to diff against at all -- computing its expected value would
+    mean re-deriving scoring.py's own scanner/NVD tier-mapping logic
+    inside this module, coupling two things that should only ever agree
+    by scoring.py changing, not by this function guessing at its rules.
 
     A tool this CVE was never called for is skipped, not treated as a
     failure -- see module docstring's "inert when a tool was never called"
     note for why that's a deliberate scope boundary, not a gap in this
-    function."""
+    function. That "inert" posture is specific to the call_log-based
+    checks above: the exploitation_summary check below needs no tool call
+    at all (it only needs the CVE ID `research` itself already carries),
+    so it always runs, even against an empty call_log."""
     calls_for = {c["tool"]: c["result"] for c in call_log if c["args"].get("cve_id") == research.cve_id}
 
     kev = calls_for.get("lookup_kev")
@@ -342,6 +358,11 @@ def verify_research_matches_tool(research: ResearchFinding, call_log: list[dict[
             raise ResearchMismatchError(
                 f"{research.cve_id}: is_kev={research.is_kev} != tool result {kev['is_listed']!r}"
             )
+        if research.kev_date_added != kev["date_added"]:
+            raise ResearchMismatchError(
+                f"{research.cve_id}: kev_date_added={research.kev_date_added!r} != "
+                f"tool result {kev['date_added']!r}"
+            )
         if research.kev_due_date != kev["due_date"]:
             raise ResearchMismatchError(
                 f"{research.cve_id}: kev_due_date={research.kev_due_date!r} != "
@@ -349,10 +370,16 @@ def verify_research_matches_tool(research: ResearchFinding, call_log: list[dict[
             )
 
     epss = calls_for.get("lookup_epss")
-    if epss is not None and not _floats_match(research.epss_score, epss["score"]):
-        raise ResearchMismatchError(
-            f"{research.cve_id}: epss_score={research.epss_score} != tool result {epss['score']!r}"
-        )
+    if epss is not None:
+        if not _floats_match(research.epss_score, epss["score"]):
+            raise ResearchMismatchError(
+                f"{research.cve_id}: epss_score={research.epss_score} != tool result {epss['score']!r}"
+            )
+        if not _floats_match(research.epss_percentile, epss["percentile"]):
+            raise ResearchMismatchError(
+                f"{research.cve_id}: epss_percentile={research.epss_percentile} != "
+                f"tool result {epss['percentile']!r}"
+            )
 
     nvd = calls_for.get("lookup_nvd")
     if nvd is not None:
@@ -382,6 +409,17 @@ def verify_research_matches_tool(research: ResearchFinding, call_log: list[dict[
             raise ResearchMismatchError(
                 f"{research.cve_id}: attack_techniques does not match the tool's techniques verbatim"
             )
+
+    # exploitation_summary is free prose with no tool field to diff
+    # against byte-for-byte (see this function's own docstring) -- but a
+    # mention of a DIFFERENT CVE ID in it is essentially always wrong,
+    # and checkable without a call_log at all (agents/entity_consistency.py).
+    wrong_cves = find_wrong_cve_mentions(research.exploitation_summary, research.cve_id)
+    if wrong_cves:
+        raise ResearchMismatchError(
+            f"{research.cve_id}: exploitation_summary mentions {sorted(wrong_cves)}, a "
+            "different CVE than this finding is about"
+        )
 
 
 def _floats_match(a: float | None, b: float | None) -> bool:

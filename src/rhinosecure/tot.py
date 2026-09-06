@@ -105,6 +105,7 @@ from crewai.llms.base_llm import BaseLLM
 from crewai.types.usage_metrics import UsageMetrics
 from pydantic import BaseModel, Field
 
+from rhinosecure.agents.entity_consistency import find_wrong_cve_mentions
 from rhinosecure.agents.environment import EnvironmentAssessment
 from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.parsing import AgentOutputParseError, parse_structured_output
@@ -510,6 +511,35 @@ def _parse_and_check_strategy(task: Task, model: type[ModelT], expected: Strateg
     return result
 
 
+def _parse_check_strategy_and_cve(
+    task: Task, model: type[ModelT], expected: Strategy, real_cve_id: str, prose_field: str
+) -> ModelT:
+    """`_parse_and_check_strategy`, extended with `agents/entity_
+    consistency.py`'s narrow CVE-mention check on `prose_field`
+    (`proposal` for Strategist output, `justification` for Critic
+    output) -- CLAUDE.md's Safety and guardrails "Grounding validation"
+    open item names ToT's Strategist/Critic as the fifth LLM surface
+    with no citation-vs-evidence check at all; this closes the one
+    narrow, mechanical slice of that gap this project can reach without
+    a second, unreliable LLM opinion (see that module's own docstring
+    for what it does and does not catch).
+
+    Reuses `AgentOutputParseError`, not a new exception type -- the same
+    way `_parse_and_check_strategy` itself already reuses that type for
+    the strategy-echo check, so this plugs into `_resolve`'s existing
+    except clause without widening it."""
+    result = _parse_and_check_strategy(task, model, expected)
+    prose = getattr(result, prose_field)
+    wrong_cves = find_wrong_cve_mentions(prose, real_cve_id)
+    if wrong_cves:
+        raise AgentOutputParseError(
+            f"{prose_field} mentions {sorted(wrong_cves)}, a different CVE than this "
+            f"finding ({real_cve_id!r}) is about",
+            raw=task.output.raw,
+        )
+    return result
+
+
 def _dispatch_batch(
     agent: Agent,
     build_task: Callable[[int], Task],
@@ -583,7 +613,9 @@ def _propose_initial(
         agent,
         lambda i: _build_propose_task(root, strategies[i], agent),
         len(strategies),
-        lambda task, i: _parse_and_check_strategy(task, ProposalOutput, strategies[i]),
+        lambda task, i: _parse_check_strategy_and_cve(
+            task, ProposalOutput, strategies[i], root.enriched.finding.cve_id, "proposal"
+        ),
         max_parse_attempts=max_parse_attempts,
         verbose=verbose,
         usage=usage,
@@ -606,7 +638,9 @@ def _critique(
         agent,
         lambda i: _build_critique_task(root, raw_thoughts[i], agent),
         len(raw_thoughts),
-        lambda task, i: _parse_and_check_strategy(task, CritiqueOutput, raw_thoughts[i].strategy),
+        lambda task, i: _parse_check_strategy_and_cve(
+            task, CritiqueOutput, raw_thoughts[i].strategy, root.enriched.finding.cve_id, "justification"
+        ),
         max_parse_attempts=max_parse_attempts,
         verbose=verbose,
         usage=usage,
@@ -645,7 +679,9 @@ def _refine(
         agent,
         lambda i: _build_refine_task(root, beam[i], agent),
         len(beam),
-        lambda task, i: _parse_and_check_strategy(task, RefinementOutput, beam[i].strategy),
+        lambda task, i: _parse_check_strategy_and_cve(
+            task, RefinementOutput, beam[i].strategy, root.enriched.finding.cve_id, "proposal"
+        ),
         max_parse_attempts=max_parse_attempts,
         verbose=verbose,
         usage=usage,

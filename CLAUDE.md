@@ -1110,43 +1110,64 @@ not mark any of these done until there's a specific module and test to point to.
 
 1. **Grounding validation.** Agents should be checked to confirm their rationale cites the
    retrieved evidence actually passed to them (Section 4's "source and timestamp" requirement),
-   not restated model knowledge dressed up as a citation. Three partial pieces exist; the item
-   stays open because none is the general mechanism this item asks for.
-   **Labeling, not checking:** Environment Analysis's `EnvironmentAssessment.os_build_consistent`
-   (`agents/environment.py`) has no tool answer to check against — there is no live "which KB
-   applies to which OS build" source named in Section 11, so it is the model's own judgment from
-   the finding's product/version text against the asset's declared os/os_build, not a database
-   fact. `os_build_consistent_provenance` (a fixed `Literal["model_judgment"]`, so the schema
-   itself cannot mislabel it) marks that explicitly rather than leaving it implicit in
-   `applicability_summary`'s prose — a human or downstream consumer can tell it's unsourced, but
-   nothing stops it from being wrong.
-   **Actual enforcement, narrowly scoped, now on two agents instead of one:** Risk &
-   Recommendation's `verify_scoring_matches_tool` (`agents/risk.py`) compares the agent's final
-   `risk_score`/`bucket`/`scoring_rationale` against what the `score_finding` tool actually
-   returned for that finding_id and raises `ScoringMismatchError` on any drift;
-   `Coordinator._dispatch_risk` calls it after every Risk task and propagates the exception rather
-   than accepting a silently-diverged result. Vulnerability Research's
-   `verify_research_matches_tool` (`agents/research.py`, added alongside the prompt-injection
-   isolation work above) does the identical check one hop upstream: `is_kev`/`kev_due_date`/
-   `epss_score`/`nvd_base_score`/`nvd_severity`/`attack_techniques` — exactly the fields
-   `merge_research_into_enriched` copies unverified into the `EnrichedFinding` `scoring.py` treats
-   as ground truth — must match the actual `lookup_kev`/`lookup_epss`/`lookup_nvd`/
-   `lookup_attack_techniques` call for that CVE, wired via the same `extra_validate` seam
-   `_resolve_output` already had. Deliberately inert when a tool was never called for a CVE at all
-   (a different failure mode — "skipped tool use," not "contradicted its own tool result" — left
-   to the task's own instruction and CrewAI's native function-calling, and the reason
-   `test_coordinator.py`'s fake-crew fixtures, which never invoke the real research tools, are
-   unaffected). Both checks remain narrow in the same way: neither confirms that any agent's
-   *prose* (`verdict_summary`/`narrative`/`exploitation_summary`/`applicability_summary`) cites the
-   specific evidence strings it was actually given, nor does anything yet check that Environment's
-   `has_patch_window` matches `lookup_asset_context`'s result. Do not mark this item done — a
-   general citation-vs-evidence checker across all four agents, and `tot.py`'s Strategist/Critic (a
-   fifth LLM surface with the same unchecked-prose-vs-evidence gap: nothing confirms a proposal or
-   a critic's justification only cites facts actually present in `ToTRoot`), is still unbuilt.
-   `tot.py`'s critic score itself is a *stronger* case than `risk_score`'s: `CriticScores.aggregate`
-   isn't just checked against the model's output after the fact (`verify_scoring_matches_tool`'s
-   pattern) — `CritiqueOutput` has no aggregate field at all, so there is nothing for the model to
-   get wrong in the first place. That closes the number; it says nothing about the prose.
+   not restated model knowledge dressed up as a citation. Substantially built now, in two tracks;
+   the item stays open because neither is the general mechanism this item asks for, and a real
+   gap remains even after both.
+   **Track A — verbatim-copy checks, now on all four agents that copy a tool result into
+   structured output.** Risk & Recommendation's `verify_scoring_matches_tool` (`agents/risk.py`)
+   and Vulnerability Research's `verify_research_matches_tool` (`agents/research.py`) already
+   existed; this pass added the other two. Environment Analysis's `verify_environment_matches_tool`
+   (`agents/environment.py`) compares `EnvironmentAssessment`'s `hostname`/`os`/`os_build`/`role`/
+   `environment`/`internet_exposed`/`patch_window`/`patch_restrictions`/`has_patch_window`/
+   `compensating_controls`/`human_constraints` against the last `lookup_asset_context` call for
+   that `asset_id`, raising `EnvironmentMismatchError` — wired into `Coordinator
+   ._dispatch_environment`'s `extra_validate`, which previously had none at all. Constraint
+   Interpretation's `verify_constraint_matches_tool` (`agents/constraint_intake.py`) compares a
+   `ConstraintInterpretation`'s `asset_id` against `search_assets`' actual matches and its
+   `affected_finding_ids` against `list_findings_for_asset`'s actual result, raising
+   `ConstraintMismatchError` — wired into `interpret_constraint`'s own hand-rolled retry loop (it
+   doesn't go through `_resolve_output`). Deliberately does NOT check `effect_value`/`patch_limit`:
+   both are meant to paraphrase or extract from the human's own text rather than copy a tool
+   result verbatim, and the task's own worked example ("only five patches fit this window") spells
+   the number as a word, so an exact-match check would reject correct output.
+   `verify_research_matches_tool` also grew two fields it previously excluded on an "doesn't feed
+   scoring" basis (`kev_date_added`, `epss_percentile`) — reversed, because both still reach
+   `export.py`/`chat.py`/the web UI as if sourced, and this item is about a human trusting a
+   citation, not only about protecting the scoring path. `severity_disagreement` stays excluded
+   for a different reason: it has no single tool field to diff against, since computing its
+   expected value would mean re-deriving `scoring.py`'s own tier-mapping logic inside this module.
+   All four checks remain narrow the same way: each is inert when its tool was never called at all
+   (skipped tool use is a different failure mode than contradicting a real result), and none of
+   them touch free prose.
+   **Track B — a new, narrow entity-consistency check for exactly the free-prose gap Track A
+   cannot reach: `agents/entity_consistency.py`'s `find_wrong_cve_mentions`.** Every prose field in
+   this codebase (`ResearchFinding.exploitation_summary`, `EnvironmentAssessment
+   .applicability_summary`, `RiskRecommendation.verdict_summary`/`narrative`, `tot.py`'s
+   `ProposalOutput.proposal`/`CritiqueOutput.justification`) is written about exactly one finding
+   with exactly one real `cve_id`; a mention of a DIFFERENT CVE ID in that prose is essentially
+   always a hallucination, and — unlike a citation-to-evidence check — checkable with a plain regex
+   and no tool call_log at all. This is deliberately narrow: it catches "wrong specific
+   identifier," not "unsupported claim," "wrong number," or "invented detail." `hostname`/
+   `finding_id` mention-checking were considered and deliberately deferred, not built badly:
+   neither has one universal shape to regex for the way a CVE ID does (`finding_id` varies by
+   ingest adapter; a hostname has no fixed pattern at all), and checking either correctly would
+   need the whole fleet's real identifiers passed into every check, not just the one finding's own
+   evidence this module's function actually receives. Wired at every prose surface named above:
+   `research.py` and `risk.py` inside their existing `verify_*_matches_tool` functions;
+   `environment.py`'s check runs unconditionally, at the TOP of `verify_environment_matches_tool`
+   before the tool-call lookup and its early return — an adversarial self-review before testing
+   caught an initial version that placed it AFTER that early return, which would have silently
+   skipped the check whenever no `lookup_asset_context` call existed in the log, defeating the
+   entire point of a check designed to need no tool call at all; `tot.py`'s Strategist/Critic get
+   a new `_parse_check_strategy_and_cve` wrapper around the existing `_parse_and_check_strategy`
+   grounding check, used at all three dispatch sites (`_propose_initial`/`_critique`/`_refine`),
+   so ToT's prose surface — previously entirely unchecked by anything in this item — now gets the
+   same entity-consistency pass as every other agent.
+   Do not mark this item done: the general citation-vs-evidence checker it originally asked
+   for — confirming a prose claim cites the SPECIFIC evidence content it was given, not just the
+   right entity ID — is still unbuilt, and is a materially harder problem (semantic grounding, not
+   exact-match) than either track above solves. `hostname`/`finding_id` entity-consistency also
+   remains open, for the reason stated above.
 2. **Cost/usage visibility.** "Trust boundary and provider independence" (above) accepts
    per-run cost as an operational property of the LLM dependency, but `rhino run --agents`
    prints nothing about it — a run's actual token usage and dollar cost are currently invisible

@@ -6,9 +6,11 @@ from pydantic import ValidationError
 
 from rhinosecure.agents.environment import (
     EnvironmentAssessment,
+    EnvironmentMismatchError,
     build_environment_agent,
     build_environment_task,
     build_environment_tools,
+    verify_environment_matches_tool,
 )
 from rhinosecure.agents.research import ResearchFinding
 from rhinosecure.llm import LLMConfig, get_llm
@@ -86,6 +88,110 @@ def test_lookup_asset_context_returns_full_record_and_logs_the_call():
     assert call_log[0]["tool"] == "lookup_asset_context"
     assert call_log[0]["args"] == {"asset_id": "A02"}
     assert call_log[0]["result"] == result
+
+
+# --- verify_environment_matches_tool -----------------------------------
+
+
+def _matching_assessment_and_log():
+    tools, call_log = _tools()
+    tools["lookup_asset_context"].run(asset_id="A02")
+    # _ASSESSMENT_KWARGS predates verify_environment_matches_tool and was
+    # never built to byte-match ASSET_A02's real fields (compensating_controls
+    # in particular -- ASSET_A02 declares "WAF, network isolated", not
+    # empty) -- overridden here rather than changed at the shared fixture,
+    # which other tests in this file use for unrelated purposes.
+    assessment = EnvironmentAssessment(
+        **{**_ASSESSMENT_KWARGS, "compensating_controls": ["WAF", "network isolated"]}
+    )
+    return assessment, call_log
+
+
+def test_verify_passes_when_assessment_matches_the_tool_result():
+    assessment, call_log = _matching_assessment_and_log()
+    verify_environment_matches_tool(assessment, call_log)  # must not raise
+
+
+def test_verify_raises_on_mismatched_hostname():
+    assessment, call_log = _matching_assessment_and_log()
+    bad = assessment.model_copy(update={"hostname": "SOMETHING-ELSE"})
+    with pytest.raises(EnvironmentMismatchError):
+        verify_environment_matches_tool(bad, call_log)
+
+
+def test_verify_raises_on_mismatched_role():
+    assessment, call_log = _matching_assessment_and_log()
+    bad = assessment.model_copy(update={"role": "workstation"})
+    with pytest.raises(EnvironmentMismatchError):
+        verify_environment_matches_tool(bad, call_log)
+
+
+def test_verify_raises_on_mismatched_patch_window():
+    assessment, call_log = _matching_assessment_and_log()
+    bad = assessment.model_copy(update={"patch_window": "Sat 00:00-04:00"})
+    with pytest.raises(EnvironmentMismatchError):
+        verify_environment_matches_tool(bad, call_log)
+
+
+def test_verify_raises_on_mismatched_has_patch_window_derivation():
+    """has_patch_window has no dedicated tool field -- it's derived from
+    whether patch_window is non-empty -- so this catches the model
+    asserting has_patch_window=False while patch_window is populated."""
+    assessment, call_log = _matching_assessment_and_log()
+    bad = assessment.model_copy(update={"has_patch_window": False})
+    with pytest.raises(EnvironmentMismatchError):
+        verify_environment_matches_tool(bad, call_log)
+
+
+def test_verify_raises_on_mismatched_compensating_controls():
+    assessment, call_log = _matching_assessment_and_log()
+    bad = assessment.model_copy(update={"compensating_controls": ["a control the tool never reported"]})
+    with pytest.raises(EnvironmentMismatchError):
+        verify_environment_matches_tool(bad, call_log)
+
+
+def test_verify_raises_on_mismatched_human_constraints():
+    assessment, call_log = _matching_assessment_and_log()
+    bad = assessment.model_copy(update={"human_constraints": ["a constraint the tool never reported"]})
+    with pytest.raises(EnvironmentMismatchError):
+        verify_environment_matches_tool(bad, call_log)
+
+
+def test_verify_raises_when_applicability_summary_names_a_different_cve():
+    """No tool call needed at all -- checked even against an empty
+    call_log, unlike every other check in this function."""
+    assessment = EnvironmentAssessment(
+        **{**_ASSESSMENT_KWARGS, "applicability_summary": "Actually about CVE-2020-1472 instead."}
+    )
+    with pytest.raises(EnvironmentMismatchError, match="CVE-2020-1472"):
+        verify_environment_matches_tool(assessment, [])
+
+
+def test_verify_passes_when_applicability_summary_names_only_the_real_cve():
+    assessment, call_log = _matching_assessment_and_log()
+    matching = assessment.model_copy(
+        update={"applicability_summary": "CVE-2021-26855 affects an internet-exposed Exchange server."}
+    )
+    verify_environment_matches_tool(matching, call_log)  # must not raise
+
+
+def test_verify_is_inert_when_no_tool_was_ever_called():
+    """The deliberate scope boundary: a fabricated assessment with an
+    entirely empty call_log does not raise -- mirrors
+    verify_research_matches_tool's identical posture, and keeps
+    test_coordinator.py's fake-crew fixtures (which never invoke the
+    real environment tool) passing unchanged."""
+    fabricated = EnvironmentAssessment(**{**_ASSESSMENT_KWARGS, "hostname": "MADE-UP-HOST"})
+    verify_environment_matches_tool(fabricated, [])  # must not raise
+
+
+def test_verify_does_not_check_os_build_consistent():
+    """os_build_consistent has no tool-sourced ground truth at all (no
+    live KB-applicability source exists) -- any value passes, since this
+    function correctly never checks it."""
+    assessment, call_log = _matching_assessment_and_log()
+    weird = assessment.model_copy(update={"os_build_consistent": not assessment.os_build_consistent})
+    verify_environment_matches_tool(weird, call_log)  # must not raise
 
 
 def test_lookup_asset_context_unknown_asset_id_reports_not_found():

@@ -346,3 +346,17 @@ def test_verify_raises_when_no_matching_call_logged():
     recommendation, _ = _matching_recommendation_and_log()
     with pytest.raises(ScoringMismatchError):
         verify_scoring_matches_tool(recommendation, [])
+
+
+def test_verify_raises_when_verdict_summary_names_a_different_cve():
+    recommendation, call_log = _matching_recommendation_and_log()
+    bad = recommendation.model_copy(update={"verdict_summary": "This is really about CVE-2020-1472."})
+    with pytest.raises(ScoringMismatchError, match="CVE-2020-1472"):
+        verify_scoring_matches_tool(bad, call_log)
+
+
+def test_verify_raises_when_narrative_names_a_different_cve():
+    recommendation, call_log = _matching_recommendation_and_log()
+    bad = recommendation.model_copy(update={"narrative": "Confusingly, CVE-2019-1068 applies here too."})
+    with pytest.raises(ScoringMismatchError, match="CVE-2019-1068"):
+        verify_scoring_matches_tool(bad, call_log)

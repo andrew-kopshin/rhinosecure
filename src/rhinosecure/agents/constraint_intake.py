@@ -492,3 +492,73 @@ def build_constraint_task(constraint_text: str, agent: Agent) -> Task:
         ),
         agent=agent,
     )
+
+
+class ConstraintMismatchError(RuntimeError):
+    """Raised when a ConstraintInterpretation claims something its own
+    tool calls don't support -- an `asset_id` `search_assets` never
+    surfaced as a match, or a `finding_id` `list_findings_for_asset`
+    never returned for the resolved asset. This is a DIFFERENT check
+    from `Coordinator.submit_constraint`'s own downstream
+    `unresolved_finding_ids` filter: that one compares against
+    ground-truth `findings` directly and silently drops what doesn't
+    match (a hallucinated-but-real finding_id on the right asset is
+    still usable there); this one catches the model contradicting its
+    OWN tool results, the same copy-fidelity shape `agents/risk.py`'s
+    `verify_scoring_matches_tool` and `agents/research.py`'s
+    `verify_research_matches_tool` already enforce for their agents."""
+
+
+def verify_constraint_matches_tool(
+    interpretation: ConstraintInterpretation, call_log: list[dict[str, Any]]
+) -> None:
+    """Raise ConstraintMismatchError if `interpretation` names an
+    `asset_id` `search_assets` never matched, or a finding_id
+    `list_findings_for_asset` never returned for that asset. Inert (does
+    nothing) when the relevant tool was never called at all -- the same
+    "catches contradiction, not tool-skipping" scope boundary
+    `verify_research_matches_tool`/`verify_environment_matches_tool`
+    already accept, for the identical reason (nothing to check against,
+    and CrewAI's own function-calling loop makes skipping a tool far
+    less likely than misreporting its result).
+
+    `effect_value` and `patch_limit` are deliberately NOT checked here,
+    even though the module docstring/task both claim `effect_value` must
+    be "grounded in the human's own words": both are meant to paraphrase
+    or extract from `constraint_text`, not copy a tool result verbatim,
+    and a capacity statement's own worked example --
+    "only five patches fit this window" -- spells the number as a WORD,
+    not a digit. A substring/exact-match check against `constraint_text`
+    would fail on exactly the case this project's own task prompt tells
+    the model to handle correctly, so there is no mechanical equality
+    check here that wouldn't reject valid output. This is genuinely
+    closer to free prose than to a tool's verbatim-copyable fact --
+    unbuilt for the same reason `RiskRecommendation.narrative` has no
+    verbatim check, not an oversight."""
+    if interpretation.asset_id is not None:
+        search_results = [c["result"] for c in call_log if c["tool"] == "search_assets"]
+        if search_results:
+            known_asset_ids = {
+                m["asset_id"] for result in search_results for m in result.get("matches", [])
+            }
+            if interpretation.asset_id not in known_asset_ids:
+                raise ConstraintMismatchError(
+                    f"asset_id={interpretation.asset_id!r} was never among search_assets' "
+                    "own matches"
+                )
+
+    if interpretation.affected_finding_ids:
+        finding_results = [
+            c["result"]
+            for c in call_log
+            if c["tool"] == "list_findings_for_asset"
+            and c["args"].get("asset_id") == interpretation.asset_id
+        ]
+        if finding_results:
+            known_finding_ids = {f["finding_id"] for f in finding_results[-1].get("findings", [])}
+            bad = [fid for fid in interpretation.affected_finding_ids if fid not in known_finding_ids]
+            if bad:
+                raise ConstraintMismatchError(
+                    f"affected_finding_ids {bad} were never returned by list_findings_for_asset "
+                    f"for asset_id={interpretation.asset_id!r}"
+                )

@@ -130,16 +130,20 @@ from rhinosecure.agents.constraint_intake import (
     ConstraintInterpretation,
     ConstraintInterpretationError,
     ConstraintKind,
+    ConstraintMismatchError,
     apply_constraints,
     build_constraint_agent,
     build_constraint_task,
     build_constraint_tools,
+    verify_constraint_matches_tool,
 )
 from rhinosecure.agents.environment import (
     EnvironmentAssessment,
+    EnvironmentMismatchError,
     build_environment_agent,
     build_environment_task,
     build_environment_tools,
+    verify_environment_matches_tool,
 )
 from rhinosecure.agents.parsing import AgentOutputParseError, parse_structured_output
 from rhinosecure.agents.research import (
@@ -656,8 +660,10 @@ class Coordinator:
         last_error: Exception | None = None
         for attempt in range(1, self.max_parse_attempts + 1):
             try:
-                return parse_structured_output(task.output.raw, ConstraintInterpretation)
-            except AgentOutputParseError as exc:
+                interpretation = parse_structured_output(task.output.raw, ConstraintInterpretation)
+                verify_constraint_matches_tool(interpretation, call_log)
+                return interpretation
+            except (AgentOutputParseError, ConstraintMismatchError) as exc:
                 last_error = exc
                 if attempt == self.max_parse_attempts:
                     break
@@ -1004,7 +1010,12 @@ class Coordinator:
                 if extra_validate is not None:
                     extra_validate(result)
                 return result
-            except (AgentOutputParseError, ScoringMismatchError, ResearchMismatchError) as exc:
+            except (
+                AgentOutputParseError,
+                ScoringMismatchError,
+                ResearchMismatchError,
+                EnvironmentMismatchError,
+            ) as exc:
                 last_error = exc
                 if attempt == self.max_parse_attempts:
                     break
@@ -1107,6 +1118,7 @@ class Coordinator:
                 lambda e=finding, r=research, a=agent: build_environment_task(e, r, a),
                 agent,
                 self.state.environment_failures,
+                extra_validate=lambda a: verify_environment_matches_tool(a, self.state.environment_call_log),
             )
             if result is not None:
                 self.state.environment_by_id[fid] = result

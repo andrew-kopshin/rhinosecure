@@ -26,13 +26,26 @@ would be artificial.
 Because `os_build_consistent` is a judgment call rather than a fact any
 tool returned, `EnvironmentAssessment` carries that distinction as a typed
 field (`os_build_consistent_provenance`) rather than leaving it implicit
-in prose -- CLAUDE.md's "Safety and guardrails" -> Open -> "Grounding
+in prose -- CLAUDE.md's "Safety and guardrails" -> "Grounding
 validation" item names exactly this failure mode ("restated model
-knowledge dressed up as a citation"). This doesn't build the validator
-that item still asks for -- nothing yet checks a rationale's citations
-against the evidence actually passed in -- it only makes the one field
-that needs that check machine-identifiable instead of requiring a human
-to reread the prose to notice it isn't sourced.
+knowledge dressed up as a citation"). `os_build_consistent_provenance`
+only labels that one field as unsourced; it was never a check on any of
+this agent's OTHER fields, and until `verify_environment_matches_tool`
+below, nothing was: every other field here -- hostname, os, os_build,
+role, environment, internet_exposed, compensating_controls,
+has_patch_window, patch_window, patch_restrictions, human_constraints --
+is exactly as verbatim-copyable from `lookup_asset_context`'s own logged
+result as `agents/research.py`'s already-checked enrichment fields, and
+was simply never checked. `verify_environment_matches_tool` closes that,
+the identical shape `agents/risk.py`'s `verify_scoring_matches_tool` and
+`agents/research.py`'s `verify_research_matches_tool` already close for
+their agents -- wired into `Coordinator._dispatch_environment`, which
+previously passed no `extra_validate` to `_resolve_output` at all.
+`applicability_summary`/`sources` remain unchecked here: free prose with
+no single tool field to diff against byte-for-byte, the same class
+`exploitation_summary` is in research.py -- CLAUDE.md's own note on why a
+narrower, different mechanism (entity-consistency checking, not
+verbatim equality) is what applies to prose, not this function.
 
 All LLM calls route through `rhinosecure.llm.get_llm` -- this module never
 constructs a provider client itself (Trust boundary section).
@@ -71,6 +84,7 @@ from crewai.llms.base_llm import BaseLLM
 from crewai.tools import BaseTool, tool
 from pydantic import BaseModel
 
+from rhinosecure.agents.entity_consistency import find_wrong_cve_mentions
 from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.prompt_safety import UNTRUSTED_TEXT_NOTICE, fence
 from rhinosecure.agents.research import ResearchFinding
@@ -277,3 +291,78 @@ def build_environment_task(
         ),
         agent=agent,
     )
+
+
+class EnvironmentMismatchError(RuntimeError):
+    """Raised when an EnvironmentAssessment's asset-sourced fields don't
+    match what `lookup_asset_context` actually returned for that
+    asset_id -- the identical gap CLAUDE.md's Safety and guardrails
+    "Grounding validation" open item names, now closed for this agent
+    the same way `agents/risk.py`'s `verify_scoring_matches_tool` and
+    `agents/research.py`'s `verify_research_matches_tool` already close
+    it for theirs."""
+
+
+def verify_environment_matches_tool(
+    assessment: EnvironmentAssessment, call_log: list[dict[str, Any]]
+) -> None:
+    """Raise EnvironmentMismatchError if `assessment` contradicts the
+    actual result of the last `lookup_asset_context` call for its
+    asset_id. Mirrors `agents/research.py`'s `verify_research_matches_
+    tool` exactly: inert (does nothing) when no matching call exists in
+    `call_log`, since this checks copy-fidelity ("the agent called the
+    tool, then contradicted it"), not tool-skipping.
+
+    `os_build_consistent`/`os_build_consistent_provenance` are
+    deliberately excluded -- there is no live source to check
+    `os_build_consistent` against at all (see module docstring).
+    `applicability_summary`'s CVE-mention check (below) needs no tool
+    call at all -- it only needs the CVE ID `assessment` itself already
+    carries -- so it always runs, even against an empty `call_log`,
+    unlike every other check here."""
+    # Checked first, and unconditionally: unlike the tool-result checks
+    # below, this needs no matching lookup_asset_context call at all.
+    wrong_cves = find_wrong_cve_mentions(assessment.applicability_summary, assessment.cve_id)
+    if wrong_cves:
+        raise EnvironmentMismatchError(
+            f"{assessment.asset_id}: applicability_summary mentions {sorted(wrong_cves)}, a "
+            "different CVE than this finding is about"
+        )
+
+    calls = [
+        c["result"]
+        for c in call_log
+        if c["tool"] == "lookup_asset_context" and c["args"].get("asset_id") == assessment.asset_id
+    ]
+    if not calls:
+        return
+    tool_result = calls[-1]
+
+    scalar_checks = (
+        ("hostname", assessment.hostname, tool_result.get("hostname")),
+        ("os", assessment.os, tool_result.get("os")),
+        ("os_build", assessment.os_build, tool_result.get("os_build")),
+        ("role", assessment.role, tool_result.get("role")),
+        ("environment", assessment.environment, tool_result.get("environment")),
+        ("internet_exposed", assessment.internet_exposed, tool_result.get("internet_exposed")),
+        ("patch_window", assessment.patch_window, tool_result.get("patch_window")),
+        ("patch_restrictions", assessment.patch_restrictions, tool_result.get("patch_restrictions")),
+        # has_patch_window has no dedicated tool field -- it's the model's
+        # own derivation from patch_window, so the expected value is
+        # computed here rather than read from the result directly.
+        ("has_patch_window", assessment.has_patch_window, bool(tool_result.get("patch_window"))),
+    )
+    for field_name, reported, actual in scalar_checks:
+        if reported != actual:
+            raise EnvironmentMismatchError(
+                f"{assessment.asset_id}: {field_name}={reported!r} != tool result {actual!r}"
+            )
+
+    if list(assessment.compensating_controls) != list(tool_result.get("compensating_controls", [])):
+        raise EnvironmentMismatchError(
+            f"{assessment.asset_id}: compensating_controls does not match the tool's result verbatim"
+        )
+    if list(assessment.human_constraints) != list(tool_result.get("human_constraints", [])):
+        raise EnvironmentMismatchError(
+            f"{assessment.asset_id}: human_constraints does not match the tool's result verbatim"
+        )

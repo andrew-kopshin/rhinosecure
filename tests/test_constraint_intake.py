@@ -195,6 +195,98 @@ def test_list_findings_for_asset_returns_empty_list_for_an_asset_with_none():
     assert result["findings"] == []
 
 
+# --- verify_constraint_matches_tool -------------------------------------
+
+
+def _interpretation(**overrides) -> ConstraintInterpretation:
+    kwargs = dict(
+        constraint_kind="asset", asset_id="A12", effect_kind="patch_window",
+        effect_value="Sun 00:00-06:00", patch_limit=None, affected_finding_ids=["F15"],
+        rationale="matched A12 via business_function", sources=["search_assets"],
+    )
+    kwargs.update(overrides)
+    return ConstraintInterpretation(**kwargs)
+
+
+def test_verify_passes_when_asset_id_and_finding_ids_are_real_tool_matches():
+    from rhinosecure.agents.constraint_intake import verify_constraint_matches_tool
+
+    tools, call_log = _tools()
+    tools["search_assets"].run(query="payroll")
+    tools["list_findings_for_asset"].run(asset_id="A12")
+
+    verify_constraint_matches_tool(_interpretation(), call_log)  # must not raise
+
+
+def test_verify_raises_on_an_asset_id_search_assets_never_matched():
+    from rhinosecure.agents.constraint_intake import ConstraintMismatchError, verify_constraint_matches_tool
+
+    tools, call_log = _tools()
+    tools["search_assets"].run(query="payroll")  # only ever matches A12
+
+    bad = _interpretation(asset_id="A09", affected_finding_ids=[])
+    with pytest.raises(ConstraintMismatchError):
+        verify_constraint_matches_tool(bad, call_log)
+
+
+def test_verify_raises_on_a_finding_id_list_findings_for_asset_never_returned():
+    from rhinosecure.agents.constraint_intake import ConstraintMismatchError, verify_constraint_matches_tool
+
+    tools, call_log = _tools()
+    tools["search_assets"].run(query="payroll")
+    tools["list_findings_for_asset"].run(asset_id="A12")  # only ever returns F15
+
+    bad = _interpretation(affected_finding_ids=["F15", "F99-never-returned"])
+    with pytest.raises(ConstraintMismatchError):
+        verify_constraint_matches_tool(bad, call_log)
+
+
+def test_verify_is_inert_when_no_tool_was_ever_called():
+    """Same deliberate scope boundary as verify_research_matches_tool/
+    verify_environment_matches_tool: catches contradiction, not
+    tool-skipping. Keeps test_coordinator.py's fake-crew fixtures (which
+    never invoke the real constraint tools) passing unchanged."""
+    from rhinosecure.agents.constraint_intake import verify_constraint_matches_tool
+
+    verify_constraint_matches_tool(_interpretation(), [])  # must not raise
+
+
+def test_verify_does_not_check_effect_value_or_patch_limit():
+    """Deliberately unbuilt: both are meant to paraphrase/extract from
+    constraint_text, not copy a tool result verbatim -- a capacity
+    statement's own worked example spells its number as a word ('only
+    five patches'), so a mechanical equality check would reject valid
+    output. Any effect_value/patch_limit passes regardless of the real
+    tool results on file."""
+    from rhinosecure.agents.constraint_intake import verify_constraint_matches_tool
+
+    tools, call_log = _tools()
+    tools["search_assets"].run(query="payroll")
+    tools["list_findings_for_asset"].run(asset_id="A12")
+
+    weird = _interpretation(effect_value="something nobody said", patch_limit=999)
+    verify_constraint_matches_tool(weird, call_log)  # must not raise
+
+
+def test_verify_is_inert_for_capacity_and_refusal_shapes():
+    """constraint_kind='capacity'/None both leave asset_id=None and
+    affected_finding_ids=[] -- both checks naturally no-op rather than
+    needing special-casing for these shapes."""
+    from rhinosecure.agents.constraint_intake import verify_constraint_matches_tool
+
+    capacity = ConstraintInterpretation(
+        constraint_kind="capacity", asset_id=None, effect_kind=None, effect_value=None,
+        patch_limit=5, affected_finding_ids=[], rationale="fake", sources=[],
+    )
+    verify_constraint_matches_tool(capacity, [])  # must not raise
+
+    refusal = ConstraintInterpretation(
+        constraint_kind=None, asset_id=None, effect_kind=None, effect_value=None,
+        patch_limit=None, affected_finding_ids=[], rationale="fake", sources=[],
+    )
+    verify_constraint_matches_tool(refusal, [])  # must not raise
+
+
 # --- agent / task construction (no network, no LLM call) --------------------
 
 

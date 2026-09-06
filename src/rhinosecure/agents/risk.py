@@ -81,6 +81,7 @@ from crewai.tools import BaseTool, tool
 from pydantic import BaseModel
 
 from rhinosecure.agents.constraint_intake import apply_constraints
+from rhinosecure.agents.entity_consistency import find_wrong_cve_mentions
 from rhinosecure.agents.environment import EnvironmentAssessment
 from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.prompt_safety import UNTRUSTED_TEXT_NOTICE, fence
@@ -307,7 +308,14 @@ def verify_scoring_matches_tool(
     check, not a hope: an agent could in principle round a number, swap a
     bucket, or paraphrase the rationale in its final structured-output
     pass, and nothing about output_pydantic prevents that on its own.
-    """
+
+    Also checks `verdict_summary`/`narrative` for a DIFFERENT CVE ID than
+    this finding is about (`agents/entity_consistency.py`) -- narrower
+    than a full grounding check on either field (neither has a single
+    tool result to diff against byte-for-byte; see that module's own
+    docstring for why a full check isn't built), but a wrong specific
+    identifier is the one class of prose error this project can catch
+    mechanically without a second, unreliable model opinion."""
     calls = [
         c
         for c in call_log
@@ -339,3 +347,16 @@ def verify_scoring_matches_tool(
             f"{recommendation.finding_id}: constraints_applied does not match the "
             "tool's constraints_applied verbatim"
         )
+
+    # verdict_summary/narrative are the two fields this agent actually
+    # authors (see RiskRecommendation's own docstring) -- free prose with
+    # nothing to diff against byte-for-byte. But a mention of a DIFFERENT
+    # CVE ID in either is essentially always wrong, and checkable without
+    # the tool result at all (agents/entity_consistency.py).
+    for field_name, prose in (("verdict_summary", recommendation.verdict_summary), ("narrative", recommendation.narrative)):
+        wrong_cves = find_wrong_cve_mentions(prose, recommendation.cve_id)
+        if wrong_cves:
+            raise ScoringMismatchError(
+                f"{recommendation.finding_id}: {field_name} mentions {sorted(wrong_cves)}, a "
+                "different CVE than this finding is about"
+            )

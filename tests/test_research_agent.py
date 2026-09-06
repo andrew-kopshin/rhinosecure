@@ -428,6 +428,23 @@ def test_verify_raises_on_mismatched_kev_due_date(tmp_path: Path):
         verify_research_matches_tool(bad, call_log)
 
 
+def test_verify_raises_on_mismatched_kev_date_added(tmp_path: Path):
+    """kev_date_added never reaches scoring, but it still reaches export.py/
+    chat.py/the web UI as if sourced -- checked for that reason, not
+    because scoring.py depends on it (see the function's own docstring)."""
+    call_log = _real_tools_and_log(tmp_path)
+    bad = _matching_research().model_copy(update={"kev_date_added": "1999-01-01"})
+    with pytest.raises(ResearchMismatchError):
+        verify_research_matches_tool(bad, call_log)
+
+
+def test_verify_raises_on_mismatched_epss_percentile(tmp_path: Path):
+    call_log = _real_tools_and_log(tmp_path)
+    bad = _matching_research().model_copy(update={"epss_percentile": 0.01})
+    with pytest.raises(ResearchMismatchError):
+        verify_research_matches_tool(bad, call_log)
+
+
 def test_verify_raises_on_mismatched_epss_score(tmp_path: Path):
     call_log = _real_tools_and_log(tmp_path)
     bad = _matching_research().model_copy(update={"epss_score": 0.1})
@@ -447,6 +464,27 @@ def test_verify_raises_on_mismatched_nvd_severity(tmp_path: Path):
     bad = _matching_research().model_copy(update={"nvd_severity": "low"})
     with pytest.raises(ResearchMismatchError):
         verify_research_matches_tool(bad, call_log)
+
+
+def test_verify_raises_when_exploitation_summary_names_a_different_cve(tmp_path: Path):
+    """Free prose has no tool field to diff against byte-for-byte, but a
+    mention of a DIFFERENT CVE ID is essentially always wrong -- checked
+    without needing any tool call at all (agents/entity_consistency.py)."""
+    call_log = _real_tools_and_log(tmp_path)
+    bad = _matching_research().model_copy(
+        update={"exploitation_summary": "This is actually about CVE-2020-1472 (Zerologon)."}
+    )
+    with pytest.raises(ResearchMismatchError, match="CVE-2020-1472"):
+        verify_research_matches_tool(bad, call_log)
+
+
+def test_verify_passes_when_exploitation_summary_names_only_the_real_cve():
+    """No tool call needed at all -- the CVE-mention check runs against
+    an entirely empty call_log, unlike every other check in this file."""
+    matching = _matching_research().model_copy(
+        update={"exploitation_summary": "CVE-2021-26855 is KEV-listed and near-certain to be exploited."}
+    )
+    verify_research_matches_tool(matching, [])  # must not raise
 
 
 def test_verify_raises_on_mismatched_attack_techniques(tmp_path: Path):

@@ -2509,3 +2509,99 @@ of `test_research_agent.py`/`test_environment_agent.py`/`test_risk_agent.py`/
 the bulk-fetch-failure graceful degradation, and the stale-entry-clearing fix directly against
 `_dispatch_risk`) plus the 2 rewritten replan tests described above; `tests/test_web_jobs.py`'s
 counterpart rewritten the same way. Full suite: `.venv312` 1012 passed, 1 skipped (up from 1003).
+
+---
+
+**Safety and guardrails, Open item #1: the general grounding validator -- proposed two tracks
+before implementing, and the user opted into both rather than the narrower recommendation.**
+
+**What existed already, and the actual gap.** `verify_scoring_matches_tool` (Risk) and
+`verify_research_matches_tool` (Research, built earlier the same day alongside the
+prompt-injection work) already caught one agent contradicting its own verbatim-copyable tool
+result. Two gaps remained: Environment and Constraint Interpretation had no such check at all
+(`_dispatch_environment`'s `_resolve_output` call had no `extra_validate` whatsoever), and none
+of the four agents' free PROSE (`exploitation_summary`, `applicability_summary`,
+`verdict_summary`/`narrative`) was checked against anything -- a verbatim-copy diff has nothing
+to compare prose against, since prose is synthesized, not copied.
+
+**Proposed before implementing, with a real scope choice.** The recommended, narrower option was
+the two remaining verbatim-copy checks alone (Environment, Constraint Interpretation) --
+mechanical, low-risk, directly mirroring the existing pattern. The riskier option added a new,
+separate mechanism for the free-prose gap: an entity-consistency checker, catching a prose field
+that names a CVE ID other than the one the finding is actually about. Chose to build both.
+
+**Track A -- the two remaining verbatim-copy checks.** `agents/environment.py`'s
+`verify_environment_matches_tool` compares `EnvironmentAssessment`'s `hostname`/`os`/`os_build`/
+`role`/`environment`/`internet_exposed`/`patch_window`/`patch_restrictions`/`has_patch_window`/
+`compensating_controls`/`human_constraints` against the last `lookup_asset_context` call for that
+`asset_id`, raising `EnvironmentMismatchError` -- wired into `Coordinator._dispatch_environment`'s
+`extra_validate`. Deliberately excluded: `os_build_consistent`, which has no tool answer to check
+against at all (Section 11 names no live "which KB applies to which OS build" source), so it stays
+`os_build_consistent_provenance="model_judgment"`, labeled rather than checked, unchanged from
+before this work. `agents/constraint_intake.py`'s `verify_constraint_matches_tool` compares a
+`ConstraintInterpretation`'s `asset_id` against `search_assets`' actual matches and its
+`affected_finding_ids` against `list_findings_for_asset`'s actual result, raising
+`ConstraintMismatchError` -- wired into `interpret_constraint`'s own hand-rolled retry loop (this
+agent doesn't go through `_resolve_output`, so the wiring is different from the other three).
+Deliberately does NOT check `effect_value`/`patch_limit`: the capacity-constraint worked example
+("only five patches fit this window") spells the number as a word, and both fields are meant to
+paraphrase the human's own text, not copy a tool result verbatim -- an exact-match check here
+would reject correct output on the task's own canonical example. Also folded in:
+`verify_research_matches_tool` grew two fields it had previously excluded on an "doesn't feed
+scoring" basis (`kev_date_added`, `epss_percentile`) -- reversed, since both still reach
+`export.py`/`chat.py`/the web UI as if sourced, and this item is about a human trusting a
+citation shown on screen, not only about protecting the scoring path specifically.
+
+**Track B -- `agents/entity_consistency.py` (new), a narrow entity-consistency check for the
+free-prose gap Track A structurally cannot reach.** `find_wrong_cve_mentions(text, real_cve_id)`
+is a pure regex function (the same `CVE-\d{4}-\d{4,}` pattern `chat.py`/`configured.py` already
+use elsewhere in this codebase): every prose field in this project is written about exactly one
+finding with exactly one real `cve_id`, so a mention of a DIFFERENT CVE ID in that prose is
+essentially always a hallucination -- and, unlike a citation-to-evidence check, this is checkable
+with no tool call_log at all, since the finding's own `cve_id` is all the ground truth it needs.
+Explicitly scoped narrower than the item's own "cites the retrieved evidence" ask: it catches
+"wrong specific identifier," never "unsupported claim," "wrong number," or "invented detail."
+`hostname`/`finding_id` mention-checking were considered and deliberately deferred: neither has a
+single universal shape to regex for the way a CVE ID does (`finding_id` varies by ingest adapter
+-- "F01" natively, "MDVMC-..." for Defender, "VULN-..." for BluePeak; a hostname has no fixed
+pattern at all), and checking either correctly would need the whole fleet's real identifiers
+threaded into every check, not just the one finding's own evidence this function actually
+receives -- a materially bigger piece of engineering than what got built here.
+
+Wired at every prose surface in the codebase: `research.py`'s `verify_research_matches_tool`
+checks `exploitation_summary` (runs unconditionally -- no call_log required, confirmed by a test
+against an empty `[]` call_log); `risk.py`'s `verify_scoring_matches_tool` checks both
+`verdict_summary` and `narrative`; `environment.py`'s `verify_environment_matches_tool` checks
+`applicability_summary`. **A real placement bug caught before any test ran, not after:** the
+Environment check was first written AFTER the function's own `if not calls: return` early exit,
+which would have silently skipped it whenever no `lookup_asset_context` call existed in the
+log -- directly defeating the documented design intent that this check "needs no tool call at
+all." Caught in code review before writing tests; fixed by moving it to the top of the function,
+before the tool-call lookup and its early return.
+
+`tot.py`'s Strategist/Critic got the same coverage via a new wrapper, `_parse_check_strategy_and_
+cve(task, model, expected_strategy, real_cve_id, prose_field)`, layered on top of the existing
+`_parse_and_check_strategy` (which already grounds the echoed `strategy` enum against what was
+asked for). All three ToT dispatch sites (`_propose_initial`, `_critique`, `_refine`) now call the
+wrapper instead of the bare strategy check -- checking `proposal` for the Strategist,
+`justification` for the Critic. This closes a gap the "Grounding validation" item had explicitly
+flagged as unbuilt: ToT's own prose was previously the one LLM surface in the entire codebase with
+no grounding check of any kind, not even entity-level.
+
+**Verification.** New `tests/test_entity_consistency.py` (6 tests: no mention, real-only mention,
+case-insensitivity both directions, one wrong mention, multiple wrong mentions, real+wrong
+together). New tests in `test_research_agent.py`, `test_environment_agent.py` (both include an
+empty-call_log variant proving the check runs unconditionally), `test_risk_agent.py` (both prose
+fields), and `test_tot.py` (`_parse_check_strategy_and_cve`: passes on the real CVE, raises on a
+wrong one for both `ProposalOutput` and `CritiqueOutput`, and a composition test confirming the
+strategy-echo check still fires first when both checks would otherwise fail -- proving the two
+don't silently mask each other). Full suite: `.venv312` 1045 passed, 1 skipped (up from 1012).
+A real `--agents --quiet --verbose` run against the demo fixture (`--data demo --seed 42`)
+reproduced the exact bucket distribution CLAUDE.md already has on record
+(`patch_now=1, next_window=8, contested=3, mitigate_monitor=3, accept=9`,
+`Contested: 3/24 (12.5%)`) and the same three contested findings (F07/F11/F14), each dispatched
+through ToT -- exercising all three of `_parse_check_strategy_and_cve`'s call sites for real.
+`--verbose` prints the raw model output behind any finding or ToT search that failed after
+exhausting retries; it printed nothing, meaning none of the six new checks (four Track A fields
+plus Track B's entity check on Research/Environment/Risk/ToT) raised a false-positive mismatch
+against real model output, across all 24 findings.

@@ -15,6 +15,7 @@ from rhinosecure.tot import (
     AGGREGATE_WEIGHTS,
     CLEAR_WINNER_MARGIN,
     CriticScores,
+    CritiqueOutput,
     ProposalOutput,
     Strategy,
     Thought,
@@ -24,6 +25,7 @@ from rhinosecure.tot import (
     _build_propose_task,
     _build_refine_task,
     _parse_and_check_strategy,
+    _parse_check_strategy_and_cve,
     _prune,
     _score_gap,
     build_critic_agent,
@@ -243,6 +245,53 @@ def test_parse_and_check_strategy_raises_when_echoed_strategy_is_wrong():
     with pytest.raises(AgentOutputParseError) as exc_info:
         _parse_and_check_strategy(task, ProposalOutput, Strategy.EMERGENCY_CHANGE)
     assert exc_info.value.raw == raw  # available for --verbose even on a grounding mismatch
+
+
+# --- _parse_check_strategy_and_cve (entity-consistency, on top of the above) -
+
+
+def test_parse_check_strategy_and_cve_passes_when_only_the_real_cve_is_named():
+    task = SimpleNamespace(
+        output=SimpleNamespace(
+            raw=json.dumps({"strategy": "build_control", "proposal": "CVE-2021-26855 needs a control."})
+        )
+    )
+    result = _parse_check_strategy_and_cve(
+        task, ProposalOutput, Strategy.BUILD_CONTROL, "CVE-2021-26855", "proposal"
+    )
+    assert "CVE-2021-26855" in result.proposal
+
+
+def test_parse_check_strategy_and_cve_raises_on_a_different_cve_in_proposal():
+    raw = json.dumps({"strategy": "build_control", "proposal": "Actually CVE-2020-1472 is the real issue."})
+    task = SimpleNamespace(output=SimpleNamespace(raw=raw))
+    with pytest.raises(AgentOutputParseError, match="CVE-2020-1472"):
+        _parse_check_strategy_and_cve(task, ProposalOutput, Strategy.BUILD_CONTROL, "CVE-2021-26855", "proposal")
+
+
+def test_parse_check_strategy_and_cve_checks_justification_for_critique_output():
+    raw = json.dumps({
+        "strategy": "build_control", "risk_reduction": 5, "operational_cost": 5,
+        "constraint_compliance": 5, "evidence_strength": 5, "contradicting_evidence": 5,
+        "justification": "This scores well, but really CVE-2019-1068 is what matters.",
+    })
+    task = SimpleNamespace(output=SimpleNamespace(raw=raw))
+    with pytest.raises(AgentOutputParseError, match="CVE-2019-1068"):
+        _parse_check_strategy_and_cve(
+            task, CritiqueOutput, Strategy.BUILD_CONTROL, "CVE-2021-26855", "justification"
+        )
+
+
+def test_parse_check_strategy_and_cve_still_checks_strategy_first():
+    """The strategy-echo check must still fire even when the CVE
+    mention would also be wrong -- confirms the two checks compose
+    rather than one silently masking the other."""
+    raw = json.dumps({"strategy": "build_control", "proposal": "Actually CVE-2020-1472 is the issue."})
+    task = SimpleNamespace(output=SimpleNamespace(raw=raw))
+    with pytest.raises(AgentOutputParseError, match="expected strategy"):
+        _parse_check_strategy_and_cve(
+            task, ProposalOutput, Strategy.EMERGENCY_CHANGE, "CVE-2021-26855", "proposal"
+        )
 
 
 # --- ToTDispatchError.usage / .raw ---------------------------------------------
