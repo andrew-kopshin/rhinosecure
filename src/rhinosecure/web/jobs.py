@@ -12,23 +12,33 @@ the exact same guarantee it already has today.
 status (`pending` -> `running` -> `succeeded`/`failed`), a `stage` string
 whose vocabulary is kind-specific, typed `input`/`result`/`error` dicts, and
 whether it refreshed the export file. Generality lives in exactly one place,
-`JOB_HANDLERS` -- a `kind -> handler` dispatch table. Two entries today:
+`JOB_HANDLERS` -- a `kind -> handler` dispatch table. Five entries today,
+all matching `agents/router.py`'s `OperationKind` names exactly (the Router's
+entire callable surface, per CLAUDE.md's own framing, IS this table plus two
+non-job actions -- `view_scenario`/`qa_question` -- neither of which is a
+`JOB_HANDLERS` entry, on purpose; see `web/route.py`):
 `"constraint_submit"` (the CLI's `rhino constraint add`, made async with
-progress) and `"ingest_propose"` (phase 1 of LLM-assisted adapter generation,
+progress), `"ingest_propose"` (phase 1 of LLM-assisted adapter generation,
 `schema_inference.propose_contract`, dispatched over an uploaded source --
 `web/uploads.py`'s conversational-front-end mechanics -- instead of a
-`--data` directory named on argv; see `_run_ingest_propose`'s own docstring).
-A later `"agent_run"` handler (a full `--agents` run) is a few lines reusing
-the same `PlanState.coordinator.run(...)`/export-write tail this module
-already has -- zero changes to the registry, the routes, or the locking
-below.
+`--data` directory named on argv; see `_run_ingest_propose`'s own docstring),
+`"run_deterministic"`/`"run_agents"` (the two ingest-and-score pipelines,
+dispatched over a Router-resolved `source_ref` -- see `resolve_source_ref`
+and each handler's own docstring), and `"remediation_mark"` (mirrors `rhino
+remediation mark`, the cheapest handler here: no ingest, no LLM, no export
+write).
 
-**One current plan per server process.** `PlanState` holds one long-lived
+**One CURRENT plan per server process -- "current" can change over the
+server's lifetime, not fixed at startup.** `PlanState` holds one long-lived
 `Coordinator` + `Memory` pair -- mirroring `web/server.py`'s own "one export
-file per server process" precedent -- seeded lazily on the FIRST job (not at
-server startup, so `rhino web --enable-jobs` starts instantly; the one-time
-full-fleet-run cost is instead surfaced through the ordinary job/progress
-mechanism as a `"seeding"` stage). This is what makes a *targeted* constraint
+file per server process" precedent -- seeded lazily on the FIRST job that
+needs one (not at server startup, so `rhino web --enable-jobs` starts
+instantly). The conversational front end's empty-workspace design
+(CLAUDE.md) means there may be NO source at startup at all (`JobConfig
+.data_dir=None`) -- the first `run_deterministic`/`run_agents` job to name a
+real `source_ref` is what establishes (or replaces) "the current plan," via
+`PlanState.run_agents_pipeline`/`resolve_source_ref`, not necessarily the
+server's own startup flags. This is what makes a *targeted* constraint
 submission able to refresh a *whole-fleet* export afterward: `Coordinator
 .submit_constraint` (agents/coordinator.py) uses `replan()`, not `run()`,
 whenever a full plan already exists on the instance -- exactly the shape
@@ -81,16 +91,29 @@ one "failed" bucket:
   outcome, never an exception). Only an unreadable/empty source, an
   ambiguous two-file layout, or the model's output never parsing raises
   -- `status="failed"`, `error["stage"] == "proposing"`.
+- `run_deterministic`/`run_agents` raise `IngestError` (caught generically,
+  `error["stage"]` reflects whatever `on_stage` last set) when `source_ref`
+  cannot be resolved at all -- an unknown upload, an upload with a
+  proposed-but-unconfirmed contract (naming the exact `rhino adapt confirm`
+  command that would finish it), or a bare `--data` name that doesn't
+  exist. There is no "partially resolved" state to report as a success.
+- `remediation_mark` raises `IngestError` for the same two CLI-mirrored
+  reasons `rhino remediation mark` exits 1 for: an unrecognized `status`,
+  or a missing `note` on the one transition (`remediated` -> `open`) where
+  it's required. A `finding_id` no scored run has ever seen is NOT a
+  failure -- recorded anyway, with `result["seen_before_in_a_scored_run"]
+  is False` naming the gap, mirroring the CLI's own warn-not-refuse choice.
 """
 
 from __future__ import annotations
 
 import json
 import random
+import re
 import sys
 import threading
 import uuid
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -125,6 +148,7 @@ from rhinosecure.enrich.cache import OfflineCacheMissError, SnapshotCache
 from rhinosecure.ingest import IngestError, load_batch
 from rhinosecure.llm import LLMConfigError
 from rhinosecure.memory import Memory
+from rhinosecure.remediation import REMEDIATION_STATUSES, note_required_for_transition
 from rhinosecure.web import uploads as uploads_module
 
 if TYPE_CHECKING:
@@ -139,15 +163,24 @@ def _now() -> str:
 
 @dataclass
 class JobConfig:
-    """What a `constraint_submit` (and later `agent_run`) job needs to
-    load and reason about a fleet -- the same inputs `cli.py`'s
-    `run_agents`/`submit_constraint` helpers take, resolved once by
-    `rhino web --enable-jobs` at startup rather than per job. `db_path`
-    is always a resolved `Path` here (never `None`) -- the caller
-    (`cli.py`) resolves `memory.DEFAULT_DB_PATH` itself, the same
-    defaulting `run_agents`/`submit_constraint` already do inline."""
+    """What a `constraint_submit` job needs to load and reason about a
+    fleet by default -- the same inputs `cli.py`'s `run_agents`/
+    `submit_constraint` helpers take, resolved once by `rhino web
+    --enable-jobs` at startup rather than per job. `db_path` is always a
+    resolved `Path` here (never `None`) -- the caller (`cli.py`) resolves
+    `memory.DEFAULT_DB_PATH` itself, the same defaulting `run_agents`/
+    `submit_constraint` already do inline.
 
-    data_dir: Path
+    `data_dir=None` is the conversational-front-end's "empty workspace"
+    starting point (CLAUDE.md) -- `rhino web --enable-jobs` with no
+    `--data` given. Nothing seeds a plan at startup in that case;
+    `PlanState.seed()` raises a clear, actionable error if `constraint_
+    submit` is dispatched before ANY `run_deterministic`/`run_agents` job
+    has resolved a real source. Passing an actual `--data` name (the
+    pre-front-end default, `"demo"`) keeps the original "a plan already
+    exists the moment jobs are enabled" behavior working unchanged."""
+
+    data_dir: Path | None = None
     fmt: str = DEFAULT_FORMAT
     adapter_config: str | None = None
     seed: int = 42
@@ -272,13 +305,125 @@ class JobRegistry:
                 self._running_job_id = None
 
 
+class PlanNotSeededError(RuntimeError):
+    """Raised by `PlanState.seed()` when no plan exists yet AND the
+    server was started with no default `--data` source (the empty-
+    workspace case, `JobConfig.data_dir is None`) -- there is nothing
+    honest to seed from. `constraint_submit` has no fallback for this;
+    a `run_deterministic`/`run_agents` job naming a real `source_ref`
+    has to run first."""
+
+
+@dataclass(frozen=True)
+class ResolvedSource:
+    """What `resolve_source_ref` turns a Router-supplied (or CLI-supplied)
+    `source_ref` into: a real directory plus the `fmt`/`adapter_config`
+    STRING pair every existing ingest entry point (`Coordinator`, `cli.
+    run_with_report`/`run_agents`) already takes -- deliberately not a
+    pre-resolved adapter INSTANCE, so this stays a drop-in for those
+    existing call sites rather than a third, parallel convention for
+    passing an adapter around. Re-resolving the adapter from these two
+    strings inside each caller (as `run_with_report`/`Coordinator`
+    already do internally) costs a cheap re-parse of a small CSV/JSON
+    file, not a second live decision -- `resolve_source_ref` already made
+    the one real decision (which format/contract this source is)."""
+
+    data_dir: Path
+    fmt: str
+    adapter_config: str | None
+
+
+#: uuid.uuid4().hex is always exactly 32 lowercase hex characters -- the
+#: same shape web/uploads.py's own upload_id always has (see that
+#: module's docstring). Used here only to DECIDE whether a source_ref
+#: names an upload directory versus a bare --data name; never used to
+#: validate or trust anything about the upload's CONTENTS.
+_UPLOAD_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+
+
+def resolve_source_ref(source_ref: str) -> ResolvedSource:
+    """Resolves a Router `source_ref` (or, identically, a human-typed one)
+    to a real directory and ingest format. Two shapes, tried in order:
+
+    1. **An upload_id** (`web/uploads.py`'s `data/uploads/<id>/` shape).
+       If the uploaded filenames exactly match a built-in format
+       (`known_format_match` -- the confirmation gate's own fast path),
+       that format is used directly, no LLM, no contract. Otherwise, an
+       already-CONFIRMED contract at this upload's default propose name
+       (`_default_propose_name`) is used if one exists -- the ordinary
+       propose-then-confirm sequence's own natural output location. A
+       PROPOSED-but-not-yet-confirmed contract is refused with a message
+       naming the exact `rhino adapt confirm` command that would finish
+       it: confirmation stays a dedicated, non-conversational, signed
+       act (CLAUDE.md's own reasoning for excluding `INGEST_CONFIRM`
+       from the Router entirely) -- nothing here, or upstream of here,
+       may skip that gate by resolving around it.
+    2. **A bare `--data <name>` directory name**, native format --
+       mirrors `cli._resolve_data_dir`'s own convention (checked under
+       `data/<name>` first, then as a literal path), duplicated rather
+       than imported since `cli.py` is not a dependency of this module
+       (see `_log_exclusions`'s docstring for that existing boundary).
+
+    Raises `IngestError` (already caught by every `_execute_job` path
+    that can raise it) naming exactly which of these was tried and why
+    it failed -- never guesses a format for an unrecognized upload."""
+    if _UPLOAD_ID_PATTERN.match(source_ref):
+        data_dir = uploads_module.DEFAULT_UPLOADS_DIR / source_ref
+        if not data_dir.is_dir():
+            raise IngestError(f"no such upload: {source_ref!r} (looked for {data_dir})")
+        filenames = sorted(p.name for p in data_dir.iterdir() if p.is_file())
+        matched_format = known_format_match(filenames)
+        if matched_format is not None:
+            return ResolvedSource(data_dir=data_dir, fmt=matched_format, adapter_config=None)
+
+        candidate = resolve_config_path(_default_propose_name(source_ref))
+        if candidate.is_file():
+            try:
+                contract = read_contract(candidate)
+            except Exception as exc:
+                raise IngestError(
+                    f"upload {source_ref!r} has a contract at {candidate}, but it could not be read: {exc}"
+                ) from exc
+            if contract.review.state == "confirmed":
+                return ResolvedSource(data_dir=data_dir, fmt=contract.format, adapter_config=str(candidate))
+            raise IngestError(
+                f"upload {source_ref!r} has a PROPOSED but unconfirmed contract at {candidate} -- run "
+                f'`rhino adapt confirm {contract.format} --data uploads/{source_ref} --by "<you>"` first, '
+                "then retry. Confirmation is a signed act that stays outside this system's automated routing."
+            )
+        raise IngestError(
+            f"upload {source_ref!r} doesn't match a known built-in format ({sorted(FORMATS)}) and has no "
+            "confirmed contract yet -- submit an ingest_propose job for it first, then confirm the result."
+        )
+
+    named = REPO_ROOT / "data" / source_ref
+    if named.is_dir():
+        return ResolvedSource(data_dir=named, fmt=DEFAULT_FORMAT, adapter_config=None)
+    literal = Path(source_ref)
+    if literal.is_dir():
+        return ResolvedSource(data_dir=literal, fmt=DEFAULT_FORMAT, adapter_config=None)
+    raise IngestError(f"no such data set: {source_ref!r} (looked for {named} and {literal})")
+
+
 class PlanState:
-    """One server process's one live plan: a long-lived `Coordinator` +
-    `Memory` pair, seeded lazily on the first job rather than at server
-    startup. `export_path` is always the SAME path `web/server.py`'s read
-    routes serve (`app.state.export_path`) -- passed in explicitly by
-    `mount_job_routes` rather than duplicated on `JobConfig`, so a job can
-    never be misconfigured to write somewhere the read routes don't look."""
+    """One server process's one CURRENT plan: a long-lived `Coordinator` +
+    `Memory` pair, seeded lazily rather than at server startup. `export_
+    path` is always the SAME path `web/server.py`'s read routes serve
+    (`app.state.export_path`) -- passed in explicitly by `mount_job_
+    routes` rather than duplicated on `JobConfig`, so a job can never be
+    misconfigured to write somewhere the read routes don't look.
+
+    "Current" is no longer fixed for the process's whole lifetime --
+    the conversational front end's `run_deterministic`/`run_agents` job
+    kinds can point this at a DIFFERENT source than whatever `JobConfig
+    .data_dir` was at startup, replacing `self.coordinator`/`self.
+    memory`/`self.findings`/`self.active_source` wholesale each time
+    (never accumulating two plans at once -- "one current plan," not
+    "one plan per source ever run"). `constraint_submit` (via `seed`)
+    always operates against whichever plan is CURRENT, which is why a
+    Router-driven `run_agents` job has to actually replace this state,
+    not just write an export file and leave `PlanState` pointing at the
+    old source underneath it."""
 
     def __init__(self, config: JobConfig, export_path: Path):
         self.config = config
@@ -286,31 +431,49 @@ class PlanState:
         self.coordinator: Coordinator | None = None
         self.memory: Memory | None = None
         self.findings: list[EnrichedFinding] | None = None
+        self.active_source: ResolvedSource | None = None
 
     def seed(self, on_stage: Callable[[str], None] | None = None) -> None:
-        """Loads the fleet and runs the full agent pipeline once. A no-op
-        if already seeded. Left at `coordinator=None` if this raises, so
-        the next job attempt retries seeding cleanly rather than working
-        from a half-built plan -- `run()` itself never partially persists
-        anything (only `submit_constraint`/`_submit_capacity_constraint`
-        touch `memory.py`), so there is nothing to roll back here."""
+        """Ensures SOME plan is current, for `constraint_submit`'s sake --
+        a no-op if one already is (regardless of whether it came from
+        server startup or a later `run_agents` job). Falls back to the
+        server's startup `JobConfig.data_dir`/`fmt`/`adapter_config` only
+        when nothing has run yet; raises `PlanNotSeededError` if that
+        fallback is also `None` (the empty-workspace case) -- there is
+        nothing honest to seed from, and constraint_submit has no
+        `source_ref` of its own to resolve one from."""
         if self.coordinator is not None:
             return
+        if self.config.data_dir is None:
+            raise PlanNotSeededError(
+                "no plan exists yet, and this server was started with no default --data source -- "
+                "submit a run_deterministic or run_agents job naming a real source first"
+            )
+        self.run_agents_pipeline(
+            ResolvedSource(data_dir=self.config.data_dir, fmt=self.config.fmt, adapter_config=self.config.adapter_config),
+            on_stage,
+        )
+
+    def run_agents_pipeline(self, resolved: ResolvedSource, on_stage: Callable[[str], None] | None = None) -> Coordinator:
+        """The full agent pipeline against `resolved`, REPLACING whatever
+        plan was current before -- the generalized form of what `seed()`
+        used to do only against the server's fixed startup source. Left
+        with the OLD `self.coordinator` still in place if this raises
+        (assignment happens last, same as the original `seed()`), so a
+        failed `run_agents` job never leaves `constraint_submit` pointed
+        at a half-built plan -- it just keeps working against whatever
+        plan was current before the failed attempt."""
         if on_stage is not None:
             on_stage("seeding")
         random.seed(self.config.seed)
-        adapter = (
-            load_config_adapter(self.config.adapter_config)
-            if self.config.adapter_config
-            else get_adapter(self.config.fmt)
-        )
-        assets, enriched = load_batch(self.config.data_dir, adapter)
+        adapter = load_config_adapter(resolved.adapter_config) if resolved.adapter_config else get_adapter(resolved.fmt)
+        assets, enriched = load_batch(resolved.data_dir, adapter)
         findings = list(enriched)
         _log_exclusions(adapter, adapter.format)
 
         memory = Memory(self.config.db_path)
         coordinator = Coordinator(
-            self.config.data_dir,
+            resolved.data_dir,
             cache=SnapshotCache(offline=self.config.offline),
             memory=memory,
             assets=assets,
@@ -321,7 +484,9 @@ class PlanState:
 
         self.memory = memory
         self.findings = findings
-        self.coordinator = coordinator  # set last: see the "left at None" note above
+        self.active_source = resolved
+        self.coordinator = coordinator  # set last: see this method's own docstring
+        return coordinator
 
 
 def _log_exclusions(adapter: Any, fmt: str) -> None:
@@ -540,10 +705,161 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
     return JobOutcome(result=result_dict)
 
 
+def _require_source_ref(job: Job, kind: str) -> str:
+    source_ref = str(job.input.get("source_ref") or "").strip()
+    if not source_ref:
+        raise IngestError(f"{kind} requires a non-empty input.source_ref")
+    return source_ref
+
+
+def _run_run_deterministic(job: Job, plan_state: PlanState, on_stage: Callable[[str], None]) -> JobOutcome:
+    """The Router's `run_deterministic` operation -- the no-LLM-in-the-
+    loop pipeline, dispatched over a resolved `source_ref` instead of a
+    `--data`/`--format` pair a human typed. Deliberately does NOT touch
+    `plan_state.coordinator`/`.memory`/`.active_source` at all: those
+    represent the CURRENT plan `constraint_submit` re-plans against, and
+    a deterministic run is a cheap, throwaway view of one source, not a
+    plan `Coordinator`-backed re-planning could ever apply to (Section 8
+    rule 2 -- scoring stays LLM-free -- has no re-plan concept at all).
+
+    Calls `cli.run_with_report` directly rather than reimplementing its
+    scoring loop -- a DIFFERENT call than `_log_exclusions`'s "cli.py is
+    not a dependency of this module" note describes: that note is about
+    this module not depending on cli.py's PRESENTATION layer (argument
+    parsing, printing), and `export.py` itself already imports `cli.
+    RunResult` directly as the deterministic export's own required
+    shape (see export.py's module docstring) -- reimplementing `run_
+    with_report`'s ~30-line loop here to avoid a second, thin dependency
+    on the exact type export.py already requires would only create a
+    second copy of that loop to keep in sync, not a cleaner boundary."""
+    source_ref = _require_source_ref(job, "run_deterministic")
+    on_stage("resolving source")
+    resolved = resolve_source_ref(source_ref)
+
+    on_stage("scoring")
+    from rhinosecure.cli import run_with_report
+
+    result = run_with_report(
+        resolved.data_dir,
+        plan_state.config.seed,
+        offline=plan_state.config.offline,
+        fmt=resolved.fmt,
+        adapter_config=resolved.adapter_config,
+    )
+
+    on_stage("exporting")
+    export_memory = plan_state.memory if plan_state.memory is not None else Memory(plan_state.config.db_path)
+    export.write_run_export(
+        plan_state.export_path,
+        fmt=result.report.format,
+        data_dir=resolved.data_dir,
+        seed=plan_state.config.seed,
+        offline=plan_state.config.offline,
+        agents=False,
+        result=result,
+        memory=export_memory,
+    )
+
+    bucket_counts = Counter(sf.bucket.value for sf in result.scored)
+    return JobOutcome(
+        result={
+            "source_ref": source_ref,
+            "format": result.report.format,
+            "total_findings": len(result.scored),
+            "bucket_distribution": dict(bucket_counts),
+        },
+        export_written=True,
+    )
+
+
+def _run_run_agents(job: Job, plan_state: PlanState, on_stage: Callable[[str], None]) -> JobOutcome:
+    """The Router's `run_agents` operation -- the full agent pipeline
+    against a resolved `source_ref`, REPLACING whatever plan was current
+    on this `PlanState` before (see `PlanState.run_agents_pipeline`'s own
+    docstring on why replacing, not accumulating, is correct here)."""
+    source_ref = _require_source_ref(job, "run_agents")
+    on_stage("resolving source")
+    resolved = resolve_source_ref(source_ref)
+
+    coordinator = plan_state.run_agents_pipeline(resolved, on_stage)
+
+    on_stage("exporting")
+    export.write_run_export(
+        plan_state.export_path,
+        fmt=coordinator.contract.format if coordinator.contract else coordinator.ingest_format,
+        data_dir=resolved.data_dir,
+        seed=plan_state.config.seed,
+        offline=plan_state.config.offline,
+        agents=True,
+        coordinator=coordinator,
+        memory=plan_state.memory,
+    )
+
+    recommendations = coordinator.ranked()
+    bucket_counts = Counter(r.bucket for r in recommendations)
+    return JobOutcome(
+        result={
+            "source_ref": source_ref,
+            "format": coordinator.contract.format if coordinator.contract else coordinator.ingest_format,
+            "total_findings": len(recommendations),
+            "bucket_distribution": dict(bucket_counts),
+        },
+        export_written=True,
+    )
+
+
+def _run_remediation_mark(job: Job, plan_state: PlanState, on_stage: Callable[[str], None]) -> JobOutcome:
+    """The Router's `remediation_mark` operation -- mirrors `rhino
+    remediation mark` exactly (same status vocabulary, same note-
+    required-for-a-`remediated`-back-to-`open` transition, same "warn,
+    don't refuse" treatment of a finding_id no scored run has ever seen).
+    Deliberately the cheapest handler here: no ingest, no LLM, no export
+    write -- `rhino remediation mark` never touches `--export` either,
+    since remediation status is tracking, not scoring (CLAUDE.md Section
+    7: "never feeds back into scoring.py")."""
+    finding_id = str(job.input.get("finding_id") or "").strip()
+    status = str(job.input.get("status") or "").strip()
+    note = job.input.get("note")
+    note = str(note).strip() or None if note else None
+
+    if not finding_id:
+        raise IngestError("remediation_mark requires a non-empty input.finding_id")
+    if status not in REMEDIATION_STATUSES:
+        raise IngestError(f"remediation_mark: status must be one of {REMEDIATION_STATUSES}, got {status!r}")
+
+    on_stage("marking")
+    memory = plan_state.memory if plan_state.memory is not None else Memory(plan_state.config.db_path)
+    previous = memory.latest_remediation_event_for_finding(finding_id)
+    previous_status = previous.status if previous is not None else None
+
+    if note_required_for_transition(previous_status, status) and not note:
+        raise IngestError(
+            f"remediation_mark: a note is required when marking {finding_id!r} back to 'open' from "
+            "'remediated' -- that's the transition where the reason matters most."
+        )
+
+    seen_before = bool(memory.decisions_for_finding(finding_id))
+    memory.record_remediation_event(finding_id, status, note=note, source="human")
+    transition = f"{previous_status} -> {status}" if previous_status else f"(untracked) -> {status}"
+    return JobOutcome(
+        result={
+            "finding_id": finding_id,
+            "status": status,
+            "previous_status": previous_status,
+            "transition": transition,
+            "note": note,
+            "seen_before_in_a_scored_run": seen_before,
+        }
+    )
+
+
 JOB_HANDLERS: dict[str, Callable[[Job, PlanState, Callable[[str], None]], JobOutcome]] = {
     "constraint_submit": _run_constraint_submit,
     "ingest_propose": _run_ingest_propose,
-    # "agent_run": _run_agent_run,  # added later -- zero changes needed
+    "run_deterministic": _run_run_deterministic,
+    "run_agents": _run_run_agents,
+    "remediation_mark": _run_remediation_mark,
+    # below this line: same registry, same routes, same locking.
     # below this line: same registry, same routes, same locking.
 }
 
@@ -623,6 +939,46 @@ class SubmitJobRequest(BaseModel):
     input: dict[str, Any] = {}
 
 
+#: kind -> required, non-empty string field(s) in `input` -- checked here so
+#: a malformed submission gets a fast 400 before ever claiming the single
+#: running-job slot, not just inside the handler after a job record already
+#: exists. `remediation_mark` additionally needs its own status-vocabulary
+#: check below, since "a required field is present" doesn't cover "and its
+#: value is legal."
+_REQUIRED_JOB_INPUT_FIELDS: dict[str, tuple[str, ...]] = {
+    "constraint_submit": ("text",),
+    "ingest_propose": ("upload_id",),
+    "run_deterministic": ("source_ref",),
+    "run_agents": ("source_ref",),
+    "remediation_mark": ("finding_id", "status"),
+}
+
+
+def _validate_job_input(kind: str, input: dict[str, Any]) -> None:
+    for field_name in _REQUIRED_JOB_INPUT_FIELDS.get(kind, ()):
+        if not str(input.get(field_name) or "").strip():
+            raise HTTPException(400, f"{kind} requires non-empty input.{field_name}")
+    if kind == "remediation_mark" and input["status"] not in REMEDIATION_STATUSES:
+        raise HTTPException(
+            400, f"remediation_mark: status must be one of {REMEDIATION_STATUSES}, got {input['status']!r}"
+        )
+
+
+def dispatch_job(kind: str, input: dict[str, Any], registry: JobRegistry, plan_state: PlanState) -> Job | None:
+    """Claims the single running-job slot and starts `kind` on its own
+    background thread, or returns `None` if another job is already
+    running. The one place a `Job` actually gets created and executed --
+    `POST /api/jobs` (below) and `web/route.py`'s per-step approval both
+    call this instead of each re-implementing "create, start a thread,"
+    so there is exactly one dispatch path to keep correct regardless of
+    how many places in this codebase can trigger a job."""
+    job = registry.create_and_start(kind, input)
+    if job is None:
+        return None
+    threading.Thread(target=_execute_job, args=(job, registry, plan_state), daemon=True).start()
+    return job
+
+
 def mount_job_routes(app: FastAPI, job_config: JobConfig) -> None:
     """Called by `create_app()` only when `jobs_enabled=True`. Builds this
     process's one `JobRegistry`/`PlanState` pair and registers the three
@@ -638,16 +994,11 @@ def mount_job_routes(app: FastAPI, job_config: JobConfig) -> None:
     def submit_job(body: SubmitJobRequest) -> dict[str, Any]:
         if body.kind not in JOB_HANDLERS:
             raise HTTPException(400, f"unknown job kind: {body.kind!r}")
-        if body.kind == "constraint_submit" and not str(body.input.get("text") or "").strip():
-            raise HTTPException(400, "constraint_submit requires non-empty input.text")
-        if body.kind == "ingest_propose" and not str(body.input.get("upload_id") or "").strip():
-            raise HTTPException(400, "ingest_propose requires non-empty input.upload_id")
+        _validate_job_input(body.kind, body.input)
 
-        job = registry.create_and_start(body.kind, body.input)
+        job = dispatch_job(body.kind, body.input, registry, plan_state)
         if job is None:
             raise HTTPException(409, "another job is already running -- try again once it finishes")
-
-        threading.Thread(target=_execute_job, args=(job, registry, plan_state), daemon=True).start()
         return job.to_dict()
 
     @app.get("/api/jobs/{job_id}")

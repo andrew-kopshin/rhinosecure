@@ -16,30 +16,39 @@ read, never a write, and never anything that recomputes what the file says.
 exceptions -- and both are structural, not a permission check.**
 `create_app(jobs_enabled=True, job_config=...)` is the only way
 `rhinosecure.web.jobs` (the write-capable job substrate -- constraint
-submission today, a full `--agents` run later, both as background jobs
-with progress polling) AND `rhinosecure.web.uploads` (filesystem-only
-upload mechanics for the conversational front end -- never a job, never
-`PlanState`/`Coordinator`/`Memory`, see that module's own docstring) are
-ever imported, and `create_app(chat_enabled=True)` is the only way
-`rhinosecure.web.chat` (read-only, LLM-backed Q&A over the currently-
-served export -- never a write, never memory.py or agents.coordinator) is
-ever imported. All three imports happen *inside* `create_app`'s own body,
-conditionally -- never at this module's top level. `create_app()` (the
-default: both flags `False`) never imports any of them and never mounts
-`POST /api/jobs`, `POST /api/uploads`, or `POST /api/chat`; a request to
-any of those routes against a default app is a plain 404 (the route was
+submission, ingest proposal, deterministic/agent runs, and remediation
+marking, all as background jobs with progress polling), `rhinosecure.web
+.uploads` (filesystem-only upload mechanics for the conversational front
+end -- never a job, never `PlanState`/`Coordinator`/`Memory`, see that
+module's own docstring), and `rhinosecure.web.route` (the Router
+dispatcher -- wires `agents/router.py` into the two modules above; never
+a THIRD way to run a job, only a second way to ask for one, gated per
+step by a human's own approval click) are ever imported, and `create_app
+(chat_enabled=True)` is the only way `rhinosecure.web.chat` (read-only,
+LLM-backed Q&A over the currently-served export -- never a write, never
+memory.py or agents.coordinator) is ever imported. All four imports
+happen *inside* `create_app`'s own body, conditionally -- never at this
+module's top level. `create_app()` (the default: both flags `False`)
+never imports any of them and never mounts `POST /api/jobs`, `POST
+/api/uploads`, `POST /api/route`, or `POST /api/chat`; a request to any
+of those routes against a default app is a plain 404 (the route was
 never registered), not a route that exists and refuses. `rhino web`'s
 `--enable-jobs`/`--enable-chat` flags are the only things that can turn
 these on, independently of each other -- see `web/jobs.py`'s,
-`web/uploads.py`'s, and `web/chat.py`'s own module docstrings for what
-each does once enabled.
+`web/uploads.py`'s, `web/route.py`'s, and `web/chat.py`'s own module
+docstrings for what each does once enabled.
 
 **One export file per server process.** The file path is resolved once,
 at `create_app()` time, from (in order) an explicit `export_path`
 argument, the `RHINOSECURE_EXPORT_PATH` environment variable, or
-`DEFAULT_EXPORT_PATH` (`out/export_demo.json` under the repo root -- the
-sample the export feature's own implementer report already generated). It
-is not re-resolved per request and cannot be changed by any request --
+`DEFAULT_EXPORT_PATH` (`out/export_web.json` under the repo root --
+deliberately NOT `out/export_demo.json`: the conversational front end's
+empty-workspace design means a fresh `rhino web` must open empty even on
+a checkout where `rhino run --data demo --export out/export_demo.json`
+has already been run for testing -- the demo fixture stays a frozen test
+artifact, not what the app happens to show on launch just because that
+file exists on disk). It is not re-resolved per request and cannot be
+changed by any request --
 there is no route that accepts a path from a client, so nothing served
 here can be pointed at an arbitrary file by a browser. A missing or
 unreadable file is a 404/500 on `/api/export`, not a startup failure: the
@@ -75,7 +84,7 @@ _STATIC_DIR = _WEB_DIR / "static"
 _REPO_ROOT = _WEB_DIR.parents[2]  # .../web -> rhinosecure -> src -> repo root
 
 EXPORT_PATH_ENV = "RHINOSECURE_EXPORT_PATH"
-DEFAULT_EXPORT_PATH = _REPO_ROOT / "out" / "export_demo.json"
+DEFAULT_EXPORT_PATH = _REPO_ROOT / "out" / "export_web.json"
 
 
 def _resolve_export_path(export_path: Path | str | None) -> Path:
@@ -129,21 +138,27 @@ def create_app(
 
     `jobs_enabled=False`/`chat_enabled=False` (both default) mount no new
     routes and import `rhinosecure.web.jobs`/`rhinosecure.web.uploads`/
-    `rhinosecure.web.chat` not at all -- the two existing GET routes and
-    static serving are unchanged; `/api/health`'s response gains two
-    fields (`"jobs_enabled"`, `"chat_enabled"`, both `false`) so a
-    frontend can tell whether to show constraint-submission/upload or
-    chat UI at all, without a route it would need to probe with a POST.
-    `jobs_enabled=True` requires `job_config` (a `web.jobs.JobConfig`)
-    and additionally mounts `POST /api/jobs`, `GET /api/jobs/{id}`,
-    `GET /api/jobs`, and (from `web/uploads.py`) `POST /api/uploads`,
-    `GET /api/uploads/{id}`, `POST /api/uploads/{id}/label` -- uploads
-    ride on the same flag rather than a third one, since an upload with
-    no job substrate to eventually ingest it has no purpose on its own
-    (`web/uploads.py`'s own module docstring). `chat_enabled=True` needs
-    no config object -- chat has nothing to seed, see `web/chat.py`'s
-    module docstring -- and additionally mounts `POST /api/chat`. The two
-    flags are independent; either, both, or neither may be set."""
+    `rhinosecure.web.route`/`rhinosecure.web.chat` not at all -- the two
+    existing GET routes and static serving are unchanged; `/api/health`'s
+    response gains two fields (`"jobs_enabled"`, `"chat_enabled"`, both
+    `false`) so a frontend can tell whether to show constraint-submission/
+    upload/route or chat UI at all, without a route it would need to
+    probe with a POST. `jobs_enabled=True` requires `job_config` (a
+    `web.jobs.JobConfig`) and additionally mounts `POST /api/jobs`,
+    `GET /api/jobs/{id}`, `GET /api/jobs`; (from `web/uploads.py`)
+    `POST /api/uploads`, `GET /api/uploads/{id}`,
+    `POST /api/uploads/{id}/label`; and (from `web/route.py`)
+    `POST /api/route`, `GET /api/route/{id}`, `GET /api/route`,
+    `POST /api/route/{id}/steps/{index}/approve`,
+    `POST /api/route/{id}/steps/{index}` -- uploads and routing both ride
+    on the same flag rather than their own, since neither has a purpose
+    without the job substrate they dispatch into (`web/uploads.py`'s and
+    `web/route.py`'s own module docstrings). `chat_enabled=True` needs no
+    config object -- chat has nothing to seed, see `web/chat.py`'s module
+    docstring -- and additionally mounts `POST /api/chat`, plus makes
+    `qa_question` a Router-selectable operation when jobs are ALSO
+    enabled (`web/route.py`'s `_registered_ops`). The two flags are
+    independent; either, both, or neither may be set."""
     resolved = _resolve_export_path(export_path)
 
     app = FastAPI(title="RhinoSecure Plan Viewer", docs_url=None, redoc_url=None)
@@ -168,10 +183,15 @@ def create_app(
         if job_config is None:
             raise ValueError("create_app(jobs_enabled=True) requires job_config=")
         from rhinosecure.web.jobs import mount_job_routes
+        from rhinosecure.web.route import mount_route_routes
         from rhinosecure.web.uploads import mount_upload_routes
 
         mount_job_routes(app, job_config)
         mount_upload_routes(app)
+        # mount_route_routes reads app.state.job_registry/plan_state/
+        # upload_registry back off what the two calls above just set --
+        # it must run after both, never before.
+        mount_route_routes(app, chat_enabled=chat_enabled)
 
     if chat_enabled:
         from rhinosecure.web.chat import mount_chat_routes

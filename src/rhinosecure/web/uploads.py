@@ -218,6 +218,15 @@ class UploadRegistry:
         with self._lock:
             return self._sets.get(upload_id)
 
+    def list_recent(self) -> list[dict[str, Any]]:
+        """Every currently-tracked upload set, newest last -- what
+        `web/route.py` reads to tell the Router which `upload_id`(s) are
+        real right now (grounding's `known_upload_ids`) and to build a
+        human-readable context note, so the model doesn't have to be told
+        an upload_id by the human typing a 32-character hex string."""
+        with self._lock:
+            return [s.to_dict() for s in self._sets.values()]
+
     def record_file(self, upload_id: str, filename: str, size: int) -> dict[str, Any]:
         """Adds (or overwrites) one file's entry. Overwriting resets any
         prior label to None -- a label is a human's claim about a
