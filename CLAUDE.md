@@ -1733,6 +1733,15 @@ rendering (`ingest_propose` → `run_deterministic`) for an upload that ISN'T a 
 built-in format, and the automatic transition to the normal tabbed view the instant a step
 reports `export_written`.
 
+The dispatcher (`web/route.py`) and `resolve_source_ref` (`web/jobs.py`) were hardened by an
+adversarial-review round that found and fixed 18 real defects across three modules — a
+concurrency race in the per-step approval gate, a dead-end state (a failed or job-evicted step
+had no path back to runnable), four distinct source-resolution gaps (`resolve_source_ref`
+missing the `uploads/` prefix, case sensitivity, a custom `ingest_propose` name, and a
+hex-named non-upload `--data` directory), a validation gap letting a step claim the single job
+slot before failing, and several HTTP/status-code and test-coverage gaps — PROGRESS.md is
+authoritative for what they were and how each was verified.
+
 Not yet built, named explicitly so it isn't assumed done by omission: Sections 5-6's remaining
 piece — fusing this into the EXISTING chat panel as one input box once a plan already exists
 (today the empty-workspace screen and the existing post-plan chat panel are two separate UIs,

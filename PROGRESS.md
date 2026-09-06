@@ -2977,3 +2977,185 @@ pair in `tests/test_web_route.py`) plus the live browser verification above, whi
 code no unit test reaches (the actual DOM event wiring, `fetch`/`FormData` from a real page
 context, and the `setTimeout` poll loop's real timing). Full suite: `.venv312` 1185 passed, 1
 skipped (up from 1182).
+
+---
+
+## 2026-09-06
+
+**An adversarial-review workflow (4 review dimensions, 3-way adversarial vote per candidate)
+run against the dispatcher work above, before pushing anything further -- the same "review
+before committing" discipline Slice 7's own hardening round used. 20 candidate findings, 18
+confirmed by majority vote (≥2/3 real), across `web/route.py` and `web/jobs.py`.** Two
+candidates were NOT confirmed and are correctly left alone: a narrow concurrent-read window on
+`PlanState.run_agents_pipeline`'s four attribute assignments racing `_context_note` (1/3 real
+votes -- the window is real but `_context_note` only ever produces a slightly-stale advisory
+string for the Router, never a scored or persisted fact, so the reviewers' skepticism reads as
+correct), and a request for route-layer HTTP tests of the other four job-backed op kinds
+beyond `remediation_mark` (0/3 real votes -- reasonable coverage to want, but not a defect).
+
+**State-machine (4 confirmed, `web/route.py`).** The core problem, common to three of the
+four: `execute_step` used to call `assert_step_approved` (a read-only check) and only
+transition the step to `"running"` as a SEPARATE, later step -- for a job-backed op, after
+`dispatch_job` returned; for a synchronous op (`view_scenario`/`qa_question`), never at all
+before running it inline. (1) Two concurrent approve requests for the same SYNCHRONOUS step
+could both pass the read-only check while the step was still `"pending"` and both execute --
+confirmed live: a double-click (or client retry) on a `qa_question` step would fire two real,
+billed LLM calls and race a last-writer-wins update onto one `RouteStep`, able to silently
+clobber a correct answer with an unrelated later failure. (2) A job-backed step whose `Job` (a
+process-wide `JobRegistry`, `MAX_JOB_HISTORY=50`) aged out of that bounded history before the
+route plan was ever polled left `_sync_step_from_job` returning early on `job is None`, and the
+step stuck reporting `"running"` FOREVER -- permanently blocking every later step in that plan,
+since `assert_step_approved` requires every earlier step to have `"succeeded"`. (3) Once any
+step failed, `edit_step` and `assert_step_approved` both only ever accepted `"pending"`, with
+no transition back from `"failed"` -- the only recovery was discarding the whole plan and
+re-approving even the parts that had already succeeded. (4) A TOCTOU: `edit_step`'s only
+precondition was `status == "pending"`, which stayed true for the entire window between a
+concurrent approve's read-only check passing and its `dispatch_job` call actually reading
+`step.params` -- a concurrent edit could report success (200, params rewritten) while the job
+that was actually dispatched still ran with the pre-edit params.
+
+**Fixed with one structural change, not four patches.** `claim_step` (new) does the
+approved-and-pending check AND the `status = "running"` write atomically, under a new
+`RoutePlan.lock` (a plain `threading.Lock`, excluded from `__eq__`/`repr`) -- the same
+check-and-set shape `JobRegistry.create_and_start` already uses for its own single-job-slot
+claim. `execute_step` now calls `claim_step` FIRST, for every op kind, synchronous or
+job-backed -- closing (1) directly (the loser's `claim_step` call sees `status == "running"`,
+not `"pending"`, and refuses) and (4) as a side effect (by the time dispatch reads
+`step.params`, the step is already `"running"`, so a concurrent `edit_step` is refused before
+it can touch anything). `_sync_step_from_job` now resolves a `job is None` read as a genuine
+terminal state -- `"failed"`, with a `JobHistoryEvictedError` naming what happened and why the
+real outcome is unrecoverable -- rather than silently doing nothing, closing (2). `edit_step`
+now also accepts a `"failed"` step, resetting it to a clean `"pending"` slate
+(`result`/`error`/`job_id`/`export_written` all cleared) alongside the existing `"pending"`
+case, closing (3) -- the one recovery path for a step that failed for a fixable reason, short
+of abandoning the whole plan.
+
+**Source-resolution (4 confirmed, `web/jobs.py`'s `resolve_source_ref`).** All four are the
+same root shape: `resolve_source_ref` recognized an upload only by one exact string form, and
+silently mis-resolved (or flatly refused) every other plausible form of the same reference. (1)
+**High.** A contract proposed and confirmed under any name OTHER than the auto-generated
+default (`ingest_propose`'s own `name` input -- a real, intentionally exposed field, exercised
+by this codebase's own `test_web_jobs_ingest_propose.py` happy path) could never be found again
+by `run_deterministic`/`run_agents` -- `resolve_source_ref` only ever checked
+`_default_propose_name`, so a genuinely confirmed contract was reported as not existing at all,
+with a message actively telling the operator to do something they'd already done. (2) **High.**
+The `"uploads/<id>"` form -- literally what `UploadSet.to_dict()["relative_data_dir"]` returns,
+and what `ingest_propose`'s own `next_step` hint text prints as the `--data` value -- failed the
+bare-32-hex-char pattern and fell through to the plain `--data <name>` branch, which then
+resolved it anyway (`data/uploads/<id>` really is a directory) with format hardcoded to
+`"native"` and zero validation: a Defender-shaped upload with coincidentally
+`assets.csv`/`findings.csv`-named files would be silently scored as native format with no error
+at all -- a wrong-but-plausible-scored plan, the exact failure class this project's
+not-collected/refuse-rather-than-guess discipline exists to prevent. (3) **Medium.** The
+upload-id branch never fell back to the plain directory branch on failure, so a real, honestly
+-named `--data` directory that happened to be 32 hex characters (a hash-named or generated
+dataset) could never resolve at all -- `resolve_source_ref` raised "no such upload" one line of
+code away from the branch that would have found it. (4) **Low.** The upload-id pattern was
+lowercase-only with no case-folding, so a re-cased id (client autocapitalization, a Router
+that emits it uppercased) missed the upload branch entirely and produced a generic "no such
+data set" error with no hint the real, lowercase upload directory sat right there.
+
+**Fixed as one shared resolution path, not four special cases.** `_upload_id_from_source_ref`
+recognizes the upload-id SHAPE (bare or `uploads/`-prefixed, case-folded to lowercase) without
+committing to whether it's a real upload; `resolve_source_ref` tries that shape first but FALLS
+THROUGH to the plain-directory branches on a shape match with no real directory, closing (3)
+directly and (2)/(4) as the same code path. `_resolve_upload_source` (new) is the one place
+that actually resolves a real upload directory: known-format fast path first, then a confirmed
+contract -- checked under `_read_upload_contract_marker`'s recorded name FIRST, falling back to
+`_default_propose_name` for backward compatibility, closing (1). The marker
+(`.rhino_contract_name`, a plain text file dropped next to the upload's own files) is written
+by `_run_ingest_propose` right after `write_contract` succeeds, naming exactly the `name` that
+call used -- best-effort (a write failure is swallowed, never load-bearing) since the
+default-name convention still works without it.
+
+**HTTP/errors and one param-shape gap (5 confirmed).** (1) **Medium, `route.py`.** A
+duplicate or retried approve on a step already dispatched (a double-click, a retry after a
+slow/dropped response -- reproduces every time, no real race needed) hit `assert_step_approved`
+'s `"already running, not pending"` refusal, and `approve_step`'s `except` clause
+UNCONDITIONALLY reset `approved` back to `False` -- leaving a job that really was authorized,
+and either running or already finished, permanently flagged as never approved. Confirmed live
+with a real `TestClient` sequence, not just read from the code. (2) **Medium, `jobs.py`/
+`route.py`.** `_dispatch_job_backed_step` never called `validate_job_input` (the same check
+`POST /api/jobs` already runs) before dispatching -- so a step whose params pass the Router's
+own fixed pydantic shape but fail a semantic check `validate_job_input` catches (a
+`RemediationMarkParams.status` that's a bare `str`, not constrained to `REMEDIATION_STATUSES`)
+claimed, and wasted, the single global job slot before failing deep inside the job itself,
+while any genuinely valid concurrent submission got a spurious 409 for a job that was never
+going to succeed. (3) **Low, `agents/router.py`.** `ViewScenarioParams.mode` was an
+unconstrained `str`; `_view_scenario` treated anything but the literal `"recommended"` as
+`"selection"` (every finding, unfiltered) while echoing the caller's own bad string back in
+`result["mode"]` -- a typo'd `mode` would silently return the whole unfiltered finding set
+labeled as if it were a curated view. (4) **Low, `route.py`.** `POST .../approve` always
+returned 200, even when the dispatched step was job-backed and still `"running"` -- work
+genuinely not yet finished, the same event `POST /api/jobs` itself already reports with 202.
+(5) **Low, `jobs.py`.** `_run_run_deterministic`/`_run_run_agents`/`_run_remediation_mark` all
+validated their own required input BEFORE their first `on_stage(...)` call, so an early
+validation failure's error carried `"stage": null` instead of naming a real stage -- exactly
+the path finding (2) above reaches in practice.
+
+**Fixed directly, matching each finding.** `edit_step`'s except-clause fix above also gates
+`approve_step`: it now only rolls `approved` back to `False` if the step is STILL `"pending"`
+by the time the exception is caught -- a concurrent winner that already claimed the step (now
+legitimately `"running"`/`"succeeded"`/`"failed"`) is left alone. `_dispatch_job_backed_step`
+now calls the newly-public `validate_job_input` (renamed from `_validate_job_input` so
+`route.py` can share the exact check `/api/jobs` already runs) before ever calling
+`dispatch_job`; a rejection is recorded as a normal terminal step failure (`stage: "validating
+input"`) rather than raised back to the HTTP layer, since by that point the step has already
+been approved and claimed -- the honest outcome is "this step failed," matching what would have
+happened had the job actually been allowed to start and fail internally. `ViewScenarioParams
+.mode` is now `Literal["recommended", "selection"]` -- pydantic rejects anything else at parse
+time. `approve_step` returns 202 (via an injected `Response` object) exactly when the returned
+step is still `"running"`; a synchronous op is already terminal by the time `execute_step`
+returns, so it still gets a plain 200. The three `on_stage(...)` calls were moved to run BEFORE
+their function's first validation check.
+
+**One related fix found and applied while implementing the above, not itself a review
+finding.** `_dispatch_job_backed_step`'s existing "another job is already running" case (`dispatch_
+job` returning `None`) raised a bare `HTTPException` that `approve_step`'s `except
+RouteApprovalError` clause never caught at all -- the review's own test-coverage findings (below)
+flagged this exact gap as untested, and fixing it properly meant converting that raise to a
+`RouteApprovalError` (now caught, now correctly reverts the step to `"pending"` -- transient,
+retryable, not a property of the step's own params -- rather than `"failed"`) so the interleaved
+-plans scenario the tests describe actually produces the documented, tested 409.
+
+**Test-coverage (5 confirmed, all closed with real tests, not just code review).**
+(1) **High.** `test_run_agents_replaces_a_previously_established_plan`
+(`tests/test_web_jobs_dispatcher.py`) never checked `plan_state.coordinator` identity after a
+second `run_agents` job replaced the plan -- only `.findings`/`.active_source`/`memory is not
+None`, none of which would catch a hypothetical refactor that reused or mutated the OLD
+`Coordinator` instead of building a fresh one, silently leaving stale asset context (A01/EXCH01)
+behind for a later `constraint_submit`. Fixed: the test now captures the first `Coordinator`
+object, asserts the second run produces a DIFFERENT one, and directly inspects
+`Coordinator._asset_index` to confirm `"B01"` is present and `"A01"` is gone. (2) **Medium.** The
+two-plans-interleaved 409 scenario (the bare-`HTTPException` gap above) had no test; added
+`test_dispatching_while_another_job_holds_the_slot_reverts_to_pending_and_raises`, exercised
+directly against `execute_step`/a pre-occupied `JobRegistry` rather than racing two real HTTP
+jobs against a fixture-sized run that might finish before the second request lands -- same
+functional shape (`JobRegistry`'s single slot is process-wide, not per-plan), deterministic
+instead of timing-dependent. (3) **Medium.** No test drove a DISPATCHED job-backed step (a real
+`job_id`, past `validate_job_input`) to a real failure and checked `_sync_step_from_job`
+surfaces it via polling -- every prior job-backed test only covered the success path, and the
+new `validate_job_input` test only covers the pre-dispatch rejection case (`job_id` stays
+`None`). Added `test_a_dispatched_jobs_real_failure_propagates_onto_the_step_via_polling`, using
+a `run_deterministic` step with a nonexistent `source_ref` (passes `validate_job_input`'s
+non-empty check, fails inside `resolve_source_ref` after a real thread has already started).
+(4) **Medium.** The `qa_question` synchronous branch inside `_execute_synchronous_step` was
+never exercised by any test despite `chat_enabled=True` on every fixture; added
+`test_approving_a_qa_question_step_runs_it_synchronously`, faking `agents.chat.answer_question`
+at its real import point (a local import inside the function, so the patch target is the `chat`
+module's own attribute, not anything in `route.py`). (5) **Low.** `_context_note`'s real
+generated text was never asserted by anything -- every route.py HTTP test monkeypatches
+`route_message` wholesale, so the function ran but its return value was always discarded by the
+fake's `**kw` catch-all. Added four direct unit tests covering all four branches (a ready
+upload with a known-format match, an unlabeled not-ready upload, an existing plan naming its
+`active_source`, and a configured-but-unseeded default source) plus the true-empty-workspace
+case.
+
+**Verification.** `tests/test_web_route.py` grew from 28 to 44 tests (`claim_step`'s atomicity
+and TOCTOU-closure, `edit_step`'s `"failed"`-recovery, the qa_question and dispatched-job-failure
+paths, `approve_step`'s conditional rollback and 202 status, the four `_context_note` branches,
+plus one existing test's assertion updated for the new 202); `tests/test_web_jobs_dispatcher.py`
+grew from 19 to 24 (the `uploads/`-prefix/case-insensitive/hex-directory-fallback/custom
+-contract-name `resolve_source_ref` cases, plus the coordinator-identity fix); `agents/router.py`'s
+`ViewScenarioParams` gained its `Literal` constraint. Full suite: `.venv312` 1206 passed, 1
+skipped (up from 1185) -- zero regressions in any previously-passing test.

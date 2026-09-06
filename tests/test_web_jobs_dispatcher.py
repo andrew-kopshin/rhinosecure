@@ -187,8 +187,12 @@ def test_resolve_source_ref_rejects_an_unknown_bare_name():
 
 
 def test_resolve_source_ref_rejects_an_unknown_upload_id():
+    """An upload-id-SHAPED source_ref with no real upload falls through
+    to the bare --data check too (a legitimate dataset directory can
+    coincidentally be 32 hex characters) before finally refusing -- the
+    error names both things it tried, not just the upload guess."""
     fake_upload_id = "a" * 32
-    with pytest.raises(IngestError, match="no such upload"):
+    with pytest.raises(IngestError, match="no such source"):
         resolve_source_ref(fake_upload_id)
 
 
@@ -214,6 +218,51 @@ def test_resolve_source_ref_refuses_an_upload_with_no_known_format_and_no_contra
 
     with pytest.raises(IngestError, match="ingest_propose"):
         resolve_source_ref(upload_id)
+
+
+def test_resolve_source_ref_accepts_the_uploads_prefixed_shape_identically(tmp_path: Path):
+    """web/uploads.py's own UploadSet.to_dict()["relative_data_dir"] (and
+    the ingest_propose job's own "next_step" hint) both hand back
+    f"uploads/{id}", not the bare id -- an adversarial review found this
+    shape used to fall through to the bare --data branch entirely,
+    silently scoring as native format with zero validation."""
+    upload_id = "f" * 32
+    upload_dir = uploads_module.DEFAULT_UPLOADS_DIR / upload_id
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "assets.csv").write_text(ASSETS_CSV_A, encoding="utf-8")
+    (upload_dir / "findings.csv").write_text(FINDINGS_CSV_A, encoding="utf-8")
+
+    resolved = resolve_source_ref(f"uploads/{upload_id}")
+    assert resolved.data_dir == upload_dir
+    assert resolved.fmt == "native"
+
+
+def test_resolve_source_ref_is_case_insensitive_on_the_upload_id(tmp_path: Path):
+    upload_id = "1a2b3c4d5e6f17181920212223242526"
+    upload_dir = uploads_module.DEFAULT_UPLOADS_DIR / upload_id
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "assets.csv").write_text(ASSETS_CSV_A, encoding="utf-8")
+    (upload_dir / "findings.csv").write_text(FINDINGS_CSV_A, encoding="utf-8")
+
+    resolved = resolve_source_ref(upload_id.upper())
+    assert resolved.data_dir == upload_dir
+
+
+def test_resolve_source_ref_falls_back_to_a_real_dataset_directory_shaped_like_an_upload_id(tmp_path: Path, monkeypatch):
+    """A legitimate --data directory can coincidentally be named with 32
+    hex characters (a hash-named or generated dataset) -- an adversarial
+    review found this used to always be misclassified as a missing
+    upload and refused, never falling back to check data/<name> at all."""
+    hex_name = "0123456789abcdef0123456789abcdef"
+    data_root = tmp_path / "data"
+    (data_root / hex_name).mkdir(parents=True)
+    (data_root / hex_name / "assets.csv").write_text(ASSETS_CSV_A, encoding="utf-8")
+    (data_root / hex_name / "findings.csv").write_text(FINDINGS_CSV_A, encoding="utf-8")
+    monkeypatch.setattr(jobs_module, "REPO_ROOT", tmp_path)
+
+    resolved = resolve_source_ref(hex_name)
+    assert resolved.data_dir == data_root / hex_name
+    assert resolved.fmt == "native"
 
 
 def _mapped(mapping: dict, columns_cited: list[str] | None = None) -> dict:
@@ -258,10 +307,33 @@ def _full_proposal_dict(name: str) -> dict:
     }
 
 
-def test_resolve_source_ref_refuses_an_upload_with_a_proposed_but_unconfirmed_contract(tmp_path: Path, monkeypatch):
-    from rhinosecure.adapters.config_io import write_contract
+def _build_contract_for_upload(upload_dir: Path, name: str, *, confirm: bool = False):
+    """Builds a real Contract (via the real assemble_contract/check_
+    grounding pipeline, never a hand-typed stand-in) for `upload_dir`'s
+    own `mystery.csv`, optionally signed via the real config_io.confirm_
+    contract. Does not write anything -- callers write_contract it
+    themselves at whatever path they're testing."""
     from rhinosecure.adapters.probe import profile_source
     from rhinosecure.agents.schema_inference import AdapterProposal, Generator, assemble_contract, check_grounding
+
+    proposal = AdapterProposal.model_validate(_full_proposal_dict(name))
+    profiles = {p.path.name: p for p in profile_source(upload_dir)}
+    report = check_grounding(proposal, profiles)
+    generator = Generator(
+        tool="x", model="y", prompt_tokens=1, completion_tokens=1, estimated_cost_usd=0.0,
+        attempts=1, call_log_digest="sha256:" + "a" * 64,
+    )
+    contract = assemble_contract(proposal, profiles, report, generator=generator, generated_at="2026-01-01T00:00:00Z")
+    assert contract is not None  # sanity: the fixture above must actually assemble
+    if confirm:
+        from rhinosecure.adapters.config_io import confirm_contract
+
+        contract = confirm_contract(contract, at="2026-01-01T01:00:00Z", by="test-suite")
+    return contract
+
+
+def test_resolve_source_ref_refuses_an_upload_with_a_proposed_but_unconfirmed_contract(tmp_path: Path, monkeypatch):
+    from rhinosecure.adapters.config_io import write_contract
 
     upload_id = "d" * 32
     upload_dir = uploads_module.DEFAULT_UPLOADS_DIR / upload_id
@@ -274,16 +346,67 @@ def test_resolve_source_ref_refuses_an_upload_with_a_proposed_but_unconfirmed_co
     monkeypatch.setattr(jobs_module, "resolve_config_path", lambda name: adapters_dir / f"{name}.json")
 
     name = jobs_module._default_propose_name(upload_id)
-    proposal = AdapterProposal.model_validate(_full_proposal_dict(name))
-    profiles = {p.path.name: p for p in profile_source(upload_dir)}
-    report = check_grounding(proposal, profiles)
-    generator = Generator(tool="x", model="y", prompt_tokens=1, completion_tokens=1, estimated_cost_usd=0.0, attempts=1, call_log_digest="sha256:" + "a" * 64)
-    contract = assemble_contract(proposal, profiles, report, generator=generator, generated_at="2026-01-01T00:00:00Z")
-    assert contract is not None  # sanity: the fixture above must actually assemble
-    write_contract(adapters_dir / f"{contract.format}.json", contract)  # review.state == "proposed", never confirmed
+    contract = _build_contract_for_upload(upload_dir, name)  # review.state == "proposed", never confirmed
+    write_contract(adapters_dir / f"{contract.format}.json", contract)
 
     with pytest.raises(IngestError, match="rhino adapt confirm"):
         resolve_source_ref(upload_id)
+
+
+def test_resolve_source_ref_finds_a_confirmed_contract_under_a_custom_name(tmp_path: Path, monkeypatch):
+    """ingest_propose's own `name` input lets a human/Router propose (and
+    later confirm) a contract under ANY name, not just the auto-generated
+    default -- an adversarial review found resolve_source_ref could only
+    ever find the default-named one, silently ignoring a real, confirmed,
+    custom-named contract and reporting "no confirmed contract yet" even
+    though one genuinely exists. The fix: _run_ingest_propose records
+    which name it used next to the upload; resolve_source_ref checks that
+    marker before falling back to the default-name guess."""
+    from rhinosecure.adapters.config_io import write_contract
+
+    upload_id = "1" * 32
+    upload_dir = uploads_module.DEFAULT_UPLOADS_DIR / upload_id
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "mystery.csv").write_text(
+        "Asset_ID,Hostname,Finding_ID,Cve,Col\nA01,HOST01,F01,CVE-2021-0001,srv\nA02,HOST02,F02,CVE-2021-0002,wks\n",
+        encoding="utf-8",
+    )
+    adapters_dir = tmp_path / "adapters"
+    monkeypatch.setattr(jobs_module, "resolve_config_path", lambda name: adapters_dir / f"{name}.json")
+
+    custom_name = "acme-scanner"
+    contract = _build_contract_for_upload(upload_dir, custom_name, confirm=True)
+    write_contract(adapters_dir / f"{custom_name}.json", contract)
+    jobs_module._record_upload_contract_name(upload_dir, custom_name)
+
+    resolved = resolve_source_ref(upload_id)
+    assert resolved.fmt == custom_name
+    assert resolved.adapter_config == str(adapters_dir / f"{custom_name}.json")
+
+
+def test_resolve_source_ref_ignores_a_stale_marker_naming_a_file_that_no_longer_exists(tmp_path: Path, monkeypatch):
+    """A best-effort marker, never load-bearing: if it names a contract
+    that isn't there (deleted, renamed), resolution still falls back to
+    the default-name convention rather than failing outright."""
+    from rhinosecure.adapters.config_io import write_contract
+
+    upload_id = "2" * 32
+    upload_dir = uploads_module.DEFAULT_UPLOADS_DIR / upload_id
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "mystery.csv").write_text(
+        "Asset_ID,Hostname,Finding_ID,Cve,Col\nA01,HOST01,F01,CVE-2021-0001,srv\nA02,HOST02,F02,CVE-2021-0002,wks\n",
+        encoding="utf-8",
+    )
+    adapters_dir = tmp_path / "adapters"
+    monkeypatch.setattr(jobs_module, "resolve_config_path", lambda name: adapters_dir / f"{name}.json")
+    jobs_module._record_upload_contract_name(upload_dir, "a-name-nothing-was-ever-written-under")
+
+    default_name = jobs_module._default_propose_name(upload_id)
+    contract = _build_contract_for_upload(upload_dir, default_name, confirm=True)
+    write_contract(adapters_dir / f"{default_name}.json", contract)
+
+    resolved = resolve_source_ref(upload_id)
+    assert resolved.fmt == default_name
 
 
 # ---------------- run_deterministic ----------------
@@ -381,6 +504,8 @@ def test_run_agents_replaces_a_previously_established_plan(tmp_path: Path, data_
     _wait_for_terminal(client, first.json()["job_id"])
     plan_state = app.state.plan_state
     assert {e.finding.finding_id for e in plan_state.findings} == {"F01"}
+    first_coordinator = plan_state.coordinator
+    assert "A01" in first_coordinator._asset_index
 
     _queue_seed_run("G01", "CVE-2020-1472", "B01", "SQL01")
     second = client.post("/api/jobs", json={"kind": "run_agents", "input": {"source_ref": str(data_dir_b)}})
@@ -390,6 +515,14 @@ def test_run_agents_replaces_a_previously_established_plan(tmp_path: Path, data_
     assert plan_state.active_source.data_dir == data_dir_b
     assert {e.finding.finding_id for e in plan_state.findings} == {"G01"}  # replaced, not merged
     assert plan_state.memory is not None
+    # An adversarial review found this test never actually proved the
+    # Coordinator itself was replaced -- only .findings/.active_source,
+    # which a hypothetical refactor could satisfy while secretly reusing
+    # (or mutating) the OLD Coordinator, silently leaving stale A01/
+    # EXCH01 asset context behind for a later constraint_submit call.
+    assert plan_state.coordinator is not first_coordinator
+    assert "B01" in plan_state.coordinator._asset_index
+    assert "A01" not in plan_state.coordinator._asset_index
 
 
 def test_plan_not_seeded_error_when_constraint_submit_runs_before_any_source_is_resolved(tmp_path: Path):

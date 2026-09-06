@@ -333,25 +333,124 @@ class ResolvedSource:
     adapter_config: str | None
 
 
-#: uuid.uuid4().hex is always exactly 32 lowercase hex characters -- the
-#: same shape web/uploads.py's own upload_id always has (see that
-#: module's docstring). Used here only to DECIDE whether a source_ref
-#: names an upload directory versus a bare --data name; never used to
-#: validate or trust anything about the upload's CONTENTS.
-_UPLOAD_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+#: uuid.uuid4().hex is always exactly 32 hex characters -- the same shape
+#: web/uploads.py's own upload_id always has (see that module's
+#: docstring). Case-insensitive on purpose (an adversarial review found
+#: a real upload_id re-cased by a client -- copy/paste autocapitalization,
+#: say -- used to silently miss this pattern and fall through to a
+#: confusing "no such data set" error instead). Used only to DECIDE
+#: whether a source_ref names an upload; never to validate or trust
+#: anything about the upload's CONTENTS.
+_UPLOAD_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$", re.IGNORECASE)
+
+#: web/uploads.py's own UploadSet.to_dict()["relative_data_dir"] -- and
+#: this module's own `next_step` hint text for a proposed contract --
+#: both hand back a source_ref of exactly this shape, `f"uploads/{id}"`,
+#: not the bare id. A previous version of this module recognized only
+#: the bare id, so a caller that faithfully echoed either of those two
+#: strings back as `source_ref` silently fell through to the bare
+#: `--data <name>` branch below instead -- an adversarial review found
+#: this resolves (data/uploads/<id> really is a directory) with `fmt`
+#: hardcoded to "native" and NO format detection at all, a real
+#: wrong-but-plausible-scoring risk. Stripped here so both shapes always
+#: reach the exact same upload resolution logic.
+_UPLOAD_SOURCE_REF_PREFIX = "uploads/"
+
+#: Written by `_run_ingest_propose` next to an upload's own files
+#: whenever it produces a real contract, naming exactly that contract --
+#: `resolve_source_ref` checks this BEFORE the auto-generated default
+#: name, so a contract proposed under an operator-chosen `name` (a real,
+#: intentionally exposed `ingest_propose` input) is still found later,
+#: not just one that happened to keep the default. Best-effort: a
+#: missing or unreadable marker never blocks resolution, it just means
+#: only the default-name convention gets tried.
+_CONTRACT_NAME_MARKER = ".rhino_contract_name"
+
+
+def _record_upload_contract_name(upload_dir: Path, name: str) -> None:
+    try:
+        (upload_dir / _CONTRACT_NAME_MARKER).write_text(name, encoding="utf-8")
+    except OSError:
+        pass  # a convenience marker, never load-bearing -- the default-name path still works without it
+
+
+def _upload_id_from_source_ref(source_ref: str) -> str | None:
+    """Returns the lowercase, canonical upload_id if `source_ref` names
+    an upload (bare, or prefixed `uploads/`) by SHAPE alone -- does not
+    check whether that upload actually exists; see `resolve_source_ref`
+    for what happens when it doesn't (a real, plausible non-upload
+    directory can also happen to be 32 hex characters -- this function
+    only recognizes the SHAPE, never commits to "this must be an
+    upload")."""
+    candidate = source_ref[len(_UPLOAD_SOURCE_REF_PREFIX) :] if source_ref.startswith(_UPLOAD_SOURCE_REF_PREFIX) else source_ref
+    return candidate.lower() if _UPLOAD_ID_PATTERN.match(candidate) else None
+
+
+def _resolve_upload_source(upload_id: str, data_dir: Path) -> ResolvedSource:
+    filenames = sorted(p.name for p in data_dir.iterdir() if p.is_file())
+    matched_format = known_format_match(filenames)
+    if matched_format is not None:
+        return ResolvedSource(data_dir=data_dir, fmt=matched_format, adapter_config=None)
+
+    candidate_names = list(
+        dict.fromkeys(
+            n
+            for n in (_read_upload_contract_marker(data_dir), _default_propose_name(upload_id))
+            if n
+        )
+    )
+    for name in candidate_names:
+        candidate = resolve_config_path(name)
+        if not candidate.is_file():
+            continue
+        try:
+            contract = read_contract(candidate)
+        except Exception as exc:
+            raise IngestError(
+                f"upload {upload_id!r} has a contract at {candidate}, but it could not be read: {exc}"
+            ) from exc
+        if contract.review.state == "confirmed":
+            return ResolvedSource(data_dir=data_dir, fmt=contract.format, adapter_config=str(candidate))
+        raise IngestError(
+            f"upload {upload_id!r} has a PROPOSED but unconfirmed contract at {candidate} -- run "
+            f'`rhino adapt confirm {contract.format} --data uploads/{upload_id} --by "<you>"` first, '
+            "then retry. Confirmation is a signed act that stays outside this system's automated routing."
+        )
+    raise IngestError(
+        f"upload {upload_id!r} doesn't match a known built-in format ({sorted(FORMATS)}) and has no "
+        "confirmed contract yet -- submit an ingest_propose job for it first, then confirm the result."
+    )
+
+
+def _read_upload_contract_marker(data_dir: Path) -> str | None:
+    marker = data_dir / _CONTRACT_NAME_MARKER
+    if not marker.is_file():
+        return None
+    try:
+        return marker.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
 
 
 def resolve_source_ref(source_ref: str) -> ResolvedSource:
     """Resolves a Router `source_ref` (or, identically, a human-typed one)
     to a real directory and ingest format. Two shapes, tried in order:
 
-    1. **An upload_id** (`web/uploads.py`'s `data/uploads/<id>/` shape).
-       If the uploaded filenames exactly match a built-in format
+    1. **An upload** (`web/uploads.py`'s `data/uploads/<id>/` shape),
+       recognized as either the bare 32-hex-character id or the
+       `uploads/<id>` form (`_upload_id_from_source_ref`) -- but only
+       actually TREATED as an upload if `data/uploads/<id>/` really
+       exists; otherwise this falls through to shape 2 rather than
+       refusing outright, since a legitimately-named `--data` directory
+       can coincidentally look upload-id-shaped (a hash-named dataset,
+       say). If the uploaded filenames exactly match a built-in format
        (`known_format_match` -- the confirmation gate's own fast path),
        that format is used directly, no LLM, no contract. Otherwise, an
-       already-CONFIRMED contract at this upload's default propose name
-       (`_default_propose_name`) is used if one exists -- the ordinary
-       propose-then-confirm sequence's own natural output location. A
+       already-CONFIRMED contract for this upload is used if one exists
+       -- checked first under whatever name `_run_ingest_propose` last
+       recorded for it (`_CONTRACT_NAME_MARKER`, covers an operator-
+       chosen `name`), then under the auto-generated default name
+       (`_default_propose_name`) for backward compatibility. A
        PROPOSED-but-not-yet-confirmed contract is refused with a message
        naming the exact `rhino adapt confirm` command that would finish
        it: confirmation stays a dedicated, non-conversational, signed
@@ -367,34 +466,15 @@ def resolve_source_ref(source_ref: str) -> ResolvedSource:
     Raises `IngestError` (already caught by every `_execute_job` path
     that can raise it) naming exactly which of these was tried and why
     it failed -- never guesses a format for an unrecognized upload."""
-    if _UPLOAD_ID_PATTERN.match(source_ref):
-        data_dir = uploads_module.DEFAULT_UPLOADS_DIR / source_ref
-        if not data_dir.is_dir():
-            raise IngestError(f"no such upload: {source_ref!r} (looked for {data_dir})")
-        filenames = sorted(p.name for p in data_dir.iterdir() if p.is_file())
-        matched_format = known_format_match(filenames)
-        if matched_format is not None:
-            return ResolvedSource(data_dir=data_dir, fmt=matched_format, adapter_config=None)
-
-        candidate = resolve_config_path(_default_propose_name(source_ref))
-        if candidate.is_file():
-            try:
-                contract = read_contract(candidate)
-            except Exception as exc:
-                raise IngestError(
-                    f"upload {source_ref!r} has a contract at {candidate}, but it could not be read: {exc}"
-                ) from exc
-            if contract.review.state == "confirmed":
-                return ResolvedSource(data_dir=data_dir, fmt=contract.format, adapter_config=str(candidate))
-            raise IngestError(
-                f"upload {source_ref!r} has a PROPOSED but unconfirmed contract at {candidate} -- run "
-                f'`rhino adapt confirm {contract.format} --data uploads/{source_ref} --by "<you>"` first, '
-                "then retry. Confirmation is a signed act that stays outside this system's automated routing."
-            )
-        raise IngestError(
-            f"upload {source_ref!r} doesn't match a known built-in format ({sorted(FORMATS)}) and has no "
-            "confirmed contract yet -- submit an ingest_propose job for it first, then confirm the result."
-        )
+    upload_id = _upload_id_from_source_ref(source_ref)
+    if upload_id is not None:
+        data_dir = uploads_module.DEFAULT_UPLOADS_DIR / upload_id
+        if data_dir.is_dir():
+            return _resolve_upload_source(upload_id, data_dir)
+        # Shaped like an upload reference, but no such upload exists --
+        # falls through to the bare-directory branch rather than refusing
+        # immediately, since a real --data directory can coincidentally
+        # be named with 32 hex characters too.
 
     named = REPO_ROOT / "data" / source_ref
     if named.is_dir():
@@ -402,6 +482,12 @@ def resolve_source_ref(source_ref: str) -> ResolvedSource:
     literal = Path(source_ref)
     if literal.is_dir():
         return ResolvedSource(data_dir=literal, fmt=DEFAULT_FORMAT, adapter_config=None)
+    if upload_id is not None:
+        raise IngestError(
+            f"no such source: {source_ref!r} -- not a known upload (looked for "
+            f"{uploads_module.DEFAULT_UPLOADS_DIR / upload_id}) and not a --data directory "
+            f"(looked for {named} and {literal})"
+        )
     raise IngestError(f"no such data set: {source_ref!r} (looked for {named} and {literal})")
 
 
@@ -698,6 +784,12 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
 
     on_stage("writing contract")
     written = write_contract(output_path, result.contract)
+    # So resolve_source_ref can find this contract later regardless of
+    # `name` -- an adversarial review found that without this marker,
+    # a contract proposed under anything other than the auto-generated
+    # default name (a real, intentionally exposed input above) could
+    # never be found again by run_deterministic/run_agents at all.
+    _record_upload_contract_name(data_dir, name)
     result_dict["contract_written"] = True
     result_dict["contract_path"] = str(output_path)
     result_dict["contract_version"] = written.version
@@ -732,8 +824,8 @@ def _run_run_deterministic(job: Job, plan_state: PlanState, on_stage: Callable[[
     with_report`'s ~30-line loop here to avoid a second, thin dependency
     on the exact type export.py already requires would only create a
     second copy of that loop to keep in sync, not a cleaner boundary."""
+    on_stage("resolving source")  # before validation -- a bad input's error must not carry stage=null
     source_ref = _require_source_ref(job, "run_deterministic")
-    on_stage("resolving source")
     resolved = resolve_source_ref(source_ref)
 
     on_stage("scoring")
@@ -777,8 +869,8 @@ def _run_run_agents(job: Job, plan_state: PlanState, on_stage: Callable[[str], N
     against a resolved `source_ref`, REPLACING whatever plan was current
     on this `PlanState` before (see `PlanState.run_agents_pipeline`'s own
     docstring on why replacing, not accumulating, is correct here)."""
+    on_stage("resolving source")  # before validation -- a bad input's error must not carry stage=null
     source_ref = _require_source_ref(job, "run_agents")
-    on_stage("resolving source")
     resolved = resolve_source_ref(source_ref)
 
     coordinator = plan_state.run_agents_pipeline(resolved, on_stage)
@@ -817,6 +909,7 @@ def _run_remediation_mark(job: Job, plan_state: PlanState, on_stage: Callable[[s
     write -- `rhino remediation mark` never touches `--export` either,
     since remediation status is tracking, not scoring (CLAUDE.md Section
     7: "never feeds back into scoring.py")."""
+    on_stage("marking")  # before validation -- a bad input's error must not carry stage=null
     finding_id = str(job.input.get("finding_id") or "").strip()
     status = str(job.input.get("status") or "").strip()
     note = job.input.get("note")
@@ -827,7 +920,6 @@ def _run_remediation_mark(job: Job, plan_state: PlanState, on_stage: Callable[[s
     if status not in REMEDIATION_STATUSES:
         raise IngestError(f"remediation_mark: status must be one of {REMEDIATION_STATUSES}, got {status!r}")
 
-    on_stage("marking")
     memory = plan_state.memory if plan_state.memory is not None else Memory(plan_state.config.db_path)
     previous = memory.latest_remediation_event_for_finding(finding_id)
     previous_status = previous.status if previous is not None else None
@@ -954,7 +1046,16 @@ _REQUIRED_JOB_INPUT_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _validate_job_input(kind: str, input: dict[str, Any]) -> None:
+def validate_job_input(kind: str, input: dict[str, Any]) -> None:
+    """Public (not `_`-prefixed) because `web/route.py`'s per-step
+    approval path needs the identical check `POST /api/jobs` already
+    runs -- an adversarial review found that route.py's dispatch used
+    to skip this entirely, letting a step whose params pass the
+    Router's own pydantic shape (e.g. a `RemediationMarkParams.status`
+    that isn't actually in `REMEDIATION_STATUSES`, since that field is a
+    bare `str`) claim the single global job slot before failing inside
+    the job itself, instead of being refused up front like the
+    identical input sent to `POST /api/jobs` already is."""
     for field_name in _REQUIRED_JOB_INPUT_FIELDS.get(kind, ()):
         if not str(input.get(field_name) or "").strip():
             raise HTTPException(400, f"{kind} requires non-empty input.{field_name}")
@@ -994,7 +1095,7 @@ def mount_job_routes(app: FastAPI, job_config: JobConfig) -> None:
     def submit_job(body: SubmitJobRequest) -> dict[str, Any]:
         if body.kind not in JOB_HANDLERS:
             raise HTTPException(400, f"unknown job kind: {body.kind!r}")
-        _validate_job_input(body.kind, body.input)
+        validate_job_input(body.kind, body.input)
 
         job = dispatch_job(body.kind, body.input, registry, plan_state)
         if job is None:

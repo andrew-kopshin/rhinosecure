@@ -39,7 +39,21 @@ completion), so there is no already-applied effect to undo, only future
 approvals to re-request. `view_scenario`/`qa_question` still go through
 this same one-click-per-step gate even though they're synchronous reads --
 CLAUDE.md's own design makes no exception for them ("a mandatory human
-click before *every* step, not just the first").
+click before *every* step, not just the first"). A `"failed"` step can
+also be edited and re-approved -- the one recovery path this module
+gives a human for a step whose params passed the Router's own grounding
+but were rejected downstream (a bad `remediation_mark` status, a job
+that failed for a fixable reason), short of abandoning the whole plan.
+
+**The approve-and-claim step is atomic (`claim_step`, under `RoutePlan
+.lock`), closing a real race an adversarial review found**: reading
+"is this step approved and pending" and writing "now it's running" used
+to be two separate, unlocked steps, so two concurrent approve requests
+for the same step could both pass the read before either applied the
+write. Job-backed steps were usually saved by `JobRegistry`'s own
+single-slot claim rejecting the loser, but a synchronous step
+(`view_scenario`/`qa_question`, which never touches `JobRegistry`)
+would have run twice.
 
 **`view_scenario`/`qa_question` are dispatched inline, never through
 `JobRegistry`, on purpose.** `agents/chat.py`'s whole design point is that
@@ -65,7 +79,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, ValidationError
 
 from rhinosecure.agents.router import (
@@ -74,7 +88,7 @@ from rhinosecure.agents.router import (
     RouterGroundingResult,
     route_message,
 )
-from rhinosecure.web.jobs import JobRegistry, PlanState, dispatch_job, known_format_match
+from rhinosecure.web.jobs import JobRegistry, PlanState, dispatch_job, known_format_match, validate_job_input
 from rhinosecure.web.server import load_export
 
 #: Operation kinds this module dispatches inline -- never through
@@ -138,6 +152,12 @@ class RoutePlan:
     clarify: str | None = None
     issues: list[dict[str, Any]] = field(default_factory=list)
     created_at: str = field(default_factory=_now)
+    #: Guards the claim-a-step-to-run transition (`claim_step`, below)
+    #: against two concurrent approve requests for the SAME step index --
+    #: excluded from `__eq__`/`repr` since a lock has no meaningful value
+    #: identity for either. Not `RoutePlanRegistry._lock`'s job: that lock
+    #: protects the registry's own dict of plans, not one plan's steps.
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -216,16 +236,27 @@ def assert_step_approved(plan: RoutePlan, index: int) -> RouteStep:
 
 def edit_step(plan: RoutePlan, index: int, new_params: dict[str, Any]) -> RouteStep:
     """Replaces step `index`'s params (revalidated against its own op's
-    fixed shape) and clears approval for it and every step after it.
-    Refuses if the step is not `"pending"` -- a step that already ran (or
-    is running) cannot be edited; by construction every LATER step is
-    still `"pending"` too whenever this succeeds (approval requires
-    strict in-order completion), so there is never an already-applied
-    effect this needs to undo, only future approvals to re-request."""
+    fixed shape), resets it to a clean `"pending"` slate, and clears
+    approval for it and every step after it.
+
+    Accepts a step in either `"pending"` OR `"failed"` status -- an
+    adversarial review flagged that refusing to edit a `"failed"` step
+    left no recovery path at all for the case a human most needs to
+    correct: a param that passed the Router's own grounding but was
+    rejected by `validate_job_input` (a bad `remediation_mark` status,
+    say), or a job that failed for a fixable reason. The only alternative
+    would be abandoning the whole plan and re-proposing from scratch,
+    discarding every already-succeeded earlier step for one bad
+    parameter. Every OTHER status (`"running"`, `"succeeded"`) still
+    refuses -- a step that already ran, or is running, cannot be edited;
+    by construction every LATER step is still `"pending"` whenever this
+    succeeds (approval requires strict in-order completion), so there is
+    never an already-applied effect this needs to undo, only future
+    approvals to re-request."""
     if not (0 <= index < len(plan.steps)):
         raise RouteApprovalError(f"step index {index} does not exist in route plan {plan.id!r}")
     step = plan.steps[index]
-    if step.status != "pending":
+    if step.status not in ("pending", "failed"):
         raise RouteApprovalError(f"step {index} is already {step.status!r} and can no longer be edited")
 
     param_model = PARAM_MODEL_BY_OP[OperationKind(step.op)]
@@ -235,10 +266,39 @@ def edit_step(plan: RoutePlan, index: int, new_params: dict[str, Any]) -> RouteS
         raise RouteApprovalError(f"params do not match the fixed shape required for {step.op!r}: {exc}") from exc
 
     step.params = validated.model_dump()
+    step.status = "pending"
+    step.result = None
+    step.error = None
+    step.job_id = None
+    step.export_written = False
     step.approved = False
     for later in plan.steps[index + 1 :]:
         later.approved = False
     return step
+
+
+def claim_step(plan: RoutePlan, index: int) -> RouteStep:
+    """Atomically (under `plan.lock`) runs `assert_step_approved`'s exact
+    checks and, only if they pass, immediately marks the step
+    `"running"` before releasing the lock -- the same check-and-set
+    shape `JobRegistry.create_and_start` already uses so a claim and the
+    read it's based on can never be split by another thread's claim in
+    between.
+
+    An adversarial review found the original code called `assert_step_
+    approved` with no lock at all: two concurrent `POST .../approve`
+    calls for the SAME step could both pass its read-only checks (both
+    see `status == "pending"`, `approved == True`) before either had
+    written `status = "running"`, and both would go on to dispatch. For
+    a job-backed step this was usually masked by `JobRegistry`'s own
+    single-slot claim rejecting the loser -- but for a SYNCHRONOUS step
+    (`view_scenario`/`qa_question`, which never touches `JobRegistry` at
+    all) nothing would have stopped both callers from running the same
+    step to completion twice."""
+    with plan.lock:
+        step = assert_step_approved(plan, index)
+        step.status = "running"
+        return step
 
 
 def _sync_step_from_job(step: RouteStep, registry: JobRegistry) -> None:
@@ -246,11 +306,34 @@ def _sync_step_from_job(step: RouteStep, registry: JobRegistry) -> None:
     status/result/error from the real `Job` record -- the same "one
     source of truth, copied, never duplicated" shape `JobRegistry.get`
     already gives `GET /api/jobs/{id}`, read here instead of making a
-    caller poll two endpoints to watch one route plan's progress."""
+    caller poll two endpoints to watch one route plan's progress.
+
+    A step whose job has since aged out of `JobRegistry`'s bounded
+    history (`MAX_JOB_HISTORY`, oldest evicted once history exceeds it)
+    is a real terminal state this must resolve, not silently ignore --
+    an adversarial review found the original version left such a step
+    reporting `"running"` forever with no way for a client to ever learn
+    what actually happened. History only ever holds jobs that already
+    reached a terminal status (a running job is tracked separately, via
+    `_running_job_id`, until it finishes), so "the job vanished while
+    this step still reads running" can only mean it finished and then
+    aged out before this ever polled it -- recorded here as failed,
+    honestly labeled as a bookkeeping gap rather than anything that went
+    wrong with the underlying job itself."""
     if step.job_id is None or step.status != "running":
         return
     job = registry.get(step.job_id)
     if job is None:
+        step.status = "failed"
+        step.error = {
+            "stage": "polling",
+            "type": "JobHistoryEvictedError",
+            "message": (
+                f"job {step.job_id!r} is no longer in job history (evicted once more than "
+                "MAX_JOB_HISTORY newer jobs ran) -- it finished, but its actual outcome is no "
+                "longer available"
+            ),
+        }
         return
     if job.status in ("succeeded", "failed"):
         step.status = job.status
@@ -304,11 +387,40 @@ def _view_scenario(export_data: dict[str, Any], params: dict[str, Any]) -> dict[
 
 
 def _dispatch_job_backed_step(step: RouteStep, registry: JobRegistry, plan_state: PlanState) -> None:
+    """`step.status` is already `"running"` -- `claim_step` sets that
+    before this is ever called. This function's only job is turning that
+    claim into either a real dispatched `Job` or an honest terminal
+    outcome; it never itself performs the pending->running transition.
+
+    Runs the SAME `validate_job_input` check `POST /api/jobs` already
+    runs on identical input -- an adversarial review found this path
+    skipped it entirely, letting params that pass the Router's own fixed
+    pydantic shape (e.g. a `RemediationMarkParams.status` that's a bare
+    `str`, not constrained to `REMEDIATION_STATUSES`) claim, and
+    immediately waste, the single global job slot before failing deep
+    inside the job itself. A validation failure here is recorded as a
+    normal terminal step failure -- matching what would happen had the
+    job actually been allowed to start and fail internally -- rather
+    than raised back to the HTTP layer: by this point the step has
+    already been approved and claimed, so the honest outcome is "this
+    step failed," not "the approve request itself was malformed.\""""
+    try:
+        validate_job_input(step.op, step.params)
+    except HTTPException as exc:
+        step.status = "failed"
+        step.error = {"stage": "validating input", "type": "HTTPException", "message": str(exc.detail)}
+        return
+
     job = dispatch_job(step.op, step.params, registry, plan_state)
     if job is None:
-        raise HTTPException(409, "another job is already running -- try again once it finishes")
+        # A DIFFERENT plan's step (or a bare POST /api/jobs) already
+        # holds JobRegistry's single running slot -- transient, not a
+        # property of this step's params, so it goes back to "pending"
+        # rather than "failed": the same approval can simply be retried
+        # once that other job finishes, with nothing here to edit.
+        step.status = "pending"
+        raise RouteApprovalError("another job is already running -- try again once it finishes")
     step.job_id = job.id
-    step.status = "running"
 
 
 def execute_step(
@@ -319,10 +431,10 @@ def execute_step(
     plan_state: PlanState,
     history: list[dict[str, str]] | None = None,
 ) -> RouteStep:
-    """The one entry point that actually runs a step: `assert_step_
-    approved` first (raises `RouteApprovalError` -- callers map that to a
-    400/409), then dispatches per `_SYNCHRONOUS_OPS`/job-backed above."""
-    step = assert_step_approved(plan, index)
+    """The one entry point that actually runs a step: `claim_step` first
+    (raises `RouteApprovalError` -- callers map that to a 409), then
+    dispatches per `_SYNCHRONOUS_OPS`/job-backed above."""
+    step = claim_step(plan, index)
     if step.op in _SYNCHRONOUS_OPS:
         _execute_synchronous_step(step, plan_state, history or [])
     else:
@@ -447,7 +559,9 @@ def mount_route_routes(app: FastAPI, *, chat_enabled: bool) -> None:
         return [p.to_dict() for p in plan_registry.list_recent()]
 
     @app.post("/api/route/{route_id}/steps/{index}/approve")
-    def approve_step(route_id: str, index: int, body: ApproveStepRequest = ApproveStepRequest()) -> dict[str, Any]:
+    def approve_step(
+        route_id: str, index: int, response: Response, body: ApproveStepRequest = ApproveStepRequest()
+    ) -> dict[str, Any]:
         plan = plan_registry.get(route_id)
         if plan is None:
             raise HTTPException(404, f"no such route plan: {route_id!r}")
@@ -456,13 +570,31 @@ def mount_route_routes(app: FastAPI, *, chat_enabled: bool) -> None:
 
         plan.steps[index].approved = True
         try:
-            execute_step(
+            step = execute_step(
                 plan, index, registry=app.state.job_registry, plan_state=app.state.plan_state,
                 history=body.history,
             )
         except RouteApprovalError as exc:
-            plan.steps[index].approved = False
+            # Only roll the approval flag back if the claim genuinely
+            # never went through (status is still "pending"). An
+            # adversarial review found the original code reset `approved`
+            # unconditionally -- but by the time this except fires, a
+            # concurrent request may have already WON the claim race and
+            # left the step legitimately "running"/"succeeded"/"failed";
+            # stomping `approved` back to False for that step would
+            # misreport a step actually in flight (or already done) as
+            # never having been approved at all.
+            if plan.steps[index].status == "pending":
+                plan.steps[index].approved = False
             raise HTTPException(409, str(exc))
+        # A job-backed step is still "running" at this point (its Job
+        # runs on its own background thread) -- 202 says so honestly,
+        # rather than 200 implying the step already finished within this
+        # request. A synchronous step (view_scenario/qa_question) is
+        # already terminal by the time execute_step returns, so it still
+        # gets a plain 200.
+        if step.status == "running":
+            response.status_code = 202
         return plan.to_dict()
 
     @app.post("/api/route/{route_id}/steps/{index}")

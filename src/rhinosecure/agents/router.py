@@ -87,7 +87,7 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from crewai import Agent, Crew, Process, Task
 from crewai.llms.base_llm import BaseLLM
@@ -177,7 +177,13 @@ class RemediationMarkParams(BaseModel):
 class ViewScenarioParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    mode: str = "recommended"
+    #: A closed Literal, not a bare `str` -- an adversarial review found
+    #: that an unconstrained string let a typo'd/unrecognized mode value
+    #: silently fall into "selection" (every finding, unfiltered) while
+    #: echoing the caller's own bad string back in the result, reading
+    #: as if it were a real, curated view. Pydantic now rejects anything
+    #: else at parse time instead.
+    mode: Literal["recommended", "selection"] = "recommended"
 
 
 class QaQuestionParams(BaseModel):
