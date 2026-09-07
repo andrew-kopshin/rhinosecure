@@ -161,13 +161,14 @@ if TYPE_CHECKING:
 from rhinosecure.adapters import (
     DEFAULT_FORMAT,
     FORMATS,
+    IngestAdapter,
     get_adapter,
     load_config_adapter,
     resolve_config_path,
 )
 from rhinosecure.adapters.config_model import Contract
 from rhinosecure.adapters.probe import ColumnProfile, FileProfile, ProbeError, profile_source
-from rhinosecure.adapters.review import Measurement, ReviewError, ReviewOutcome, review_contract
+from rhinosecure.adapters.review import Measurement, ReviewError, ReviewOutcome, is_provisional, review_contract
 from rhinosecure.enrich.attack import load_index as load_attack_index
 from rhinosecure.enrich.cache import OfflineCacheMissError, SnapshotCache
 from rhinosecure.enrich.kev import load_catalog as load_kev_catalog
@@ -256,23 +257,37 @@ def run(
 
 
 def run_with_report(
-    data_dir: Path, seed: int, *, offline: bool = False, fmt: str = DEFAULT_FORMAT, adapter_config: str | None = None
+    data_dir: Path,
+    seed: int,
+    *,
+    offline: bool = False,
+    fmt: str = DEFAULT_FORMAT,
+    adapter_config: str | None = None,
+    adapter: IngestAdapter | None = None,
 ) -> RunResult:
     # Scoring is fully deterministic (no sampling); the seed is accepted
     # now so the CLI contract does not change once Slice 4's ToT beam
     # search introduces anything seed-sensitive.
     random.seed(seed)
 
-    # adapter_config, when given, wins outright -- cli.py's argparse group
-    # already makes --format/--adapter-config mutually exclusive, so this
-    # is never resolving a genuine conflict, just picking whichever path
-    # supplied something. `fmt` is rebound to the resolved adapter's OWN
-    # declared name afterward: a no-op for a built-in (`adapter.format ==
-    # fmt` already), and correct for a contract, whose `format` need not
-    # equal the --adapter-config argument itself (a path vs. the name the
-    # contract declares) -- every print/report below reads `fmt`, not the
-    # original argument, from this point on.
-    adapter = load_config_adapter(adapter_config) if adapter_config else get_adapter(fmt)
+    # `adapter`, when given, wins outright and skips resolution entirely --
+    # the provisional-run path (web/jobs.py) already built one (a
+    # ConfiguredAdapter over an UNCONFIRMED contract via review._provisional,
+    # since load_config_adapter below refuses anything but a confirmed one).
+    # Every other caller passes `None` and gets exactly today's resolution,
+    # unchanged.
+    #
+    # adapter_config, when given, wins outright over `fmt` -- cli.py's
+    # argparse group already makes --format/--adapter-config mutually
+    # exclusive, so this is never resolving a genuine conflict, just picking
+    # whichever path supplied something. `fmt` is rebound to the resolved
+    # adapter's OWN declared name afterward: a no-op for a built-in
+    # (`adapter.format == fmt` already), and correct for a contract, whose
+    # `format` need not equal the --adapter-config argument itself (a path
+    # vs. the name the contract declares) -- every print/report below reads
+    # `fmt`, not the original argument, from this point on.
+    if adapter is None:
+        adapter = load_config_adapter(adapter_config) if adapter_config else get_adapter(fmt)
     fmt = adapter.format
     contract = getattr(adapter, "contract", None)
     assets, enriched = load_batch(data_dir, adapter)
@@ -1708,11 +1723,18 @@ def main(argv: list[str] | None = None) -> int:
             _print_contested_rate(contested_rate(r.bucket for r in recommendations))
 
             if args.track_remediation:
-                from rhinosecure import remediation
+                if is_provisional(coordinator.contract):
+                    print(
+                        "refusing --track-remediation: this run used a provisional (unconfirmed) mapping -- "
+                        "confirm the contract first (rhino adapt confirm), then re-run.",
+                        file=sys.stderr,
+                    )
+                else:
+                    from rhinosecure import remediation
 
-                tracked = _tracked_findings_from_recommendations(coordinator, recommendations)
-                summary = remediation.classify_remediation(tracked, coordinator.memory.latest_remediation_events())
-                _print_remediation_summary(summary, db_path=str(coordinator.memory.db_path))
+                    tracked = _tracked_findings_from_recommendations(coordinator, recommendations)
+                    summary = remediation.classify_remediation(tracked, coordinator.memory.latest_remediation_events())
+                    _print_remediation_summary(summary, db_path=str(coordinator.memory.db_path))
 
             if args.explain:
                 for r in recommendations:
@@ -1762,13 +1784,20 @@ def main(argv: list[str] | None = None) -> int:
         _print_ingest_report(result.report, result.contract)
 
         if args.track_remediation:
-            from rhinosecure import remediation
-            from rhinosecure.memory import Memory
+            if is_provisional(result.contract):
+                print(
+                    "refusing --track-remediation: this run used a provisional (unconfirmed) mapping -- "
+                    "confirm the contract first (rhino adapt confirm), then re-run.",
+                    file=sys.stderr,
+                )
+            else:
+                from rhinosecure import remediation
+                from rhinosecure.memory import Memory
 
-            track_memory = Memory(args.db) if args.db else Memory()
-            tracked = _tracked_findings_from_scored(result)
-            summary = remediation.classify_remediation(tracked, track_memory.latest_remediation_events())
-            _print_remediation_summary(summary, db_path=str(track_memory.db_path))
+                track_memory = Memory(args.db) if args.db else Memory()
+                tracked = _tracked_findings_from_scored(result)
+                summary = remediation.classify_remediation(tracked, track_memory.latest_remediation_events())
+                _print_remediation_summary(summary, db_path=str(track_memory.db_path))
 
         if args.explain:
             for s in scored:

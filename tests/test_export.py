@@ -16,6 +16,21 @@ FINDING_KEYS = {
     "narrative", "constraints_applied", "cited_text", "sources", "not_collected",
     "asset_not_collected", "has_tot",
 }
+# The deterministic path ALONE gets a structured decomposition (CLAUDE.md's
+# "drop a CSV, get a plan" spec: "This must come from the deterministic
+# scorer, with no LLM involved") -- agents/risk.py's own scoring_rationale
+# is prose, not scoring.ScoreDecomposition, and _agents_finding_entry
+# (export.py) deliberately does not carry one.
+DET_FINDING_KEYS = FINDING_KEYS | {"decomposition"}
+DECOMPOSITION_THREAT_KEYS = {
+    "severity_base", "severity_source", "internet_exposed", "internet_exposed_neutralized",
+    "epss", "is_kev", "likelihood_multiplier", "attack_prevalence",
+}
+DECOMPOSITION_IMPACT_KEYS = {
+    "criticality", "criticality_neutralized", "environment", "environment_neutralized",
+    "data_sensitivity", "data_sensitivity_neutralized", "role", "role_neutralized",
+    "composite", "compensating_controls",
+}
 ASSET_SUMMARY_KEYS = {"role", "internet_exposed", "criticality", "environment", "data_sensitivity"}
 SOURCE_KEYS = {"source", "key", "retrieved_at"}
 PIPELINE_STAGES = ("ingest", "enrichment", "scoring", "agents", "tot")
@@ -50,6 +65,7 @@ def test_deterministic_export_matches_schema_shape(tmp_path):
         "data_dir": str(DEMO_DIR), "format": "native", "seed": 42, "offline": True, "agents": False,
     }
     assert data["provenance"] is None  # native is a built-in adapter -- no contract behind it
+    assert data["provisional"] is False  # a plain native run is never provisional
 
     assert set(data["pipeline"].keys()) == set(PIPELINE_STAGES)
     for stage in ("ingest", "enrichment", "scoring"):
@@ -75,7 +91,7 @@ def test_deterministic_export_matches_schema_shape(tmp_path):
 
     assert len(data["findings"]) == 24
     for entry in data["findings"]:
-        assert set(entry.keys()) == FINDING_KEYS
+        assert set(entry.keys()) == DET_FINDING_KEYS
         assert entry["threat_score"] is not None
         assert entry["impact_score"] is not None
         assert isinstance(entry["is_kev"], bool)
@@ -85,6 +101,14 @@ def test_deterministic_export_matches_schema_shape(tmp_path):
         assert entry["constraints_applied"] == []
         assert entry["cited_text"] == []
         assert entry["has_tot"] is False  # deterministic path never dispatches ToT
+        decomposition = entry["decomposition"]
+        assert set(decomposition["threat"].keys()) == DECOMPOSITION_THREAT_KEYS
+        assert set(decomposition["impact"].keys()) == DECOMPOSITION_IMPACT_KEYS
+        # The demo fixture is a fully-mapped native run -- nothing is ever
+        # neutralized there (that's the provisional-run path's own job).
+        assert decomposition["impact"]["criticality_neutralized"] is False
+        assert decomposition["impact"]["role_neutralized"] is False
+        assert decomposition["threat"]["internet_exposed_neutralized"] is False
 
     by_id = {e["finding_id"]: e for e in data["findings"]}
     f14 = by_id["F14"]  # the fixture's designated contested/bad-data case
@@ -650,6 +674,7 @@ def test_agents_export_full_shape_with_contested_finding_and_constraint(monkeypa
 
     assert data["run"]["agents"] is True
     assert data["provenance"] is None  # this Coordinator was built with no contract (native)
+    assert data["provisional"] is False  # run_agents never runs against an unconfirmed contract
     assert data["pipeline"]["agents"]["status"] == "completed"
     assert data["pipeline"]["tot"]["status"] == "completed"
     assert "1 contested finding(s) resolved, 0 failed" in data["pipeline"]["tot"]["detail"]

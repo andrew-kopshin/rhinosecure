@@ -207,7 +207,15 @@ def test_adapter_routes_are_404_when_jobs_are_disabled(tmp_path: Path):
 def test_get_proposal_surfaces_unresolved_slot_detail(client: TestClient):
     upload_id = _upload(client)
     job = _propose(client, upload_id, "upload-detail", _proposal_dict(name="upload-detail", environment_status="unresolved"))
-    assert job["result"]["contract_written"] is False
+    # environment is gap-legal AND scoring-relevant -- the provisional-run
+    # fallback (assemble_provisional_contract) now auto-fills it via
+    # not_collected (neutralized for scoring) and writes immediately,
+    # rather than leaving the proposal blocked. `unresolved` below is still
+    # populated from the SAVED PROPOSAL (out/propose_<name>.json, written
+    # unconditionally), not the contract, so this endpoint's own behavior
+    # -- the actual thing this test exercises -- is otherwise unaffected.
+    assert job["result"]["contract_written"] is True
+    assert job["result"]["provisional"] is True
 
     resp = client.get(f"/api/adapters/upload-detail/proposal", params={"upload_id": upload_id})
     assert resp.status_code == 200

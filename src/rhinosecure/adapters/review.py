@@ -130,6 +130,18 @@ PROVISIONAL_AT = "0000-00-00T00:00:00Z"
 PROVISIONAL_BY = "rhino adapt (provisional, in memory, never written)"
 
 
+def is_provisional(contract: Contract | None) -> bool:
+    """True for a contract that went through `_provisional()` -- `review.
+    state == "confirmed"` is NOT the right check here: that is exactly what
+    `_provisional()` stamps, on purpose, so `ConfiguredAdapter`'s own
+    `assert_confirmed` gate lets it construct at all. The sentinel identity
+    (`PROVISIONAL_BY`), never a real reviewer's name, is what actually
+    distinguishes it. `None` (a built-in `--format` run has no contract at
+    all) is False, not an error -- the same "absent means no, never
+    guessed" convention `export.py`'s own provenance fields already use."""
+    return contract is not None and contract.review.confirmed_by == PROVISIONAL_BY
+
+
 class ReviewError(ContractError):
     """The review itself cannot proceed -- an already-confirmed contract
     without `--reconfirm`, a bad `--attest` argument, a frozen identity

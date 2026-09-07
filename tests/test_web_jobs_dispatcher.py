@@ -475,6 +475,82 @@ def test_run_deterministic_resolves_an_uploaded_known_format_source(client: Test
     assert body["result"]["total_findings"] == 1
 
 
+def test_run_deterministic_scores_provisionally_against_an_unconfirmed_upload_contract(
+    client: TestClient, tmp_path: Path, monkeypatch
+):
+    """CLAUDE.md's 'drop a CSV, get a plan' spec: run_deterministic, run
+    against an upload whose contract exists but was never confirmed
+    (exactly the state test_resolve_source_ref_refuses_an_upload_with_a_
+    proposed_but_unconfirmed_contract shows resolve_source_ref itself still
+    refuses), now scores provisionally instead of refusing -- the
+    ConfiguredAdapter(review._provisional(...), excluding_targets=
+    SCORING_ENUM_TARGETS) branch web/jobs.py's _run_run_deterministic
+    takes before ever calling resolve_source_ref. CVE-2021-26855 (ProxyLogon)
+    is a real, already-snapshotted demo anchor CVE, so this exercises a
+    genuine scored run, not just contract construction."""
+    from rhinosecure.adapters.config_io import write_contract
+    from rhinosecure.adapters.probe import profile_source
+    from rhinosecure.agents.schema_inference import (
+        AdapterProposal,
+        Generator,
+        assemble_provisional_contract,
+        check_grounding,
+    )
+
+    monkeypatch.setattr(jobs_module, "REPO_ROOT", REPO_ROOT)
+
+    upload_id = "f" * 32
+    upload_dir = uploads_module.DEFAULT_UPLOADS_DIR / upload_id
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "mystery.csv").write_text(
+        # Both rows use Col="srv" -- _full_proposal_dict's own
+        # scanner_severity vocabulary table only has an entry for "srv"
+        # (scanner_severity is NOT a neutralizable/excludable target, so a
+        # miss on it would fatally refuse the whole batch, unrelated to
+        # what this test is actually exercising).
+        "Asset_ID,Hostname,Finding_ID,Cve,Col\n"
+        "A01,EXCH01,F01,CVE-2021-26855,srv\n"
+        "A02,EXCH02,F02,CVE-2021-26855,srv\n",
+        encoding="utf-8",
+    )
+    adapters_dir = tmp_path / "adapters"
+    monkeypatch.setattr(jobs_module, "resolve_config_path", lambda name: adapters_dir / f"{name}.json")
+    name = jobs_module._default_propose_name(upload_id)
+
+    # role and criticality are left UNRESOLVED -- exactly the shape
+    # assemble_provisional_contract exists for: role gets a literal
+    # placeholder (neutralized), criticality gets not_collected
+    # (neutralized, since it's a scoring input).
+    data = _full_proposal_dict(name)
+    data["asset"]["role"] = {"status": "unresolved", "candidate_columns": [], "reason": "test"}
+    data["asset"]["criticality"] = {"status": "unresolved", "candidate_columns": [], "reason": "test"}
+    proposal = AdapterProposal.model_validate(data)
+    profiles = {p.path.name: p for p in profile_source(upload_dir)}
+    report = check_grounding(proposal, profiles)
+    generator = Generator(
+        tool="x", model="y", prompt_tokens=1, completion_tokens=1, estimated_cost_usd=0.0,
+        attempts=1, call_log_digest="sha256:" + "a" * 64,
+    )
+    contract, notes = assemble_provisional_contract(
+        proposal, profiles, report, generator=generator, generated_at="2026-01-01T00:00:00Z"
+    )
+    assert contract is not None, notes.hard_stop_reason
+    assert notes.neutralized_axes == frozenset({"role", "criticality"})
+    assert contract.review.state == "proposed"  # never confirmed
+    write_contract(adapters_dir / f"{contract.format}.json", contract)
+
+    resp = client.post("/api/jobs", json={"kind": "run_deterministic", "input": {"source_ref": upload_id}})
+    body = _wait_for_terminal(client, resp.json()["job_id"])
+
+    assert body["status"] == "succeeded", body.get("error")
+    assert body["result"]["provisional"] is True
+    assert body["result"]["total_findings"] == 2
+    assert body["result"]["format"] == name
+
+    export_data = json.loads((tmp_path / "export.json").read_text(encoding="utf-8"))
+    assert export_data["provisional"] is True
+
+
 # ---------------- run_agents: PlanState really replaces the current plan ----------------
 
 

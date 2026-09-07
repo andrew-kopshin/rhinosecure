@@ -16,15 +16,18 @@ the test compares around it rather than pretending it does not exist.
 Fatal vs. exclude, resolved here and nowhere else
 --------------------------------------------------
 `config_model.py`'s contract grammar has no `on_unmapped` key (see its own
-module docstring). The engine is what makes that omission meaningful:
-`_role_reference` forward-traces which check decides `Asset.role`'s value
--- either a `vocabulary` mapping directly on `asset.role`, or the `derived`
-block a `default_by` mapping is keyed by -- and only THAT check's unmapped
-values are scope-exclusions (`ProblemCollector.exclude`). Every other
-vocabulary or derivation-table miss anywhere else in the contract is
-`ProblemCollector.add`: a whole-batch, data-quality refusal. Neither the
-contract nor a human confirming it gets a knob for this; it is derived
-structurally, every time, the same way.
+module docstring). The engine is what makes that omission meaningful: a
+vocabulary-table or derivation-table MISS on a target in
+`self.excluding_targets` is a scope-exclusion (`ProblemCollector.exclude`);
+every other miss anywhere else in the contract is `ProblemCollector.add`: a
+whole-batch, data-quality refusal. `self.excluding_targets` defaults to
+`EXCLUDING_TARGETS` (`{"role"}`) for every confirmed-contract run -- Rule
+1's original, unchanged scope -- and is widened only by the provisional-run
+path (`web/jobs.py`), which is the one place this project accepts that a
+data-quality gap should degrade a plan rather than block it outright.
+Neither the contract nor a human confirming it gets a knob for this; it is
+a property of the CALLER (which targets it passes), never something the
+contract itself declares or a human can dial in.
 
 Per-row not_collected
 ----------------------
@@ -63,6 +66,7 @@ from rhinosecure.adapters.config_model import (
     DefaultByMapping,
     Derivation,
     DerivedMapping,
+    EXCLUDING_TARGETS,
     ContractValidationError,
     LiteralMapping,
     NotCollectedMapping,
@@ -310,7 +314,12 @@ class ConfiguredAdapter(IngestAdapter):
     implementation of it."""
 
     def __init__(
-        self, contract: Contract, *, collector_factory: Callable[[Path], ProblemCollector] = ProblemCollector
+        self,
+        contract: Contract,
+        *,
+        collector_factory: Callable[[Path], ProblemCollector] = ProblemCollector,
+        excluding_targets: frozenset[str] = EXCLUDING_TARGETS,
+        force_not_collected: frozenset[str] = frozenset(),
     ) -> None:
         assert_confirmed(contract)
         super().__init__()
@@ -320,6 +329,29 @@ class ConfiguredAdapter(IngestAdapter):
         self.findings_filename = contract.source.findings_filename
         self.provides_enrichment = contract.enrichment is not None
         self._collector_factory = collector_factory
+        #: Which targets get a table-lookup MISS treated as
+        #: `ProblemCollector.exclude` (scope-boundary, non-fatal) rather than
+        #: `.add` (fatal, whole-batch refusal) -- Rule 1, CLAUDE.md. `{"role"}`
+        #: (the default, `EXCLUDING_TARGETS`) for every confirmed-contract
+        #: run, unchanged from this project's original design. Widened only
+        #: by the provisional-run path (`web/jobs.py`), which passes every
+        #: scoring-relevant target -- never by a confirmed contract's own
+        #: run, and never stored on the contract itself: this is a property
+        #: of HOW a contract is being run, not of the contract.
+        self.excluding_targets = excluding_targets
+        #: Extra target names OR'd into every asset's `not_collected` set,
+        #: unconditionally -- for a target `not_collected`/`blank="gap"`
+        #: cannot legally represent at all (`role`, which has no
+        #: `NOT_COLLECTED_DEFAULTS` entry: `_resolve_target` would KeyError
+        #: on `NOT_COLLECTED_DEFAULTS["role"]` if it tried). The
+        #: provisional-run path (web/jobs.py) gives `role` a real, legal
+        #: `literal` placeholder value instead so the contract stays
+        #: constructible -- that value is never trusted for scoring
+        #: (scoring.py neutralizes any axis this set names), but downstream
+        #: rationale/display code needs to know it's a placeholder, not a
+        #: fact, which is exactly what `Asset.not_collected` already means
+        #: for every other gap. Empty for every confirmed-contract run.
+        self.force_not_collected = force_not_collected
         self._derivation_output_index: dict[str, dict[str, int]] = {
             name: {output: i for i, output in enumerate(d.outputs)} for name, d in contract.derived.items()
         }
@@ -344,30 +376,29 @@ class ConfiguredAdapter(IngestAdapter):
     def run_label(self) -> str:
         return f"{self.contract.format}@v{self.contract.version}"
 
-    def _role_reference(self) -> tuple[str, str]:
-        """See the module docstring's "Fatal vs. exclude" section. Returns
-        `("vocabulary", "role")` when `asset.role` is a direct vocabulary
-        lookup, `("derivation", <name>)` when it comes from a `default_by`
-        keyed to derivation `<name>`, or `("none", "")` when role has no
-        forward-traceable vocabulary at all (a plain `column`/`literal`
-        mapping -- no exclusion concept applies; an invalid value there
-        fails at `Asset` construction instead, same as any other schema
-        `ValidationError` this module already catches)."""
-        mapping = self.contract.asset["role"]
-        if isinstance(mapping, VocabularyMapping):
-            return ("vocabulary", "role")
-        if isinstance(mapping, DefaultByMapping):
-            return ("derivation", mapping.keyed_by.from_)
-        return ("none", "")
-
     # --- shared row-reading helpers --------------------------------------
 
     def _open(self, path: Path) -> tuple[IO[str], csv.DictReader]:
         return _open_csv(self.contract, path)
 
     def _resolve_derivation(
-        self, name: str, row: dict[str, str], row_no: int, problems: ProblemCollector, cache: dict[str, tuple[Any, ...] | None], identity: str | None
+        self,
+        name: str,
+        target: str,
+        row: dict[str, str],
+        row_no: int,
+        problems: ProblemCollector,
+        cache: dict[str, tuple[Any, ...] | None],
+        identity: str | None,
     ) -> tuple[Any, ...] | None:
+        """`target` is whichever field is asking (a `DerivedMapping` or
+        `DefaultByMapping` consumer) -- used only to decide exclude-vs-fatal
+        on a genuine miss (`target in self.excluding_targets`, see Rule 1 /
+        CLAUDE.md and this module's own docstring). A cache hit -- including
+        a cached miss -- never re-decides or re-reports; the FIRST caller to
+        resolve a given derivation in a row is the one whose target governs,
+        which is why `_map_asset_row` resolves every `self.excluding_targets`
+        member before anything else."""
         if name in cache:
             return cache[name]
         derivation: Derivation = self.contract.derived[name]
@@ -379,11 +410,11 @@ class ConfiguredAdapter(IngestAdapter):
             return None
         outputs = derivation.table.get(cased)
         if outputs is None:
-            if self._role_reference() == ("derivation", name):
+            if target in self.excluding_targets:
                 problems.exclude(
                     identity or f"row {row_no}",
-                    f"{derivation.column} {raw!r} has no honest role equivalent in this contract's vocabulary "
-                    f"(known: {sorted(derivation.table)}) -- not guessing a blast-radius weight for it",
+                    f"{derivation.column} {raw!r} has no honest {target} equivalent in this contract's "
+                    f"vocabulary (known: {sorted(derivation.table)}) -- not guessing a value for it",
                 )
             else:
                 problems.add(f"row {row_no}: {derivation.column} {raw!r} is not one of {sorted(derivation.table)}")
@@ -415,13 +446,15 @@ class ConfiguredAdapter(IngestAdapter):
             return mapping.value
 
         if isinstance(mapping, DerivedMapping):
-            outputs = self._resolve_derivation(mapping.from_, row, row_no, problems, derivation_cache, identity)
+            outputs = self._resolve_derivation(mapping.from_, target, row, row_no, problems, derivation_cache, identity)
             if outputs is None:
                 return _FAIL
             return outputs[self._derivation_output_index[mapping.from_][mapping.output]]
 
         if isinstance(mapping, DefaultByMapping):
-            outputs = self._resolve_derivation(mapping.keyed_by.from_, row, row_no, problems, derivation_cache, identity)
+            outputs = self._resolve_derivation(
+                mapping.keyed_by.from_, target, row, row_no, problems, derivation_cache, identity
+            )
             if outputs is None:
                 return _FAIL
             keyed_value = outputs[self._derivation_output_index[mapping.keyed_by.from_][mapping.keyed_by.output]]
@@ -437,12 +470,11 @@ class ConfiguredAdapter(IngestAdapter):
             if isinstance(mapping, VocabularyMapping):
                 value = mapping.table.get(cased)
                 if value is None:
-                    if self._role_reference() == ("vocabulary", target):
+                    if target in self.excluding_targets:
                         problems.exclude(
                             identity or f"row {row_no}",
-                            f"{mapping.column} {raw!r} has no honest role equivalent in this contract's "
-                            f"vocabulary (known: {sorted(mapping.table)}) -- not guessing a blast-radius "
-                            "weight for it",
+                            f"{mapping.column} {raw!r} has no honest {target} equivalent in this contract's "
+                            f"vocabulary (known: {sorted(mapping.table)}) -- not guessing a value for it",
                         )
                     else:
                         problems.add(f"row {row_no}: {mapping.column} {raw!r} is not one of {sorted(mapping.table)}")
@@ -568,30 +600,37 @@ class ConfiguredAdapter(IngestAdapter):
         if asset_id is _FAIL or hostname_val is _FAIL:
             return None
 
-        role_kind, role_ref_name = self._role_reference()
-        if role_kind == "derivation":
-            # Resolve the role-deciding derivation FIRST, mirroring
-            # defender.py's own "check the platform right after identity"
-            # order -- an unrecognized value here excludes the WHOLE asset
-            # before any other field is evaluated.
-            if self._resolve_derivation(role_ref_name, row, row_no, problems, derivation_cache, asset_id) is None:
-                return None
-        elif role_kind == "vocabulary":
-            role_mapping = contract.asset["role"]
-            probe = self._resolve_target(role_mapping, "role", row, row_no, problems, derivation_cache, asset_id)
-            if probe is _FAIL:
-                return None
-
+        # Resolve every excludable target FIRST, mirroring defender.py's own
+        # "check the platform right after identity" order -- an unrecognized
+        # value on any of them excludes the WHOLE asset before any other
+        # field is evaluated, rather than partially populating `fields` for
+        # a row about to be dropped. `self.excluding_targets` is `{"role"}`
+        # for every confirmed-contract run (Rule 1, CLAUDE.md) and widened
+        # only by the provisional-run path (`excluding_targets=`) -- this
+        # loop is target-driven, not role-specific, so it needs no forward
+        # trace: `_resolve_target` already knows which target it's resolving
+        # and checks `target in self.excluding_targets` itself. A target
+        # whose mapping can't miss a table lookup at all (column/parsed/
+        # literal/not_collected) has nothing to gain from pre-resolution, so
+        # only the three miss-capable kinds are pre-resolved here.
         fields: dict[str, Any] = {"asset_id": asset_id, "hostname": hostname_val}
+        pre_resolved: set[str] = set()
+        for target in sorted(self.excluding_targets):
+            if target in ("asset_id", "hostname"):
+                continue
+            mapping = contract.asset.get(target)
+            if mapping is None or not isinstance(mapping, (VocabularyMapping, DerivedMapping, DefaultByMapping)):
+                continue
+            value = self._resolve_target(mapping, target, row, row_no, problems, derivation_cache, asset_id)
+            if value is _FAIL:
+                return None
+            fields[target] = value
+            pre_resolved.add(target)
+
         row_not_collected: set[str] = set()
         union_row_values: dict[str, str] = {}
         for target, mapping in contract.asset.items():
-            if target in ("asset_id", "hostname"):
-                continue
-            if target == "role" and role_kind == "vocabulary":
-                # Already resolved above (as `probe`) -- resolving twice
-                # would double up any problems.add/.exclude call.
-                fields["role"] = probe
+            if target in ("asset_id", "hostname") or target in pre_resolved:
                 continue
             was_blank_column = (
                 isinstance(mapping, _COLUMN_BEARING_KINDS)
@@ -615,7 +654,7 @@ class ConfiguredAdapter(IngestAdapter):
                 continue
             fields[target] = value
 
-        fields["not_collected"] = frozenset(always_not_collected | row_not_collected)
+        fields["not_collected"] = frozenset(always_not_collected | row_not_collected | self.force_not_collected)
 
         order_value: Any = None
         if grouping.order_by is not None:

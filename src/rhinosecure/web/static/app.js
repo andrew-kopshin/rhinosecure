@@ -217,9 +217,11 @@ function renderOverview(data) {
   const cr = data.summary.contested_rate;
   const gapsHtml = renderDataGaps(data.summary.data_gaps, data.provenance);
   const usageHtml = renderUsageSummary(data.usage, data.run.agents);
-  const provenanceHtml = renderProvenance(data.provenance);
+  const provenanceHtml = renderProvenance(data.provenance, data.provisional);
+  const bannerHtml = data.provisional ? renderProvisionalBanner(data.provenance) : "";
 
   el.innerHTML = `
+    ${bannerHtml}
     <div class="card">
       <h3>Bucket distribution</h3>
       <div class="bucket-chart">${bars}</div>
@@ -247,12 +249,46 @@ function shortHash(s) {
   return s.length > 20 ? `${s.slice(0, 18)}…` : s;
 }
 
-function renderProvenance(prov) {
+/* CLAUDE.md's "drop a CSV, get a plan" spec: nothing provisional may be
+ * exported, dispatched, or written to remediation tracking -- this banner
+ * is the entire user-facing enforcement of that on the read side (the CLI
+ * guard in cli.py's --track-remediation is the write-side one). A flag and
+ * a banner, not a lifecycle: there is no dismiss/acknowledge state to
+ * track here, it just renders whenever the export says provisional. */
+function renderProvisionalBanner(prov) {
+  const name = prov ? esc(prov.format) : "";
+  return `
+    <div class="provisional-banner">
+      <strong>PROVISIONAL</strong> — this plan uses an inferred, unreviewed mapping.
+      Some values below may be excluded from scoring rather than known (see Mapping provenance
+      and Data gaps). Nothing here is exported, dispatched, or tracked as remediated.
+      ${name ? `Run <code>rhino adapt confirm ${name}</code> to review and sign it.` : ""}
+    </div>
+  `;
+}
+
+function renderProvenance(prov, provisional) {
   if (!prov) {
     return `
       <div class="card">
         <h3>Mapping provenance</h3>
         <p class="empty-note">Built-in adapter — no reviewed contract behind this run.</p>
+      </div>
+    `;
+  }
+
+  if (provisional) {
+    return `
+      <div class="card">
+        <h3>Mapping provenance</h3>
+        <p class="stat-line">Contract <code>${esc(prov.format)}</code> — <strong>not yet confirmed</strong></p>
+        <p class="hint">
+          This run used a provisional mapping: unresolved fields were either auto-filled with a
+          documented default (harmless -- they never feed scoring) or excluded from the risk
+          calculation entirely (never guessed at). Run
+          <code>rhino adapt confirm ${esc(prov.format)}</code> to review it, resolve what's still
+          open, and sign a real, reusable contract.
+        </p>
       </div>
     `;
   }
@@ -409,6 +445,64 @@ function toggleFindingDetail(row, finding) {
   if (link) link.addEventListener("click", (e) => { e.preventDefault(); switchTab("contested"); });
 }
 
+/* The structured Threat/Impact breakdown CLAUDE.md's "drop a CSV, get a
+ * plan" spec asks for: named components and values, not another prose
+ * sentence (`rationale`, below, already covers that). Every value here
+ * comes straight from `f.decomposition` (export.py's `_decomposition_dict`,
+ * itself a mirror of scoring.ScoreDecomposition) -- this function only
+ * formats it, it never computes anything the deterministic scorer didn't
+ * already compute. A `*_neutralized` axis means the source never
+ * determined it at all (an entirely-unresolved slot on a provisional run)
+ * -- shown as excluded, never as a fabricated value. */
+function decompositionHtml(f) {
+  const d = f.decomposition;
+  if (!d) return "";
+  const t = d.threat;
+  const im = d.impact;
+
+  const impactParts = [
+    im.criticality_neutralized ? "criticality unavailable — excluded" : `criticality ${im.criticality}/5`,
+    im.environment_neutralized ? "environment unavailable — excluded" : `environment ${esc(im.environment)}`,
+    im.data_sensitivity_neutralized
+      ? "data sensitivity unavailable — excluded"
+      : `data sensitivity ${esc(im.data_sensitivity)}`,
+    im.role_neutralized ? "role unavailable — excluded" : `role ${esc(im.role)}`,
+  ];
+  const controlsPart = im.compensating_controls.length
+    ? `, ${im.compensating_controls.length} compensating control(s) applied`
+    : "";
+
+  const threatParts = [
+    `severity ${t.severity_base.toFixed(1)} (${esc(t.severity_source)})`,
+    t.internet_exposed_neutralized
+      ? "internet exposure unavailable — neutralized"
+      : t.internet_exposed
+        ? "internet-exposed"
+        : "not internet-exposed",
+    t.is_kev ? "KEV-listed" : "not KEV-listed",
+    t.epss !== null && t.epss !== undefined ? `EPSS ${t.epss.toFixed(3)}` : "EPSS unscored",
+  ];
+  if (t.attack_prevalence !== null && t.attack_prevalence !== undefined) {
+    threatParts.push(`ATT&CK prevalence ${t.attack_prevalence.toFixed(2)}`);
+  }
+
+  const anyNeutralized =
+    im.criticality_neutralized || im.environment_neutralized || im.data_sensitivity_neutralized ||
+    im.role_neutralized || t.internet_exposed_neutralized;
+  const neutralizedNote = anyNeutralized
+    ? `<p class="hint">Excluded axes were never trusted for this score at all -- not defaulted, not guessed. See the coverage summary on the Overview tab.</p>`
+    : "";
+
+  return `
+    <div class="detail-block decomposition-block">
+      <h4>Score decomposition</h4>
+      <p class="decomposition-line"><strong>Impact ${f.impact_score.toFixed(2)}</strong> (${impactParts.join(", ")}${controlsPart})</p>
+      <p class="decomposition-line"><strong>Threat ${f.threat_score.toFixed(2)}</strong> (${threatParts.join(", ")})</p>
+      ${neutralizedNote}
+    </div>
+  `;
+}
+
 function findingDetailHtml(f) {
   const rationale = f.rationale.map((r) => `<li>${esc(r)}</li>`).join("");
 
@@ -452,6 +546,7 @@ function findingDetailHtml(f) {
   return `
     <div class="finding-detail">
       ${verdictHtml}
+      ${decompositionHtml(f)}
       <div class="detail-block">
         <h4>Rationale</h4>
         <ul class="rationale-list">${rationale}</ul>

@@ -20,15 +20,18 @@ import rhinosecure.agents.schema_inference as schema_inference_module
 from rhinosecure.adapters.config_model import ASSET_SLOTS, FINDING_SLOTS, Contract, validate_contract
 from rhinosecure.adapters.probe import profile_source
 from rhinosecure.agents.schema_inference import (
+    PROVISIONAL_ROLE_PLACEHOLDER,
     AdapterProposal,
     Generator,
     ProposalGenerationError,
     ProposalIncompleteError,
+    ProvisionalAssemblyNotes,
     SavedProposal,
     SchemaInferenceError,
     _resolve_layout,
     _validate_format_name,
     assemble_contract,
+    assemble_provisional_contract,
     check_grounding,
     dump_saved_proposal,
     load_saved_proposal,
@@ -362,6 +365,124 @@ def test_a_low_confidence_scoring_slot_requires_attestation_before_it_can_confir
     report = check_grounding(proposal, profiles)
     contract = assemble_contract(proposal, profiles, report, generator=_generator(), generated_at=_GENERATED_AT)
     assert "low_confidence_mappings" in missing_attestations(contract)
+
+
+# --- assemble_provisional_contract -------------------------------------------
+
+
+def test_provisional_assembly_neutralizes_an_entirely_unresolved_scoring_field(profiles):
+    """criticality is gap-legal (NOT_COLLECTED_DEFAULTS has an entry), so it
+    gets a real not_collected mapping (the contract stays constructible) --
+    but it's ALSO a scoring input, so it lands in neutralized_axes too:
+    the placeholder default is never trusted for the risk number itself."""
+    data = _full_proposal_dict(overrides_asset={"criticality": _unresolved()})
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles)
+    contract, notes = assemble_provisional_contract(proposal, profiles, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract is not None
+    assert notes.hard_stop_reason is None
+    assert notes.neutralized_axes == frozenset({"criticality"})
+    assert contract.asset["criticality"].kind == "not_collected"
+    validate_contract(contract, {"data.csv": _HEADER})
+
+
+def test_provisional_assembly_gives_role_a_literal_placeholder_and_neutralizes_it(profiles):
+    """role has no NOT_COLLECTED_DEFAULTS entry at all -- a bare not_collected
+    mapping would be illegal (and would KeyError in the engine before that).
+    literal(PROVISIONAL_ROLE_PLACEHOLDER) is the one grammar-legal way to
+    give it a real, schema-valid value without asserting a fact -- and it's
+    always neutralized, so that placeholder is never actually read."""
+    data = _full_proposal_dict(overrides_asset={"role": _unresolved()})
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles)
+    contract, notes = assemble_provisional_contract(proposal, profiles, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract is not None
+    assert notes.neutralized_axes == frozenset({"role"})
+    role_mapping = contract.asset["role"]
+    assert role_mapping.kind == "literal"
+    assert role_mapping.value == PROVISIONAL_ROLE_PLACEHOLDER
+    validate_contract(contract, {"data.csv": _HEADER})
+
+
+def test_provisional_assembly_auto_fills_a_non_scoring_gap_legal_field_without_neutralizing(profiles):
+    """owner is gap-legal but never feeds scoring.py at all -- auto-filled
+    exactly like a Defender export already does unconditionally, and never
+    added to neutralized_axes (there is no axis for it to neutralize)."""
+    data = _full_proposal_dict(overrides_asset={"owner": _unresolved()})
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles)
+    contract, notes = assemble_provisional_contract(proposal, profiles, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract is not None
+    assert notes.neutralized_axes == frozenset()
+    assert contract.asset["owner"].kind == "not_collected"
+
+
+def test_provisional_assembly_auto_fills_absent_fact_only_fields_via_empty_literal(profiles):
+    """product has NO not_collected default (config_model.GAP_LEGAL_TARGETS
+    excludes it) but IS in ABSENT_FACT_LEGAL_TARGETS -- the schema's own
+    'blank is the fact' encoding, so literal("") is the honest fill."""
+    data = _full_proposal_dict(overrides_finding={"product": _unresolved()})
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles)
+    contract, notes = assemble_provisional_contract(proposal, profiles, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract is not None
+    product_mapping = contract.finding["product"]
+    assert product_mapping.kind == "literal"
+    assert product_mapping.value == ""
+
+
+@pytest.mark.parametrize("target", ["asset_id", "hostname"])
+def test_provisional_assembly_hard_stops_on_an_unresolved_asset_identity_field(profiles, target):
+    data = _full_proposal_dict(overrides_asset={target: _unresolved()})
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles)
+    contract, notes = assemble_provisional_contract(proposal, profiles, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract is None
+    assert notes.hard_stop_reason is not None
+    assert f"asset.{target}" in notes.hard_stop_reason
+
+
+def test_provisional_assembly_hard_stops_on_unresolved_scanner_severity(profiles):
+    """Deliberately NOT neutralized -- severity_base is a base value, not a
+    weighted composite term, and scanner_severity's real impact varies per
+    finding (NVD may cover the gap for some), unlike a uniformly-missing
+    Impact axis. See _PROVISIONAL_HARD_STOP_TARGETS' own docstring."""
+    data = _full_proposal_dict(overrides_finding={"scanner_severity": _unresolved()})
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles)
+    contract, notes = assemble_provisional_contract(proposal, profiles, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract is None
+    assert "finding.scanner_severity" in notes.hard_stop_reason
+
+
+def test_provisional_assembly_still_refuses_a_real_grounding_failure(profiles):
+    """A genuine data-quality problem (a cited column that isn't real) is
+    not a coverage gap -- it stays a hard stop, exactly like
+    assemble_contract, never silently degraded around."""
+    data = _full_proposal_dict(overrides_asset={
+        "owner": _mapped({"kind": "column", "column": "Ghost", "case": "exact", "blank": "gap"}),
+    })
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles)
+    assert report.failures
+    contract, notes = assemble_provisional_contract(proposal, profiles, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract is None
+    assert "asset.owner" in notes.hard_stop_reason
+    assert notes.neutralized_axes == frozenset()
+
+
+def test_provisional_assembly_of_a_fully_resolved_proposal_behaves_like_assemble_contract(profiles):
+    """No unresolved slots at all -- the provisional path should produce
+    the identical contract assemble_contract would, with an empty notes
+    object, never a spurious neutralization."""
+    proposal = AdapterProposal.model_validate(_full_proposal_dict())
+    report = check_grounding(proposal, profiles)
+    contract, notes = assemble_provisional_contract(proposal, profiles, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract is not None
+    assert notes == ProvisionalAssemblyNotes()
+    strict_contract = assemble_contract(proposal, profiles, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract.asset == strict_contract.asset
+    assert contract.finding == strict_contract.finding
 
 
 def test_assemble_contract_a_caveat_alone_does_not_block(tmp_path):

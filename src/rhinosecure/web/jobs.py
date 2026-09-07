@@ -132,6 +132,9 @@ from rhinosecure.adapters import (
     resolve_config_path,
 )
 from rhinosecure.adapters.config_io import read_contract, write_contract
+from rhinosecure.adapters.config_model import SCORING_ENUM_TARGETS, Attestation, Contract, missing_attestations
+from rhinosecure.adapters.configured import ConfiguredAdapter
+from rhinosecure.adapters.review import _provisional as provisional_stamp
 from rhinosecure.agents.constraint_intake import ConstraintInterpretationError
 from rhinosecure.agents.coordinator import Coordinator, CoordinatorError, ConstraintReplanFailedError
 from rhinosecure.agents.schema_inference import (
@@ -140,6 +143,7 @@ from rhinosecure.agents.schema_inference import (
     ProposalGenerationError,
     SchemaInferenceError,
     SavedProposal,
+    assemble_provisional_contract,
     dump_saved_proposal,
     propose_contract,
     saved_proposal_from_dict,
@@ -387,12 +391,14 @@ def _upload_id_from_source_ref(source_ref: str) -> str | None:
     return candidate.lower() if _UPLOAD_ID_PATTERN.match(candidate) else None
 
 
-def _resolve_upload_source(upload_id: str, data_dir: Path) -> ResolvedSource:
-    filenames = sorted(p.name for p in data_dir.iterdir() if p.is_file())
-    matched_format = known_format_match(filenames)
-    if matched_format is not None:
-        return ResolvedSource(data_dir=data_dir, fmt=matched_format, adapter_config=None)
-
+def _find_upload_contract(upload_id: str, data_dir: Path) -> tuple[Path, Contract] | None:
+    """The contract-lookup half of `_resolve_upload_source` -- factored out
+    so a caller that needs to know "is there ANY contract at all, confirmed
+    or not" (the provisional-run branch of `_run_run_deterministic`) doesn't
+    duplicate the candidate-name search, and `_resolve_upload_source`'s own
+    refusal wording for an unconfirmed contract stays in exactly one place.
+    `None` means nothing has ever been proposed for this upload -- not an
+    error; every caller decides what that means for itself."""
     candidate_names = list(
         dict.fromkeys(
             n
@@ -405,11 +411,23 @@ def _resolve_upload_source(upload_id: str, data_dir: Path) -> ResolvedSource:
         if not candidate.is_file():
             continue
         try:
-            contract = read_contract(candidate)
+            return candidate, read_contract(candidate)
         except Exception as exc:
             raise IngestError(
                 f"upload {upload_id!r} has a contract at {candidate}, but it could not be read: {exc}"
             ) from exc
+    return None
+
+
+def _resolve_upload_source(upload_id: str, data_dir: Path) -> ResolvedSource:
+    filenames = sorted(p.name for p in data_dir.iterdir() if p.is_file())
+    matched_format = known_format_match(filenames)
+    if matched_format is not None:
+        return ResolvedSource(data_dir=data_dir, fmt=matched_format, adapter_config=None)
+
+    found = _find_upload_contract(upload_id, data_dir)
+    if found is not None:
+        candidate, contract = found
         if contract.review.state == "confirmed":
             return ResolvedSource(data_dir=data_dir, fmt=contract.format, adapter_config=str(candidate))
         raise IngestError(
@@ -804,9 +822,38 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
         "contract_path": None,
         "incomplete_reason": result.incomplete_reason,
         "next_step": None,
+        "provisional": False,
+        "neutralized_axes": [],
     }
 
     if result.contract is None:
+        # CLAUDE.md's "drop a CSV, get a plan" spec: assemble_contract
+        # refused (a real unresolved slot, or a grounding failure), but that
+        # doesn't have to mean nothing gets written -- assemble_provisional_
+        # contract (degrade-rather-than-block) gets a second attempt against
+        # the identical proposal/profiles/grounding report, auto-filling
+        # what it legally can and neutralizing the scoring axes it can't
+        # honestly determine. Still refuses (contract stays None) for a real
+        # grounding failure or a genuinely load-bearing gap (an identity
+        # field, scanner_severity) -- see that function's own docstring.
+        on_stage("attempting a provisional assembly")
+        provisional_contract, notes = assemble_provisional_contract(
+            result.proposal, result.profiles, result.grounding, generator=result.generator, generated_at=_now()
+        )
+        if provisional_contract is None:
+            result_dict["incomplete_reason"] = notes.hard_stop_reason or result.incomplete_reason
+            return JobOutcome(result=result_dict)
+
+        on_stage("writing provisional contract")
+        written = write_contract(output_path, provisional_contract)
+        _record_upload_contract_name(data_dir, name)
+        result_dict["contract_written"] = True
+        result_dict["contract_path"] = str(output_path)
+        result_dict["contract_version"] = written.version
+        result_dict["incomplete_reason"] = None
+        result_dict["provisional"] = True
+        result_dict["neutralized_axes"] = sorted(notes.neutralized_axes)
+        result_dict["next_step"] = f'rhino adapt confirm {name} --data uploads/{upload_id} --by "<you>"'
         return JobOutcome(result=result_dict)
 
     on_stage("writing contract")
@@ -853,7 +900,72 @@ def _run_run_deterministic(job: Job, plan_state: PlanState, on_stage: Callable[[
     second copy of that loop to keep in sync, not a cleaner boundary."""
     on_stage("resolving source")  # before validation -- a bad input's error must not carry stage=null
     source_ref = _require_source_ref(job, "run_deterministic")
-    resolved = resolve_source_ref(source_ref)
+
+    # CLAUDE.md's "drop a CSV, get a plan" spec: an upload whose contract
+    # exists but was never confirmed -- ordinarily resolve_source_ref's own
+    # refusal ("confirmation stays outside this system's automated
+    # routing") -- gets a PROVISIONAL run instead, here and only here. This
+    # check runs BEFORE calling resolve_source_ref, never around a refusal
+    # it raised: resolve_source_ref itself, and every other caller of it
+    # (run_agents, constraint_submit), is completely untouched. A confirmed
+    # contract, a known built-in format match, or no contract proposed for
+    # this upload at all fall straight through to the identical
+    # resolve_source_ref call this function has always made.
+    provisional_adapter: ConfiguredAdapter | None = None
+    upload_id = _upload_id_from_source_ref(source_ref)
+    if upload_id is not None:
+        upload_dir = uploads_module.DEFAULT_UPLOADS_DIR / upload_id
+        if upload_dir.is_dir():
+            found = _find_upload_contract(upload_id, upload_dir)
+            if found is not None and found[1].review.state != "confirmed":
+                contract = found[1]
+                # `role` gets a `literal` placeholder ONLY via the
+                # provisional-assembly auto-fill (assemble_provisional_
+                # contract) -- a real, confident model proposal never uses
+                # `literal` for a per-asset field like role. Checking the
+                # contract itself (rather than trusting stale state from
+                # whatever job proposed it) means this is correct even if
+                # the contract was hand-edited or resolved through the
+                # browser slot-resolution form after the fact.
+                force_not_collected = (
+                    frozenset({"role"}) if contract.asset["role"].kind == "literal" else frozenset()
+                )
+                # `ConfiguredAdapter.load_assets`/`.load_findings` run the
+                # real `validate_contract` on every load (docs/adapter-
+                # generation.md's "Order, which is not negotiable"), which
+                # includes V18: a scoring-relevant slot the model mapped at
+                # below `LOW_CONFIDENCE_THRESHOLD` (a REAL mapping, just an
+                # unconfident one -- a different case from an unresolved
+                # slot, and not something assemble_provisional_contract
+                # touches at all) requires a `low_confidence_mappings`
+                # attestation. `_provisional()`'s own stamp clears `review`
+                # entirely, so this contract carries none -- confirmed live:
+                # a real run against a model output with asset.environment/
+                # internet_exposed both at 0.55 confidence failed here with
+                # exactly this ContractValidationError before this fix.
+                # Placeholder attestations -- the identical "propose-time
+                # structural check only, not a real one" text and mechanism
+                # `_assemble_and_validate`'s own pre-check already uses --
+                # satisfy V18 without claiming a human reviewed anything;
+                # they are attached to THIS in-memory copy only, never
+                # written, exactly like assemble_contract's placeholder
+                # attestations never reach the file it writes either.
+                placeholder_attestations = [
+                    Attestation(item=item, text="provisional run -- not a real attestation", at=_now())
+                    for item in missing_attestations(contract)
+                ]
+                contract = contract.model_copy(
+                    update={"attestations": list(contract.attestations) + placeholder_attestations}
+                )
+                provisional_adapter = ConfiguredAdapter(
+                    provisional_stamp(contract),
+                    excluding_targets=SCORING_ENUM_TARGETS,
+                    force_not_collected=force_not_collected,
+                )
+                resolved = ResolvedSource(data_dir=upload_dir, fmt=contract.format, adapter_config=None)
+
+    if provisional_adapter is None:
+        resolved = resolve_source_ref(source_ref)
 
     on_stage("scoring")
     from rhinosecure.cli import run_with_report
@@ -864,6 +976,7 @@ def _run_run_deterministic(job: Job, plan_state: PlanState, on_stage: Callable[[
         offline=plan_state.config.offline,
         fmt=resolved.fmt,
         adapter_config=resolved.adapter_config,
+        adapter=provisional_adapter,
     )
 
     on_stage("exporting")
@@ -886,6 +999,7 @@ def _run_run_deterministic(job: Job, plan_state: PlanState, on_stage: Callable[[
             "format": result.report.format,
             "total_findings": len(result.scored),
             "bucket_distribution": dict(bucket_counts),
+            "provisional": provisional_adapter is not None,
         },
         export_written=True,
     )

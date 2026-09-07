@@ -91,8 +91,10 @@ from rhinosecure.adapters.config_model import (
     Generator,
     Header,
     HeaderSpec,
+    LiteralMapping,
     Mapping,
     NotCollectedDerived,
+    NotCollectedMapping,
     Review,
     Source,
     UnmappedColumnEntry,
@@ -108,6 +110,7 @@ from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.parsing import AgentOutputParseError, parse_structured_output
 from rhinosecure.adapters.probe import ColumnProfile, FileProfile, profile_source
 from rhinosecure.llm import DEFAULT_MODEL, get_llm
+from rhinosecure.scoring import IMPACT_AXIS_TARGETS, THREAT_AXIS_TARGETS
 
 ROLE = "Schema Inference"
 
@@ -650,45 +653,29 @@ def _hash_header(columns: list[str]) -> str:
     return "sha256:" + hashlib.sha256(("\n".join(columns) + "\n").encode("utf-8")).hexdigest()
 
 
-def assemble_contract(
+def _assemble_and_validate(
     proposal: AdapterProposal,
     profiles: dict[str, FileProfile],
-    report: GroundingReport,
+    asset_mappings: dict[str, Mapping],
+    finding_mappings: dict[str, Mapping],
+    mapping_confidence: dict[str, float],
     *,
     generator: Generator,
     generated_at: str,
 ) -> Contract:
-    """Refuses (`ProposalIncompleteError`) unless every slot is `mapped` AND
-    grounding reports zero failures -- a caveat alone never blocks this.
-    Never called with a report computed against different profiles than
-    `profiles` (the caller, `propose_contract`, always computes both from
-    the same profiling pass)."""
-    blocking = sorted(set(unresolved_slots(proposal)) | {i.slot for i in report.failures})
-    if blocking:
-        raise ProposalIncompleteError(
-            f"{len(blocking)} slot(s)/reference(s) cannot be assembled: {blocking}. Resolve them by hand "
-            "in the saved proposal file, then re-run with --from-proposal."
-        )
-
+    """The shared tail of `assemble_contract`/`assemble_provisional_contract`
+    -- builds `Header`/`Source`, recomputes `not_collected` (V09), and runs
+    the real `validate_contract` as the final safety net, exactly as this
+    function's own body always has. The two callers differ ONLY in how
+    `asset_mappings`/`finding_mappings`/`mapping_confidence` were built
+    (every slot resolved by the model, vs. some auto-filled with a legal
+    placeholder) -- everything after that point is identical, and drifting
+    the two would silently reopen exactly the gaps an adversarial review of
+    this module already found and closed once (see the validate_contract
+    call below's own comment)."""
     assets_profile = profiles[proposal.meta.assets_filename]
     findings_profile = profiles[proposal.meta.findings_filename]
 
-    asset_mappings: dict[str, Mapping] = {t: sp.mapping for t, sp in proposal.asset.items()}
-    finding_mappings: dict[str, Mapping] = {t: sp.mapping for t, sp in proposal.finding.items()}
-    # `blocking` above already guarantees every slot is `SlotMapped` (an
-    # unresolved one would have refused already), so `.confidence` is
-    # always present here -- carried into the Contract as audit trail
-    # (Contract.mapping_confidence's own docstring), never read by
-    # configured.py's engine. This is the ONLY place `.confidence` survives
-    # past this function -- assemble_contract's own `asset_mappings`/
-    # `finding_mappings` above already discard everything else `SlotMapped`
-    # carried (`.evidence`), and that discard is deliberate, not an oversight
-    # this line is quietly working around.
-    mapping_confidence = {
-        f"{section}.{t}": sp.confidence
-        for section, slots in (("asset", proposal.asset), ("finding", proposal.finding))
-        for t, sp in slots.items()
-    }
     unmapped_columns = {
         filename: {col: UnmappedColumnEntry(disposition=e.disposition, reason=e.reason) for col, e in entries.items()}
         for filename, entries in proposal.unmapped_columns.items()
@@ -783,6 +770,208 @@ def assemble_contract(
         ) from exc
 
     return contract
+
+
+def assemble_contract(
+    proposal: AdapterProposal,
+    profiles: dict[str, FileProfile],
+    report: GroundingReport,
+    *,
+    generator: Generator,
+    generated_at: str,
+) -> Contract:
+    """Refuses (`ProposalIncompleteError`) unless every slot is `mapped` AND
+    grounding reports zero failures -- a caveat alone never blocks this.
+    Never called with a report computed against different profiles than
+    `profiles` (the caller, `propose_contract`, always computes both from
+    the same profiling pass). See `assemble_provisional_contract` for the
+    sibling that degrades instead of refusing -- this function's own
+    strictness is unchanged by that sibling existing."""
+    blocking = sorted(set(unresolved_slots(proposal)) | {i.slot for i in report.failures})
+    if blocking:
+        raise ProposalIncompleteError(
+            f"{len(blocking)} slot(s)/reference(s) cannot be assembled: {blocking}. Resolve them by hand "
+            "in the saved proposal file, then re-run with --from-proposal."
+        )
+
+    asset_mappings: dict[str, Mapping] = {t: sp.mapping for t, sp in proposal.asset.items()}
+    finding_mappings: dict[str, Mapping] = {t: sp.mapping for t, sp in proposal.finding.items()}
+    # `blocking` above already guarantees every slot is `SlotMapped` (an
+    # unresolved one would have refused already), so `.confidence` is
+    # always present here -- carried into the Contract as audit trail
+    # (Contract.mapping_confidence's own docstring), never read by
+    # configured.py's engine. This is the ONLY place `.confidence` survives
+    # past this function -- assemble_contract's own `asset_mappings`/
+    # `finding_mappings` above already discard everything else `SlotMapped`
+    # carried (`.evidence`), and that discard is deliberate, not an oversight
+    # this line is quietly working around.
+    mapping_confidence = {
+        f"{section}.{t}": sp.confidence
+        for section, slots in (("asset", proposal.asset), ("finding", proposal.finding))
+        for t, sp in slots.items()
+    }
+    return _assemble_and_validate(
+        proposal, profiles, asset_mappings, finding_mappings, mapping_confidence,
+        generator=generator, generated_at=generated_at,
+    )
+
+
+#: `role`'s legal placeholder when its whole slot is unresolved -- never a
+#: guess about any real asset, because `impact_composite` NEUTRALIZES (drops
+#: entirely, never reads) any axis in `ProvisionalAssemblyNotes
+#: .neutralized_axes`, and `role` is always in that set whenever this value
+#: is used. `role` has no `NOT_COLLECTED_DEFAULTS` entry (unlike
+#: criticality/environment/data_sensitivity/internet_exposed) -- see
+#: `configured.NOT_COLLECTED_DEFAULTS`'s own docstring -- so `not_collected`
+#: is not just illegal for it (`GAP_LEGAL_TARGETS`), it would KeyError in the
+#: engine. A `literal` mapping is the one grammar-legal way to give it SOME
+#: concrete, schema-valid value without asserting a fact about any asset;
+#: "workstation" is arbitrary among the 15 legal `AssetRole` values -- any
+#: would do, since none of them is ever read for scoring here.
+PROVISIONAL_ROLE_PLACEHOLDER = "workstation"
+
+#: Targets whose whole-slot absence CANNOT be represented honestly at all --
+#: no `not_collected` default (identity fields are always `blank="fatal"`;
+#: `scanner_severity` has no NOT_COLLECTED_DEFAULTS entry and, unlike role,
+#: no neutralize path either: severity_base is a Threat/Impact BASE VALUE,
+#: not a weighted composite term, so there is nothing to drop it from and
+#: renormalize around -- see scoring.impact_composite's own docstring for
+#: why neutralizing only makes sense for a weighted-sum term). A provisional
+#: assembly refuses (hard stop) rather than assembling around any of these,
+#: exactly like assemble_contract does for every slot today -- this is a
+#: DELIBERATELY NARROWER set than "everything not otherwise handled," not an
+#: oversight: scanner_severity's real-world impact varies per finding (NVD
+#: may cover the gap for some), which is a materially different, harder
+#: problem than a uniformly-missing field -- CLAUDE.md's own plan for this
+#: feature names it as explicitly deferred, not solved here.
+_PROVISIONAL_HARD_STOP_TARGETS = frozenset({"asset_id", "hostname", "finding_id", "cve_id", "scanner_severity"})
+
+
+@dataclass(frozen=True)
+class ProvisionalAssemblyNotes:
+    """What `assemble_provisional_contract` had to do to produce a
+    contract that never blocks on an unresolved slot -- read by the
+    provisional-run path (web/jobs.py) to mark the resulting plan and by
+    `export.py` to show the reader what was neutralized, never by
+    `configured.py`'s engine (this is reporting, the same "audit trail, not
+    input to any decision" role `Contract.generator` already has)."""
+
+    #: Targets scoring.py must treat as absent for every asset in this run
+    #: (`scoring.IMPACT_AXIS_TARGETS`/`THREAT_AXIS_TARGETS` -- a subset of
+    #: those two sets, never anything outside them). Empty when nothing
+    #: needed it.
+    neutralized_axes: frozenset[str] = frozenset()
+    #: Set only when assembly could not proceed at all -- a target in
+    #: `_PROVISIONAL_HARD_STOP_TARGETS` was unresolved, or the real
+    #: `validate_contract` safety net refused for an unrelated reason. When
+    #: set, the contract this call returns is `None`; when `None`, it isn't.
+    hard_stop_reason: str | None = None
+
+
+def assemble_provisional_contract(
+    proposal: AdapterProposal,
+    profiles: dict[str, FileProfile],
+    report: GroundingReport,
+    *,
+    generator: Generator,
+    generated_at: str,
+) -> tuple[Contract | None, ProvisionalAssemblyNotes]:
+    """The degrade-rather-than-block sibling of `assemble_contract` (see its
+    own docstring), built for the provisional-run path (CLAUDE.md's "drop a
+    CSV, get a plan" spec) -- never called from `rhino adapt propose`/the
+    confirm flow, which stay exactly as strict as `assemble_contract` always
+    was. Never raises for an incomplete proposal (that's the whole point);
+    returns `(None, notes-with-a-reason)` instead, exactly the "refuse
+    loudly, but as data, not an exception" shape `check_grounding`/
+    `ConfiguredAdapter`'s own probing mode already use elsewhere in this
+    codebase.
+
+    A real grounding FAILURE (a cited column/table-key that isn't real, or a
+    hallucinated value) is a data-quality problem, not a coverage gap -- it
+    stays a hard stop here exactly like it already is in `assemble_contract`,
+    never silently degraded around. Only genuinely UNRESOLVED slots (the
+    model proposed no mapping at all) get the degrade treatment below.
+
+    Per-slot treatment for an unresolved target, in order:
+    1. In `_PROVISIONAL_HARD_STOP_TARGETS` (an identity field, or
+       scanner_severity) -- hard stop, no contract, no guessing.
+    2. `role` specifically -- `literal(PROVISIONAL_ROLE_PLACEHOLDER)`,
+       neutralized (never read for scoring).
+    3. In `GAP_LEGAL_TARGETS` -- `not_collected` (the code-level default is
+       legal and constructs a real contract; a target also in
+       `IMPACT_AXIS_TARGETS`/`THREAT_AXIS_TARGETS` -- criticality,
+       environment, data_sensitivity, internet_exposed -- is ADDITIONALLY
+       neutralized, so that default value is never actually trusted for
+       scoring, only used to keep the contract structurally legal).
+    4. In `ABSENT_FACT_LEGAL_TARGETS` (free text, e.g. product/evidence) --
+       `literal("")`, the schema's own "blank is the fact" encoding. Never
+       neutralized -- these never feed scoring."""
+    if report.failures:
+        failing = sorted({i.slot for i in report.failures})
+        return None, ProvisionalAssemblyNotes(
+            hard_stop_reason=(
+                f"{len(failing)} slot(s)/reference(s) failed grounding (a real data-quality problem, not a "
+                f"coverage gap): {failing}. Resolve them by hand in the saved proposal file, then re-run with "
+                "--from-proposal."
+            )
+        )
+
+    asset_mappings: dict[str, Mapping] = {}
+    finding_mappings: dict[str, Mapping] = {}
+    mapping_confidence: dict[str, float] = {}
+    neutralized_axes: set[str] = set()
+    hard_stop_targets: list[str] = []
+
+    for section, slots, mapping_dict in (
+        ("asset", proposal.asset, asset_mappings),
+        ("finding", proposal.finding, finding_mappings),
+    ):
+        for target, sp in slots.items():
+            if isinstance(sp, SlotMapped):
+                mapping_dict[target] = sp.mapping
+                mapping_confidence[f"{section}.{target}"] = sp.confidence
+                continue
+            # SlotUnresolved from here on.
+            if target in _PROVISIONAL_HARD_STOP_TARGETS:
+                hard_stop_targets.append(f"{section}.{target}")
+            elif target == "role":
+                mapping_dict[target] = LiteralMapping(kind="literal", value=PROVISIONAL_ROLE_PLACEHOLDER)
+                neutralized_axes.add("role")
+            elif target in GAP_LEGAL_TARGETS:
+                mapping_dict[target] = NotCollectedMapping(kind="not_collected")
+                if target in IMPACT_AXIS_TARGETS or target in THREAT_AXIS_TARGETS:
+                    neutralized_axes.add(target)
+            elif target in ABSENT_FACT_LEGAL_TARGETS:
+                mapping_dict[target] = LiteralMapping(kind="literal", value="")
+            else:
+                # No legal placeholder exists for this target at all --
+                # narrower than _PROVISIONAL_HARD_STOP_TARGETS only in that
+                # nothing in this schema is actually expected to land here
+                # today (every real ASSET_SLOTS/FINDING_SLOTS member is
+                # covered by one of the branches above); kept as an honest
+                # refusal rather than a silent `pass` in case the schema
+                # ever grows a field none of them cover.
+                hard_stop_targets.append(f"{section}.{target}")
+
+    if hard_stop_targets:
+        return None, ProvisionalAssemblyNotes(
+            hard_stop_reason=(
+                f"{len(hard_stop_targets)} slot(s) have no source signal and no legal placeholder: "
+                f"{sorted(hard_stop_targets)}. This source cannot be scored, even provisionally, without one of "
+                "these -- resolve them by hand in the saved proposal file, then re-run with --from-proposal, or "
+                "use the browser slot-resolution form."
+            )
+        )
+
+    try:
+        contract = _assemble_and_validate(
+            proposal, profiles, asset_mappings, finding_mappings, mapping_confidence,
+            generator=generator, generated_at=generated_at,
+        )
+    except ProposalIncompleteError as exc:
+        return None, ProvisionalAssemblyNotes(hard_stop_reason=str(exc))
+
+    return contract, ProvisionalAssemblyNotes(neutralized_axes=frozenset(neutralized_axes))
 
 
 # ---------------------------------------------------------------------------

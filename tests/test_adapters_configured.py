@@ -13,8 +13,9 @@ from pathlib import Path
 
 import pytest
 
-from rhinosecure.adapters.base import AdapterError, IngestAdapter
+from rhinosecure.adapters.base import AdapterError, IngestAdapter, ProblemCollector
 from rhinosecure.adapters.config_model import (
+    EXCLUDING_TARGETS,
     Contract,
     ContractDigestMismatchError,
     ContractNotConfirmedError,
@@ -22,7 +23,7 @@ from rhinosecure.adapters.config_model import (
     compute_content_digest,
     compute_decision_digest,
 )
-from rhinosecure.adapters.configured import ConfiguredAdapter, _render_composed
+from rhinosecure.adapters.configured import _FAIL, ConfiguredAdapter, _render_composed
 from rhinosecure.ingest import load_batch
 
 from test_adapters_bluepeak import COLUMNS as BP_COLUMNS
@@ -202,11 +203,61 @@ def test_composed_always_emits_the_first_bluepeak_part_even_with_blank_detection
     assert _render_composed(evidence_mapping, row) == "[Server] A bug."
 
 
-def test_role_forward_trace_identifies_the_correct_check_for_each_contract():
-    assert _bluepeak_gen().asset["role"].kind == "vocabulary"
-    assert ConfiguredAdapter(_bluepeak_gen())._role_reference() == ("vocabulary", "role")
-    assert _mdvm_gen().asset["role"].kind == "default_by"
-    assert ConfiguredAdapter(_mdvm_gen())._role_reference() == ("derivation", "os_platform")
+def test_excluding_targets_defaults_to_role_only():
+    """`EXCLUDING_TARGETS` (`{"role"}`) is the default for every confirmed-
+    contract run -- Rule 1's original, unchanged scope. A caller has to
+    explicitly widen it (the provisional-run path, web/jobs.py) to get
+    anything else excluded rather than fatal."""
+    assert EXCLUDING_TARGETS == frozenset({"role"})
+    assert ConfiguredAdapter(_bluepeak_gen()).excluding_targets == EXCLUDING_TARGETS
+    assert ConfiguredAdapter(_mdvm_gen()).excluding_targets == EXCLUDING_TARGETS
+
+
+def test_a_vocabulary_miss_on_role_excludes_by_default_but_the_same_miss_on_criticality_is_fatal():
+    """The real bluepeak-gen contract maps both `role` and `criticality`
+    via `vocabulary` on real columns (Asset_Type / Asset_Criticality) --
+    exercising `_resolve_target`'s exclude-vs-fatal branch directly against
+    an unrecognized value for each, with the DEFAULT `excluding_targets`."""
+    contract = _bluepeak_gen()
+    role_mapping = contract.asset["role"]
+    assert role_mapping.kind == "vocabulary" and role_mapping.column == "Asset_Type"
+    criticality_mapping = contract.asset["criticality"]
+    assert criticality_mapping.kind == "vocabulary" and criticality_mapping.column == "Asset_Criticality"
+    adapter = ConfiguredAdapter(contract)
+
+    role_problems = ProblemCollector(Path("irrelevant.csv"))
+    value = adapter._resolve_target(
+        role_mapping, "role", {"Asset_Type": "Not A Real Type"}, 2, role_problems, {}, "A1"
+    )
+    assert value is _FAIL
+    assert "A1" in role_problems.excluded and "role" in role_problems.excluded["A1"]
+    assert not role_problems.fatal
+
+    criticality_problems = ProblemCollector(Path("irrelevant.csv"))
+    value = adapter._resolve_target(
+        criticality_mapping, "criticality", {"Asset_Criticality": "not-a-real-tier"}, 2, criticality_problems, {}, "A1"
+    )
+    assert value is _FAIL
+    assert criticality_problems.fatal  # NOT excluded -- criticality isn't in excluding_targets by default
+    assert not criticality_problems.excluded
+
+
+def test_widened_excluding_targets_turns_the_same_criticality_miss_into_an_exclusion():
+    """The exact mechanism the provisional-run path depends on: passing a
+    wider `excluding_targets` at construction time makes a miss on ANY of
+    those targets excludable, not just role -- generalizing Rule 1 to the
+    scoring-relevant targets, but only for a caller that explicitly asks."""
+    contract = _bluepeak_gen()
+    criticality_mapping = contract.asset["criticality"]
+    adapter = ConfiguredAdapter(contract, excluding_targets=frozenset({"role", "criticality"}))
+
+    problems = ProblemCollector(Path("irrelevant.csv"))
+    value = adapter._resolve_target(
+        criticality_mapping, "criticality", {"Asset_Criticality": "not-a-real-tier"}, 2, problems, {}, "A1"
+    )
+    assert value is _FAIL
+    assert "A1" in problems.excluded and "criticality" in problems.excluded["A1"]
+    assert not problems.fatal
 
 
 # --- finding identity vs. content: the bug this file most wants to pin ---

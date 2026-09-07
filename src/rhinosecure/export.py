@@ -127,6 +127,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from rhinosecure.adapters.config_model import Contract
+from rhinosecure.adapters.review import is_provisional
 from rhinosecure.enrich.cache import SnapshotCache
 from rhinosecure.ingest import GapTally, IngestReport, IngestStats
 from rhinosecure.memory import Memory
@@ -330,6 +331,41 @@ def _asset_summary(asset: Any) -> dict[str, Any]:
     }
 
 
+def _decomposition_dict(d: Any) -> dict[str, Any]:
+    """`scoring.ScoreDecomposition`, structured for the web UI's per-finding
+    breakdown -- CLAUDE.md's "drop a CSV, get a plan" spec's own worked
+    example ("Impact 4.1 (environment production, role domain-controller --
+    criticality unavailable, excluded from calculation)"): the actual named
+    components a reader can check the math on, not another prose sentence
+    (`rationale`, above, already covers that). Every field here is already
+    on `ScoreDecomposition` -- this is a plain field-for-field mirror, never
+    a second computation of anything scoring.py itself computed."""
+    return {
+        "threat": {
+            "severity_base": d.severity_base,
+            "severity_source": d.severity_source,
+            "internet_exposed": d.internet_exposed,
+            "internet_exposed_neutralized": d.internet_exposed_neutralized,
+            "epss": d.epss,
+            "is_kev": d.is_kev,
+            "likelihood_multiplier": d.likelihood_multiplier,
+            "attack_prevalence": d.attack_prevalence,
+        },
+        "impact": {
+            "criticality": d.criticality,
+            "criticality_neutralized": d.criticality_neutralized,
+            "environment": d.environment,
+            "environment_neutralized": d.environment_neutralized,
+            "data_sensitivity": d.data_sensitivity,
+            "data_sensitivity_neutralized": d.data_sensitivity_neutralized,
+            "role": d.role,
+            "role_neutralized": d.role_neutralized,
+            "composite": d.impact_composite,
+            "compensating_controls": list(d.compensating_controls),
+        },
+    }
+
+
 def _det_finding_entry(
     scored: Any,
     cache: SnapshotCache,
@@ -351,6 +387,7 @@ def _det_finding_entry(
         "is_kev": is_kev_by_finding.get(scored.finding_id, False),
         "asset": _asset_summary(asset),
         "rationale": list(scored.rationale),
+        "decomposition": _decomposition_dict(scored.decomposition),
         "verdict_summary": None,
         "narrative": None,
         "constraints_applied": [],
@@ -676,6 +713,16 @@ def _build_deterministic_export(
         "generated_at": _now_iso(),
         "run": {"data_dir": str(data_dir), "format": fmt, "seed": seed, "offline": offline, "agents": False},
         "provenance": _provenance_dict(contract, result.report),
+        # True only for the provisional-run path (CLAUDE.md's "drop a CSV,
+        # get a plan" spec). False (never absent) for a built-in --format
+        # run (contract is None) and for a real --adapter-config run
+        # against a genuinely confirmed contract. Deliberately NOT
+        # `contract.review.state != "confirmed"` -- review._provisional
+        # (which ConfiguredAdapter.__init__'s own assert_confirmed gate
+        # requires to even construct) stamps state="confirmed" with a
+        # sentinel identity on purpose; is_provisional checks THAT
+        # identity, not the state, which the stamp deliberately fakes.
+        "provisional": is_provisional(contract),
         "pipeline": pipeline,
         "summary": {
             "total_findings": len(scored),
@@ -770,6 +817,12 @@ def _build_agents_export(
         "generated_at": _now_iso(),
         "run": {"data_dir": str(data_dir), "format": fmt, "seed": seed, "offline": offline, "agents": True},
         "provenance": _provenance_dict(contract, report),
+        # Always False on this path -- run_agents/Coordinator never runs
+        # against an unconfirmed contract (resolve_source_ref's own refusal
+        # is untouched for it; only run_deterministic's dedicated
+        # provisional branch can produce True). Present unconditionally so
+        # a reader never has to treat a missing key as "assume False."
+        "provisional": is_provisional(contract),
         "pipeline": pipeline,
         "summary": {
             "total_findings": len(recommendations),

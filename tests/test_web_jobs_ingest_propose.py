@@ -409,9 +409,40 @@ def test_two_file_upload_without_explicit_filenames_fails_as_ambiguous(client: T
     assert "ambiguous" in body["error"]["message"]
 
 
-def test_incomplete_proposal_succeeds_without_writing_a_contract(client: TestClient, isolated_dirs: Path):
+def test_an_unresolved_non_scoring_gap_legal_field_now_writes_a_provisional_contract(
+    client: TestClient, isolated_dirs: Path
+):
+    """owner is gap-legal and never feeds scoring.py -- CLAUDE.md's "drop a
+    CSV, get a plan" fallback (assemble_provisional_contract, tried when
+    assemble_contract itself refuses) auto-fills it via not_collected and
+    writes a real, unconfirmed contract immediately, rather than leaving
+    the proposal blocked the way this exact scenario used to."""
     upload_id = _upload(client, "inventory.csv", _csv_bytes(_ROWS))["upload_id"]
     data = _full_proposal_dict(name="upload-incomplete", overrides_asset={"owner": _unresolved()})
+    _QueuedFakeCrew.queue = [json.dumps(data)]
+
+    job = _submit(client, upload_id=upload_id, name="upload-incomplete")
+    body = _wait_for_terminal(client, job["job_id"])
+
+    assert body["status"] == "succeeded"
+    result = body["result"]
+    assert result["contract_written"] is True
+    assert result["provisional"] is True
+    assert result["neutralized_axes"] == []  # owner isn't a scoring input -- nothing to neutralize
+    assert "asset.owner" in result["unresolved_slots"]  # still reported -- the model DID leave it unresolved
+    assert result["next_step"] is not None
+    written = json.loads((isolated_dirs / "upload-incomplete.json").read_text(encoding="utf-8"))
+    assert written["asset"]["owner"]["kind"] == "not_collected"
+    assert written["review"]["state"] == "proposed"
+
+
+def test_a_genuinely_unrecoverable_gap_still_writes_nothing(client: TestClient, isolated_dirs: Path):
+    """cve_id is a mandatory identity field -- no not_collected default, no
+    neutralize path (there's no row to identify a finding by without it).
+    The provisional fallback refuses too, exactly like assemble_contract
+    always has for this case, and nothing is written."""
+    upload_id = _upload(client, "inventory.csv", _csv_bytes(_ROWS))["upload_id"]
+    data = _full_proposal_dict(name="upload-incomplete", overrides_finding={"cve_id": _unresolved()})
     _QueuedFakeCrew.queue = [json.dumps(data)]
 
     job = _submit(client, upload_id=upload_id, name="upload-incomplete")
@@ -420,7 +451,8 @@ def test_incomplete_proposal_succeeds_without_writing_a_contract(client: TestCli
     assert body["status"] == "succeeded"  # an incomplete proposal is NOT a job failure
     result = body["result"]
     assert result["contract_written"] is False
-    assert "asset.owner" in result["unresolved_slots"]
+    assert result["provisional"] is False
+    assert "finding.cve_id" in result["unresolved_slots"]
     assert result["next_step"] is None
     assert not (isolated_dirs / "upload-incomplete.json").exists()
 
@@ -472,14 +504,20 @@ def test_edited_saved_proposal_resolves_without_a_new_llm_call(client: TestClien
     zero new LLM tokens -- the same guarantee `--from-proposal` already
     gives the CLI path."""
     upload_id = _upload(client, "inventory.csv", _csv_bytes(_ROWS))["upload_id"]
-    incomplete = _full_proposal_dict(name="upload-resolve", overrides_asset={"owner": _unresolved()})
+    # cve_id (a mandatory identity field, no not_collected/neutralize
+    # escape) is a genuine, still-a-hard-stop unresolved slot -- unlike an
+    # owner-shaped gap, which the provisional-run fallback now auto-fills
+    # and writes immediately (see test_an_unresolved_non_scoring_gap_legal
+    # _field_now_writes_a_provisional_contract), so this keeps exercising
+    # the "still incomplete, resolve and resubmit" path this test is for.
+    incomplete = _full_proposal_dict(name="upload-resolve", overrides_finding={"cve_id": _unresolved()})
     _QueuedFakeCrew.queue = [json.dumps(incomplete)]
 
     job = _submit(client, upload_id=upload_id, name="upload-resolve")
     body = _wait_for_terminal(client, job["job_id"])
     assert body["result"]["contract_written"] is False
 
-    fixed = _full_proposal_dict(name="upload-resolve")  # owner resolved to not_collected
+    fixed = _full_proposal_dict(name="upload-resolve")  # cve_id resolved normally
     edited_saved_proposal = {
         "proposal": fixed,
         "generator": {
@@ -579,7 +617,13 @@ def test_resolving_a_free_text_unresolved_slot_via_a_column_mapping_writes_a_con
 
     job = _submit(client, upload_id=upload_id, name="upload-product")
     body = _wait_for_terminal(client, job["job_id"])
-    assert body["result"]["contract_written"] is False
+    # product has no not_collected default but IS absent-fact-legal, so the
+    # provisional-run fallback (assemble_provisional_contract) now auto-
+    # fills it via literal("") and writes immediately -- unresolved_slots
+    # still names it (the MODEL genuinely left it unresolved), even though
+    # a contract was written.
+    assert body["result"]["contract_written"] is True
+    assert body["result"]["provisional"] is True
     assert body["result"]["unresolved_slots"] == ["finding.product"]
 
     # Exactly what the fixed browser widget now submits for this case: a
@@ -609,6 +653,7 @@ def test_resolving_a_free_text_unresolved_slot_via_a_column_mapping_writes_a_con
 
     assert body2["status"] == "succeeded"
     assert body2["result"]["contract_written"] is True, body2["result"].get("incomplete_reason")
+    assert body2["result"]["provisional"] is False  # every slot is now genuinely resolved, not auto-filled
 
     contract_path = Path(body2["result"]["contract_path"])
     assert contract_path.exists(), f"contract_written was True but {contract_path} does not exist"

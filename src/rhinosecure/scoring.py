@@ -233,6 +233,41 @@ class ImpactInputs:
 
 
 @dataclass(frozen=True)
+class ScoreDecomposition:
+    """A structured snapshot of every named value `score_finding` actually
+    used to reach `threat_score`/`impact_score`/`risk_score` -- built for
+    display (export.py, the web UI's per-finding breakdown), never read
+    back into scoring. Every field here is either already a `ScoredFinding`
+    input or a value `_rationale` already turns into a sentence; this is
+    the identical set of facts, structured instead of prose, so a caller
+    can render "Impact 4.1 (criticality 5 x production x domain-controller)"
+    without re-deriving anything the scorer itself didn't already compute.
+
+    The five `*_neutralized` flags are `False` for every confirmed-contract
+    run -- see `impact_composite`/`score_threat`'s own `neutralized_axes`
+    parameter for what `True` means and when it can happen."""
+
+    severity_base: float
+    severity_source: str
+    internet_exposed: bool
+    internet_exposed_neutralized: bool
+    epss: float | None
+    is_kev: bool
+    likelihood_multiplier: float
+    attack_prevalence: float | None
+    criticality: int
+    criticality_neutralized: bool
+    environment: Environment
+    environment_neutralized: bool
+    data_sensitivity: DataSensitivity
+    data_sensitivity_neutralized: bool
+    role: AssetRole
+    role_neutralized: bool
+    impact_composite: float
+    compensating_controls: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ScoredFinding:
     finding_id: str
     cve_id: str
@@ -243,6 +278,7 @@ class ScoredFinding:
     risk_score: float
     bucket: Bucket
     rationale: tuple[str, ...]
+    decomposition: ScoreDecomposition
 
 
 def _likelihood_multiplier(epss: float | None, is_kev: bool) -> float:
@@ -257,33 +293,77 @@ def _likelihood_multiplier(epss: float | None, is_kev: bool) -> float:
     return multiplier
 
 
-def score_threat(inputs: ThreatInputs) -> float:
+def score_threat(inputs: ThreatInputs, *, neutralized_axes: frozenset[str] = frozenset()) -> float:
+    """`neutralized_axes` mirrors `impact_composite`'s own parameter -- see
+    its docstring. The only Threat-side axis it can name is
+    `internet_exposed`: when the source never determined exposure at all,
+    apply neither the exposed nor the not-exposed multiplier (each asserts
+    a specific fact this run doesn't have), using 1.0 -- no adjustment
+    either way -- instead."""
     score = inputs.exploitability_base
-    score *= INTERNET_EXPOSED_MULTIPLIER if inputs.internet_exposed else NOT_EXPOSED_MULTIPLIER
+    if "internet_exposed" in neutralized_axes:
+        pass  # x1.0 -- see docstring
+    else:
+        score *= INTERNET_EXPOSED_MULTIPLIER if inputs.internet_exposed else NOT_EXPOSED_MULTIPLIER
     score *= _likelihood_multiplier(inputs.epss, inputs.is_kev)
     if inputs.attack_prevalence is not None:
         score *= 0.8 + 0.4 * inputs.attack_prevalence
     return score
 
 
-def impact_composite(inputs: ImpactInputs) -> float:
+#: The four Impact-composite terms, by name -- the set `neutralized_axes`
+#: (below) draws from. Identical to `IMPACT_COMPOSITE_WEIGHTS`'s own keys;
+#: named separately so a reader doesn't have to infer "these are the
+#: neutralizable axes" from a dict built for a different purpose.
+IMPACT_AXIS_TARGETS: frozenset[str] = frozenset(IMPACT_COMPOSITE_WEIGHTS)
+
+#: The one Threat-side axis this project's provisional-run path can
+#: neutralize (CLAUDE.md's "uniform gap" rule) -- a single name, not a set,
+#: because unlike Impact's weighted sum, Threat has exactly one input this
+#: applies to; kept as a frozenset anyway so callers use the identical
+#: `in`/intersection idiom for both axes rather than two different shapes.
+THREAT_AXIS_TARGETS: frozenset[str] = frozenset({"internet_exposed"})
+
+
+def impact_composite(inputs: ImpactInputs, *, neutralized_axes: frozenset[str] = frozenset()) -> float:
     """Weighted sum of the four "how much does this asset matter" factors.
 
     These overlap in what they measure (criticality, environment, data
     sensitivity, and role blast radius are all facets of asset importance),
     so they are added, not multiplied -- an asset should not need to score
     high on every axis at once to register as mattering.
-    """
-    return (
-        IMPACT_COMPOSITE_WEIGHTS["criticality"] * (inputs.criticality / 5)
-        + IMPACT_COMPOSITE_WEIGHTS["environment"] * ENVIRONMENT_WEIGHT[inputs.environment]
-        + IMPACT_COMPOSITE_WEIGHTS["data_sensitivity"] * DATA_SENSITIVITY_WEIGHT[inputs.data_sensitivity]
-        + IMPACT_COMPOSITE_WEIGHTS["role"] * ROLE_BLAST_RADIUS[inputs.role]
-    )
+
+    `neutralized_axes` names any of the four terms this asset's SOURCE could
+    not determine at all (a whole slot the schema-inference model never
+    mapped, filled with an inert placeholder that must never be trusted as a
+    real value -- see `Asset.not_collected` and the provisional-run path,
+    web/jobs.py). A neutralized axis's own term is dropped entirely, not
+    computed against its placeholder value, and the remaining weights are
+    renormalized to their original relative proportions -- so a ranking
+    stays governed only by axes this run actually has evidence for. Empty
+    for every confirmed-contract run: this parameter exists ONLY because the
+    provisional path needs it, never because a real, resolved mapping is
+    somehow less than fully known."""
+    contributions = {
+        "criticality": IMPACT_COMPOSITE_WEIGHTS["criticality"] * (inputs.criticality / 5),
+        "environment": IMPACT_COMPOSITE_WEIGHTS["environment"] * ENVIRONMENT_WEIGHT[inputs.environment],
+        "data_sensitivity": IMPACT_COMPOSITE_WEIGHTS["data_sensitivity"] * DATA_SENSITIVITY_WEIGHT[inputs.data_sensitivity],
+        "role": IMPACT_COMPOSITE_WEIGHTS["role"] * ROLE_BLAST_RADIUS[inputs.role],
+    }
+    if not neutralized_axes:
+        return sum(contributions.values())
+    active_weight = sum(w for axis, w in IMPACT_COMPOSITE_WEIGHTS.items() if axis not in neutralized_axes)
+    if active_weight <= 0:
+        # Every Impact axis is neutralized -- no honest signal at all for
+        # this asset's importance. 0.0, not a guess, and not a crash (a
+        # division by zero here would be a worse failure than a 0 score).
+        return 0.0
+    active_contribution = sum(v for axis, v in contributions.items() if axis not in neutralized_axes)
+    return active_contribution / active_weight
 
 
-def score_impact(inputs: ImpactInputs) -> float:
-    score = inputs.impact_base * impact_composite(inputs)
+def score_impact(inputs: ImpactInputs, *, neutralized_axes: frozenset[str] = frozenset()) -> float:
+    score = inputs.impact_base * impact_composite(inputs, neutralized_axes=neutralized_axes)
     if inputs.compensating_controls:
         score *= COMPENSATING_CONTROL_DECAY ** min(
             len(inputs.compensating_controls), MAX_CONTROLS_COUNTED
@@ -429,9 +509,11 @@ def _rationale(
     impact: ImpactInputs,
     risk_pct: float,
     bucket: Bucket,
+    *,
+    neutralized_axes: frozenset[str] = frozenset(),
 ) -> tuple[str, ...]:
     asset = enriched.asset
-    composite = impact_composite(impact)
+    composite = impact_composite(impact, neutralized_axes=neutralized_axes)
     epss_multiplier = EPSS_MULTIPLIER_BASELINE + threat.epss if threat.epss is not None else 1.0
     likelihood = _likelihood_multiplier(threat.epss, threat.is_kev)
     epss_desc = f"epss={threat.epss:.3f}" if threat.epss is not None else "epss=unscored"
@@ -469,16 +551,49 @@ def _rationale(
             f"{severity_source}-reported CVSS {severity_base:.1f} used directly (source={severity_source}, "
             f"not fetched -- see Finding.source_enrichment); scanner_severity='{scanner_tier}' for comparison"
         )
+    if "internet_exposed" in neutralized_axes:
+        internet_exposed_line = (
+            "internet_exposed=unknown (uniformly not determined from this source) -- neutralized: "
+            "x1.0 threat, neither the exposed nor not-exposed multiplier applied"
+        )
+    else:
+        internet_exposed_line = (
+            f"internet_exposed={asset.internet_exposed} "
+            f"({'x' + str(INTERNET_EXPOSED_MULTIPLIER) if asset.internet_exposed else 'x' + str(NOT_EXPOSED_MULTIPLIER)} threat)"
+        )
+
+    def _impact_axis_line(axis: str, value_desc: str, contribution: float, suffix: str = "") -> str:
+        if axis in neutralized_axes:
+            return f"{axis} unavailable -- excluded from calculation (not mapped from this source)"
+        return (
+            f"{axis}={value_desc} (weight {IMPACT_COMPOSITE_WEIGHTS[axis]} -> "
+            f"+{contribution:.3f} to impact composite{suffix})"
+        )
+
     lines = [
         severity_line,
-        f"internet_exposed={asset.internet_exposed} ({'x' + str(INTERNET_EXPOSED_MULTIPLIER) if asset.internet_exposed else 'x' + str(NOT_EXPOSED_MULTIPLIER)} threat)",
+        internet_exposed_line,
         f"{epss_desc}, {kev_desc} -> x{likelihood:.3f} likelihood multiplier",
         *_attack_rationale_lines(enriched, threat),
-        f"criticality={asset.criticality}/5 (weight {IMPACT_COMPOSITE_WEIGHTS['criticality']} -> +{IMPACT_COMPOSITE_WEIGHTS['criticality'] * (asset.criticality / 5):.3f} to impact composite)",
-        f"environment={asset.environment} (weight {IMPACT_COMPOSITE_WEIGHTS['environment']} -> +{IMPACT_COMPOSITE_WEIGHTS['environment'] * ENVIRONMENT_WEIGHT[asset.environment]:.3f} to impact composite)",
-        f"data_sensitivity={asset.data_sensitivity} (weight {IMPACT_COMPOSITE_WEIGHTS['data_sensitivity']} -> +{IMPACT_COMPOSITE_WEIGHTS['data_sensitivity'] * DATA_SENSITIVITY_WEIGHT[asset.data_sensitivity]:.3f} to impact composite)",
-        f"role={asset.role} (weight {IMPACT_COMPOSITE_WEIGHTS['role']} -> +{IMPACT_COMPOSITE_WEIGHTS['role'] * ROLE_BLAST_RADIUS[asset.role]:.3f} to impact composite, blast radius)",
-        f"impact composite={composite:.3f} (of max {_MAX_IMPACT_COMPOSITE:.3f})",
+        _impact_axis_line(
+            "criticality", f"{asset.criticality}/5",
+            IMPACT_COMPOSITE_WEIGHTS["criticality"] * (asset.criticality / 5),
+        ),
+        _impact_axis_line(
+            "environment", str(asset.environment),
+            IMPACT_COMPOSITE_WEIGHTS["environment"] * ENVIRONMENT_WEIGHT[asset.environment],
+        ),
+        _impact_axis_line(
+            "data_sensitivity", str(asset.data_sensitivity),
+            IMPACT_COMPOSITE_WEIGHTS["data_sensitivity"] * DATA_SENSITIVITY_WEIGHT[asset.data_sensitivity],
+        ),
+        _impact_axis_line(
+            "role", str(asset.role),
+            IMPACT_COMPOSITE_WEIGHTS["role"] * ROLE_BLAST_RADIUS[asset.role],
+            suffix=", blast radius",
+        ),
+        f"impact composite={composite:.3f} (of max {_MAX_IMPACT_COMPOSITE:.3f})"
+        + (f" -- renormalized over {len(IMPACT_AXIS_TARGETS) - len(neutralized_axes & IMPACT_AXIS_TARGETS)}/{len(IMPACT_AXIS_TARGETS)} axes" if neutralized_axes & IMPACT_AXIS_TARGETS else ""),
     ]
     if impact.compensating_controls:
         decay = COMPENSATING_CONTROL_DECAY ** min(
@@ -527,10 +642,22 @@ def _rationale(
 
 
 def score_finding(enriched: EnrichedFinding) -> ScoredFinding:
+    asset = enriched.asset
+    # Which axes this asset's SOURCE never determined at all -- an entirely
+    # unresolved slot from the provisional-run path (web/jobs.py), marked
+    # via Asset.not_collected the same way any other gap is (or, for `role`,
+    # via application-level post-processing, since `role` has no legal
+    # `not_collected` mapping of its own -- see IMPACT_AXIS_TARGETS/
+    # THREAT_AXIS_TARGETS' own docstrings). Empty for every confirmed-
+    # contract run.
+    impact_neutralized = IMPACT_AXIS_TARGETS & asset.not_collected
+    threat_neutralized = THREAT_AXIS_TARGETS & asset.not_collected
+    neutralized_axes = impact_neutralized | threat_neutralized
+
     threat_inputs = build_threat_inputs(enriched)
     impact_inputs = build_impact_inputs(enriched)
-    threat = score_threat(threat_inputs)
-    impact = score_impact(impact_inputs)
+    threat = score_threat(threat_inputs, neutralized_axes=threat_neutralized)
+    impact = score_impact(impact_inputs, neutralized_axes=impact_neutralized)
     risk = threat * impact
     risk_pct = min(100.0, 100.0 * risk / RISK_NORMALIZATION)
     bucket = bucket_for(
@@ -539,7 +666,28 @@ def score_finding(enriched: EnrichedFinding) -> ScoredFinding:
         has_compensating_controls=bool(impact_inputs.compensating_controls),
         is_kev=threat_inputs.is_kev,
     )
-    rationale = _rationale(enriched, threat_inputs, impact_inputs, risk_pct, bucket)
+    rationale = _rationale(enriched, threat_inputs, impact_inputs, risk_pct, bucket, neutralized_axes=neutralized_axes)
+    severity_base, severity_source = _resolve_severity(enriched)
+    decomposition = ScoreDecomposition(
+        severity_base=severity_base,
+        severity_source=severity_source,
+        internet_exposed=threat_inputs.internet_exposed,
+        internet_exposed_neutralized="internet_exposed" in threat_neutralized,
+        epss=threat_inputs.epss,
+        is_kev=threat_inputs.is_kev,
+        likelihood_multiplier=_likelihood_multiplier(threat_inputs.epss, threat_inputs.is_kev),
+        attack_prevalence=threat_inputs.attack_prevalence,
+        criticality=impact_inputs.criticality,
+        criticality_neutralized="criticality" in impact_neutralized,
+        environment=impact_inputs.environment,
+        environment_neutralized="environment" in impact_neutralized,
+        data_sensitivity=impact_inputs.data_sensitivity,
+        data_sensitivity_neutralized="data_sensitivity" in impact_neutralized,
+        role=impact_inputs.role,
+        role_neutralized="role" in impact_neutralized,
+        impact_composite=impact_composite(impact_inputs, neutralized_axes=impact_neutralized),
+        compensating_controls=impact_inputs.compensating_controls,
+    )
     return ScoredFinding(
         finding_id=enriched.finding.finding_id,
         cve_id=enriched.finding.cve_id,
@@ -550,6 +698,7 @@ def score_finding(enriched: EnrichedFinding) -> ScoredFinding:
         risk_score=risk_pct,
         bucket=bucket,
         rationale=rationale,
+        decomposition=decomposition,
     )
 
 
