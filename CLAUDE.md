@@ -928,6 +928,18 @@ deliberate follow-up, not built here.
 4. Never overwrite a snapshot without bumping its version.
 5. The old repository is **read-only reference**. Consult it; do not import from it without
    reviewing against this spec first.
+6. **Implement directly, solo — no Workflow tool, no multi-agent panel — unless the user
+   explicitly asks for one in that message.** A prior session routed a plain bug-fix request
+   through the Workflow tool (a multi-agent orchestration) on the strength of a session-level
+   "ultracode" default, over the user's own explicit "implement directly, no workflow" line in
+   that same request. The fix that came out of it was correct, but the user had to say so a
+   second time, in the very next request, for it to stick — meaning it hadn't actually stuck the
+   first time. A general session default is not authorization for this repo: when a request
+   names its own process ("implement directly," "no workflow"), that instruction governs this
+   session regardless of what any ambient default says. This does not bar a subagent dispatched
+   with the `Agent` tool for a scoped sub-task (research, a parallel read-only investigation) —
+   it bars defaulting to multi-agent orchestration for what is, at bottom, a single coherent
+   change.
 
 ---
 

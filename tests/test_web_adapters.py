@@ -256,6 +256,114 @@ def test_get_proposal_surfaces_a_low_confidence_mapped_slot(client: TestClient):
     assert "asset.environment" not in low_conf
 
 
+def test_get_proposal_low_confidence_surfaces_affected_row_counts(client: TestClient):
+    """`ColumnProfile.distinct_values` is `value -> occurrence count`
+    (probe.py) -- the confirm form's per-mapping correction UI needs the
+    count, not just the value, to show "affected row count"."""
+    rows = [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "srv", "Production"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "wks", "Corporate"],
+        ["A03", "HOST03", "F03", "CVE-2021-0003", "srv", "Production"],
+    ]
+    upload_id = _upload(client, content=_csv_bytes(rows))
+    job = _propose(client, upload_id, "upload-row-counts", _proposal_dict(name="upload-row-counts", role_confidence=0.5))
+    assert job["result"]["contract_written"] is True
+
+    resp = client.get("/api/adapters/upload-row-counts/proposal", params={"upload_id": upload_id})
+    body = resp.json()
+    low_conf = {entry["slot"]: entry for entry in body["low_confidence"]}
+    assert low_conf["asset.role"]["column_profiles"]["Col"]["distinct_values"] == {"srv": 2, "wks": 1}
+
+
+def test_get_proposal_low_confidence_predicts_values_for_a_mixed_case_vocabulary(client: TestClient):
+    """The engine applies a `vocabulary` mapping's declared `case`
+    transform BEFORE the table lookup (`configured._apply_case`,
+    `_resolve_target`) -- the corrector's "proposed:" hint must use the
+    identical transform, not compare the table's (already-lowercase) keys
+    against the raw, un-cased observed value."""
+    rows = [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "SRV", "Production"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "WKS", "Corporate"],
+    ]
+    upload_id = _upload(client, content=_csv_bytes(rows))
+    job = _propose(client, upload_id, "upload-mixed-case", _proposal_dict(name="upload-mixed-case", role_confidence=0.5))
+    assert job["result"]["contract_written"] is True
+
+    resp = client.get("/api/adapters/upload-mixed-case/proposal", params={"upload_id": upload_id})
+    low_conf = {entry["slot"]: entry for entry in resp.json()["low_confidence"]}
+    # role's mapping is `case: "lower"`, table keys "srv"/"wks" -- the raw
+    # observed values are upper-case, so a naive uncased lookup would find
+    # nothing at all.
+    assert low_conf["asset.role"]["current_values"] == {"SRV": "dc", "WKS": "workstation"}
+
+
+def test_get_proposal_low_confidence_predicts_values_for_a_default_by_mapping(client: TestClient):
+    """The flagship real-world case (data/adapters/defender-propose-check
+    .json's own `asset.role`): a `default_by` mapping has no per-value
+    `table` of its own at all -- its "proposed" value for an observed raw
+    value comes from resolving a `derived` block first, then looking that
+    key up in the named `REGISTERED_DEFAULT_TABLES` entry. Not a
+    `vocabulary` mapping, so the corrector must not fall back to showing
+    nothing just because `current_mapping.kind != "vocabulary"`."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-default-by", role_confidence=0.5)
+    proposal["asset"]["role"] = _mapped(
+        {
+            "kind": "default_by",
+            "table": "ROLE_DEFAULT_BY_OS_CLASS",
+            "keyed_by": {"from": "os_class_from_env", "output": "os_class"},
+        },
+        confidence=0.5,
+        columns_cited=["Env"],
+    )
+    proposal["derived"] = {
+        "os_class_from_env": {
+            "column": "Env",
+            "case": "exact",
+            "blank": "fatal",
+            "outputs": ["os_class"],
+            "table": {"Production": ["server"], "Corporate": ["client"]},
+        }
+    }
+    job = _propose(client, upload_id, "upload-default-by", proposal)
+    assert job["result"]["contract_written"] is True
+
+    resp = client.get("/api/adapters/upload-default-by/proposal", params={"upload_id": upload_id})
+    low_conf = {entry["slot"]: entry for entry in resp.json()["low_confidence"]}
+    assert low_conf["asset.role"]["candidate_columns"] == ["Env"]
+    # Production -> derived os_class "server" -> ROLE_DEFAULT_BY_OS_CLASS["server"] == "file"
+    # Corporate  -> derived os_class "client" -> ROLE_DEFAULT_BY_OS_CLASS["client"] == "workstation"
+    assert low_conf["asset.role"]["current_values"] == {"Production": "file", "Corporate": "workstation"}
+
+
+def test_get_proposal_low_confidence_predicts_values_for_a_parsed_bool_mapping(client: TestClient):
+    """`internet_exposed` (a `SCORING_ENUM_TARGETS` member) is legally
+    mapped via `parsed`/`parser="bool"`, never `vocabulary` -- the
+    corrector must predict per-value using the SAME parser the engine
+    calls (`configured._parse_scalar`), not only understand a raw
+    dict-lookup table."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-parsed-bool", role_confidence=0.5)
+    proposal["asset"]["internet_exposed"] = _mapped(
+        {
+            "kind": "parsed",
+            "column": "Col",
+            "case": "lower",
+            "blank": "fatal",
+            "parser": "bool",
+            "params": {"true": ["srv"], "false": ["wks"]},
+        },
+        confidence=0.4,
+        columns_cited=["Col"],
+    )
+    job = _propose(client, upload_id, "upload-parsed-bool", proposal)
+    assert job["result"]["contract_written"] is True
+
+    resp = client.get("/api/adapters/upload-parsed-bool/proposal", params={"upload_id": upload_id})
+    low_conf = {entry["slot"]: entry for entry in resp.json()["low_confidence"]}
+    assert low_conf["asset.internet_exposed"]["current_values"] == {"srv": True, "wks": False}
+
+
 def test_get_proposal_low_confidence_is_empty_when_every_slot_is_confident(client: TestClient):
     upload_id = _upload(client)
     _propose(client, upload_id, "upload-confident", _proposal_dict(name="upload-confident"))

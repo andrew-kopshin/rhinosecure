@@ -1,0 +1,371 @@
+{
+  "asset": {
+    "asset_id": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "Asset_ID",
+      "kind": "column",
+      "optional": false
+    },
+    "business_function": {
+      "blank": "gap",
+      "case": "exact",
+      "column": "Department",
+      "kind": "column",
+      "optional": true
+    },
+    "compensating_controls": {
+      "blank": "absent_fact",
+      "case": "exact",
+      "column": "Compensating_Control",
+      "kind": "column",
+      "optional": true
+    },
+    "criticality": {
+      "kind": "not_collected"
+    },
+    "data_sensitivity": {
+      "kind": "not_collected"
+    },
+    "environment": {
+      "kind": "not_collected"
+    },
+    "hostname": {
+      "blank": "fatal",
+      "case": "lower",
+      "column": "Asset_Hostname",
+      "kind": "column",
+      "optional": false
+    },
+    "internet_exposed": {
+      "blank": "gap",
+      "case": "exact",
+      "column": "Internet_Exposed",
+      "kind": "parsed",
+      "optional": true,
+      "params": {
+        "false": [
+          "No"
+        ],
+        "true": [
+          "Yes"
+        ]
+      },
+      "parser": "bool"
+    },
+    "os": {
+      "blank": "gap",
+      "case": "exact",
+      "column": "Operating_System",
+      "kind": "column",
+      "optional": true
+    },
+    "os_build": {
+      "kind": "not_collected"
+    },
+    "owner": {
+      "kind": "not_collected"
+    },
+    "patch_restrictions": {
+      "kind": "not_collected"
+    },
+    "patch_window": {
+      "blank": "absent_fact",
+      "case": "exact",
+      "column": "Patch_Window",
+      "kind": "column",
+      "optional": true
+    },
+    "role": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "Asset_Type",
+      "kind": "vocabulary",
+      "optional": false,
+      "table": {
+        "Workstation": "workstation"
+      },
+      "table_notes": null
+    }
+  },
+  "asset_grouping": {
+    "key": "Asset_ID",
+    "order_by": {
+      "column": "Detected_Date",
+      "params": null,
+      "parser": "date",
+      "required": false
+    },
+    "resolution": "agree_or_recency",
+    "union_fields": [
+      "compensating_controls"
+    ],
+    "union_justification": {
+      "compensating_controls": "The same physical asset may show different or blank compensating controls across its several vulnerability rows; unioning preserves every reported mitigation instead of forcing all findings for one asset to agree."
+    }
+  },
+  "attestations": [],
+  "config_schema_version": "1.0.0",
+  "derived": {},
+  "description": "Single-file CSV export from a vulnerability scanner (Northgate) combining one asset-inventory row and one CVE finding per line, with host, OS, department, criticality, and per-vulnerability CVSS/exploitation/ATT&CK metadata.",
+  "divergences": [],
+  "enrichment": {
+    "attack_technique": {
+      "blank": "absent_fact",
+      "column": "MITRE_ATTACK_Technique",
+      "on_no_match": "degrade",
+      "optional": false,
+      "outputs": [
+        "technique_id"
+      ],
+      "pattern": "attack_technique"
+    },
+    "known_exploited": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "Known_Exploited",
+      "kind": "parsed",
+      "optional": false,
+      "params": {
+        "false": [
+          "No"
+        ],
+        "true": [
+          "Yes"
+        ]
+      },
+      "parser": "bool"
+    },
+    "severity_score": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "CVSS_Base_Score",
+      "kind": "parsed",
+      "optional": false,
+      "params": {
+        "max": 10,
+        "min": 0
+      },
+      "parser": "float"
+    }
+  },
+  "finding": {
+    "asset_id": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "Asset_ID",
+      "kind": "column",
+      "optional": false
+    },
+    "cve_id": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "CVE_ID",
+      "kind": "parsed",
+      "optional": false,
+      "params": {},
+      "parser": "cve_id"
+    },
+    "detected_date": {
+      "blank": "gap",
+      "case": "exact",
+      "column": "Detected_Date",
+      "kind": "parsed",
+      "optional": true,
+      "params": {
+        "format": "iso"
+      },
+      "parser": "date"
+    },
+    "evidence": {
+      "join": "; ",
+      "kind": "composed",
+      "max_chars": 4096,
+      "parts": [
+        {
+          "emit_if_any": null,
+          "fallback_template": null,
+          "required_non_blank": [
+            "Description"
+          ],
+          "template": "{Description}"
+        }
+      ]
+    },
+    "finding_id": {
+      "algorithm": "sha256",
+      "case": "lower",
+      "columns": [
+        "Asset_ID",
+        "CVE_ID",
+        "Detected_Date"
+      ],
+      "hex_len": 16,
+      "join": "",
+      "kind": "content_address",
+      "prefix": "",
+      "recipe_version": 1
+    },
+    "port": {
+      "kind": "not_collected"
+    },
+    "product": {
+      "blank": "absent_fact",
+      "case": "exact",
+      "column": "Affected_Product",
+      "kind": "column",
+      "optional": true
+    },
+    "scanner_severity": {
+      "blank": "fatal",
+      "case": "exact",
+      "column": "Severity",
+      "kind": "column",
+      "optional": false
+    },
+    "service": {
+      "kind": "not_collected"
+    },
+    "version": {
+      "blank": "absent_fact",
+      "case": "exact",
+      "column": "Affected_Version",
+      "kind": "column",
+      "optional": true
+    }
+  },
+  "finding_dedup": {
+    "content_targets": [
+      "asset_id",
+      "cve_id",
+      "detected_date"
+    ],
+    "on_conflict": "fatal",
+    "on_identical": "collapse_and_count"
+  },
+  "format": "upload-6f1bbcfe799046ff864be03e",
+  "generated_at": "2026-09-07T00:03:43.215646+00:00",
+  "generator": {
+    "attempts": 2,
+    "call_log_digest": "sha256:ff126d4a5e2b4a08b076d2eaf4c19a9076dab4967e26b2397d861e16a2ebda4f",
+    "completion_tokens": 41630,
+    "estimated_cost_usd": 0.445364,
+    "model": "claude-sonnet-5",
+    "prompt_tokens": 14532,
+    "tool": "rhino-adapt-propose"
+  },
+  "header": {
+    "assets": {
+      "columns": [
+        "Asset_ID",
+        "Asset_Hostname",
+        "Operating_System",
+        "Asset_Type",
+        "Department",
+        "Environment",
+        "Asset_Criticality",
+        "Internet_Exposed",
+        "Compensating_Control",
+        "Patch_Window",
+        "CVE_ID",
+        "Severity",
+        "CVSS_Base_Score",
+        "Affected_Product",
+        "Affected_Version",
+        "Known_Exploited",
+        "Exploit_Maturity",
+        "MITRE_ATTACK_Technique",
+        "Detected_Date",
+        "Description"
+      ],
+      "sha256": "sha256:65528df36ca16e274d06ed281ac2137ec8f1a8dc34596e80b98be146f574e822"
+    },
+    "findings": null,
+    "mode": "declared"
+  },
+  "mapping_confidence": {
+    "asset.asset_id": 0.95,
+    "asset.business_function": 0.6,
+    "asset.compensating_controls": 0.9,
+    "asset.criticality": 1.0,
+    "asset.data_sensitivity": 1.0,
+    "asset.environment": 1.0,
+    "asset.hostname": 0.95,
+    "asset.internet_exposed": 0.9,
+    "asset.os": 0.9,
+    "asset.os_build": 0.85,
+    "asset.owner": 0.9,
+    "asset.patch_restrictions": 0.8,
+    "asset.patch_window": 0.85,
+    "asset.role": 0.5,
+    "finding.asset_id": 0.95,
+    "finding.cve_id": 0.95,
+    "finding.detected_date": 0.9,
+    "finding.evidence": 0.85,
+    "finding.finding_id": 0.8,
+    "finding.port": 0.95,
+    "finding.product": 0.85,
+    "finding.scanner_severity": 0.85,
+    "finding.service": 0.9,
+    "finding.version": 0.8
+  },
+  "not_collected": {
+    "always_asset": [
+      "criticality",
+      "data_sensitivity",
+      "environment",
+      "os_build",
+      "owner",
+      "patch_restrictions"
+    ],
+    "always_finding": [
+      "port",
+      "service"
+    ],
+    "per_row_eligible_asset": [
+      "business_function",
+      "internet_exposed",
+      "os"
+    ],
+    "per_row_eligible_finding": [
+      "detected_date"
+    ]
+  },
+  "observed": null,
+  "review": {
+    "confirmed_at": null,
+    "confirmed_by": null,
+    "confirmed_version": null,
+    "content_digest": null,
+    "decision_digest": null,
+    "slot_digests": null,
+    "state": "proposed"
+  },
+  "source": {
+    "assets_filename": "northgate_findings_5.csv",
+    "delimiter": ",",
+    "encoding": "utf-8",
+    "findings_filename": "northgate_findings_5.csv",
+    "first_data_row": 2,
+    "layout": "single_file",
+    "quotechar": "\""
+  },
+  "unmapped_columns": {
+    "northgate_findings_5.csv": {
+      "Asset_Criticality": {
+        "disposition": "ignored",
+        "reason": "Concept exists but asset.criticality is left unresolved pending confirmation of the target's accepted scale/vocabulary; see asset.criticality."
+      },
+      "Environment": {
+        "disposition": "ignored",
+        "reason": "Concept exists but asset.environment is left unresolved pending confirmation of the target's accepted tokens beyond 'Production'; see asset.environment."
+      },
+      "Exploit_Maturity": {
+        "disposition": "ignored",
+        "reason": "No Asset/Finding target field corresponds to exploit-maturity classification; not part of the closed schema."
+      }
+    }
+  },
+  "validator_overrides": [],
+  "version": 2
+}

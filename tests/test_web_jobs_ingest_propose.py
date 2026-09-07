@@ -105,11 +105,15 @@ def _full_proposal_dict(
 
 
 def _csv_bytes(rows: list[list[str]]) -> bytes:
+    return _csv_bytes_with_header(_HEADER, rows)
+
+
+def _csv_bytes_with_header(header: list[str], rows: list[list[str]]) -> bytes:
     import io
 
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(_HEADER)
+    writer.writerow(header)
     writer.writerows(rows)
     return buf.getvalue().encode("utf-8")
 
@@ -493,6 +497,18 @@ def test_edited_saved_proposal_resolves_without_a_new_llm_call(client: TestClien
     assert body2["result"]["contract_written"] is True
     assert _QueuedFakeCrew.instantiations == 1  # only the FIRST (incomplete) submission ever called the LLM
 
+    # `contract_written: True` in the JSON response is a CLAIM, not proof --
+    # a real regression (this file's own module docstring at the top,
+    # CLAUDE.md's "0 slot(s) remain unresolved" incident) had this claim
+    # true while nothing was actually readable at `contract_path` for a
+    # different (unresolved-slot-shaped) reason. Assert the file itself,
+    # over the real path the response names, not just the flag.
+    contract_path = Path(body2["result"]["contract_path"])
+    assert contract_path.exists(), f"contract_written was True but {contract_path} does not exist"
+    on_disk = json.loads(contract_path.read_text(encoding="utf-8"))
+    assert on_disk["review"]["state"] == "proposed"
+    assert on_disk["format"] == "upload-resolve"
+
 
 def test_edited_saved_proposal_still_refuses_an_illegal_edit(client: TestClient, isolated_dirs: Path):
     """A human's edit is held to the identical grounding gate a model's
@@ -524,6 +540,83 @@ def test_edited_saved_proposal_still_refuses_an_illegal_edit(client: TestClient,
     assert body["status"] == "succeeded"  # a refused mapping is an incomplete proposal, not a job failure
     assert body["result"]["contract_written"] is False
     assert _QueuedFakeCrew.instantiations == 0
+
+
+def test_resolving_a_free_text_unresolved_slot_via_a_column_mapping_writes_a_confirmable_contract(
+    client: TestClient, isolated_dirs: Path
+):
+    """Regression test for the reported propose->persist bug: `finding.
+    product` (like `evidence`) has no `NOT_COLLECTED_DEFAULTS` entry
+    (config_model.GAP_LEGAL_TARGETS), so "mark not collected" -- the ONLY
+    correction the browser's slot-resolution widget offered before this
+    fix -- is illegal for it and always failed `validate_contract`, with
+    the real reason hidden behind a JSON response that reported "0 slot(s)
+    remain unresolved" (unresolved_slots is empty once a slot IS mapped,
+    even illegally). This exercises the fixed resolution path instead: a
+    `column` mapping with `blank: "absent_fact"`
+    (config_model.ABSENT_FACT_LEGAL_TARGETS' own legal escape hatch) on a
+    candidate column DEDICATED to this one slot -- not shared with any
+    other mapping, unlike this file's usual "Col" placeholder, so the
+    unmapped_columns reconciliation this fix also added is exercised for
+    real rather than accidentally masked by column reuse."""
+    header = ["Asset_ID", "Hostname", "Finding_ID", "Cve", "Col", "ProductCol"]
+    rows = [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "srv", "Windows Server"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "wks", "Office"],
+    ]
+    upload_id = _upload(client, "inventory.csv", _csv_bytes_with_header(header, rows))["upload_id"]
+
+    incomplete = _full_proposal_dict(
+        name="upload-product",
+        overrides_finding={
+            "product": _unresolved("model was not confident how to parse this field", candidates=["ProductCol"])
+        },
+    )
+    incomplete["unmapped_columns"] = {
+        "inventory.csv": {"ProductCol": {"disposition": "ignored", "reason": "not yet resolved", "profile_cited": "n/a"}}
+    }
+    _QueuedFakeCrew.queue = [json.dumps(incomplete)]
+
+    job = _submit(client, upload_id=upload_id, name="upload-product")
+    body = _wait_for_terminal(client, job["job_id"])
+    assert body["result"]["contract_written"] is False
+    assert body["result"]["unresolved_slots"] == ["finding.product"]
+
+    # Exactly what the fixed browser widget now submits for this case: a
+    # `column` mapping with blank="absent_fact" (never bare not_collected),
+    # with "ProductCol" no longer in unmapped_columns (it's genuinely
+    # mapped now) -- the reconciliation applySlotEditToProposal performs.
+    fixed = _full_proposal_dict(
+        name="upload-product",
+        overrides_finding={
+            "product": _mapped(
+                {"kind": "column", "column": "ProductCol", "case": "exact", "blank": "absent_fact"},
+                confidence=1.0, columns_cited=["ProductCol"],
+            )
+        },
+    )
+    edited_saved_proposal = {
+        "proposal": fixed,
+        "generator": {
+            "tool": "rhino-adapt-propose", "model": "claude-sonnet-5", "prompt_tokens": 100,
+            "completion_tokens": 50, "estimated_cost_usd": 0.001, "attempts": 1,
+            "call_log_digest": "sha256:" + "a" * 64,
+        },
+    }
+
+    job2 = _submit(client, upload_id=upload_id, name="upload-product", edited_saved_proposal=edited_saved_proposal)
+    body2 = _wait_for_terminal(client, job2["job_id"])
+
+    assert body2["status"] == "succeeded"
+    assert body2["result"]["contract_written"] is True, body2["result"].get("incomplete_reason")
+
+    contract_path = Path(body2["result"]["contract_path"])
+    assert contract_path.exists(), f"contract_written was True but {contract_path} does not exist"
+    on_disk = json.loads(contract_path.read_text(encoding="utf-8"))
+    assert on_disk["review"]["state"] == "proposed"
+    assert on_disk["finding"]["product"]["kind"] == "column"
+    assert on_disk["finding"]["product"]["column"] == "ProductCol"
+    assert on_disk["finding"]["product"]["blank"] == "absent_fact"
 
 
 def test_malformed_edited_saved_proposal_fails_cleanly(client: TestClient):

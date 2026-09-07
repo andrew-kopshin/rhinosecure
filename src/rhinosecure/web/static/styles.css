@@ -933,6 +933,9 @@ a { color: var(--accent); }
   flex: 1;
   max-width: 260px;
 }
+.confirm-low-confidence-list { margin: 10px 0; }
+.confirm-low-confidence-item { margin: 8px 0; }
+.confirm-low-confidence-item .low-confidence-apply-btn { margin-top: 6px; }
 .confirm-attest-row { margin: 10px 0; }
 .confirm-attest-row label { display: block; font-size: 12.5px; margin-bottom: 4px; }
 .confirm-attest-input {

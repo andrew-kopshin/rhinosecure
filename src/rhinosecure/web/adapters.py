@@ -113,12 +113,16 @@ from pydantic import BaseModel, ValidationError
 from rhinosecure.adapters import resolve_config_path
 from rhinosecure.adapters.config_io import read_contract
 from rhinosecure.adapters.config_model import (
+    ABSENT_FACT_LEGAL_TARGETS,
+    GAP_LEGAL_TARGETS,
     LOW_CONFIDENCE_THRESHOLD,
+    REGISTERED_DEFAULT_TABLES,
     SCORING_ENUM_TARGETS,
     describe_target_vocabulary,
     missing_attestations,
     required_attestations,
 )
+from rhinosecure.adapters.configured import _apply_case, _parse_scalar
 from rhinosecure.adapters.probe import profile_source
 from rhinosecure.adapters.review import Measurement, ReviewError, ReviewOutcome, review_contract
 from rhinosecure.agents.schema_inference import (
@@ -179,6 +183,79 @@ def _mapping_source_columns(mapping: Any, derived: dict) -> list[str]:
     return []
 
 
+def _predict_current_values(mapping: Any, derived: dict[str, Any], distinct_values: dict[str, int]) -> dict[str, Any]:
+    """For every raw value the candidate column was actually observed to
+    contain, what the CURRENTLY proposed mapping would resolve it to --
+    computed with the SAME case-transform and scalar-parser functions the
+    real engine (`adapters.configured.ConfiguredAdapter._resolve_target`)
+    applies at read time, imported and called directly rather than a
+    second, hand-written copy of that logic. That duplication is exactly
+    what produced this function's own reason to exist: an earlier version
+    of the browser corrector re-implemented the vocabulary-table lookup
+    inline in JS without applying the mapping's declared `case` transform
+    first, so a mixed-case source column silently showed no "proposed"
+    hint at all for a mapping that was actually correct. Reusing the real
+    functions here means there is only one place case/parsing logic can
+    disagree with the engine, and it's the engine's own module.
+
+    Covers every `SCORING_ENUM_TARGETS`-legal mapping kind that reads a
+    single column (`column`, `vocabulary`, `parsed`, `default_by`,
+    `derived`) -- not just `vocabulary`, which is all the previous version
+    handled. `literal`/`composed`/`content_address`/`not_collected` have no
+    single source column to predict per-value against
+    (`_mapping_source_columns` already returns `[]` for them) and never
+    reach this function with a non-empty `distinct_values`.
+
+    Returns only the values this mapping actually resolves. A value the
+    mapping doesn't recognize (absent from a vocabulary/derivation/default
+    table, or one a parser rejects) is simply omitted -- the browser
+    corrector then starts that value on "(exclude this value)" with no
+    false "proposed:" hint, the same honest-blank behavior an unresolved
+    slot already has, rather than guessing what the model "must have
+    meant"."""
+    predicted: dict[str, Any] = {}
+    kind = getattr(mapping, "kind", None)
+    for raw in distinct_values:
+        cased = _apply_case(raw.strip(), getattr(mapping, "case", "exact"))
+        if not cased:
+            continue
+        if kind == "column":
+            predicted[raw] = cased
+        elif kind == "vocabulary":
+            value = mapping.table.get(cased)
+            if value is not None:
+                predicted[raw] = value
+        elif kind == "parsed":
+            value = _parse_scalar(mapping.parser, cased, mapping.params)
+            if value is not None:
+                predicted[raw] = value
+        elif kind in ("default_by", "derived"):
+            deriv_name = mapping.keyed_by.from_ if kind == "default_by" else mapping.from_
+            deriv_output = mapping.keyed_by.output if kind == "default_by" else mapping.output
+            deriv = derived.get(deriv_name)
+            if deriv is None:
+                continue
+            # `cased` above already applied `mapping`'s own case (a no-op --
+            # neither DefaultByMapping nor DerivedMapping HAS a `case`
+            # field), so re-derive from the raw value using the
+            # DERIVATION's own case, exactly matching
+            # `_resolve_derivation`'s `_apply_case(raw, derivation.case)`.
+            deriv_cased = _apply_case(raw.strip(), deriv.case)
+            outputs = deriv.table.get(deriv_cased)
+            if outputs is None:
+                continue
+            if deriv_output not in deriv.outputs:
+                continue
+            key = outputs[deriv.outputs.index(deriv_output)]
+            if kind == "derived":
+                predicted[raw] = key
+            else:
+                table = REGISTERED_DEFAULT_TABLES.get(mapping.table, {})
+                if key in table:
+                    predicted[raw] = table[key]
+    return predicted
+
+
 def _low_confidence_detail(
     proposal: AdapterProposal, profiles: dict
 ) -> list[dict[str, Any]]:
@@ -199,14 +276,37 @@ def _low_confidence_detail(
             for column in candidate_columns
             if (profile := _column_profile_dict(profiles, column)) is not None
         }
+        # Predicted per-value, not just the raw mapping JSON: the browser
+        # corrector pre-fills "proposed: X" from this, and it has to be
+        # right for every mapping kind this slot can carry (`default_by`,
+        # `parsed`, `column` -- not only `vocabulary`), computed the one
+        # place that can't disagree with the real engine. Empty when there
+        # is no single candidate column to predict against (`literal` etc.)
+        # or the column's profile wasn't measured.
+        current_values: dict[str, Any] = {}
+        if candidate_columns:
+            profile = column_profiles.get(candidate_columns[0])
+            if profile is not None:
+                current_values = _predict_current_values(
+                    slot.mapping, proposal.derived, profile["distinct_values"]
+                )
         detail.append(
             {
                 "slot": f"asset.{target}",
                 "confidence": slot.confidence,
                 "reason": slot.evidence.note,
                 "current_mapping": slot.mapping.model_dump(mode="json"),
+                "current_values": current_values,
                 "candidate_columns": candidate_columns,
                 "column_profiles": column_profiles,
+                # Whether "mark not collected" is even a legal correction for
+                # THIS target -- `role` is not a `NOT_COLLECTED_DEFAULTS` key
+                # (it falls back through `default_by`/`ROLE_DEFAULT_BY_OS_CLASS`
+                # instead), so a bare `not_collected` mapping on it fails
+                # `validate_contract` exactly the way it does for `product`/
+                # `evidence` below -- the browser corrector must not offer an
+                # illegal escape hatch here either.
+                "gap_legal": target in GAP_LEGAL_TARGETS,
                 "target_vocabulary": describe_target_vocabulary(target),
             }
         )
@@ -218,7 +318,13 @@ def _column_profile_dict(profiles: dict, column: str) -> dict[str, Any] | None:
         column_profile = profile.columns.get(column)
         if column_profile is not None:
             return {
-                "distinct_values": sorted(column_profile.distinct_values),
+                # value -> occurrence count, not just the value list -- a
+                # low-confidence review needs "how many rows does this
+                # source value affect", not only "what values exist"
+                # (ColumnProfile.distinct_values' own docstring already
+                # carries the count; `sorted()` over the dict alone would
+                # silently discard it).
+                "distinct_values": dict(sorted(column_profile.distinct_values.items())),
                 "distinct_overflow": column_profile.distinct_overflow,
                 "blank": column_profile.blank,
                 "non_blank": column_profile.non_blank,
@@ -298,6 +404,24 @@ def mount_adapter_routes(app: FastAPI) -> None:
                     "candidate_columns": list(entry.candidate_columns),
                     "column_profiles": column_profiles,
                     "target_vocabulary": describe_target_vocabulary(target),
+                    # A free-text target (target_vocabulary is None, e.g.
+                    # finding.product/evidence) has no per-value picker at
+                    # all -- the browser's only other tool is "mark not
+                    # collected", which is illegal whenever the target has no
+                    # NOT_COLLECTED_DEFAULTS entry (validate_contract refuses
+                    # it: "not_collected has no NOT_COLLECTED_DEFAULTS entry
+                    # for '<target>'"). Confirmed live, not assumed: a
+                    # standalone repro resolving finding.product this way
+                    # reproduced exactly the reported bug -- 0 unresolved
+                    # slots, contract still not written, real reason hidden
+                    # by the frontend's old message. `absent_fact_legal` is
+                    # the legal escape hatch for that case instead (a real
+                    # `column` mapping with `blank: "absent_fact"`) -- both
+                    # flags are read off the SAME registries
+                    # `validate_contract` itself enforces, never guessed at
+                    # in JS.
+                    "gap_legal": target in GAP_LEGAL_TARGETS,
+                    "absent_fact_legal": target in ABSENT_FACT_LEGAL_TARGETS,
                 }
             )
 

@@ -1841,6 +1841,32 @@ function appendFollowUpCard(html) {
 
 /* ---------------- slot resolution (GET .../proposal, then POST /api/jobs) ---------------- */
 
+/* `ingest_propose`'s result carries `contract_written: false` in exactly
+ * two, structurally different cases (schema_inference.ProposeResult /
+ * propose_contract's own module docstring): (1) slots are still
+ * unresolved or a value failed grounding -- `unresolved_slots` names them;
+ * (2) every slot IS mapped and grounded, but the assembled contract fails
+ * the real contract validator (an illegal mapping for its target, a
+ * column left neither mapped nor unmapped, ...) -- `unresolved_slots` is
+ * EMPTY in this case, and the real reason lives only in
+ * `incomplete_reason`. `incomplete_reason` is set in BOTH cases (it is
+ * the exact str(ProposalIncompleteError) either way) -- so it alone is
+ * always the right thing to show, and showing `unresolved_slots` instead
+ * whenever it happens to be empty is what silently reported "0 slot(s)
+ * remain unresolved: ." for case (2), hiding the one thing making the
+ * state make sense. Confirmed live: a standalone repro resolving a
+ * free-text unresolved slot (finding.product) the only way the old UI
+ * offered reproduced exactly this -- 0 unresolved, not written, real
+ * reason (`not_collected has no NOT_COLLECTED_DEFAULTS entry for
+ * 'product'`) present in the job result the whole time, never rendered. */
+function describeIngestProposeIncomplete(result) {
+  if (result.incomplete_reason) return result.incomplete_reason;
+  if (result.unresolved_slots && result.unresolved_slots.length) {
+    return `${result.unresolved_slots.length} slot(s) remain unresolved: ${result.unresolved_slots.join(", ")}.`;
+  }
+  return "not written, and the backend reported no reason for it -- this is itself a bug; please report it.";
+}
+
 async function openResolvePanel(name, uploadId) {
   const card = appendFollowUpCard(`<span class="spinner"></span> Loading unresolved slot(s)…`);
   let data;
@@ -1859,24 +1885,84 @@ async function openResolvePanel(name, uploadId) {
   renderResolvePanel(card, data.unresolved);
 }
 
-function resolveSlotRowHtml(slot, cardId) {
+/* Shared by the unresolved-slot resolver and the low-confidence-mapping
+ * corrector (renderConfirmPanel) -- an unresolved slot has no
+ * `current_values` at all, so every control starts on "(exclude this
+ * value)"; a low-confidence slot's `current_values` (web/adapters.py's
+ * `_predict_current_values` -- computed server-side by calling the real
+ * engine's own case-transform/parser functions, not a second copy of that
+ * logic here) pre-selects each control to the value the CURRENTLY
+ * proposed mapping actually resolves that source value to, whatever kind
+ * of mapping it is (vocabulary, parsed, default_by, ...) -- so leaving
+ * every control untouched and submitting reproduces the model's own
+ * mapping. Each control's pre-filled value is also stamped onto
+ * `data-initial-value`, so a caller (the low-confidence corrector's dirty
+ * check, `isLowConfidenceItemDirty`) can tell "still exactly what was
+ * proposed" apart from "edited, not yet applied" without re-deriving it. */
+function resolveSlotRowHtml(slot) {
   const vocab = slot.target_vocabulary;
   const column = slot.candidate_columns[0];
   const profile = column ? slot.column_profiles[column] : null;
+  const currentValues = slot.current_values || null;
+  // Both false only for a target this backend endpoint hasn't been taught
+  // about yet (every real target is in at least one of these two sets --
+  // config_model.ABSENT_FACT_LEGAL_TARGETS covers essentially every
+  // free-text field) -- default true rather than silently hiding the
+  // not-collected checkbox for a caller that predates these fields.
+  const gapLegal = slot.gap_legal !== undefined ? slot.gap_legal : true;
+  const absentFactLegal = !!slot.absent_fact_legal;
 
-  let valuePickerHtml = `<p class="hint">No candidate column with a known profile -- only "mark not collected" is offered.</p>`;
-  if (column && profile && vocab && (vocab.kind === "enum" || vocab.kind === "range")) {
-    const options =
-      vocab.kind === "enum"
-        ? [`<option value="">(exclude this value)</option>`, ...vocab.values.map((v) => `<option value="${esc(v)}">${esc(v)}</option>`)]
-        : null;
-    const rows = profile.distinct_values
-      .map((value) => {
+  let valuePickerHtml = "";
+  let columnPickerHtml = "";
+  if (!vocab && slot.candidate_columns.length) {
+    // A free-text target (finding.product, .evidence, ...) has no closed
+    // set of legal values to pick per source value -- the correction is
+    // WHICH column feeds it, not what each value maps to. Building this as
+    // a `column` mapping (never a value lookup) keeps Rule 2's "no
+    // free-text pattern at runtime" intact: the human picks a column from
+    // a closed list the model already profiled, nothing else.
+    const blankPolicy = absentFactLegal ? "absent_fact" : gapLegal ? "gap" : null;
+    if (blankPolicy) {
+      const options = slot.candidate_columns
+        .map((c) => `<option value="${esc(c)}">${esc(c)}</option>`)
+        .join("");
+      columnPickerHtml = `
+        <p class="hint">No fixed set of legal values for this field -- map it directly to the column it should read from:</p>
+        <select class="resolve-column-select" data-blank-policy="${blankPolicy}">${options}</select>
+      `;
+    }
+  }
+  if (!vocab && !columnPickerHtml) {
+    valuePickerHtml = gapLegal
+      ? `<p class="hint">No candidate column with a known profile -- only "mark not collected" is offered.</p>`
+      : `<p class="chat-msg-error">This slot has no legal automatic resolution through this form: no candidate column to map to, and "not collected" is not a legal value for this target. Edit the saved proposal file by hand and re-run "rhino adapt propose --from-proposal".</p>`;
+  }
+  if (column && profile && vocab && (vocab.kind === "enum" || vocab.kind === "range" || vocab.kind === "bool")) {
+    const selectOptions = (current) => {
+      if (vocab.kind === "bool") {
+        return [
+          `<option value="">(exclude this value)</option>`,
+          `<option value="true" ${current === true ? "selected" : ""}>true</option>`,
+          `<option value="false" ${current === false ? "selected" : ""}>false</option>`,
+        ].join("");
+      }
+      return [
+        `<option value="">(exclude this value)</option>`,
+        ...vocab.values.map((v) => `<option value="${esc(v)}" ${current === v ? "selected" : ""}>${esc(v)}</option>`),
+      ].join("");
+    };
+    const rows = Object.entries(profile.distinct_values)
+      .sort((a, b) => b[1] - a[1])
+      .map(([value, count]) => {
+        const current = currentValues ? currentValues[value] : undefined;
+        const initialValue = current !== undefined ? String(current) : "";
         const input =
-          vocab.kind === "enum"
-            ? `<select class="resolve-value-select" data-source-value="${esc(value)}">${options.join("")}</select>`
-            : `<input type="number" class="resolve-value-select" data-source-value="${esc(value)}" min="${vocab.min}" max="${vocab.max}" placeholder="${vocab.min}-${vocab.max}, or blank to exclude" />`;
-        return `<div class="resolve-value-row"><code>${esc(value)}</code> <span class="hint">→</span> ${input}</div>`;
+          vocab.kind === "range"
+            ? `<input type="number" class="resolve-value-select" data-source-value="${esc(value)}" data-initial-value="${esc(initialValue)}" min="${vocab.min}" max="${vocab.max}" value="${esc(initialValue)}" placeholder="${vocab.min}-${vocab.max}, or blank to exclude" />`
+            : `<select class="resolve-value-select" data-source-value="${esc(value)}" data-initial-value="${esc(initialValue)}">${selectOptions(current)}</select>`;
+        const proposedHtml =
+          current !== undefined ? `<span class="hint">proposed: <strong>${esc(String(current))}</strong> →</span>` : "";
+        return `<div class="resolve-value-row"><code>${esc(value)}</code> <span class="hint">(${count} row${count === 1 ? "" : "s"})</span> ${proposedHtml} ${input}</div>`;
       })
       .join("");
     valuePickerHtml = `
@@ -1885,14 +1971,31 @@ function resolveSlotRowHtml(slot, cardId) {
     `;
   }
 
-  return `
-    <div class="resolve-slot" data-slot="${esc(slot.slot)}">
-      <h4>${esc(slot.slot)}</h4>
-      <p class="hint">${esc(slot.reason)}</p>
-      ${valuePickerHtml}
+  const confidenceHtml =
+    slot.confidence !== undefined ? `<p class="hint">Model confidence: ${(slot.confidence * 100).toFixed(0)}%</p>` : "";
+
+  // "Mark not collected" is only ever a legal correction for a target with
+  // its own NOT_COLLECTED_DEFAULTS entry (config_model.GAP_LEGAL_TARGETS) --
+  // asset.role is the sharpest example: it falls back through `default_by`/
+  // ROLE_DEFAULT_BY_OS_CLASS, not a bare `not_collected` mapping, so
+  // offering this checkbox for it (or for finding.product/evidence) would
+  // let a human build a contract validate_contract refuses outright.
+  const notCollectedHtml = gapLegal
+    ? `
       <label class="resolve-not-collected">
         <input type="checkbox" class="resolve-not-collected-checkbox" /> This source has no such field at all (mark not collected)
       </label>
+    `
+    : "";
+
+  return `
+    <div class="resolve-slot" data-slot="${esc(slot.slot)}">
+      <h4>${esc(slot.slot)}</h4>
+      ${confidenceHtml}
+      <p class="hint">${esc(slot.reason)}</p>
+      ${valuePickerHtml}
+      ${columnPickerHtml}
+      ${notCollectedHtml}
     </div>
   `;
 }
@@ -1908,44 +2011,141 @@ function renderResolvePanel(card, unresolved) {
   card.querySelector(".resolve-submit-btn").addEventListener("click", () => submitResolvedProposal(card, unresolved));
 }
 
+/* Shared by the unresolved-slot resolver and the low-confidence-mapping
+ * corrector: a human's filled-in `.resolve-slot` row -> a fresh,
+ * code-owned mapping node. Always `vocabulary` or `not_collected` --
+ * never anything the closed grammar's own `check_grounding`/
+ * `assemble_contract` gate wouldn't already accept from a model. */
+function buildSlotMapping(slot, row) {
+  // A free-text target (no target_vocabulary) has no per-value picker at
+  // all -- its only controls are this column-select and (when legal) the
+  // not-collected checkbox below, so it's checked first.
+  const columnSelect = row.querySelector(".resolve-column-select");
+  if (columnSelect) {
+    const column = columnSelect.value;
+    return {
+      status: "mapped", confidence: 1.0,
+      mapping: { kind: "column", column, case: "exact", blank: columnSelect.dataset.blankPolicy },
+      evidence: { columns_cited: [column], sample_values_cited: [], note: "Mapped directly to a column via the browser slot-resolution form." },
+    };
+  }
+  const notCollectedCheckbox = row.querySelector(".resolve-not-collected-checkbox");
+  const notCollected = notCollectedCheckbox ? notCollectedCheckbox.checked : false;
+  if (notCollected) {
+    return {
+      status: "mapped", confidence: 1.0, mapping: { kind: "not_collected" },
+      evidence: { columns_cited: [], sample_values_cited: [], note: "Marked not collected via the browser slot-resolution form." },
+    };
+  }
+  const column = slot.candidate_columns[0];
+  const table = {};
+  row.querySelectorAll(".resolve-value-select").forEach((input) => {
+    const value = input.value.trim();
+    if (!value) return;
+    if (slot.target_vocabulary.kind === "range") table[input.dataset.sourceValue] = Number(value);
+    else if (slot.target_vocabulary.kind === "bool") table[input.dataset.sourceValue] = value === "true";
+    else table[input.dataset.sourceValue] = value;
+  });
+  return {
+    status: "mapped", confidence: 1.0,
+    mapping: { kind: "vocabulary", column, case: "exact", blank: "fatal", table },
+    evidence: {
+      columns_cited: [column], sample_values_cited: [],
+      note: "Resolved via the browser slot-resolution form.",
+    },
+  };
+}
+
+/* `{ColumnName}` placeholders inside a composed template -- mirrors
+ * config_model.py's own `_PLACEHOLDER_PATTERN`. */
+const COMPOSED_PLACEHOLDER_RE = /\{([^{}]+)\}/g;
+
+/* Every column a mapping node actually reads, best-effort -- used only to
+ * decide unmapped_columns bookkeeping below, never to reproduce the
+ * engine's read-time semantics (case transform, parsing, vocabulary
+ * lookup -- see `_predict_current_values`'s own docstring on why THAT
+ * duplication is the one to avoid). Plain column/vocabulary/parsed carry
+ * `.column`; content_address carries `.columns`; composed cites columns
+ * through template placeholders and its two non-template fields. */
+function _mappingColumns(mapping) {
+  const columns = [];
+  if (mapping.column) columns.push(mapping.column);
+  if (Array.isArray(mapping.columns)) columns.push(...mapping.columns);
+  if (mapping.kind === "composed") {
+    for (const part of mapping.parts || []) {
+      for (const text of [part.template, part.fallback_template]) {
+        if (text) columns.push(...[...text.matchAll(COMPOSED_PLACEHOLDER_RE)].map((m) => m[1]));
+      }
+      if (Array.isArray(part.required_non_blank)) columns.push(...part.required_non_blank);
+      if (Array.isArray(part.emit_if_any)) columns.push(...part.emit_if_any);
+      if (Array.isArray(part.join_nonblank)) columns.push(...part.join_nonblank);
+    }
+  }
+  return columns;
+}
+
+/* Whether `column` is read by some OTHER mapping in this proposal (or a
+ * `derived` block another mapping keys off) -- so resolving one slot never
+ * un-declares a column a different slot still genuinely uses. A missed
+ * case here still surfaces loudly as validate_contract's own "mapped AND
+ * unmapped" contradiction rather than silently corrupting anything -- this
+ * is bookkeeping, not a semantic judgment call. */
+function _isColumnUsedElsewhere(proposal, column, excludeSlotKey) {
+  for (const section of ["asset", "finding"]) {
+    for (const [target, sp] of Object.entries(proposal[section] || {})) {
+      if (`${section}.${target}` === excludeSlotKey) continue;
+      if (sp.status === "mapped" && _mappingColumns(sp.mapping).includes(column)) return true;
+    }
+  }
+  return Object.values(proposal.derived || {}).some((d) => d.column === column);
+}
+
+function applySlotEditToProposal(proposal, slot, row) {
+  const [section, target] = slot.slot.split(".");
+  const built = buildSlotMapping(slot, row);
+  proposal[section][target] = built;
+
+  // Every real header column must end up either mapped or explicitly
+  // declared in unmapped_columns (validate_contract's V08 "neither mapped
+  // nor in unmapped_columns" check) -- never both, never neither. Before
+  // this edit, the slot's own candidate column(s) sat in NEITHER state (an
+  // unresolved or low-confidence slot's candidate is "under
+  // consideration," not yet mapped and not yet disclaimed). Resolving the
+  // slot must settle every one of its candidates one way or the other: the
+  // column the new mapping actually reads comes OUT of unmapped_columns;
+  // every other candidate -- declined, or the whole slot marked
+  // not_collected -- goes IN. Confirmed necessary by a standalone repro,
+  // not assumed: without the "add" direction, resolving an unresolved
+  // slot's dedicated candidate column via not_collected left that column
+  // accounted for nowhere, and validate_contract refused with "column(s)
+  // [...] are neither mapped nor in unmapped_columns" -- on top of (or
+  // instead of) the illegal-not_collected failure this same fix also
+  // closes.
+  const filename = section === "asset" ? proposal.meta.assets_filename : proposal.meta.findings_filename;
+  const usedColumns = new Set(_mappingColumns(built.mapping));
+  proposal.unmapped_columns = proposal.unmapped_columns || {};
+  proposal.unmapped_columns[filename] = proposal.unmapped_columns[filename] || {};
+  const unmapped = proposal.unmapped_columns[filename];
+
+  for (const candidate of slot.candidate_columns) {
+    if (usedColumns.has(candidate)) {
+      delete unmapped[candidate];
+    } else if (!(candidate in unmapped) && !_isColumnUsedElsewhere(proposal, candidate, slot.slot)) {
+      unmapped[candidate] = {
+        disposition: "ignored",
+        reason: `Not used by ${slot.slot}'s resolved mapping (resolved via the browser slot-resolution form).`,
+        profile_cited: "not evaluated -- declined via the browser slot-resolution form",
+      };
+    }
+  }
+  return proposal;
+}
+
 function buildResolvedProposal(card, unresolved) {
   const proposal = JSON.parse(JSON.stringify(card.savedProposal.proposal));
   for (const slot of unresolved) {
-    const [section, target] = slot.slot.split(".");
     const row = card.querySelector(`.resolve-slot[data-slot="${CSS.escape(slot.slot)}"]`);
-    const notCollected = row.querySelector(".resolve-not-collected-checkbox").checked;
-    if (notCollected) {
-      proposal[section][target] = {
-        status: "mapped", confidence: 1.0, mapping: { kind: "not_collected" },
-        evidence: { columns_cited: [], sample_values_cited: [], note: "Marked not collected via the browser slot-resolution form." },
-      };
-      continue;
-    }
-    const column = slot.candidate_columns[0];
-    const table = {};
-    row.querySelectorAll(".resolve-value-select").forEach((input) => {
-      const value = input.value.trim();
-      if (value) table[input.dataset.sourceValue] = slot.target_vocabulary.kind === "range" ? Number(value) : value;
-    });
-    proposal[section][target] = {
-      status: "mapped", confidence: 1.0,
-      mapping: { kind: "vocabulary", column, case: "exact", blank: "fatal", table },
-      evidence: {
-        columns_cited: [column], sample_values_cited: [],
-        note: "Resolved via the browser slot-resolution form.",
-      },
-    };
-    // The unresolved slot's candidate column was, by construction, either
-    // never cited by any mapping or explicitly disclaimed in
-    // unmapped_columns (schema_inference.py's own grammar requires every
-    // column end up in exactly one of those two places) -- now that it
-    // feeds a real mapping, it must come out of every file's
-    // unmapped_columns entry, or validate_contract correctly refuses the
-    // contradiction "mapped AND unmapped" (confirmed live against the
-    // real northgate file before this fix existed).
-    for (const entries of Object.values(proposal.unmapped_columns || {})) {
-      delete entries[column];
-    }
+    applySlotEditToProposal(proposal, slot, row);
   }
   return proposal;
 }
@@ -1991,7 +2191,7 @@ async function submitResolvedProposal(card, unresolved) {
 
   const result = job.result;
   if (!result.contract_written) {
-    statusEl.innerHTML = `Still not written -- ${result.unresolved_slots.length} slot(s) remain unresolved: ${esc(result.unresolved_slots.join(", "))}.`;
+    statusEl.innerHTML = `Still not written -- ${esc(describeIngestProposeIncomplete(result))}`;
     submitBtn.disabled = false;
     return;
   }
@@ -2039,10 +2239,28 @@ async function openConfirmPanel(name, uploadId) {
     card.innerHTML = `<p class="chat-msg-error">Could not load the review: ${esc(err.message)}</p>`;
     return;
   }
-  renderConfirmPanel(card, name, uploadId, review);
+  card.dataset.name = name;
+  card.dataset.uploadId = uploadId;
+  // A hand-authored contract confirmed without ever going through propose
+  // has no saved-proposal file (web/adapters.py's `GET .../proposal` 404s)
+  // -- the low_confidence_mappings attestation still shows as a plain
+  // sentence in that case, exactly as before this fix, since there is no
+  // proposal JSON to correct.
+  let lowConfidence = [];
+  try {
+    const propRes = await fetch(`/api/adapters/${encodeURIComponent(name)}/proposal?upload_id=${encodeURIComponent(uploadId)}`);
+    if (propRes.ok) {
+      const propData = await propRes.json();
+      card.savedProposal = propData.saved_proposal;
+      lowConfidence = propData.low_confidence || [];
+    }
+  } catch (err) {
+    // no saved proposal to draw correction detail from -- fall through.
+  }
+  renderConfirmPanel(card, name, uploadId, review, lowConfidence);
 }
 
-function renderConfirmPanel(card, name, uploadId, review) {
+function renderConfirmPanel(card, name, uploadId, review, lowConfidence = []) {
   const m = review.measurement;
   const attestItems = Object.entries(review.required_attestations);
   // `measurement` is null when this contract still needs an attestation it
@@ -2062,8 +2280,19 @@ function renderConfirmPanel(card, name, uploadId, review) {
     ${!m.is_clean ? `<p class="chat-msg-error">The mapping hit fatal problems on this source -- fix the mapping (resolve slots again) before confirming.</p>` : ""}
   `
     : `<p class="hint">Fill in the attestation(s) below and confirm to see the real measurement.</p>`;
+  // `low_confidence_mappings`, when required, is the one attestation item
+  // this form must not let stand for itself as a sentence to type -- the
+  // mapping(s) that triggered it render inline, directly above its row,
+  // each correctable through the identical slot-resolution widget an
+  // unresolved slot already uses (never a second, parallel one).
   const attestHtml = attestItems.length
-    ? `<div class="confirm-attest-list">${attestItems.map(([item, reason]) => confirmAttestRowHtml(item, reason)).join("")}</div>`
+    ? `<div class="confirm-attest-list">${attestItems
+        .map(([item, reason]) =>
+          item === "low_confidence_mappings" && lowConfidence.length
+            ? lowConfidenceMappingsHtml(lowConfidence) + confirmAttestRowHtml(item, reason)
+            : confirmAttestRowHtml(item, reason)
+        )
+        .join("")}</div>`
     : `<p class="hint">Nothing this contract's shape requires an attestation for.</p>`;
 
   card.innerHTML = `
@@ -2077,6 +2306,10 @@ function renderConfirmPanel(card, name, uploadId, review) {
   card.querySelector(".confirm-submit-btn").addEventListener("click", () =>
     submitConfirm(card, name, uploadId)
   );
+  card.querySelectorAll(".low-confidence-apply-btn").forEach((btn) => {
+    const slot = lowConfidence.find((s) => s.slot === btn.dataset.slot);
+    if (slot) btn.addEventListener("click", () => applyLowConfidenceCorrection(card, name, uploadId, slot));
+  });
 }
 
 function confirmAttestRowHtml(item, reason) {
@@ -2088,6 +2321,105 @@ function confirmAttestRowHtml(item, reason) {
   `;
 }
 
+/* One card per low-confidence slot, each an independent unit -- a human
+ * may correct one, leave another exactly as proposed, and attest to the
+ * lot in the single sentence below, matching web/adapters.py's own "not
+ * REQUIRED to change, only required to be seen" design. */
+function lowConfidenceMappingsHtml(lowConfidence) {
+  return `
+    <div class="confirm-low-confidence-list">
+      <p class="hint">Model confidence below threshold on the mapping(s) below -- verify the proposed target per value, correct any that are wrong, or leave as proposed and attest below.</p>
+      ${lowConfidence
+        .map(
+          (slot) => `
+        <div class="confirm-low-confidence-item">
+          ${resolveSlotRowHtml(slot)}
+          <div class="route-step-result confirm-low-confidence-status" hidden></div>
+          <button type="button" class="secondary-btn low-confidence-apply-btn" data-slot="${esc(slot.slot)}">Apply this correction</button>
+        </div>
+      `
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+/* True when a `.confirm-low-confidence-item`'s controls no longer match
+ * what they were rendered with (`data-initial-value`, stamped by
+ * `resolveSlotRowHtml` from the same `current_values` the controls were
+ * pre-filled from) -- i.e. a human touched this correction but never
+ * clicked its own "Apply this correction" button. `submitConfirm` refuses
+ * to sign while any item is in this state: the main Confirm button only
+ * ever reads `.confirm-identity-input`/`.confirm-attest-input`, never
+ * these per-value controls, so an edited-but-unapplied row would
+ * otherwise be silently discarded -- the signed contract would still
+ * carry the ORIGINAL low-confidence mapping while the attestation text
+ * claims it was reviewed and corrected. */
+function isLowConfidenceItemDirty(item) {
+  const checkbox = item.querySelector(".resolve-not-collected-checkbox");
+  if (checkbox && checkbox.checked) return true;
+  return Array.from(item.querySelectorAll(".resolve-value-select")).some(
+    (input) => input.value !== (input.dataset.initialValue || "")
+  );
+}
+
+async function applyLowConfidenceCorrection(card, name, uploadId, slot) {
+  const item = card.querySelector(`.confirm-low-confidence-item .resolve-slot[data-slot="${CSS.escape(slot.slot)}"]`).closest(
+    ".confirm-low-confidence-item"
+  );
+  const row = item.querySelector(".resolve-slot");
+  const statusEl = item.querySelector(".confirm-low-confidence-status");
+  const btn = item.querySelector(".low-confidence-apply-btn");
+  btn.disabled = true;
+  statusEl.hidden = false;
+  statusEl.innerHTML = `<span class="spinner"></span> Re-checking against the real file…`;
+
+  const editedProposal = applySlotEditToProposal(JSON.parse(JSON.stringify(card.savedProposal.proposal)), slot, row);
+  const editedSavedProposal = {
+    proposal: editedProposal,
+    generator: card.savedProposal.generator,
+    attempt_usage: card.savedProposal.attempt_usage || [],
+  };
+
+  let job;
+  try {
+    const res = await fetch("/api/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        kind: "ingest_propose",
+        input: { upload_id: uploadId, name, edited_saved_proposal: editedSavedProposal },
+      }),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+    job = await pollJobOnce(body.job_id);
+  } catch (err) {
+    statusEl.innerHTML = `<span style="color: var(--status-failed)">Could not apply: ${esc(err.message)}</span>`;
+    btn.disabled = false;
+    return;
+  }
+
+  if (job.status === "failed") {
+    statusEl.innerHTML = `<span style="color: var(--status-failed)">${esc(job.error?.message || "failed")}</span>`;
+    btn.disabled = false;
+    return;
+  }
+
+  const result = job.result;
+  if (!result.contract_written) {
+    statusEl.innerHTML = `Still not written -- ${esc(describeIngestProposeIncomplete(result))}`;
+    btn.disabled = false;
+    return;
+  }
+  // The rewritten, unconfirmed contract is on disk now, at a strictly
+  // lower confidence-attestation surface than before -- reload the whole
+  // panel rather than patch this one card in place, so `still_missing`
+  // reflects the correction before anything is ever signed.
+  statusEl.innerHTML = `Correction applied.`;
+  openConfirmPanel(name, uploadId);
+}
+
 async function submitConfirm(card, name, uploadId) {
   const statusEl = card.querySelector(".confirm-status");
   const submitBtn = card.querySelector(".confirm-submit-btn");
@@ -2095,6 +2427,14 @@ async function submitConfirm(card, name, uploadId) {
   if (!by) {
     statusEl.hidden = false;
     statusEl.innerHTML = `<span style="color: var(--status-failed)">Signed by is required.</span>`;
+    return;
+  }
+  const dirtyCount = card.querySelectorAll(".confirm-low-confidence-item").length
+    ? Array.from(card.querySelectorAll(".confirm-low-confidence-item")).filter(isLowConfidenceItemDirty).length
+    : 0;
+  if (dirtyCount) {
+    statusEl.hidden = false;
+    statusEl.innerHTML = `<span style="color: var(--status-failed)">You changed ${dirtyCount} low-confidence mapping${dirtyCount === 1 ? "" : "s"} above but haven't clicked its "Apply this correction" button -- apply it (or set the control(s) back to how they were proposed) before confirming, so the signed contract matches what you're attesting to.</span>`;
     return;
   }
   const attestations = {};
@@ -2213,7 +2553,7 @@ function formatStepResult(step) {
     case "ingest_propose":
       return r.contract_written
         ? `Contract written to ${esc(baseName(r.contract_path))}. Next: ${r.next_step}`
-        : `Not written yet -- ${(r.unresolved_slots || []).length} slot(s) still unresolved.`;
+        : `Not written yet -- ${esc(describeIngestProposeIncomplete(r))}`;
     case "constraint_submit":
       return r.persisted ? "Constraint applied." : "Nothing to apply.";
     case "remediation_mark":
