@@ -17,7 +17,7 @@ import pytest
 from crewai.types.usage_metrics import UsageMetrics
 
 import rhinosecure.agents.schema_inference as schema_inference_module
-from rhinosecure.adapters.config_model import ASSET_SLOTS, FINDING_SLOTS, Contract, validate_contract
+from rhinosecure.adapters.config_model import ASSET_SLOTS, FINDING_SLOTS, ColumnMapping, Contract, validate_contract
 from rhinosecure.adapters.probe import profile_source
 from rhinosecure.agents.schema_inference import (
     PROVISIONAL_ROLE_PLACEHOLDER,
@@ -29,11 +29,15 @@ from rhinosecure.agents.schema_inference import (
     ProvisionalAssemblyNotes,
     SavedProposal,
     SchemaInferenceError,
+    SlotMapped,
+    SlotUnresolved,
+    _apply_registry_aliases,
     _check_mapped_slots_legal,
     _resolve_layout,
     _validate_format_name,
     assemble_contract,
     assemble_provisional_contract,
+    check_column_mapping_legal_values,
     check_grounding,
     dump_saved_proposal,
     load_saved_proposal,
@@ -644,18 +648,18 @@ def test_provisional_assembly_hard_stops_when_an_illegal_mapping_has_no_placehol
 # --- _check_mapped_slots_legal: closing the grammar at FRESH generation ------
 
 
-def test_check_mapped_slots_legal_flags_an_illegal_mapping():
+def test_check_mapped_slots_legal_flags_an_illegal_mapping(profiles):
     data = _full_proposal_dict(overrides_asset={
         "role": _mapped({"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "gap", "table": {"srv": "dc"}}, columns_cited=["Col"]),
     })
     proposal = AdapterProposal.model_validate(data)  # must NOT raise -- see module docstring
     with pytest.raises(MappingLegalityError, match="asset.role"):
-        _check_mapped_slots_legal(proposal)
+        _check_mapped_slots_legal(proposal, profiles)
 
 
-def test_check_mapped_slots_legal_passes_the_valid_fixture():
+def test_check_mapped_slots_legal_passes_the_valid_fixture(profiles):
     proposal = AdapterProposal.model_validate(_full_proposal_dict())
-    _check_mapped_slots_legal(proposal)  # must not raise
+    _check_mapped_slots_legal(proposal, profiles)  # must not raise
 
 
 def test_assemble_contract_a_caveat_alone_does_not_block(tmp_path):
@@ -1332,3 +1336,458 @@ def test_dump_saved_proposal_omits_attempt_usage_key_when_empty():
     proposal = AdapterProposal.model_validate(_full_proposal_dict())
     saved = SavedProposal(proposal=proposal, generator=_generator())
     assert "attempt_usage" not in dump_saved_proposal(saved)
+
+
+# --- _apply_registry_aliases: table augmentation ----------------------------
+
+
+def test_apply_registry_aliases_augments_an_incomplete_role_table(tmp_path):
+    """The exact real-world shape (a smaller, synthetic version of the
+    northgate_flat_2.csv case): the model correctly mapped 'Workstation' but
+    left 'Domain Controller' out of the table for lack of a known target
+    token -- augmentation adds it, without touching the entry already there."""
+    _write_csv(tmp_path, _HEADER, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "Workstation"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "Domain Controller"],
+    ])
+    profiles = {p.path.name: p for p in profile_source(tmp_path)}
+    data = _full_proposal_dict(overrides_asset={
+        "role": _mapped(
+            {"kind": "vocabulary", "column": "Col", "case": "exact", "blank": "fatal", "table": {"Workstation": "workstation"}},
+            columns_cited=["Col"],
+        ),
+    })
+    proposal = AdapterProposal.model_validate(data)
+    new_proposal = _apply_registry_aliases(proposal, profiles)
+    slot = new_proposal.asset["role"]
+    assert isinstance(slot, SlotMapped)
+    assert slot.mapping.table == {"Workstation": "workstation", "Domain Controller": "dc"}
+
+
+def test_apply_registry_aliases_never_overwrites_a_disagreeing_existing_entry(tmp_path):
+    """A genuine disagreement between the model's table and the registry is
+    `check_grounding`'s new alias-contradiction check's job, never something
+    augmentation silently 'fixes' -- only entries ABSENT from the table are
+    ever added."""
+    _write_csv(tmp_path, _HEADER, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "Domain Controller"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "Domain Controller"],
+    ])
+    profiles = {p.path.name: p for p in profile_source(tmp_path)}
+    data = _full_proposal_dict(overrides_asset={
+        "role": _mapped(
+            {"kind": "vocabulary", "column": "Col", "case": "exact", "blank": "fatal", "table": {"Domain Controller": "workstation"}},
+            columns_cited=["Col"],
+        ),
+    })
+    proposal = AdapterProposal.model_validate(data)
+    new_proposal = _apply_registry_aliases(proposal, profiles)
+    assert new_proposal.asset["role"].mapping.table == {"Domain Controller": "workstation"}
+
+
+def test_apply_registry_aliases_leaves_an_already_complete_table_unchanged(profiles):
+    """`data_dir`'s Col column only ever takes 'srv'/'wks' (`_full_proposal_dict`'s
+    own role table already covers 'srv'); neither is a registry alias, so
+    augmentation has nothing to add and the table is returned unchanged."""
+    data = _full_proposal_dict()
+    proposal = AdapterProposal.model_validate(data)
+    new_proposal = _apply_registry_aliases(proposal, profiles)
+    assert new_proposal.asset["role"].mapping.table == proposal.asset["role"].mapping.table
+
+
+# --- _apply_registry_aliases: slot promotion --------------------------------
+
+
+def test_apply_registry_aliases_promotes_a_fully_resolvable_unresolved_criticality(tmp_path):
+    _write_csv(tmp_path, _HEADER, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "Critical"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "Critical"],
+    ])
+    profiles = {p.path.name: p for p in profile_source(tmp_path)}
+    data = _full_proposal_dict(overrides_asset={
+        "criticality": _unresolved("no numeric scale specified", candidates=["Col"]),
+    })
+    proposal = AdapterProposal.model_validate(data)
+    new_proposal = _apply_registry_aliases(proposal, profiles)
+    slot = new_proposal.asset["criticality"]
+    assert isinstance(slot, SlotMapped)
+    assert slot.mapping.table == {"Critical": 5}
+    assert slot.mapping.blank == "gap"  # criticality IS gap-legal (a NOT_COLLECTED_DEFAULTS key)
+    assert slot.confidence == 1.0
+    assert "no model judgment" in slot.evidence.note
+
+
+def test_apply_registry_aliases_promotes_role_with_blank_fatal_not_gap(tmp_path):
+    """`role` has no `NOT_COLLECTED_DEFAULTS` entry -- `blank='gap'` would be
+    illegal for it (`config_model.GAP_LEGAL_TARGETS`); a promoted role
+    mapping must use `blank='fatal'` instead, the same choice both real
+    confirmed contracts make for this target."""
+    _write_csv(tmp_path, _HEADER, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "Domain Controller"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "Domain Controller"],
+    ])
+    profiles = {p.path.name: p for p in profile_source(tmp_path)}
+    data = _full_proposal_dict(overrides_asset={
+        "role": _unresolved("no verified target token", candidates=["Col"]),
+    })
+    proposal = AdapterProposal.model_validate(data)
+    new_proposal = _apply_registry_aliases(proposal, profiles)
+    slot = new_proposal.asset["role"]
+    assert isinstance(slot, SlotMapped)
+    assert slot.mapping.table == {"Domain Controller": "dc"}
+    assert slot.mapping.blank == "fatal"
+
+
+def test_apply_registry_aliases_does_not_promote_partial_coverage():
+    """The real northgate case, in miniature: exactly one candidate column,
+    two observed values, only one of which (Critical) is a registry anchor.
+    `full_alias_coverage` correctly refuses to return a partial table, so
+    the slot stays unresolved rather than being promoted with a table that
+    would fatal-refuse the whole batch the first time real ingest saw the
+    OTHER value."""
+    def _profiles(tmp_path):
+        _write_csv(tmp_path, _HEADER, [
+            ["A01", "HOST01", "F01", "CVE-2021-0001", "Critical"],
+            ["A02", "HOST02", "F02", "CVE-2021-0002", "Low"],
+        ])
+        return {p.path.name: p for p in profile_source(tmp_path)}
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        profiles = _profiles(Path(tmp))
+        data = _full_proposal_dict(overrides_asset={
+            "criticality": _unresolved("scale not specified", candidates=["Col"]),
+        })
+        proposal = AdapterProposal.model_validate(data)
+        new_proposal = _apply_registry_aliases(proposal, profiles)
+        assert isinstance(new_proposal.asset["criticality"], SlotUnresolved)
+
+
+def test_apply_registry_aliases_does_not_promote_when_two_candidates_both_achieve_full_coverage(tmp_path):
+    """More than one candidate column independently achieving full coverage
+    is ambiguous -- stay conservative, promote neither."""
+    header = ["Asset_ID", "Hostname", "Finding_ID", "Cve", "Col", "ColA", "ColB"]
+    _write_csv(tmp_path, header, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "srv", "Critical", "Critical"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "wks", "Critical", "Critical"],
+    ], name="data.csv")
+    profiles = {p.path.name: p for p in profile_source(tmp_path)}
+    data = _full_proposal_dict(overrides_asset={
+        "criticality": _unresolved("ambiguous source", candidates=["ColA", "ColB"]),
+    })
+    proposal = AdapterProposal.model_validate(data)
+    new_proposal = _apply_registry_aliases(proposal, profiles)
+    assert isinstance(new_proposal.asset["criticality"], SlotUnresolved)
+
+
+def test_apply_registry_aliases_skips_a_hallucinated_candidate_column(tmp_path):
+    _write_csv(tmp_path, _HEADER, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "Critical"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "Critical"],
+    ])
+    profiles = {p.path.name: p for p in profile_source(tmp_path)}
+    data = _full_proposal_dict(overrides_asset={
+        "criticality": _unresolved("scale not specified", candidates=["Column_That_Does_Not_Exist"]),
+    })
+    proposal = AdapterProposal.model_validate(data)
+    new_proposal = _apply_registry_aliases(proposal, profiles)
+    assert isinstance(new_proposal.asset["criticality"], SlotUnresolved)
+
+
+def test_apply_registry_aliases_runs_unconditionally_for_from_proposal(data_dir, profiles):
+    """Unlike `_check_mapped_slots_legal`, `_apply_registry_aliases` is
+    documented to run for BOTH branches of `propose_contract` -- verified
+    end to end via `propose_contract(..., from_proposal=...)` itself,
+    monkeypatching nothing (no LLM call happens on that path at all)."""
+    data = _full_proposal_dict(overrides_asset={
+        "role": _mapped(
+            {"kind": "vocabulary", "column": "Col", "case": "exact", "blank": "fatal", "table": {"wks": "workstation"}},
+            columns_cited=["Col"],
+        ),
+    })
+    proposal = AdapterProposal.model_validate(data)
+    saved = SavedProposal(proposal=proposal, generator=_generator())
+    result = propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, from_proposal=saved)
+    # the fixture's Col column also contains "srv" -- not a registry alias,
+    # so nothing new resolves here; this just confirms the call site runs
+    # without error on the from_proposal branch and grounding still passes.
+    assert result.grounding.failures == []
+
+
+# --- check_grounding: the new alias-contradiction check ---------------------
+
+
+#: A second, dedicated role column, distinct from `_HEADER`'s own "Col" --
+#: `_full_proposal_dict`'s DEFAULT `finding.scanner_severity` mapping also
+#: reads "Col" (expecting only "srv"/"wks"), so a test that repurposes "Col"
+#: itself for role values and then asserts a CLEAN `check_grounding` result
+#: would spuriously fail on that unrelated, pre-existing mapping instead.
+_ROLE_HEADER = ["Asset_ID", "Hostname", "Finding_ID", "Cve", "Col", "RoleCol"]
+
+
+def test_check_grounding_flags_alias_contradiction_for_role(tmp_path):
+    _write_csv(tmp_path, _ROLE_HEADER, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "srv", "Domain Controller"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "wks", "Domain Controller"],
+    ])
+    profiles = {p.path.name: p for p in profile_source(tmp_path)}
+    data = _full_proposal_dict(overrides_asset={
+        "role": _mapped(
+            {"kind": "vocabulary", "column": "RoleCol", "case": "exact", "blank": "fatal", "table": {"Domain Controller": "workstation"}},
+            columns_cited=["RoleCol"],
+        ),
+    })
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles)
+    assert "asset.role" in report.failed_slots
+    assert any("Domain Controller" in i.message and "'dc'" in i.message for i in report.failures)
+
+
+def test_check_grounding_does_not_flag_a_correct_alias_mapping(tmp_path):
+    _write_csv(tmp_path, _ROLE_HEADER, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "srv", "Domain Controller"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "wks", "Domain Controller"],
+    ])
+    profiles = {p.path.name: p for p in profile_source(tmp_path)}
+    data = _full_proposal_dict(overrides_asset={
+        "role": _mapped(
+            {"kind": "vocabulary", "column": "RoleCol", "case": "exact", "blank": "fatal", "table": {"Domain Controller": "dc"}},
+            columns_cited=["RoleCol"],
+        ),
+    })
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles)
+    assert report.failures == []
+
+
+def test_check_grounding_alias_contradiction_is_a_no_op_for_a_non_registry_target(profiles):
+    """`scanner_severity` is a closed Literal vocabulary too, but not one of
+    the four REGISTRY_BACKED_TARGETS -- no alias data exists to disagree
+    with, so a table using an unrelated key can never trip this check."""
+    data = _full_proposal_dict()  # scanner_severity is already mapped with table {"srv": "low"}
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles)
+    assert report.failures == []
+
+
+# --- real-fixture regression: northgate_flat_2.csv --------------------------
+
+
+def test_apply_registry_aliases_against_the_real_northgate_saved_proposal():
+    """Offline, LLM-free regression test against a REAL saved proposal from
+    a live LLM run: `out/baseline-flat2/propose_upload-366ed3c04d4645a09fdbc6ed.json`,
+    the exact case that motivated `adapters/schema_registry.py`'s existence
+    (one domain-controller asset, one dev workstation, same CVE). Loads the
+    saved proposal and runs THIS module's own deterministic functions
+    directly against it -- no live model call, no crewai involved.
+
+    Both `out/` and `data/uploads/` are gitignored (CLAUDE.md's own repo
+    layout names `out/` as generated and gitignored), so this real artifact
+    is only present in a working tree that already has it -- skipped, not
+    failed, when it's absent (a fresh checkout or CI runner without it)."""
+    repo_root = Path(__file__).resolve().parents[1]
+    saved_path = repo_root / "out" / "baseline-flat2" / "propose_upload-366ed3c04d4645a09fdbc6ed.json"
+    real_data_dir = repo_root / "data" / "uploads" / "366ed3c04d4645a09fdbc6edd76f48e0"
+    if not saved_path.exists() or not real_data_dir.is_dir():
+        pytest.skip(f"{saved_path} / {real_data_dir} not present in this working tree (both gitignored)")
+
+    saved = load_saved_proposal(saved_path)
+    real_profiles = {p.path.name: p for p in profile_source(real_data_dir)}
+
+    new_proposal = _apply_registry_aliases(saved.proposal, real_profiles)
+
+    # TABLE AUGMENTATION: "Domain Controller" was cited in evidence but left
+    # out of the model's own table for lack of a verified target token --
+    # the registry now supplies one.
+    role_slot = new_proposal.asset["role"]
+    assert isinstance(role_slot, SlotMapped)
+    assert role_slot.mapping.table == {"Workstation": "workstation", "Domain Controller": "dc"}
+
+    # SLOT PROMOTION does NOT fire here, correctly: the source's own "Asset
+    # Criticality" column has exactly two observed values, Critical and
+    # Low, and "Low" is deliberately not a registry alias (the anchor-only
+    # scope decision -- see schema_registry.py's own module docstring).
+    # full_alias_coverage can never return a COMPLETE table for this single
+    # candidate column, so the slot correctly stays unresolved rather than
+    # being promoted with a table that would fatal-refuse the whole batch
+    # the moment real ingest saw "Low".
+    criticality_slot = new_proposal.asset["criticality"]
+    assert isinstance(criticality_slot, SlotUnresolved)
+
+    # The augmentation introduced no new grounding failures.
+    report = check_grounding(new_proposal, real_profiles)
+    assert report.failures == []
+
+
+# --- real-fixture regression: the scanner_severity case-mismatch bug --------
+#
+# northgate_flat_2.csv's real "Risk" column holds "Critical" (title case) on
+# both real rows; schema.ScannerSeverity only accepts lowercase tokens. A
+# "column" mapping (kind="column", case="exact") never normalizes a value --
+# it is a raw passthrough -- so this is STRUCTURALLY legal grammar (nothing
+# about the mapping's own shape is wrong) but produces an illegal value at
+# real ingest. These tests build a minimal, otherwise-valid AdapterProposal
+# against the REAL profiled CSV (not the out/baseline-flat2/ saved proposal,
+# which is shape reference only -- see this module's docstring above -- and,
+# separately, is not a clean fixture: it carries its OWN pre-existing,
+# unrelated legality violations from an earlier model run, e.g. asset.role's
+# blank='gap', which would contaminate an assertion that the WHOLE proposal
+# passes cleanly). This proposal's only interesting slot is
+# finding.scanner_severity; every other slot is deliberately simple so a
+# passing/failing assertion can only be about the one slot under test.
+
+
+def _real_northgate_profiles():
+    repo_root = Path(__file__).resolve().parents[1]
+    real_data_dir = repo_root / "data" / "uploads" / "366ed3c04d4645a09fdbc6edd76f48e0"
+    if not real_data_dir.is_dir():
+        pytest.skip(f"{real_data_dir} not present in this working tree (gitignored)")
+    return {p.path.name: p for p in profile_source(real_data_dir)}
+
+
+_NORTHGATE_FILE = "northgate_flat_2.csv"
+
+
+def _northgate_proposal_dict(scanner_severity: dict) -> dict:
+    """A minimal, otherwise-valid proposal dict against the real
+    `northgate_flat_2.csv` header: identity fields get a real column/parsed/
+    content_address mapping, `asset.role` gets a small legal vocabulary
+    table, everything else is `not_collected` (all gap-legal, mirroring
+    `_full_proposal_dict`'s own convention), and `finding.scanner_severity`
+    is exactly `scanner_severity` -- the one slot each test varies."""
+    asset: dict = {}
+    for slot in ASSET_SLOTS:
+        if slot == "asset_id":
+            asset[slot] = _mapped({"kind": "column", "column": "Host", "case": "exact", "blank": "fatal"}, columns_cited=["Host"])
+        elif slot == "hostname":
+            asset[slot] = _mapped({"kind": "column", "column": "DNS Name", "case": "exact", "blank": "fatal"}, columns_cited=["DNS Name"])
+        elif slot == "role":
+            asset[slot] = _mapped(
+                {"kind": "vocabulary", "column": "Asset Role", "case": "exact", "blank": "fatal", "table": {"Workstation": "workstation"}},
+                columns_cited=["Asset Role"],
+            )
+        else:
+            asset[slot] = _mapped({"kind": "not_collected"})
+
+    finding: dict = {}
+    for slot in FINDING_SLOTS:
+        if slot == "finding_id":
+            finding[slot] = _mapped(
+                {
+                    "kind": "content_address", "algorithm": "sha256", "columns": ["Host", "Port", "CVE"],
+                    "hex_len": 16, "case": "lower",
+                },
+                columns_cited=["Host", "Port", "CVE"],
+            )
+        elif slot == "asset_id":
+            finding[slot] = _mapped({"kind": "column", "column": "Host", "case": "exact", "blank": "fatal"}, columns_cited=["Host"])
+        elif slot == "cve_id":
+            finding[slot] = _mapped({"kind": "parsed", "column": "CVE", "case": "upper", "blank": "fatal", "parser": "cve_id"}, columns_cited=["CVE"])
+        elif slot == "scanner_severity":
+            finding[slot] = scanner_severity
+        elif slot in ("product", "evidence"):
+            finding[slot] = _mapped({"kind": "column", "column": "Name", "case": "exact", "blank": "absent_fact"}, columns_cited=["Name"])
+        else:
+            finding[slot] = _mapped({"kind": "not_collected"})
+
+    return {
+        "meta": {
+            "format": "northgate-min-test", "description": "test fixture", "source_layout": "single_file",
+            "assets_filename": _NORTHGATE_FILE, "findings_filename": _NORTHGATE_FILE, "reasoning_summary": "test",
+        },
+        "asset": asset, "finding": finding, "derived": {},
+        "asset_grouping": {"key": "Host", "resolution": "agree_or_recency"},
+        "finding_dedup": {"content_targets": ["asset_id", "cve_id"], "on_identical": "collapse_and_count", "on_conflict": "fatal"},
+        "unmapped_columns": {},
+        "open_questions": [],
+    }
+
+
+def _buggy_column_scanner_severity(*, case: str) -> dict:
+    """The exact bug shape observed live: a raw `column` passthrough over
+    the real `Risk` column (whose only real value is "Critical")."""
+    return _mapped({"kind": "column", "column": "Risk", "case": case, "blank": "fatal"}, columns_cited=["Risk"])
+
+
+def _correct_vocabulary_scanner_severity() -> dict:
+    return _mapped(
+        {"kind": "vocabulary", "column": "Risk", "case": "exact", "blank": "fatal", "table": {"Critical": "critical"}},
+        columns_cited=["Risk"],
+    )
+
+
+def test_check_grounding_flags_a_column_mapping_whose_observed_values_are_illegal():
+    real_profiles = _real_northgate_profiles()
+    data = _northgate_proposal_dict(_buggy_column_scanner_severity(case="exact"))
+    proposal = AdapterProposal.model_validate(data)
+
+    report = check_grounding(proposal, real_profiles)
+
+    assert "finding.scanner_severity" in report.failed_slots
+    messages = [i.message for i in report.failures if i.slot == "finding.scanner_severity"]
+    assert any("Critical" in m for m in messages)
+
+
+def test_check_mapped_slots_legal_flags_the_same_candidate_at_generation():
+    real_profiles = _real_northgate_profiles()
+    data = _northgate_proposal_dict(_buggy_column_scanner_severity(case="exact"))
+    proposal = AdapterProposal.model_validate(data)
+
+    with pytest.raises(MappingLegalityError, match="finding.scanner_severity"):
+        _check_mapped_slots_legal(proposal, real_profiles)
+
+
+def test_lowercasing_the_case_transform_fixes_both_checks():
+    """Same candidate, `case="lower"` instead of `"exact"` -- "Critical"
+    case-folds to "critical", a legal `ScannerSeverity` value, so both the
+    terminal grounding check and the retry-loop legality check must now
+    pass cleanly. Proves the fix's own suggested remedy actually works, not
+    only that the bug is detected."""
+    real_profiles = _real_northgate_profiles()
+    data = _northgate_proposal_dict(_buggy_column_scanner_severity(case="lower"))
+    proposal = AdapterProposal.model_validate(data)
+
+    report = check_grounding(proposal, real_profiles)
+    assert "finding.scanner_severity" not in report.failed_slots
+
+    _check_mapped_slots_legal(proposal, real_profiles)  # must not raise -- every slot is clean
+
+
+def test_vocabulary_mapping_for_scanner_severity_is_unaffected_by_the_new_check():
+    """A `vocabulary` mapping over the identical real column/value
+    (`{"Critical": "critical"}`) is grounded by its own, pre-existing
+    key-matching path (`_ground_table`) -- this new check must never touch
+    it, and both the grounding and legality checks stay clean."""
+    real_profiles = _real_northgate_profiles()
+    data = _northgate_proposal_dict(_correct_vocabulary_scanner_severity())
+    proposal = AdapterProposal.model_validate(data)
+
+    report = check_grounding(proposal, real_profiles)
+    assert "finding.scanner_severity" not in report.failed_slots
+    _check_mapped_slots_legal(proposal, real_profiles)  # must not raise
+
+
+def test_check_column_mapping_legal_values_direct():
+    """Unit-level check of the shared function itself: exact inputs, exact
+    expected output, isolated from any full proposal."""
+    real_profiles = _real_northgate_profiles()
+    profile = real_profiles[_NORTHGATE_FILE]
+
+    illegal_mapping = ColumnMapping(kind="column", column="Risk", case="exact", blank="fatal")
+    problems = check_column_mapping_legal_values("finding.scanner_severity", "scanner_severity", illegal_mapping, profile)
+    assert len(problems) == 1
+    assert "Critical" in problems[0]
+    assert "scanner_severity" in problems[0]
+
+    legal_mapping = ColumnMapping(kind="column", column="Risk", case="lower", blank="fatal")
+    assert check_column_mapping_legal_values("finding.scanner_severity", "scanner_severity", legal_mapping, profile) == []
+
+    # No closed vocabulary for this target at all -> always [].
+    assert check_column_mapping_legal_values("asset.owner", "owner", illegal_mapping, profile) == []
+
+    # Column not actually profiled -> always [].
+    missing_column_mapping = ColumnMapping(kind="column", column="Does Not Exist", case="exact", blank="fatal")
+    assert (
+        check_column_mapping_legal_values("finding.scanner_severity", "scanner_severity", missing_column_mapping, profile)
+        == []
+    )

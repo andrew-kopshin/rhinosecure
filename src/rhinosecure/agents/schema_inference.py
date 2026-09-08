@@ -63,7 +63,7 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Annotated, Literal, Union
+from typing import Annotated, Any, Literal, Union
 
 from crewai import Agent, Crew, Process, Task
 from crewai.llms.base_llm import BaseLLM
@@ -86,6 +86,7 @@ from rhinosecure.adapters.config_model import (
     UNIONABLE_TARGETS,
     AssetGrouping,
     Attestation,
+    ColumnMapping,
     Contract,
     Derivation,
     Enrichment,
@@ -100,6 +101,8 @@ from rhinosecure.adapters.config_model import (
     Review,
     Source,
     UnmappedColumnEntry,
+    VocabularyMapping,
+    DerivedMapping,
     _compute_not_collected,  # the exact V09 recomputation validate_contract itself uses
     _composed_columns,  # the exact placeholder-extraction validate_contract itself uses
     _FORMAT_PATTERN,  # the exact pattern Contract.format itself is checked against
@@ -109,6 +112,13 @@ from rhinosecure.adapters.config_model import (
     validate_contract,
 )
 from rhinosecure.adapters.configured import _apply_case  # the exact case transform applied before any table lookup
+from rhinosecure.adapters.schema_registry import (
+    TARGET_REGISTRY,
+    alias_table_for_column,
+    full_alias_coverage,
+    resolve_criticality_anchor,
+    resolve_enum_alias,
+)
 from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.parsing import AgentOutputParseError, parse_structured_output
 from rhinosecure.adapters.probe import ColumnProfile, FileProfile, profile_source
@@ -546,6 +556,100 @@ def _ground_enrichment(issues: list[GroundingIssue], enrichment: Enrichment, fin
         )
 
 
+def _check_alias_contradiction(issues: list[GroundingIssue], slot: str, target: str, table: dict[str, Any], case: str) -> None:
+    """A `VocabularyMapping`/`Derivation` table entry whose KEY case-
+    normalizes to a known `schema_registry` alias, but whose VALUE disagrees
+    with what that alias resolves to, is a genuine contradiction -- a
+    grounding FAILURE, never silently corrected. Only `_apply_registry_
+    aliases`'s table-augmentation mechanism is allowed to ADD an entry, and
+    only when none already exists for that key; this is what happens when
+    one already exists and disagrees with the registry.
+
+    Scoped to `REGISTRY_BACKED_TARGETS` -- the four targets this project
+    publishes alias data for at all; every other target has no registry
+    entry to disagree with, so this is a silent no-op for them.
+
+    Deliberately lives HERE, in `check_grounding`, and not in
+    `config_model.validate_contract`: this function runs only during
+    `rhino adapt propose`, against a fresh-or-reloaded `AdapterProposal` --
+    never against an already-confirmed `Contract`. `bluepeak-gen.json` and
+    `mdvm-gen.json` are both already confirmed and never re-proposed, so
+    this check can never reach -- and so can never affect -- either one,
+    even in principle."""
+    if target not in REGISTRY_BACKED_TARGETS:
+        return
+    for key, declared_value in table.items():
+        resolved = (
+            resolve_criticality_anchor(key, case) if target == "criticality"
+            else resolve_enum_alias(target, key, case)
+        )
+        if resolved is not None and resolved != declared_value:
+            issues.append(
+                GroundingIssue(
+                    slot, "fail",
+                    f"table key {key!r} case-normalizes to a known schema-registry alias that resolves "
+                    f"to {resolved!r}, but this table maps it to {declared_value!r} instead -- a real "
+                    "disagreement with published schema knowledge, not something to silently correct",
+                )
+            )
+
+
+def check_column_mapping_legal_values(
+    where: str, target: str, mapping: ColumnMapping, profile: FileProfile
+) -> list[str]:
+    """The data-dependent half of the same problem `config_model
+    ._check_column_mapping_type` (Part B of that fix) catches statically: a
+    `ColumnMapping` always writes its raw, case-transformed source value
+    VERBATIM (`ColumnMapping`'s own docstring), so a closed, string-shaped
+    vocabulary target (`role`, `environment`, `data_sensitivity`,
+    `scanner_severity` -- anything with a `TARGET_REGISTRY[...].enum`) is
+    only ACTUALLY illegal for one when the column's real, observed values
+    (after the mapping's own `case`) fall outside that vocabulary --
+    something only real profiled data (`probe.ColumnProfile.distinct_values`)
+    can answer. A non-string-shaped target (`criticality`, `internet_exposed`)
+    can never even reach here as a `ColumnMapping` in valid output, since
+    `_check_column_mapping_type` already forbids that combination outright,
+    regardless of data -- so this function only ever has something to say
+    about the four registry-enumerated, string-shaped targets above, or any
+    other closed `Literal[str, ...]` target this schema later adds.
+
+    Mirrors `config_model.check_slot_mapping_legality`'s own "returns
+    list[str], never raises" convention. Returns `[]` when `target` has no
+    closed vocabulary at all (`TARGET_REGISTRY.get(target)` is `None` or its
+    `.enum` is `None` -- most targets, e.g. free text), or when
+    `mapping.column` was not actually profiled -- a missing-column problem
+    is `_check_column_exists`'s job; this function does not duplicate it.
+
+    Deliberately does NOT apply `_ground_table`'s own `distinct_overflow`
+    caveat treatment. That caveat exists because incomplete sampling cannot
+    prove a CITED token is ABSENT from a column (more values may exist past
+    the tracked cap, so a "missing" key might still be real). The concern
+    here runs the opposite direction: every value this function flags was
+    genuinely OBSERVED in the column, so its illegality against a closed
+    vocabulary is a certain fact regardless of whether more, as-yet-unseen
+    values also exist past the cap -- `distinct_overflow` cannot retroactively
+    make an observed-illegal value legal, so it is simply irrelevant here."""
+    spec = TARGET_REGISTRY.get(target)
+    if spec is None or spec.enum is None:
+        return []
+    column = profile.columns.get(mapping.column)
+    if column is None:
+        return []
+    legal = {aliased.value for aliased in spec.enum.values}
+    cased_observed = {_apply_case(raw, mapping.case) for raw in column.distinct_values}
+    illegal = sorted(cased_observed - legal)
+    if not illegal:
+        return []
+    return [
+        f"{where}: kind='column' (case={mapping.case!r}) on column {mapping.column!r} passes the "
+        f"observed value(s) {illegal} through VERBATIM, but target {target!r}'s closed vocabulary "
+        f"only accepts {sorted(legal)} -- a plain 'column' mapping never normalizes a value, so this "
+        "will fail at real ingest with a generic pydantic error instead of this specific one. Fix by "
+        "setting case='lower'/'upper' if that alone makes every observed value legal, or by using a "
+        "'vocabulary' mapping to translate each raw token to a legal value explicitly."
+    ]
+
+
 def _ground_slot(
     issues: list[GroundingIssue],
     slot: str,
@@ -573,10 +677,19 @@ def _ground_slot(
         issues.append(GroundingIssue(slot, "fail", f"{kind} is legal only for a finding.* target, not this asset.* slot"))
         return
     if kind in ("column", "parsed"):
-        _check_column_exists(issues, slot, mapping.column, own_profile, optional=mapping.optional)
+        exists = _check_column_exists(issues, slot, mapping.column, own_profile, optional=mapping.optional)
+        if kind == "column" and exists:
+            # A "parsed" mapping's output type is already enforced by its
+            # own parser (bool/float/date/timestamp/cve_id) -- this concern
+            # (a raw column value passed through verbatim to a closed
+            # vocabulary target) is specific to "column".
+            target = slot.split(".", 1)[1]
+            for problem in check_column_mapping_legal_values(slot, target, mapping, own_profile):
+                issues.append(GroundingIssue(slot, "fail", problem))
     elif kind == "vocabulary":
         if _check_column_exists(issues, slot, mapping.column, own_profile, optional=mapping.optional):
             _ground_table(issues, slot, mapping.column, list(mapping.table), mapping.case, own_profile)
+        _check_alias_contradiction(issues, slot, slot.split(".", 1)[1], mapping.table, mapping.case)
     elif kind == "literal":
         _ground_literal(issues, slot, mapping.value, sp.evidence, own_profile)
     elif kind == "composed":
@@ -599,6 +712,16 @@ def _ground_slot(
             _check_column_exists(issues, slot, column, findings_profile)
     elif kind == "derived":
         _ground_derivation(issues, slot, mapping.from_, proposal, assets_profile)
+        target = slot.split(".", 1)[1]
+        derivation = proposal.derived.get(mapping.from_)
+        if derivation is not None and len(derivation.outputs) == 1 and derivation.outputs[0] == mapping.output:
+            # Single-output derivation: every row's one value directly
+            # encodes this target's value, the identical shape
+            # _augment_mapped_slot's own DerivedMapping branch requires --
+            # a multi-output derivation is out of scope here for the same
+            # reason it's out of scope there (see that function's docstring).
+            single_output_table = {key: values[0] for key, values in derivation.table.items()}
+            _check_alias_contradiction(issues, slot, target, single_output_table, derivation.case)
     elif kind == "default_by":
         _ground_derivation(issues, slot, mapping.keyed_by.from_, proposal, assets_profile)
     elif kind == "not_collected":
@@ -654,6 +777,173 @@ def unresolved_slots(proposal: AdapterProposal) -> list[str]:
     out = [f"asset.{t}" for t, sp in proposal.asset.items() if isinstance(sp, SlotUnresolved)]
     out += [f"finding.{t}" for t, sp in proposal.finding.items() if isinstance(sp, SlotUnresolved)]
     return sorted(out)
+
+
+# ---------------------------------------------------------------------------
+# Registry-backed alias resolution (deterministic, no LLM): closes exactly
+# the gap that produced an incomplete `role` table and an unresolved
+# `criticality` on the real northgate_flat_2.csv case this module's schema
+# registry (`adapters/schema_registry.py`) exists to fix -- the model had a
+# real column and real values, but no PUBLISHED meaning or known spelling to
+# ground a mapping in. `REGISTRY_BACKED_TARGETS` (role/environment/
+# data_sensitivity/criticality) are ALL asset-only targets (none appear in
+# `FINDING_SLOTS`), so only `proposal.asset` is ever touched here.
+# ---------------------------------------------------------------------------
+
+
+#: Every REGISTRY_BACKED_TARGETS member except `role` has a
+#: NOT_COLLECTED_DEFAULTS entry (`GAP_LEGAL_TARGETS`), so `blank="gap"` is
+#: the legal, honest policy for a code-derived table on those three. `role`
+#: has none -- it is the one `EXCLUDING_TARGETS` member -- so a promoted
+#: role mapping instead uses `blank="fatal"`, the identical choice both real
+#: confirmed contracts make for this target (e.g. bluepeak-gen.json's own
+#: `asset.role`).
+def _promoted_blank_policy(target: str) -> str:
+    return "fatal" if target in EXCLUDING_TARGETS else "gap"
+
+
+def _augment_mapped_slot(
+    target: str, mapping: Mapping, derived: dict[str, Derivation], assets_profile: FileProfile
+) -> Mapping | None:
+    """TABLE AUGMENTATION for one already-`SlotMapped` slot. Returns a NEW
+    mapping node for the slot itself when its OWN table gained entries
+    (a `VocabularyMapping`), or `None` when nothing changed there --
+    including the `DerivedMapping` case, where any augmentation happens to
+    `derived[mapping.from_]` (mutated in place in the caller-owned `derived`
+    dict) rather than to the slot's own mapping node, which never changes.
+    Never overwrites an existing table entry with a different value: only
+    keys ABSENT from the table are ever added -- a genuine disagreement is
+    `check_grounding`'s new alias-contradiction check's job, not this
+    function's."""
+    if isinstance(mapping, VocabularyMapping):
+        column = assets_profile.columns.get(mapping.column)
+        if column is None:
+            return None
+        additions = alias_table_for_column(target, column.distinct_values, mapping.case)
+        missing = {k: v for k, v in additions.items() if k not in mapping.table}
+        if not missing:
+            return None
+        merged_table = dict(mapping.table)
+        merged_table.update(missing)
+        return mapping.model_copy(update={"table": merged_table})
+
+    if isinstance(mapping, DerivedMapping):
+        derivation = derived.get(mapping.from_)
+        # A multi-output derivation can't be safely augmented here: adding a
+        # new row would require inventing a value for every OTHER output
+        # too, which is exactly the guessing this module exists to avoid --
+        # only a single-output derivation (this target's own table, in every
+        # sense that matters) is in scope.
+        if derivation is None or len(derivation.outputs) != 1 or derivation.outputs[0] != mapping.output:
+            return None
+        column = assets_profile.columns.get(derivation.column)
+        if column is None:
+            return None
+        additions = alias_table_for_column(target, column.distinct_values, derivation.case)
+        missing = {k: [v] for k, v in additions.items() if k not in derivation.table}
+        if not missing:
+            return None
+        merged_table = dict(derivation.table)
+        merged_table.update(missing)
+        derived[mapping.from_] = derivation.model_copy(update={"table": merged_table})
+        return None
+
+    return None
+
+
+def _promote_unresolved_slot(target: str, slot: SlotUnresolved, assets_profile: FileProfile) -> SlotMapped | None:
+    """SLOT PROMOTION for one `SlotUnresolved` target. Promotes ONLY when
+    `full_alias_coverage` achieves a COMPLETE table for EXACTLY ONE of
+    `slot.candidate_columns` -- more than one candidate independently
+    achieving full coverage is ambiguous, so this stays conservative and
+    promotes neither. A candidate column absent from `assets_profile`
+    (a hallucinated citation) is simply skipped, never treated as a match.
+
+    Only `case="exact"` is tried: a promoted slot has no model-declared
+    `case` to defer to (it was never mapped at all), and the registry's own
+    alias spellings are stored in their natural, real-world casing, which is
+    also how `probe.py` records a column's own observed distinct values --
+    so this is the correct default, not merely the simplest one. A source
+    whose real values need `case="lower"`/`"upper"` to match stays
+    unresolved, exactly as it would with no registry at all -- a
+    conservative shortfall, not a silent wrong answer."""
+    achieving: list[tuple[str, dict[str, Any]]] = []
+    for column_name in slot.candidate_columns:
+        column = assets_profile.columns.get(column_name)
+        if column is None:
+            continue
+        table = full_alias_coverage(target, column.distinct_values, "exact")
+        if table is not None:
+            achieving.append((column_name, table))
+    if len(achieving) != 1:
+        return None
+
+    column_name, table = achieving[0]
+    mapping = VocabularyMapping(
+        kind="vocabulary",
+        column=column_name,
+        case="exact",
+        blank=_promoted_blank_policy(target),
+        optional=False,
+        table=table,
+    )
+    return SlotMapped(
+        status="mapped",
+        mapping=mapping,
+        confidence=1.0,
+        evidence=SlotEvidence(
+            columns_cited=[column_name],
+            sample_values_cited=sorted(table)[:6],
+            note="resolved via schema registry alias table, no model judgment",
+        ),
+    )
+
+
+def _apply_registry_aliases(proposal: AdapterProposal, profiles: dict[str, FileProfile]) -> AdapterProposal:
+    """Deterministic, LLM-free pass over the four `REGISTRY_BACKED_TARGETS`
+    slots in `proposal.asset` -- table augmentation for an already-mapped
+    slot, promotion for a genuinely unresolved one (see
+    `_augment_mapped_slot`/`_promote_unresolved_slot`'s own docstrings for
+    the two mechanisms). Called exactly ONCE inside `propose_contract`,
+    immediately before `check_grounding` -- the one call site that reaches
+    both the strict path (`rhino adapt propose`/`--from-proposal`) and, via
+    `web/jobs.py`'s `_run_ingest_propose` reusing the identical
+    `propose_contract` call, the provisional drop-a-CSV path too.
+
+    Runs unconditionally for BOTH the fresh-LLM branch and the
+    `from_proposal` branch -- unlike `_check_mapped_slots_legal`, which is
+    deliberately skipped for `from_proposal` (see that call site's own
+    comment: a hand-fixed file must still be loadable even when it carries
+    a legality violation, so it can reach the degrade-on-validation-failure
+    path). Alias resolution never RAISES and never REMOVES anything a human
+    or model already decided -- it only adds coverage that was missing --
+    so there is nothing unsafe about running it unconditionally against
+    already-reviewed input.
+
+    Returns a NEW `AdapterProposal` via `.model_copy(update=...)` -- never
+    mutates `proposal` in place, matching this module's existing immutable-
+    update idiom (see `_assemble_and_validate`'s own `.model_copy` calls)."""
+    assets_profile = profiles.get(proposal.meta.assets_filename)
+    if assets_profile is None:
+        return proposal  # nothing to ground against -- leave the proposal untouched
+
+    new_asset: dict[str, SlotProposal] = dict(proposal.asset)
+    new_derived: dict[str, Derivation] = dict(proposal.derived)
+
+    for target in REGISTRY_BACKED_TARGETS:
+        slot = new_asset.get(target)
+        if slot is None:
+            continue
+        if isinstance(slot, SlotMapped):
+            new_mapping = _augment_mapped_slot(target, slot.mapping, new_derived, assets_profile)
+            if new_mapping is not None:
+                new_asset[target] = slot.model_copy(update={"mapping": new_mapping})
+        else:
+            promoted = _promote_unresolved_slot(target, slot, assets_profile)
+            if promoted is not None:
+                new_asset[target] = promoted
+
+    return proposal.model_copy(update={"asset": new_asset, "derived": new_derived})
 
 
 # ---------------------------------------------------------------------------
@@ -1299,6 +1589,74 @@ def _sample_rows(profile: FileProfile, n: int) -> str:
     return "\n".join(lines)
 
 
+#: The four targets `schema_registry.py` publishes meaning/alias data for --
+#: the same four `_apply_registry_aliases` (below) resolves against. Named
+#: once, here, so the prompt-enrichment section and the deterministic pass
+#: can never silently drift onto different target sets.
+REGISTRY_BACKED_TARGETS: frozenset[str] = frozenset({"role", "environment", "data_sensitivity", "criticality"})
+
+
+def _render_enum_target_guidance(target: str) -> str:
+    """One registry-backed enum target (`role`/`environment`/
+    `data_sensitivity`), rendered as its legal values, each value's real
+    meaning, and the real-world source spellings this project has already
+    confirmed map to it -- so a proposal has something concrete to ground a
+    mapping in, instead of a bare list of legal tokens with no stated
+    meaning (the exact gap that produced an incomplete `role` table and an
+    unresolved `criticality` in the real northgate_flat_2.csv case this
+    module's prompt enrichment exists to close)."""
+    spec = TARGET_REGISTRY[target]
+    assert spec.enum is not None
+    lines = [f"{target} -- legal values, meaning, and known real-world spellings:"]
+    for aliased in spec.enum.values:
+        meaning = aliased.meaning or "(no published meaning yet)"
+        aliases = ", ".join(f"{a!r}" for a in sorted(aliased.aliases)) or "(no known aliases yet)"
+        lines.append(f"  - {aliased.value!r}: {meaning} Known real-world spellings: {aliases}.")
+    return "\n".join(lines)
+
+
+def _render_criticality_guidance() -> str:
+    """`criticality`'s own guidance is structurally different from the
+    other three registry-backed targets: it is a 1-5 NUMBER, not a closed
+    string vocabulary, and only its two ends are safe to resolve
+    deterministically (`resolve_criticality_anchor`'s own docstring) -- a
+    middle word's correct number depends on how many tiers the SOURCE's own
+    scale has. This renders that as an explicit, cited fact rather than
+    leaving the model to guess blind: two of this project's own confirmed,
+    human-reviewed contracts made DIFFERENT correct choices for the exact
+    same middle words, which is real, checkable precedent for why this is a
+    judgment call and not something this prompt can hand the model a fixed
+    answer for."""
+    scale = TARGET_REGISTRY["criticality"].criticality
+    assert scale is not None
+    tier_lines = "\n".join(f"    level {i + 1}: {meaning}" for i, meaning in enumerate(scale.tier_meanings))
+    anchor_lines = "\n".join(
+        f"    level {anchor.level} ({', '.join(f'{a!r}' for a in sorted(anchor.aliases))}): {anchor.meaning}"
+        for anchor in scale.anchors
+    )
+    return (
+        f"criticality -- an integer {scale.low}-{scale.high}. Tier meanings:\n{tier_lines}\n"
+        f"Exactly two levels are FIXED, unambiguous facts, safe to map directly regardless of how many "
+        f"tiers your source's own scale has:\n{anchor_lines}\n"
+        "Every OTHER word your source might use for a middle tier (\"High\", \"Medium\", \"Normal\", "
+        "\"Low\", \"Moderate\", or similar) has NO universal correct number -- it depends on how many "
+        "other tiers exist in THIS source's own scale, and is your own judgment call. This is not a "
+        "hypothetical: two of this project's own confirmed, human-reviewed contracts made DIFFERENT "
+        "correct choices for the identical words. A 4-tier source (bluepeak-gen.json) mapped "
+        "critical->5, high->4, medium->3, low->2 -- its own table_notes explains why: \"low is "
+        "deliberately 2, not 1 -- this source's four tiers do not reach the schema's floor.\" A 3-tier "
+        "source (mdvm-gen.json) mapped high->5, normal->3, low->1 instead. Neither is more correct than "
+        "the other; reason about how many tiers YOUR source has the same way they did, and mark the "
+        "slot unresolved rather than guess if you genuinely cannot tell."
+    )
+
+
+_REGISTRY_GUIDANCE = "\n\n".join(
+    [_render_enum_target_guidance("role"), _render_enum_target_guidance("environment"),
+     _render_enum_target_guidance("data_sensitivity"), _render_criticality_guidance()]
+)
+
+
 _GRAMMAR_REFERENCE = f"""
 TARGET SCHEMA -- every asset.<field> and finding.<field> below must be addressed, each with
 EXACTLY one status:
@@ -1315,9 +1673,23 @@ EXACTLY one status:
 asset.* targets ({len(ASSET_SLOTS)}): {sorted(ASSET_SLOTS)}
 finding.* targets ({len(FINDING_SLOTS)}): {sorted(FINDING_SLOTS)}
 
+REGISTRY-BACKED TARGET GUIDANCE -- {sorted(REGISTRY_BACKED_TARGETS)} each have a published meaning
+and known real-world spellings for every legal value below. Use this to ground a real mapping
+instead of leaving the slot unresolved for lack of a stated meaning to work from -- but it is still
+your job to decide whether a column's actual observed values genuinely match; never force a token
+onto this list's spellings that isn't a real match.
+
+{_REGISTRY_GUIDANCE}
+
 MAPPING KINDS (kind, and required fields):
   column: {{kind:"column", column, case:"exact"|"lower"|"upper", blank:"gap"|"absent_fact"|"fatal",
-    optional:bool}} -- read a named column, strip it, write verbatim.
+    optional:bool}} -- read a named column, strip it, write verbatim. For a CLOSED-vocabulary target
+    (role, environment, data_sensitivity, scanner_severity), "verbatim" means every value the column
+    actually contains, AFTER your chosen case transform, must exactly equal one of that target's own
+    legal values -- if it does not (e.g. the column says "Critical" but scanner_severity only accepts
+    lowercase "critical"), "column" is the wrong kind: use case:"lower"/"upper" if that alone makes
+    every observed value match, or "vocabulary" to translate each raw token explicitly. This is
+    checked against your ACTUAL profiled data, not merely reviewed for plausibility.
   vocabulary: {{kind:"vocabulary", column, case, blank, optional, table:{{source_token: target_value}}}}
     -- a CLOSED table. A source token you never saw does not need an entry; leaving it out is
     correct, not incomplete -- it will be excluded/refused row-by-row at real ingest time, never
@@ -1527,7 +1899,7 @@ class MappingLegalityError(ValueError):
     label."""
 
 
-def _check_mapped_slots_legal(proposal: AdapterProposal) -> None:
+def _check_mapped_slots_legal(proposal: AdapterProposal, profiles: dict[str, FileProfile]) -> None:
     """Closes the grammar at GENERATION for a FRESH, LLM-driven candidate --
     not only at final contract validation (CLAUDE.md's own framing of this
     gap). Called only from `propose_contract`'s own retry loop, immediately
@@ -1548,6 +1920,20 @@ def _check_mapped_slots_legal(proposal: AdapterProposal) -> None:
     `validate_contract`'s own per-slot loops call, so this can never drift
     from what the real engine will eventually refuse anyway.
 
+    `profiles` (keyed by filename, exactly like `check_grounding`'s own
+    parameter) lets this ALSO run `check_column_mapping_legal_values` --
+    `check_slot_mapping_legality` alone only catches a non-string-shaped
+    target statically (config_model.py's Part B); a string-shaped CLOSED
+    vocabulary target (`role`/`environment`/`data_sensitivity`/
+    `scanner_severity`) fed by a `ColumnMapping` needs real profiled data to
+    know whether the column's OBSERVED values actually violate it -- the
+    exact bug this function's own module docstring's `northgate_flat_2.csv`
+    case demonstrates live (`finding.scanner_severity` as a raw `"column"`
+    passthrough over a `"Critical"`-valued column). Picks the correct half
+    of `profiles` for each slot the identical way `_ground_slot` does: an
+    `asset.*` mapping's column lives in `proposal.meta.assets_filename`, a
+    `finding.*` mapping's in `proposal.meta.findings_filename`.
+
     Deliberately NOT a blanket check on every `AdapterProposal`
     construction (e.g. a pydantic model validator): a `--from-proposal`
     file -- exactly the mechanism this project already uses for a human to
@@ -1559,12 +1945,20 @@ def _check_mapped_slots_legal(proposal: AdapterProposal) -> None:
     impossible: the very file a human needs to open and fix would refuse to
     load at all."""
     problems: list[str] = []
+    assets_profile = profiles.get(proposal.meta.assets_filename)
+    findings_profile = profiles.get(proposal.meta.findings_filename)
     for target, sp in proposal.asset.items():
         if isinstance(sp, SlotMapped):
-            problems.extend(check_slot_mapping_legality(f"asset.{target}", target, sp.mapping))
+            where = f"asset.{target}"
+            problems.extend(check_slot_mapping_legality(where, target, sp.mapping))
+            if isinstance(sp.mapping, ColumnMapping) and assets_profile is not None:
+                problems.extend(check_column_mapping_legal_values(where, target, sp.mapping, assets_profile))
     for target, sp in proposal.finding.items():
         if isinstance(sp, SlotMapped):
-            problems.extend(check_slot_mapping_legality(f"finding.{target}", target, sp.mapping))
+            where = f"finding.{target}"
+            problems.extend(check_slot_mapping_legality(where, target, sp.mapping))
+            if isinstance(sp.mapping, ColumnMapping) and findings_profile is not None:
+                problems.extend(check_column_mapping_legal_values(where, target, sp.mapping, findings_profile))
     if problems:
         raise MappingLegalityError(
             f"{len(problems)} mapped slot(s) violate the closed contract grammar (the identical "
@@ -1659,7 +2053,7 @@ def propose_contract(
             try:
                 candidate = parse_structured_output(task.output.raw, AdapterProposal)
                 _check_meta_matches(candidate, name, layout, resolved_assets, resolved_findings)
-                _check_mapped_slots_legal(candidate)
+                _check_mapped_slots_legal(candidate, profiles)
                 proposal = candidate
                 attempt_usage_list.append(
                     {
@@ -1712,6 +2106,7 @@ def propose_contract(
             call_log_digest="sha256:" + hashlib.sha256("\n===\n".join(call_log_parts).encode("utf-8")).hexdigest(),
         )
 
+    proposal = _apply_registry_aliases(proposal, profiles)
     report = check_grounding(proposal, profiles)
     incomplete_reason: str | None = None
     try:

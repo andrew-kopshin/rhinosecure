@@ -61,12 +61,20 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Annotated, Any, Literal, Union, get_args, get_type_hints
+from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from rhinosecure.adapters import FORMATS as _BUILTIN_ADAPTER_FORMATS
 from rhinosecure.adapters.base import AdapterError, NOT_COLLECTED_DEFAULTS, ROLE_DEFAULT_BY_OS_CLASS
+from rhinosecure.adapters.schema_registry import (
+    ASSET_SLOTS,
+    FINDING_SLOTS,
+    PARSER_POSITIONS,
+    TARGET_REGISTRY,
+    _ASSET_TYPE_HINTS,
+    _FINDING_TYPE_HINTS,
+)
 from rhinosecure.schema import Asset, Finding
 
 # ---------------------------------------------------------------------------
@@ -76,19 +84,14 @@ from rhinosecure.schema import Asset, Finding
 # exclude" section for EXCLUDING_TARGETS specifically.
 # ---------------------------------------------------------------------------
 
-#: The Asset target-field names a contract's `asset` block must map, exactly
-#: -- every non-`not_collected` field the schema has, in schema.py's own
-#: declared order. `not_collected` is excluded: it is never a mapping
-#: target, it is what `validate_contract` derives (V09).
-ASSET_SLOTS: tuple[str, ...] = tuple(k for k in Asset.model_fields if k != "not_collected")
-
-#: The Finding target-field names a contract's `finding` block must map.
-#: `not_collected` and `source_enrichment` are excluded -- the latter is
-#: populated through the separate, optional `enrichment` block, not through
-#: `finding`.
-FINDING_SLOTS: tuple[str, ...] = tuple(
-    k for k in Finding.model_fields if k not in ("not_collected", "source_enrichment")
-)
+#: `ASSET_SLOTS`, `FINDING_SLOTS`, `_ASSET_TYPE_HINTS`, `_FINDING_TYPE_HINTS`
+#: are relocated to `schema_registry.py` (imported above) and re-exported
+#: here under these identical names -- `adapters/configured.py` and
+#: `agents/schema_inference.py` already import them FROM this module, so
+#: this relocation needs zero import changes in either. See
+#: `schema_registry.py`'s own module docstring for why: it is the single
+#: published source of truth for every target's accepted type and
+#: blank-policy legality, not just this module's own concern.
 
 #: The four fields `SourceEnrichment` actually carries as configurable
 #: targets (`severity_label` is not one -- see ENRICHMENT below).
@@ -98,35 +101,26 @@ SOURCE_ENRICHMENT_FIELDS: frozenset[str] = frozenset(
 
 #: `blank: "gap"` is legal only where the target has a documented
 #: not-collected default to fall back to -- i.e. is a key of
-#: `NOT_COLLECTED_DEFAULTS` (adapters/base.py). Deriving this from that dict,
-#: rather than re-declaring the list, is what closes the exact conflation a
-#: majority of the source proposals made: `gap` on `product` or `evidence`
-#: would be a `KeyError` at engine runtime, not a policy, because neither
-#: field has an entry there.
-GAP_LEGAL_TARGETS: frozenset[str] = frozenset(NOT_COLLECTED_DEFAULTS)
+#: `NOT_COLLECTED_DEFAULTS` (adapters/base.py). Read back from
+#: `TARGET_REGISTRY` (schema_registry.py), which derives this identically
+#: (`frozenset(NOT_COLLECTED_DEFAULTS)`) -- not re-derived here, so there is
+#: exactly one place this can drift from `NOT_COLLECTED_DEFAULTS`'s keys.
+GAP_LEGAL_TARGETS: frozenset[str] = frozenset(
+    target for target, spec in TARGET_REGISTRY.items() if "gap" in spec.legal_blank_policies
+)
 
-
-def _absent_fact_legal_targets() -> frozenset[str]:
-    """Every Asset/Finding field whose own pydantic default is `""` -- the
-    schema's existing "blank means no restriction/fact" encoding
-    (schema.py's own docstring). Computed by introspection, not hand-copied,
-    for the same reason as GAP_LEGAL_TARGETS: three of four source proposals
-    conflated this set with NOT_COLLECTED_DEFAULTS's keys, and the two sets
-    genuinely differ -- `criticality`/`internet_exposed`/`environment`/
-    `data_sensitivity`/`os`/`os_build` are gap-legal but have no `""`
-    default (an enumerated Literal has no blank member), while `product` and
-    `evidence` have a `""` default but no NOT_COLLECTED_DEFAULTS entry."""
-    targets: set[str] = set()
-    for name, field in Asset.model_fields.items():
-        if name != "not_collected" and field.default == "":
-            targets.add(name)
-    for name, field in Finding.model_fields.items():
-        if name not in ("not_collected", "source_enrichment") and field.default == "":
-            targets.add(name)
-    return frozenset(targets)
-
-
-ABSENT_FACT_LEGAL_TARGETS: frozenset[str] = _absent_fact_legal_targets()
+#: Every Asset/Finding field whose own pydantic default is `""` -- the
+#: schema's existing "blank means no restriction/fact" encoding (schema.py's
+#: own docstring). Read back from `TARGET_REGISTRY`, which derives this by
+#: the identical introspection this module used to perform directly (see
+#: `schema_registry._derive_absent_fact_legal` for that derivation) --
+#: `GAP_LEGAL_TARGETS` and this set genuinely differ (`criticality`/
+#: `internet_exposed`/`environment`/`data_sensitivity`/`os`/`os_build` are
+#: gap-legal but have no `""` default; `product` and `evidence` have a `""`
+#: default but no `NOT_COLLECTED_DEFAULTS` entry).
+ABSENT_FACT_LEGAL_TARGETS: frozenset[str] = frozenset(
+    target for target, spec in TARGET_REGISTRY.items() if "absent_fact" in spec.legal_blank_policies
+)
 
 #: See the module docstring's "Fatal vs. exclude" section. Not consumed by
 #: anything in this module -- the engine (a later slice) is what forward-
@@ -161,9 +155,6 @@ RESERVED_PROVENANCE_LABELS: frozenset[str] = frozenset({"nvd", "nist", "cvss", "
 #: for `role`, applied when a source has no role signal at all).
 REGISTERED_DEFAULT_TABLES: dict[str, dict[str, str]] = {"ROLE_DEFAULT_BY_OS_CLASS": dict(ROLE_DEFAULT_BY_OS_CLASS)}
 DEFAULT_BY_LEGAL_TARGET: dict[str, str] = {"ROLE_DEFAULT_BY_OS_CLASS": "role"}
-
-_ASSET_TYPE_HINTS = get_type_hints(Asset)
-_FINDING_TYPE_HINTS = get_type_hints(Finding)
 
 _FILENAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _FORMAT_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
@@ -1073,18 +1064,25 @@ def assert_confirmed(contract: Contract) -> None:
 def _target_vocabulary(target: str) -> frozenset[str] | tuple[int, int] | Literal["bool"] | None:
     """What a `vocabulary`/`derived`-output value at `target` is allowed to
     be, or None if the target has no closed constraint this function knows
-    to check (a free-text field like `business_function`)."""
-    if target == "criticality":
-        return (1, 5)  # schema.Asset.criticality: Field(ge=1, le=5)
-    if target == "internet_exposed":
-        return "bool"
-    hints = _ASSET_TYPE_HINTS if target in _ASSET_TYPE_HINTS else _FINDING_TYPE_HINTS
-    annotation = hints.get(target)
-    if annotation is None:
+    to check (a free-text field like `business_function`).
+
+    Reads `TARGET_REGISTRY` (schema_registry.py) instead of deriving this
+    independently -- a pure relocation, produces IDENTICAL results to the
+    previous hand-written version for every existing target: `criticality`
+    (a `TargetSpec.criticality` scale) returns its `(low, high)` range,
+    `internet_exposed` (the one bool-typed target) returns `"bool"` via its
+    `python_type`, and every closed `Literal[str, ...]` target (`role`,
+    `environment`, `data_sensitivity`, `scanner_severity`) returns its
+    `TargetSpec.enum`'s legal value set."""
+    spec = TARGET_REGISTRY.get(target)
+    if spec is None:
         return None
-    args = get_args(annotation)
-    if args and all(isinstance(a, str) for a in args):
-        return frozenset(args)
+    if spec.criticality is not None:
+        return (spec.criticality.low, spec.criticality.high)
+    if spec.python_type is bool:
+        return "bool"
+    if spec.enum is not None:
+        return frozenset(aliased.value for aliased in spec.enum.values)
     return None
 
 
@@ -1456,6 +1454,13 @@ def _check_blank_policy(problems: list[str], where: str, blank: BlankPolicy, tar
         )
 
 
+#: Human-readable label for a `PARSER_POSITIONS` position, for
+#: `_check_parser_placement`'s message text. Only "order_by" is ever named
+#: in a refusal today (every parser is legal at "row"; `_check_parser_placement`
+#: only fires when "row" is ABSENT from a parser's legal positions).
+_PARSER_POSITION_LABELS: dict[str, str] = {"row": "a per-row mapping", "order_by": "asset_grouping.order_by"}
+
+
 def _check_parser_placement(problems: list[str], where: str, mapping: Any) -> None:
     """`parser: "timestamp"` is legal only inside `asset_grouping.order_by`
     (`AssetGroupingOrderBy.parser` has its own, separate Literal for that)
@@ -1463,9 +1468,65 @@ def _check_parser_placement(problems: list[str], where: str, mapping: Any) -> No
     `validate_contract`'s own per-slot loops so `check_slot_mapping_legality`
     (below) -- and, through it, `agents/schema_inference.py`'s construction-
     time proposal check -- runs the identical rule rather than a second,
-    hand-copied one."""
-    if isinstance(mapping, ParsedMapping) and mapping.parser == "timestamp":
-        problems.append(f"{where}: parser 'timestamp' is legal only inside asset_grouping.order_by")
+    hand-copied one.
+
+    Reads `PARSER_POSITIONS` (schema_registry.py) instead of a hardcoded
+    single-parser check -- the identical rule, generalized: a parser mapped
+    onto a plain per-row `ParsedMapping` (this function's only call shape)
+    is illegal unless `"row"` is one of its legal positions. Today only
+    `"timestamp"` lacks `"row"` (`PARSER_POSITIONS["timestamp"] ==
+    {"order_by"}`), so this produces byte-identical messages to the
+    previous hand-written version for every existing parser."""
+    if not isinstance(mapping, ParsedMapping):
+        return
+    positions = PARSER_POSITIONS.get(mapping.parser, frozenset())
+    if "row" in positions:
+        return
+    legal_elsewhere = ", ".join(sorted(_PARSER_POSITION_LABELS.get(p, p) for p in positions))
+    problems.append(f"{where}: parser {mapping.parser!r} is legal only inside {legal_elsewhere}")
+
+
+def _is_string_shaped_type(python_type: Any) -> bool:
+    """`True` for exactly `str` and for a closed `Literal[str, ...]` (every
+    arg a plain `str`) -- the two target shapes a `ColumnMapping`'s raw,
+    case-transformed, verbatim-written string CAN legally satisfy. `False`
+    for everything else (`int`, `bool`, or any other shape), including a
+    `Literal` with a non-str member -- this schema has none today, but the
+    check should not silently pass one. Uses `get_origin`/`get_args` rather
+    than `python_type is str` alone, since that alone would incorrectly flag
+    every `Literal[str, ...]` target (`role`, `environment`,
+    `data_sensitivity`, `scanner_severity`) as non-string-shaped too."""
+    if python_type is str:
+        return True
+    if get_origin(python_type) is Literal:
+        args = get_args(python_type)
+        return bool(args) and all(isinstance(a, str) for a in args)
+    return False
+
+
+def _check_column_mapping_type(problems: list[str], where: str, target: str, mapping: Any) -> None:
+    """A `ColumnMapping` always produces a string (its own docstring: "read
+    a column, strip it, apply case, write it to the target verbatim") -- so
+    a target whose declared Python type is genuinely non-string
+    (`criticality`: int, `internet_exposed`: bool) can NEVER legally be fed
+    by one, regardless of what the source data actually contains. This is a
+    pure, static, zero-cost check (no real data needed, unlike
+    `agents/schema_inference.check_column_mapping_legal_values`, which
+    checks the OTHER half of this same problem class -- whether a
+    string-shaped closed vocabulary's OBSERVED values are legal members,
+    which only real profiled data can answer)."""
+    if not isinstance(mapping, ColumnMapping):
+        return
+    spec = TARGET_REGISTRY.get(target)
+    if spec is None:
+        return
+    if not _is_string_shaped_type(spec.python_type):
+        problems.append(
+            f"{where}: kind='column' always produces a string, but target {target!r} has type "
+            f"{spec.python_type!r} (neither str nor a closed Literal[str, ...]) -- a plain column "
+            "mapping can never legally hold this value regardless of the source data; use 'parsed' "
+            "(with the matching parser) or, for a closed vocabulary, 'vocabulary'/'derived' instead"
+        )
 
 
 def check_slot_mapping_legality(where: str, target: str, mapping: Any) -> list[str]:
@@ -1486,6 +1547,7 @@ def check_slot_mapping_legality(where: str, target: str, mapping: Any) -> list[s
     if isinstance(mapping, _BLANK_BEARING_KINDS):
         _check_blank_policy(problems, where, mapping.blank, target)
     _check_parser_placement(problems, where, mapping)
+    _check_column_mapping_type(problems, where, target, mapping)
     return problems
 
 

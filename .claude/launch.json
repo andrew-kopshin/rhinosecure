@@ -24,6 +24,18 @@
         "--port", "8422"
       ],
       "port": 8422
+    },
+    {
+      "name": "rhino-web-verify",
+      "runtimeExecutable": ".venv312/Scripts/python.exe",
+      "runtimeArgs": [
+        "-m", "rhinosecure.cli",
+        "web", "--enable-jobs",
+        "--export", "out/export_verify_registry.json",
+        "--db", "out/verify_registry.db",
+        "--port", "8423"
+      ],
+      "port": 8423
     }
   ]
 }

@@ -326,14 +326,210 @@ runtime decision — including the one qualitative judgment call it makes
 (fatal vs. exclude) — resolves against fixed code and a frozen, hashed
 contract, never a live model call or a pattern the model chose on this run.
 
+## Schema registry: what the target schema *means*
+
+`config_model.py`'s grammar names which `asset.*`/`finding.*` slots exist and,
+for a handful of them, which bare token strings a source may use — but a bare
+legal token (`"dc"`) has no stated meaning and no known real-world spelling
+attached to it. That gap was found, not theorized: a real upload
+(`northgate_flat_2.csv` — one domain controller, one dev workstation, the same
+CVE) produced a proposal where the model correctly *refused to guess* rather
+than fabricate an answer — `asset.role`'s table covered "Workstation" but left
+"Domain Controller" out ("no verified target token"), and `asset.criticality`
+went `unresolved` entirely ("the target's own numeric scale is not specified
+here") — and both hosts were scored with their criticality/role axes
+*neutralized*, flattening a domain controller and a dev workstation to the
+same placeholder despite the model having a real column and real values to
+work from. It had nothing to ground a judgment call in.
+
+`src/rhinosecure/adapters/schema_registry.py` is that missing half: `TARGET_
+REGISTRY` (`dict[str, TargetSpec]`) is the single published source of truth
+for every `asset.*`/`finding.*` slot's accepted Python type and legal blank
+policies, and — for `role`, `environment`, `data_sensitivity`, and
+`criticality` — each legal value's real meaning and the real-world source
+spellings this project has already confirmed map to it. `config_model.py`'s
+`GAP_LEGAL_TARGETS`, `ABSENT_FACT_LEGAL_TARGETS`, `_target_vocabulary`,
+`describe_target_vocabulary`, and `_check_parser_placement` all now *read*
+this registry (and its sibling `PARSER_POSITIONS` dict) instead of deriving
+their answers independently — a pure relocation: every existing target
+produces byte-identical results, proven by the same hardcoded-partition tests
+(`test_gap_legal_targets_match_the_three_verified_partitions`,
+`test_absent_fact_legal_targets_match_the_three_verified_partitions`) that
+existed before this module did, left unmodified.
+
+**No I/O, no LLM, no `crewai` import** — the same deterministic-path
+discipline `config_model.py` itself holds to, and structurally required here:
+this module is one of `config_model.py`'s own dependencies.
+
+**Three mechanisms close the northgate gap, none of them guesses:**
+
+1. **Prompt enrichment.** `agents/schema_inference.py`'s grammar reference now
+   renders, for the four registry-backed targets, every legal value's
+   published meaning and known aliases — so the model has something concrete
+   to ground a mapping in instead of a bare token list. `criticality` gets a
+   structurally different treatment (below) since it's a number, not a closed
+   string vocabulary.
+2. **`_apply_registry_aliases`** — a deterministic, LLM-free pass, called
+   exactly once inside `propose_contract`, immediately before
+   `check_grounding` (the one call site that reaches both `rhino adapt
+   propose`/`--from-proposal` *and*, via `web/jobs.py`'s `_run_ingest_propose`
+   reusing the identical `propose_contract` call, the provisional
+   drop-a-CSV path too). Two mechanisms, scoped to only the four
+   registry-backed targets:
+   - **Table augmentation** — an already-`SlotMapped` `VocabularyMapping` (or
+     single-output `Derivation`) whose table is missing entries the cited
+     column's *observed* distinct values would resolve gets those entries
+     *added*. An existing entry is never overwritten, even when it disagrees
+     with the registry — that's a contradiction (mechanism 3), not something
+     to silently paper over.
+   - **Slot promotion** — a `SlotUnresolved` target is promoted to
+     `SlotMapped` only when `full_alias_coverage` finds a *complete* table
+     (every observed value resolves) for exactly one candidate column. More
+     than one candidate independently achieving full coverage is ambiguous —
+     neither is promoted. A promoted mapping's `evidence.note` says
+     `"resolved via schema registry alias table, no model judgment"` and
+     carries `confidence=1.0`, so a code-verified fact never trips the
+     `low_confidence_mappings` attestation gate.
+3. **`check_grounding`'s new alias-contradiction check.** A table entry whose
+   key case-normalizes to a known registry alias but whose *value* disagrees
+   with what that alias resolves to is a real contradiction — flagged as a
+   grounding `"fail"`, never silently corrected. This lives in
+   `check_grounding` (`schema_inference.py`), **not** in `validate_contract`
+   (`config_model.py`): `check_grounding` runs only during `rhino adapt
+   propose`, against a fresh-or-reloaded `AdapterProposal`, never against an
+   already-confirmed `Contract` — so this check can never reach, and so can
+   never affect, `bluepeak-gen.json` or `mdvm-gen.json` (both already
+   confirmed, never re-proposed), even in principle.
+
+**The criticality anchor-only scope decision.** `CriticalityScale.anchors`
+covers *only* the two unambiguous ends of the 1–5 scale — never a middle word
+like "High"/"Medium"/"Normal"/"Low"/"Moderate". This is a safety boundary, not
+an oversight, and the evidence is sitting in this repository's own two
+confirmed, human-reviewed contracts: `data/adapters/bluepeak-gen.json` maps
+its four-tier scale `critical`→5, `high`→4, `medium`→3, `low`→2 (its own
+`table_notes`: *"low is deliberately 2, not 1 — this source's four tiers do
+not reach the schema's floor"*), while `data/adapters/mdvm-gen.json` maps its
+three-tier scale `high`→5, `normal`→3, `low`→1. Two real, careful reviewers
+made *different, both-correct* judgment calls for the identical words,
+because the right number for a middle tier depends on how many other tiers
+the source's own scale has — there is no universal mapping to encode. A
+deterministic alias table that resolved "Low" to a fixed number would
+silently assert one source's judgment as fact for every future source, which
+is exactly the wrong-but-plausible-number failure the whole
+not-collected/refuse-rather-than-guess discipline exists to prevent. "Critical"
+and "Informational"/"Minimal"/"Negligible" carry no such ambiguity — they mean
+the same absolute thing regardless of how many tiers a scale has — so, and
+only so, they resolve deterministically (`resolve_criticality_anchor`).
+Every middle word stays the model's own judgment call, now *informed* (the
+enriched prompt cites both real contracts above as worked precedent) rather
+than blind. Confirmed as a real consequence, not just a design intent: run
+against the actual `northgate_flat_2.csv` proposal, `asset.role`'s table
+correctly gains `"Domain Controller"` → `"dc"` (a real anchor), while
+`asset.criticality` correctly *stays unresolved* — its only candidate column
+has exactly two observed values, `"Critical"` and `"Low"`, and `"Low"` is
+deliberately not an anchor, so `full_alias_coverage` can never return a
+complete table for it. Promoting the slot anyway with a partial table would
+have been a *worse* outcome than staying unresolved: at real ingest time, a
+non-`role` vocabulary miss is a fatal, whole-batch refusal, not a per-record
+exclusion — the very first `"Low"` row would have taken down the entire plan.
+`tests/test_adapters_schema_registry.py` asserts this boundary directly and
+explicitly, as a safety property: `"High"`/`"Medium"`/`"Normal"`/`"Low"` must
+never be resolvable via `resolve_criticality_anchor`, in any case fold.
+
+## A `column` mapping's raw value must actually be legal, not merely cited
+
+A `ColumnMapping` reads a named column, strips it, applies its declared
+`case`, and writes the result to the target *verbatim* — no translation, no
+vocabulary lookup. That's fine for a free-text target (`business_function`,
+`owner`), but for a target with a **closed vocabulary** (`role`,
+`environment`, `data_sensitivity`, `scanner_severity`) nothing previously
+checked that the column's real, cased values actually equal one of that
+target's legal members. `check_grounding` verified only that the *cited
+column exists* — never that a `"column"` mapping's *observed* values were
+legal for where they were being written. The gap was structural, not a
+missed edge case: `check_slot_mapping_legality` had conditions for a
+mapping's blank policy and parser placement, but none for this at all, so a
+proposal built entirely from legal, well-formed pieces could still be
+guaranteed to fail at real ingest.
+
+**Found live, not theorized.** A real upload, `northgate_flat_2.csv` (the
+same file the schema registry section above uses), has a `Risk` column whose
+only observed value is `"Critical"` — title case. `schema.ScannerSeverity`
+is `Literal["critical", "high", "medium", "low", "informational"]`, lowercase
+only. A proposal mapping `finding.scanner_severity` as
+`{kind: "column", column: "Risk", case: "exact"}` is structurally legal by
+every check that existed: the column is real, the mapping shape is valid,
+`check_grounding` passes cleanly. The contract assembles, gets confirmed,
+and looks complete. Only at real ingest — `adapters/configured.py` handing
+the raw `"Critical"` string straight to `Finding(scanner_severity=...)` —
+does pydantic raise a generic `literal_error`
+(`"Input should be 'critical', 'high', 'medium', 'low' or 'informational'"`),
+with no hint that the fix is `case="lower"` or a `"vocabulary"` mapping, and
+no indication of which slot is actually at fault.
+
+**Two checks close this, one static and one data-dependent, matching the
+same split the rest of this document already draws between what a mapping's
+*shape* can prove and what only *real profiled data* can prove.**
+
+- **`config_model._check_column_mapping_type`** (static, zero-cost, needs no
+  data): a `ColumnMapping` always produces a string, so a target whose
+  declared Python type is genuinely non-string — `criticality` (`int`),
+  `internet_exposed` (`bool`) — can *never* legally be fed by one, regardless
+  of what the source data contains. Wired into
+  `check_slot_mapping_legality` alongside the existing blank-policy and
+  parser-placement checks, so it runs at both proposal-generation time and
+  real `validate_contract` time, for every adapter path, not just LLM-
+  generated ones.
+- **`schema_inference.check_column_mapping_legal_values`** (data-dependent):
+  the other half of the same problem class — a *string-shaped* closed
+  vocabulary (`role`, `environment`, `data_sensitivity`, `scanner_severity`,
+  or any future closed `Literal[str, ...]` target) is only actually illegal
+  for a `"column"` mapping when the column's real, case-transformed observed
+  values (`probe.ColumnProfile.distinct_values`) fall outside that
+  vocabulary — something only real profiled data can answer. Reads
+  `schema_registry.TARGET_REGISTRY` for each target's legal value set, and
+  applies the mapping's own `case` through `configured._apply_case` (the
+  identical transform the real engine applies) before comparing, so a
+  `case="lower"` mapping over the same `"Critical"` column is correctly
+  never flagged. Wired at two points: `_ground_slot`, so the terminal
+  `check_grounding` report fails a `"column"` mapping the same way it fails
+  any other grounding problem, naming the actual illegal value(s) and
+  suggesting `case="lower"`/`"upper"` or a `"vocabulary"` mapping instead;
+  and `_check_mapped_slots_legal`, so the same problem is caught during
+  `propose_contract`'s own generation-time retry loop, not only at the
+  end — `_check_mapped_slots_legal` now takes the same `profiles` dict
+  `check_grounding` does for exactly this reason.
+
+**Confirmed against the real fixture, not just synthetic data.** Loaded
+`northgate_flat_2.csv`'s real profile and built the exact buggy proposal
+above: both `check_grounding` and `_check_mapped_slots_legal` reject
+`finding.scanner_severity`'s `"column"`/`case="exact"` mapping over `Risk`,
+naming `"Critical"` as the illegal observed value. Switching to
+`case="lower"` — the fix the message itself suggests — makes both checks
+pass cleanly, proving the suggested remedy actually works. A `"vocabulary"`
+mapping over the identical column and value (`{"Critical": "critical"}`) is
+untouched by this new check either way, since it's grounded by its own,
+pre-existing key-matching path (`_ground_table`). `tests/test_adapters_config_model.py`
+gained 3 new test functions (6 collected cases, one parametrized across
+`role`/`environment`/`scanner_severity`/`hostname`) covering the static
+non-string-type check; `tests/test_schema_inference.py` gained 5 new test
+functions covering the data-dependent check end to end, all built directly
+against `northgate_flat_2.csv`'s own profile rather than synthetic
+stand-ins. Full suite after this fix: 1354 passed, 1 skipped (up from 1343,
+this document's own schema-registry milestone above) — 11 new tests, zero
+regressions.
+
 ## Where to look
 
 `src/rhinosecure/adapters/config_model.py` (schema + validation + digests),
 `configured.py` (the engine), `config_io.py` (read/write/confirm),
 `base.py` (`not_collected`, `ProblemCollector`), `__init__.py`
-(`load_config_adapter`), `probe.py` (the column profiler phase 1 reads).
+(`load_config_adapter`), `probe.py` (the column profiler phase 1 reads),
+`schema_registry.py` (published target meaning + alias data — see above).
 `src/rhinosecure/agents/schema_inference.py` is phase 1 itself
 (`AdapterProposal`, `check_grounding`, `assemble_contract`,
-`propose_contract`) — `rhino adapt propose` in `cli.py` is its only caller.
-Example confirmed contracts: `data/adapters/bluepeak-gen.json`,
-`data/adapters/mdvm-gen.json`.
+`propose_contract`, `_apply_registry_aliases`,
+`check_column_mapping_legal_values` — see "A `column` mapping's raw value
+must actually be legal" above) — `rhino adapt propose` in `cli.py` is its
+only caller. Example confirmed contracts:
+`data/adapters/bluepeak-gen.json`, `data/adapters/mdvm-gen.json`.

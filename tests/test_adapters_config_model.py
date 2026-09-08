@@ -24,6 +24,7 @@ from rhinosecure.adapters.config_model import (
     GAP_LEGAL_TARGETS,
     LOW_CONFIDENCE_THRESHOLD,
     SCORING_ENUM_TARGETS,
+    ColumnMapping,
     Contract,
     ContractValidationError,
     NotCollectedMapping,
@@ -491,6 +492,59 @@ def test_absent_fact_legal_targets_match_the_three_verified_partitions():
     assert ABSENT_FACT_LEGAL_TARGETS == ABSENT_FACT_ONLY | GAP_AND_ABSENT_FACT_BOTH_LEGAL
 
 
+# --- these are now sourced from schema_registry.TARGET_REGISTRY, not derived
+# independently -- the two tests above (hardcoded partitions) are the proof
+# the relocation is behavior-preserving; these two confirm the SOURCING
+# itself, directly against the registry.
+
+
+def test_gap_legal_targets_is_sourced_from_target_registry():
+    from rhinosecure.adapters.schema_registry import TARGET_REGISTRY
+
+    assert GAP_LEGAL_TARGETS == frozenset(
+        target for target, spec in TARGET_REGISTRY.items() if "gap" in spec.legal_blank_policies
+    )
+
+
+def test_absent_fact_legal_targets_is_sourced_from_target_registry():
+    from rhinosecure.adapters.schema_registry import TARGET_REGISTRY
+
+    assert ABSENT_FACT_LEGAL_TARGETS == frozenset(
+        target for target, spec in TARGET_REGISTRY.items() if "absent_fact" in spec.legal_blank_policies
+    )
+
+
+def test_target_vocabulary_is_sourced_from_target_registry():
+    from rhinosecure.adapters.config_model import _target_vocabulary
+    from rhinosecure.adapters.schema_registry import TARGET_REGISTRY
+
+    assert _target_vocabulary("criticality") == (
+        TARGET_REGISTRY["criticality"].criticality.low, TARGET_REGISTRY["criticality"].criticality.high
+    )
+    assert _target_vocabulary("internet_exposed") == "bool"
+    assert _target_vocabulary("role") == frozenset(v.value for v in TARGET_REGISTRY["role"].enum.values)
+    assert _target_vocabulary("hostname") is None
+
+
+def test_describe_target_vocabulary_return_shape_is_unchanged():
+    """web/adapters.py and app.js's browser slot-resolution form depend on
+    this exact shape -- the relocation to TARGET_REGISTRY must not change
+    it (CLAUDE.md/this refactor's own scope boundary)."""
+    from rhinosecure.adapters.config_model import describe_target_vocabulary
+
+    assert describe_target_vocabulary("criticality") == {"kind": "range", "min": 1, "max": 5}
+    assert describe_target_vocabulary("internet_exposed") == {"kind": "bool"}
+    assert describe_target_vocabulary("environment") == {"kind": "enum", "values": ["dev", "prod", "staging"]}
+    assert describe_target_vocabulary("hostname") is None
+
+
+def test_check_parser_placement_is_sourced_from_parser_positions():
+    from rhinosecure.adapters.schema_registry import PARSER_POSITIONS
+
+    assert "row" not in PARSER_POSITIONS["timestamp"]
+    assert all("row" in PARSER_POSITIONS[p] for p in ("bool", "float", "date", "cve_id"))
+
+
 @pytest.mark.parametrize("target", sorted(GAP_ONLY))
 def test_gap_only_targets_reject_absent_fact(target):
     with pytest.raises(ContractValidationError, match="not legal for target"):
@@ -818,6 +872,49 @@ def test_check_slot_mapping_legality_ignores_kinds_with_no_blank_or_parser():
     # silent no-op here (its own legality -- whether `role` may be
     # not_collected at all -- is a DIFFERENT check, not this function's job).
     assert check_slot_mapping_legality("asset.role", "role", NotCollectedMapping(kind="not_collected")) == []
+
+
+# --- check_slot_mapping_legality: a "column" mapping can never legally feed
+# a non-string-shaped target (static, zero-cost -- no real data needed) -----
+
+
+def test_column_mapping_targeting_criticality_is_always_illegal():
+    # criticality's declared type is int -- a ColumnMapping always writes a
+    # raw string verbatim, so this is illegal regardless of what the source
+    # data actually contains.
+    mapping = ColumnMapping(kind="column", column="Asset_Criticality", case="exact", blank="gap")
+    problems = check_slot_mapping_legality("asset.criticality", "criticality", mapping)
+    assert len(problems) == 1
+    assert "kind='column'" in problems[0]
+    assert "criticality" in problems[0]
+
+
+def test_column_mapping_targeting_internet_exposed_is_always_illegal():
+    # internet_exposed's declared type is bool -- same reasoning.
+    mapping = ColumnMapping(kind="column", column="Internet_Exposed", case="exact", blank="gap")
+    problems = check_slot_mapping_legality("asset.internet_exposed", "internet_exposed", mapping)
+    assert len(problems) == 1
+    assert "kind='column'" in problems[0]
+    assert "internet_exposed" in problems[0]
+
+
+@pytest.mark.parametrize(
+    ("where", "target", "column"),
+    [
+        ("asset.role", "role", "Asset_Type"),
+        ("asset.environment", "environment", "Environment"),
+        ("finding.scanner_severity", "scanner_severity", "Severity"),
+        ("asset.hostname", "hostname", "Asset_Hostname"),
+    ],
+)
+def test_column_mapping_is_not_flagged_by_the_static_type_check_for_string_shaped_targets(where, target, column):
+    # role/environment/scanner_severity are closed Literal[str, ...] targets
+    # (still "string-shaped" at the TYPE level -- whether their OBSERVED
+    # values are legal members is a separate, data-dependent check,
+    # agents/schema_inference.check_column_mapping_legal_values, not this
+    # one); hostname is plain str. None of these are flagged here.
+    mapping = ColumnMapping(kind="column", column=column, case="exact", blank="fatal")
+    assert check_slot_mapping_legality(where, target, mapping) == []
 
 
 def test_not_collected_target_cannot_be_mapped():
