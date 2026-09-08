@@ -8,3 +8,10 @@ out/
 *.db
 .pytest_cache/
 data/uploads/
+
+# Live-verification debris (upload/propose scratch runs), not fixtures
+Claude outputs/
+data/verify-ctrlflow-a/
+data/adapters/*verify*.json
+data/adapters/upload-*.json
+!data/adapters/upload-6f1bbcfe799046ff864be03e.json
