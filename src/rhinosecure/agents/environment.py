@@ -84,13 +84,17 @@ from crewai.llms.base_llm import BaseLLM
 from crewai.tools import BaseTool, tool
 from pydantic import BaseModel
 
-from rhinosecure.agents.entity_consistency import find_wrong_cve_mentions
+from rhinosecure.agents.entity_consistency import (
+    find_neutralized_axis_assertions,
+    find_wrong_cve_mentions,
+)
 from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.prompt_safety import UNTRUSTED_TEXT_NOTICE, fence
 from rhinosecure.agents.research import ResearchFinding
 from rhinosecure.llm import get_llm
 from rhinosecure.memory import Memory
 from rhinosecure.schema import Asset, EnrichedFinding
+from rhinosecure.scoring import neutralized_axes_for
 
 ROLE = "Environment Analysis"
 
@@ -135,6 +139,17 @@ class EnvironmentAssessment(BaseModel):
     # Active memory.Constraint text for this asset, if any -- informational
     # only, never merged into the three fields above. See module docstring.
     human_constraints: list[str] = []
+    # Which of criticality/environment/data_sensitivity/role/internet_exposed
+    # this asset's SOURCE never determined at all (scoring.neutralized_axes_for)
+    # -- copied verbatim from lookup_asset_context's own result, the same
+    # copy-fidelity discipline every other tool-sourced field here already
+    # gets. Defaults to [] so every existing fixture/test (never populating
+    # this) is unaffected; expected_output below requires a model to echo it
+    # explicitly rather than let the empty default silently satisfy the
+    # schema -- omitting that requirement would make verify_environment_
+    # matches_tool's new structural check below falsely fail a genuinely
+    # neutralized-axis run whose model simply left the field at [].
+    neutralized_axes: list[str] = []
     applicability_summary: str
     sources: list[str]
 
@@ -204,6 +219,14 @@ def build_environment_tools(
                 # a Defender-sourced asset needs and a native one never
                 # has (its set is always empty).
                 "not_collected": sorted(asset.not_collected),
+                # The scoring-relevant subset of not_collected --
+                # scoring.neutralized_axes_for, the same set score_finding
+                # itself drops/renormalizes around. Structurally identical
+                # information to not_collected filtered to the five scoring
+                # axes, surfaced separately so this agent (and the
+                # verify_environment_matches_tool check below) doesn't have
+                # to re-derive that intersection itself.
+                "neutralized_axes": sorted(neutralized_axes_for(asset)),
             }
         call_log.append(
             {"tool": "lookup_asset_context", "args": {"asset_id": asset_id}, "result": result}
@@ -272,7 +295,16 @@ def build_environment_task(
             "declared patch_window/compensating_controls/patch_restrictions "
             "-- never blend a human constraint into those three fields, "
             "which must always report only what the asset record itself "
-            "declares."
+            "declares. Copy the tool's neutralized_axes list verbatim into "
+            "your own neutralized_axes field. For every axis named there "
+            "(role, environment, data_sensitivity, criticality, "
+            "internet_exposed), the value the tool returned for it is a "
+            "PLACEHOLDER, not a fact this asset's source ever actually "
+            "determined -- do not state that axis's specific value in "
+            "applicability_summary at all, not even hedged (\"likely a "
+            "workstation\" is still an assertion). Say instead that this "
+            "asset's source never determined it, without repeating the "
+            "placeholder value."
         ),
         expected_output=(
             "Return ONLY a single JSON object, with these keys directly at "
@@ -285,9 +317,13 @@ def build_environment_task(
             "compensating_controls (a list of strings), has_patch_window "
             "(bool), patch_window, patch_restrictions, human_constraints "
             "(a list of strings, copied verbatim from the tool result -- "
-            "empty list if the tool returned none), applicability_summary "
-            "(a short prose summary), and sources (a list of strings "
-            "citing each source used)."
+            "empty list if the tool returned none), neutralized_axes (a "
+            "list of strings, copied verbatim from the tool result's own "
+            "neutralized_axes -- empty list if the tool returned none; "
+            "REQUIRED even when empty, never omitted), applicability_summary "
+            "(a short prose summary that never states the specific value of "
+            "any axis named in neutralized_axes), and sources (a list of "
+            "strings citing each source used)."
         ),
         agent=agent,
     )
@@ -319,7 +355,16 @@ def verify_environment_matches_tool(
     `applicability_summary`'s CVE-mention check (below) needs no tool
     call at all -- it only needs the CVE ID `assessment` itself already
     carries -- so it always runs, even against an empty `call_log`,
-    unlike every other check here."""
+    unlike every other check here.
+
+    Also runs `entity_consistency.find_neutralized_axis_assertions`
+    against `applicability_summary` (Track C, CLAUDE.md's provisional-run
+    entry) whenever `neutralized_axes` is non-empty -- catching a model
+    that stated a neutralized axis's placeholder value as though it were
+    an observed fact. This one DOES need the tool result (for the actual
+    axis values in effect), so unlike the CVE check it runs after the
+    `if not calls: return` early exit, alongside the other tool-sourced
+    checks below."""
     # Checked first, and unconditionally: unlike the tool-result checks
     # below, this needs no matching lookup_asset_context call at all.
     wrong_cves = find_wrong_cve_mentions(assessment.applicability_summary, assessment.cve_id)
@@ -351,6 +396,7 @@ def verify_environment_matches_tool(
         # own derivation from patch_window, so the expected value is
         # computed here rather than read from the result directly.
         ("has_patch_window", assessment.has_patch_window, bool(tool_result.get("patch_window"))),
+        ("neutralized_axes", sorted(assessment.neutralized_axes), sorted(tool_result.get("neutralized_axes", []))),
     )
     for field_name, reported, actual in scalar_checks:
         if reported != actual:
@@ -366,3 +412,22 @@ def verify_environment_matches_tool(
         raise EnvironmentMismatchError(
             f"{assessment.asset_id}: human_constraints does not match the tool's result verbatim"
         )
+
+    neutralized = tool_result.get("neutralized_axes") or []
+    if neutralized:
+        axis_values = {
+            "role": tool_result.get("role"),
+            "environment": tool_result.get("environment"),
+            "data_sensitivity": tool_result.get("data_sensitivity"),
+            "criticality": tool_result.get("criticality"),
+            "internet_exposed": tool_result.get("internet_exposed"),
+        }
+        violated = find_neutralized_axis_assertions(
+            assessment.applicability_summary, neutralized, axis_values
+        )
+        if violated:
+            raise EnvironmentMismatchError(
+                f"{assessment.asset_id}: applicability_summary states a value for neutralized "
+                f"axis/axes {sorted(violated)} as though it were an observed fact -- this "
+                "source never determined it (see neutralized_axes)"
+            )

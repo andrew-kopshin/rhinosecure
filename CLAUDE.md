@@ -1314,6 +1314,356 @@ model-chosen pattern.
 
 ---
 
+## Provisional scoring reaches `run_agents` and Tree-of-Thought (2026-09-08)
+
+**What already existed, and had zero coverage in this file until now.** `web/jobs.py`'s
+`_run_run_deterministic` job handler could already score a plan against an **unconfirmed**
+ingest contract — one that hasn't gone through the human `rhino adapt confirm` signature gate
+(Adapter generation, above). Given an upload whose contract was proposed but never confirmed,
+it builds a `ConfiguredAdapter` over `review._provisional(contract)` with
+`excluding_targets=SCORING_ENUM_TARGETS`, scores it, and reports `"provisional": true` in both
+the job result and the export — but never adopts that run as "the current plan"
+(`PlanState.coordinator`/`.memory`/`.active_source` stay untouched). This is CLAUDE.md's own
+"drop a CSV, get a plan" spec (referenced repeatedly in the Adapter generation section above)
+made concrete for the deterministic path only. `run_agents` had no equivalent branch at all: it
+refused outright via `resolve_source_ref`'s `IngestError`, so a fresh upload could reach a
+scored deterministic plan but the web UI's Agents/ToT pipeline stages stayed permanently
+"NOT RUN" unless a human confirmed the contract first.
+
+**Built: the identical branch for `run_agents`, sharing the gate instead of duplicating it.**
+`web/jobs.py`'s `_run_run_deterministic`'s provisional-detection block (resolve an upload's
+unconfirmed contract, compute `force_not_collected` for an auto-filled `literal` role, attach
+placeholder attestations via `missing_attestations`, build `ConfiguredAdapter(provisional_stamp
+(contract), excluding_targets=SCORING_ENUM_TARGETS, force_not_collected=...)`) is now a shared
+private helper, `_resolve_provisional(source_ref) -> tuple[ConfiguredAdapter, ResolvedSource] |
+None`, taking the RAW `source_ref` (not a pre-split `upload_id`/`upload_dir`) so both callers
+share the entire gate, including the upload-shape check — `None` collapses "not an upload at
+all," "no contract ever proposed," and "the contract IS already confirmed" into the identical
+"fall through to the ordinary `resolve_source_ref` call" signal both callers already used the
+same way. `_run_run_deterministic` is now a pure, behavior-preserving refactor onto this helper
+— confirmed via the full existing `tests/test_web_jobs_dispatcher.py` suite passing unmodified
+before the new `run_agents` branch was even added, so a refactor regression could never be
+conflated with new-feature work.
+
+`PlanState.run_agents_pipeline` is split into a build-and-run step
+(`_build_and_run_coordinator(resolved, adapter, *, memory, on_stage)` — ingest, build a
+`Coordinator`, dispatch `run()`, deliberately touching none of `self.coordinator`/`.memory`/
+`.active_source`/`.findings`) and the commit itself (`run_agents_pipeline`, unchanged in every
+other respect, now a thin wrapper: build a real `Memory`, call the shared helper, assign the
+result onto `self` last). `_run_run_agents`'s new provisional branch calls
+`plan_state._build_and_run_coordinator(resolved, provisional_adapter, memory=None,
+on_stage=on_stage)` **directly** and **never commits** — the exact same one-line difference
+(`memory=None` instead of a real `Memory`, and skipping the three `self.*` assignments) that
+makes this a structural, not a policy, guarantee (next paragraph). Export is written the same
+way `_run_run_deterministic` already writes its own (`export_memory = plan_state.memory if
+plan_state.memory is not None else Memory(plan_state.config.db_path)` — a throwaway, read-only
+`Memory` for the constraints section's display, never the Coordinator's own scoring input, which
+saw `memory=None`).
+
+**Decided, and verified two layers deep: `constraint_submit` stays refusing against a
+provisional plan.** Persisting a constraint, or a `decisions`/`runs` row, against an unconfirmed,
+possibly-still-changing mapping is exactly the kind of durable, hard-to-undo write this file's
+"never guess, refuse loudly" discipline already argues against elsewhere — an `asset_id` from an
+unconfirmed contract can legitimately change once a human actually reviews and confirms it, and
+a `decisions` row scored against neutralized placeholder axes shouldn't sit in the same audit
+trail as a real, reviewed decision. Mechanism, not policy: since the provisional branch never
+assigns `plan_state.coordinator`, a subsequent `constraint_submit` job (which only ever operates
+via `plan_state.seed()` → the already-seeded `self.coordinator`) either raises
+`PlanNotSeededError` (the empty-workspace case — confirmed live: a provisional `run_agents` job
+followed immediately by `constraint_submit`, nothing else, still raises `PlanNotSeededError`
+exactly as if no job had ever run) or applies to whatever OLDER, confirmed plan happens to be
+current (confirmed live: a confirmed plan established first, then a provisional `run_agents` job
+against a different upload, then `constraint_submit` — the older plan's `Coordinator` object is
+untouched, `_asset_index` still holds only the confirmed plan's assets, and the resolved
+constraint's `asset_id` is the confirmed plan's own, never the provisional run's). **Backstop**,
+for defense in depth: the provisional `Coordinator` is constructed with `memory=None`, so
+`Coordinator.submit_constraint`'s existing `if self.memory is None: raise CoordinatorError`
+fires immediately if anything ever did hold a direct reference to it — an existing guard doing
+double duty, zero new code. `run_agents` itself stays an explicit, human/job-triggered step,
+unchanged by any of this: `ingest_propose`/`run_deterministic` never cascade into it.
+
+**The harder half: a live test showed a local model producing schema-valid prose that
+confidently restated a neutralized axis's placeholder value as if it were a real fact.** A
+provisional plan routinely has scoring axes (`criticality`/`environment`/`data_sensitivity`/
+`role`/`internet_exposed`) **neutralized** — excluded from the risk calculation, not guessed at
+(`scoring.py`'s own `impact_composite`/`score_threat`, Section 3) — because the source never
+determined them. The existing `verify_*_matches_tool` grounding checks (Safety and guardrails →
+Grounding validation) only diff *structural* fields against a tool's own call log; they never
+look at what free prose (`narrative`, `applicability_summary`, ToT's `proposal`/`justification`)
+actually *claims*. This is not provisional-only: a **confirmed** Microsoft Defender run already
+triggers the identical neutralization today (`adapters/base.py`'s `NOT_COLLECTED_DEFAULTS` marks
+`criticality`/`environment`/`data_sensitivity`/`role` not-collected for every Defender asset) —
+the provisional path just triggers it far more broadly, via `excluding_targets=
+SCORING_ENUM_TARGETS`.
+
+**Built: `scoring.neutralized_axes_for(asset) -> frozenset[str]`**, a pure extraction of
+`score_finding`'s existing inline `impact_neutralized | threat_neutralized` union (mathematically
+identical — `IMPACT_AXIS_TARGETS`/`THREAT_AXIS_TARGETS` are disjoint — so this is behavior-inert,
+confirmed by the full existing `test_scoring.py` suite passing unmodified). Callers outside
+`scoring.py` (`agents/environment.py`'s `lookup_asset_context`, `agents/risk.py`'s
+`score_finding_tool`, `tot.py`'s grounding check) now compute the identical set without
+duplicating the union or reaching into `Asset.not_collected` semantics themselves.
+`EnvironmentAssessment`/`RiskRecommendation` each gained a `neutralized_axes: list[str] = []`
+field, copied verbatim from the matching tool result; `score_finding_tool`'s result also gained
+the five raw axis values (`role`/`environment`/`data_sensitivity`/`criticality`/
+`internet_exposed`) so the new prose check (below) has value-tokens to check against without
+widening `verify_scoring_matches_tool`'s own signature. Both tasks' `expected_output` text now
+explicitly requires echoing `neutralized_axes` — **required**, not incidental: a model that
+simply omitted the field would let pydantic's `[]` default silently satisfy the schema, and the
+new structural check would then falsely fail a genuinely-neutralized **confirmed** run (Defender)
+that never bothered to state it. Confirmed against `data/defender-sample/` directly (a real,
+non-provisional source with 3 genuinely neutralized axes for its domain controller): a
+correctly-authored `EnvironmentAssessment`/`RiskRecommendation` that echoes the tool's own
+`neutralized_axes` round-trips through both `verify_*_matches_tool` functions cleanly.
+
+**Closed the actual root cause, not just added a check.** `build_risk_task`'s prompt line
+(`"...role {environment.role}, environment {environment.environment}, internet_exposed:
+{environment.internet_exposed}..."`) and `tot.py`'s `_describe_root` both bald-stated a
+possibly-placeholder value as fact in the same prompt that also carried the honest caveat
+elsewhere (buried in `scoring_rationale`) — never co-located with the value itself. That
+disconnect is what actually produced the live test's confidently-wrong prose. Fixed by making
+the template lines conditional at the exact point each value is stated:
+`entity_consistency.neutralized_axis_note(axis, neutralized_axes)` returns `" (NOT COLLECTED for
+this source -- placeholder, not a fact)"` when `axis` is neutralized, `""` otherwise — applied to
+`role`/`environment`/`internet_exposed` in both `build_risk_task` and `_describe_root` (the only
+two axes either template bald-states at all; `criticality`/`data_sensitivity` never appear as raw
+values in either — `EnvironmentAssessment`/`RiskRecommendation` carry no such fields — so they
+have no bald-value line to annotate; both are already only ever honestly caveated via
+`scoring_rationale`'s own wording). Empty for every confirmed-contract run, so every existing
+prompt for a non-neutralized axis is byte-identical to before this existed. `build_environment_
+task`'s own prompt never bald-stated values to begin with, but now explicitly instructs: copy
+`neutralized_axes` verbatim, and for any axis it names, never state that axis's specific value in
+`applicability_summary` at all, not even hedged.
+
+**Built: `entity_consistency.find_neutralized_axis_assertions` — Track C, precision-biased, not a
+flat presence scan.** A flat "does the placeholder value appear anywhere in the prose" check was
+considered and rejected: the placeholder values are common English words (`"workstation"`,
+`"file"`, `"internal"`, the bare digit `3`) that collide constantly with legitimate prose (this
+project's own PROGRESS.md uses the literal phrase "dev workstation" for this exact scenario). A
+grounding-check false positive is worse than the bug it fixes: it burns a retry and then, if it
+survives every retry, silently drops an honest finding out of the exported plan
+(`Coordinator._resolve_output`'s failure path). So the check requires TWO literal conditions
+together: the placeholder value token AND its own axis-name anchor (`"role"`/`"sensitivity"`/
+`"environment"`/`"criticality"`) must both appear within a small character window of each other
+(60 chars for role/environment/data_sensitivity, 20 for criticality — a bare digit is a much
+shorter, more common token, so its window stays tighter). `criticality` anchors on the literal
+word `"criticality"` only, never `"critical"` — that collides with CVSS/NVD severity language
+appearing in essentially every Research/Risk/ToT prompt. `internet_exposed` has no single value
+token to anchor on (it's boolean), so it uses a curated, already multi-word (already
+proximity-safe) phrase list instead (`"internet-facing"`, `"internal-only"`, etc., keyed by which
+boolean value is the placeholder). An `environment="prod"`/`"dev"` alias table also checks the
+natural-English expansion (`"production"`/`"development"`) a model is far more likely to write
+than the schema's own short code — checked in addition to, never instead of, the literal value.
+Deliberately no hedge detection: a properly-hedged restatement ("role: workstation, though this
+was never collected") still trips it, on purpose — teaching the check to parse hedge language
+would reopen the "trust the model's own framing" problem this whole mechanism exists to close,
+and the safe failure mode is an extra retry, not a missed violation. Wired into
+`verify_environment_matches_tool` (against `applicability_summary`), `verify_scoring_matches_tool`
+(against `verdict_summary`/`narrative`), and `tot.py`'s `_parse_check_strategy_and_cve` (extended
+to take the whole `ToTRoot` instead of a bare CVE id, deriving both the existing CVE-mention check
+and this new one from `root.enriched.asset` — ground truth via `neutralized_axes_for`, not
+`root.risk.neutralized_axes`, which is itself model output already verified elsewhere — applied
+at all three ToT dispatch sites: propose/critique/refine). Every site reuses its module's existing
+exception type (`EnvironmentMismatchError`/`ScoringMismatchError`/`AgentOutputParseError`) — zero
+changes to `coordinator.py`'s retry plumbing.
+
+**Adversarial review (Reviewer A's mandatory task: try to defeat the check directly) found and
+fixed one real bypass before this shipped.** The anchor originally matched only the exact
+singular word (`\brole\b`), so `"Roles: workstation"` — a plausible model phrasing (plural, no
+parenthesis) — matched neither the anchor nor triggered the value-proximity condition, and passed
+the check clean despite confidently restating the placeholder. Fixed by widening each anchor to
+its plain-plural form (`role`/`roles`, `environment`/`environments`,
+`sensitivity`/`sensitivities`, `criticality`/`criticalities`) — still gated by proximity to a
+value token, so this stays a precision-biased check, not a broader one; re-verified the existing
+collision-safety cases ("dev workstation", "the file server hosts...") still never fire.
+Regression tests for both the original bypass and the re-confirmed collision safety are in
+`tests/test_entity_consistency.py`. **Documented, accepted scope limit, matching `find_wrong_cve_
+mentions`'s own admitted limits above:** a paraphrase that never puts the axis's own name (or its
+plain plural) anywhere near the axis's own value — "this looks like an ordinary workstation," with
+no nearby mention of "role" — still evades detection. Closing that would mean either a positive
+keyword classifier (the kind of fuzzy, ever-growing heuristic this codebase avoids elsewhere) or a
+second LLM opinion (the exact "unreliable second model" problem this whole mechanism exists to
+avoid) — this is a mitigation for the concretely-observed failure mode, never a proof of full
+prose grounding.
+
+**Built: `export.py`'s agents-path decomposition is now a LIVE recompute, closing a pre-existing
+gap unrelated to provisional-ness.** Before this, `_agents_finding_entry` carried no
+`decomposition` field at all — the per-finding neutralized-axis UI note never rendered for ANY
+agents-path finding, including a confirmed Defender run, only ever for the deterministic path.
+`_agents_decomposition(coordinator, enriched, research)` mirrors `agents/risk.py`'s
+`score_finding_tool` exactly: merge Research's signals into the ground-truth `EnrichedFinding`,
+fold in any active constraint via `coordinator.memory` (identical `constraints_for_asset`/
+`apply_constraints` calls, same `if coordinator.memory is not None` guard), then
+`scoring.score_finding` — deliberately NOT `_asset_constraint_deltas`'s constraint-free "before"
+pattern, which exists specifically to isolate a constraint's own effect for a diff and would
+silently disagree with the actually-displayed `risk_score`/`bucket` on a confirmed run with an
+active constraint (confirmed live via a real, non-fabricated compensating-control constraint in
+`tests/test_export.py`: the exported decomposition's `impact.compensating_controls` shows the
+real control, and its `impact.composite` matches an independent recomputation through the same
+merge/overlay/score path). `None` when Research failed upstream for that finding — the same
+"absent, not fabricated" rule this module already applies to every other path-conditional field.
+
+**Fixed the constraints-section's now-inaccurate blanket `agents: bool`.** A confirmed agents run
+and a PROVISIONAL agents run both have `agents=True` in the caller's own prior sense (the 4-agent
+pipeline really did dispatch), but only a confirmed run's `Coordinator` was ever given a real
+`Memory` — without this fix, a provisional run's constraints section would show an active
+constraint as "applied" with a no-op delta, misrepresenting one that was never actually folded
+into what was scored. `_asset_scoped_constraints`/`_constraints_section` now take `live: bool`
+(`coordinator.memory is not None` on the agents path; always `False` on the deterministic path,
+which never touches `memory.py` at all) plus a caller-supplied `not_live_note`, so each path states
+its own honest reason (`_DETERMINISTIC_NOTE` vs. the new `_PROVISIONAL_NO_MEMORY_NOTE`) instead of
+this function guessing which applies. Confirmed live (`tests/test_export.py`): a real constraint,
+added to a real `Memory`, genuinely applicable to an asset with findings in a memory-less
+Coordinator's run, now correctly shows `deltas=[]` and the new note — not a fabricated "applied"
+delta. `_build_agents_export`'s stale `"provisional": ... # Always False on this path` comment
+(no longer true) is corrected in place.
+
+**Left open, deliberately, and flagged rather than silently widened:** `_run_remediation_mark`/
+`cli.py`'s `remediation mark` accept a bare `finding_id` string with zero contract-awareness —
+writing through `plan_state.memory` or a fresh fallback `Memory` directly, never through
+`plan_state.coordinator`. Independent of this task and unaffected by it in either direction (this
+work doesn't widen the gap, and doesn't close it either); Section 7's own remediation-tracking
+entry already documents the write path this shares. Fixing it is a separate decision about that
+command's own contract, not made here.
+
+**A second, unrelated real bug found by the live verification for this same entry, and fixed
+alongside it.** Verifying the provisional `run_agents` branch above against a genuine third-party
+export (`northgate_fleet_14.csv`, a synthetic Nessus/Tenable-shaped scan whose own finding
+identity column, `Plugin ID`, is numeric — `148676`, `150890`, ...) produced a plan with **zero**
+scored findings: `agents/research.py`'s `ResearchFinding.finding_id` is `str`-typed, but the model
+consistently emitted it as a bare JSON *number* (`"finding_id": 148676`) rather than a JSON
+*string*, and pydantic v2's default (non-strict) mode — unlike v1 — does not coerce an `int` into
+a `str`-typed field. This is not occasional flakiness: `Coordinator._resolve_output`'s retry loop
+rebuilds the **identical** task on each attempt with no error-specific correction (unlike
+`schema_inference.py`'s own retry loop, which embeds the previous failure's exact message), so a
+model that made this exact choice once reliably repeated it for all `max_parse_attempts`, taking
+every finding on that source down with it — confirmed by dispatching Research for one finding
+directly and reading `RunState.last_raw_output`, rather than guessing from the aggregate failure
+count. `agents/parsing.py`'s `parse_structured_output` — the single shared seam Research,
+Environment, Risk, and the Constraint Interpreter all already route through — now applies
+`_coerce_str_fields` before validation: a bare `int`/`float` (never `bool`, which is an `int`
+subclass in Python and would hide a genuine type mistake) is coerced to its `str()` form, but only
+for a field the model's own target schema actually declares `str`-typed (or `str | None`) — the
+same "accept the same value in the other JSON-legal encoding of it, never invent one" discipline
+`adapters/configured.py`'s own str-typed-target coercion already established for a different
+parsing seam (CSV cell values), applied here to agent-output parsing. Re-running the identical
+verification after this fix scored all 14 findings cleanly. Out of this task's originally planned
+scope, but blocking its own live verification outright, so fixed rather than deferred — the same
+"a real, live-testing-surfaced defect gets fixed, not filed" instinct this file applies throughout.
+
+## Adversarial-review hardening: `find_neutralized_axis_assertions` (2026-09-08)
+
+**A second adversarial-review round on the entry above (4 independent reviewers, each finding
+re-verified by an independent skeptic before being reported) found six real, confirmed defects
+in Track C's mechanical check itself — all fixed in `agents/entity_consistency.py`, none in the
+mechanism that dispatches or wires it.** The check's own module docstring now carries the full
+numbered account (mirrored here at CLAUDE.md's usual level of decision/rationale, not restated
+verbatim); this entry is the dated record the rest of this file's own convention requires.
+
+1. **Critical: `internet_exposed` was directionally blind by construction.** The old branch
+   looked up `_EXPOSURE_CLAIM_PHRASES[bool(exposed)]` — only the phrase list matching the
+   CURRENT placeholder direction, which is always `False`
+   (`NOT_COLLECTED_DEFAULTS["internet_exposed"]`). A model confidently asserting the OPPOSITE
+   direction ("this asset is internet-facing" when exposure is genuinely unknown) was
+   undetectable, unconditionally, with zero adversarial phrasing required — and that is exactly
+   the direction that inflates apparent risk, the single worst direction for a security tool to
+   be blind to. Fixed: both direction phrase lists are now checked together, always, whenever the
+   axis is neutralized — asserting either direction about an unknown value is an equally
+   dishonest claim, so the placeholder's own value no longer gates which phrases get checked.
+2. **Medium, same branch: no proximity or subject scoping at all.** A flat whole-text substring
+   scan meant a claim clearly attributed to a DIFFERENT, named asset ("the payroll server ... is
+   not exposed to the internet") tripped a violation on THIS finding's own asset. Fixed by giving
+   `internet_exposed` the same anchor+value proximity gate the other four axes already had,
+   anchored on a small, self-referential subject pattern ("this asset/host/device/server/
+   system/machine/endpoint") rather than an axis name — a boolean claim has no axis-name word of
+   its own to anchor on, but it's always made about a specific subject, and requiring that
+   subject to read as THIS finding's own asset is what an axis-name anchor already does for the
+   other four.
+3. **Medium: an off-by-truncation bug in `_value_near_anchor`.** The old implementation sliced
+   `text[lo:hi]` to the proximity window and searched inside the slice; when a value token's own
+   span straddled the slice boundary, the slice truncated it mid-word (`"internal"` cut to
+   `"intern"`), silently missing a value whose START was well within the stated window —
+   confirmed with the check's own real placeholder value (`data_sensitivity="internal"`) in a
+   plausible sentence, not a contrived string. Fixed by comparing match SPANS directly (both
+   patterns matched against the whole text, then a plain integer gap between spans) instead of
+   ever slicing and re-searching a substring — there is no boundary left to truncate across.
+4. **High, tempered to medium: the 60-/20-char proximity windows were narrower than ordinary
+   two-sentence prose.** Measured directly: a plain two-sentence restatement ("This host's role
+   has already been confirmed ... It is a workstation used daily by finance staff.") put the
+   value only 64 characters past the anchor — 4 over the old 60-char window — and an equally
+   ordinary one-sentence criticality restatement needed only 49 against a 20-char window. Neither
+   is adversarial phrasing. Widened to 150 / 55 chars respectively, both values measured against
+   the actual pre-existing "must NOT fire" regression test
+   (`test_criticality_anchor_far_from_its_value_does_not_fire`, real measured gap 69) to confirm
+   the wider window still excludes a genuinely distant mention, rather than picked by feel.
+5. **High, tempered — see below: ordinary paraphrase defeated detection even with the axis name
+   directly adjacent.** The value-alias table covered exactly two hand-picked words
+   (`prod`→`production`, `dev`→`development`); every other schema value had no alias at all, so a
+   model's ordinary paraphrase ("a managed corporate laptop" for `workstation`, "a
+   network-attached storage node" for `file`, "a domain controller" for `dc`, "a live,
+   customer-facing tier" for `prod`) evaded the check outright, axis name present and all. Fixed
+   by making the alias table axis-scoped (`_AXIS_VALUE_ALIASES`, replacing the old flat table —
+   also closes a latent ambiguity, since `"dev"` is both an Environment value and an AssetRole
+   value) and extending it with the specific paraphrases the review round actually demonstrated a
+   model producing. Still deliberately NOT a semantic paraphrase detector — the same curated,
+   closed-list discipline `_EXPOSURE_CLAIM_PHRASES` already uses for booleans, extended to cover
+   demonstrated real cases rather than attempting exhaustive English coverage.
+6. **Medium: negation-blind proximity matching produced a real false positive.** "Unlike the
+   file share host discussed earlier, this asset's role is unrelated to storage" tripped `role`
+   even though the sentence explicitly DENIES the placeholder value rather than restating it. A
+   minimal, narrow guard was added: a small curated set of CONTRAST markers (`"unlike"`, `"in
+   contrast to"`, `"as opposed to"`, `"distinct from"`, `"differs from"`) checked in the text
+   immediately spanning a matched anchor/value pair suppresses that one match. Deliberately NOT
+   general negation or hedge detection — `"not"`/`"isn't"`/`"never"` and similar are deliberately
+   excluded, because the check's own hedge-tolerance design (below) depends on those NOT
+   suppressing a match. A contrast marker names a comparison to a DIFFERENT subject; a hedge
+   qualifies confidence about the SAME subject — different things, and only the former is guarded
+   against.
+
+**Two collision classes the review round also demonstrated, left open on purpose, matching this
+file's own "record what's still open, don't overclaim" discipline (the Grounding validation
+Track A/B "does not do" callouts are the same convention).** (a) A polysemous anchor word
+colliding with an unrelated sense of itself in the same window — `"role"` also means RBAC
+("reviewed role-based access control (RBAC) settings on the file server"), `"environment"` also
+means an OS env var ("environment variable configuration from a file named prod.env"); and (b)
+an unrelated digit near `"criticality"` with no decimal point involved ("criticality aside, 3 of
+the servers ... were already patched last week"). Both are real, but neither is a bounded,
+low-regression-risk fix the way items 1-6 above were — (a) needs actual word-sense
+disambiguation, (b) has no mechanical signal (no negation, no decimal point, no alias mismatch)
+to hang a narrow rule on without also suppressing genuine "criticality ... 3" restatements the
+check exists to catch. Left as an accepted false-positive risk, consistent with the check's own
+stated tradeoff (an occasional extra retry, never a missed violation, is the acceptable failure
+mode) rather than patched with a rule likely to trade one false positive for a new false
+negative.
+
+**Also fixed, same review round:** a stale inline comment in `tests/test_export.py`
+(`# run_agents never runs against an unconfirmed contract`) that predated this file's own
+"Provisional scoring reaches `run_agents`" entry above and no longer described the module in
+general — the assertion itself was never wrong (that specific test builds its `Coordinator`
+directly against a native fixture with `contract=None`, never through `web/jobs.py`'s
+provisional branch), only the comment's blanket claim about the module.
+
+**Documented, not code-changed:** a reviewer confirmed live that a provisional `run_agents` job
+dispatched while an OLDER confirmed plan is still current briefly leaves the visible
+`export.json` — the file the web UI actually reads — showing the provisional run's data, even
+though a constraint submitted in that window still resolves against the older confirmed plan
+(the mechanism this file's own "Provisional scoring reaches `run_agents`" entry above already
+documents and tests: the provisional branch never assigns `plan_state.coordinator`). That
+mechanism itself is intentional and unchanged; this is a narrow addendum recording the one
+consequence the earlier entry didn't spell out — the on-screen plan and the plan a submitted
+constraint will actually affect can transiently disagree in that specific window. Confirmed to
+self-correct: the export reverts to the confirmed plan's own data as soon as the subsequent
+`constraint_submit` re-plans and re-exports.
+
+**Regression tests** (`tests/test_entity_consistency.py`) lock in all six fixes with the
+reviewers' own repro text, plus a companion "must still fire" case for hedge tolerance (item 6's
+guard must never suppress "role: workstation, though this was never actually collected") and a
+companion "must still exclude" case for the widened windows (item 4's regression test above).
+39 tests in that file (was 26), full suite unaffected: 1433 passed, 1 skipped, same as before
+this pass.
+
+---
+
 ## 9. Repository layout
 
 ```

@@ -26,19 +26,75 @@ whether any conversion succeeds) is what gets parsed, here, by code this
 project owns, tests, and can retry or give up on deliberately. See
 `agents/coordinator.py` for the retry-cap-then-skip logic built on top of
 this.
+
+**A second, real incident, found the same way as the first: live testing
+against a real, previously-untested source shape.** A source whose own
+`finding_id` is naturally numeric (a scanner's numeric "Plugin ID", e.g.
+`148676`) produces a model response that emits it as a bare JSON *number*
+(`"finding_id": 148676`) rather than a JSON *string* (`"finding_id":
+"148676"`) -- both encode the identical value, but pydantic v2's default
+(non-strict) mode, unlike v1, does NOT coerce an int/float into a
+`str`-typed field, so validation fails every time. This is not
+occasional model flakiness: `agents/coordinator.py`'s own retry loop
+(`_resolve_output`) rebuilds the IDENTICAL task with no error-specific
+correction on each attempt (unlike `schema_inference.py`'s own retry
+loop, which embeds the previous failure's exact message) -- so a model
+that made this exact type choice once reliably makes it again on every
+retry, exhausting `max_parse_attempts` deterministically and taking every
+finding on that source down with it. `_coerce_str_fields` (below) closes
+this the same way `adapters/configured.py`'s own str-typed-target
+coercion already does for a different parsing seam (CSV cell values):
+accept the same value in the other JSON-legal encoding of it, never
+invent one. Scoped narrowly on purpose -- top-level fields only (every
+schema this module parses is flat), and only when the model's OWN field
+is genuinely typed `str`, never a guess at what the value should be.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from typing import TypeVar
+from typing import Any, TypeVar, get_args, get_origin
 
 from pydantic import BaseModel, ValidationError
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 _JSON_BLOB = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _is_str_typed(annotation: Any) -> bool:
+    """True for `str` itself, or a `Union` (`str | None`, `Optional[str]`)
+    that includes `str` as one of its members -- every shape a top-level
+    field on the models this module parses can legally have. Never
+    matches a field typed anything else (a `Literal[...]` of strings,
+    say), which is a deliberate, narrower target this coercion has no
+    reason to touch."""
+    if annotation is str:
+        return True
+    return get_origin(annotation) is not None and str in get_args(annotation)
+
+
+def _coerce_str_fields(data: dict[str, Any], model: type[BaseModel]) -> dict[str, Any]:
+    """Returns a shallow copy of `data` with every top-level value that is
+    a bare `int`/`float` (never `bool` -- `bool` is an `int` subclass in
+    Python, and stringifying a genuine boolean mistake would hide a real
+    type error rather than tolerate a harmless encoding choice) coerced
+    to its `str()` form, but ONLY for a key `model` itself declares as
+    str-typed (`_is_str_typed`). See module docstring for the concrete
+    incident this exists to close (a numeric `finding_id`/`Plugin ID`
+    emitted as a JSON number)."""
+    fields = model.model_fields
+    coerced = dict(data)
+    for name, value in data.items():
+        if (
+            name in fields
+            and _is_str_typed(fields[name].annotation)
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        ):
+            coerced[name] = str(value)
+    return coerced
 
 
 class AgentOutputParseError(RuntimeError):
@@ -77,6 +133,9 @@ def parse_structured_output(raw: str, model: type[ModelT]) -> ModelT:
     except json.JSONDecodeError as exc:
         raise AgentOutputParseError("no valid JSON object found in agent output", raw=raw) from exc
 
+    if isinstance(parsed, dict):
+        parsed = _coerce_str_fields(parsed, model)
+
     try:
         return model.model_validate(parsed)
     except ValidationError as direct_error:
@@ -84,7 +143,7 @@ def parse_structured_output(raw: str, model: type[ModelT]) -> ModelT:
             (inner,) = parsed.values()
             if isinstance(inner, dict):
                 try:
-                    return model.model_validate(inner)
+                    return model.model_validate(_coerce_str_fields(inner, model))
                 except ValidationError:
                     pass  # fall through to the error below -- unwrapping didn't fix it either
         raise AgentOutputParseError(

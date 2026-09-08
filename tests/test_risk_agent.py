@@ -360,3 +360,188 @@ def test_verify_raises_when_narrative_names_a_different_cve():
     bad = recommendation.model_copy(update={"narrative": "Confusingly, CVE-2019-1068 applies here too."})
     with pytest.raises(ScoringMismatchError, match="CVE-2019-1068"):
         verify_scoring_matches_tool(bad, call_log)
+
+
+# --- neutralized_axes: tool result, structural check, Track C prose check ---
+
+
+def test_score_finding_tool_reports_no_neutralized_axes_for_a_fully_collected_asset():
+    tools, _ = _tools()
+    result = json.loads(tools["score_finding"].run(finding_id="F01"))
+    assert result["neutralized_axes"] == []
+    assert result["role"] == "exchange"
+    assert result["environment"] == "prod"
+    assert result["data_sensitivity"] == "confidential"
+    assert result["criticality"] == 5
+    assert result["internet_exposed"] is True
+
+
+_NEUTRALIZED_ASSET = Asset(
+    asset_id="A60",
+    hostname="WKS-60",
+    os="Windows 10",
+    os_build="19045",
+    role="workstation",
+    criticality=3,
+    internet_exposed=False,
+    environment="prod",
+    data_sensitivity="internal",
+    not_collected=frozenset({"role"}),
+)
+_NEUTRALIZED_FINDING = Finding(
+    finding_id="F60",
+    asset_id="A60",
+    cve_id="CVE-2021-26855",
+    scanner_severity="critical",
+    product="p",
+    version="v",
+    evidence="e",
+)
+_NEUTRALIZED_ENRICHED = EnrichedFinding(finding=_NEUTRALIZED_FINDING, asset=_NEUTRALIZED_ASSET)
+
+
+def _neutralized_tools():
+    call_log: list[dict] = []
+    tools = build_risk_tools({"F60": _NEUTRALIZED_ENRICHED}, {"F60": RESEARCH.model_copy(
+        update={"finding_id": "F60", "cve_id": "CVE-2021-26855"}
+    )}, call_log)
+    return {t.name: t for t in tools}, call_log
+
+
+def test_score_finding_tool_reports_neutralized_axes_for_a_gapped_asset():
+    tools, _ = _neutralized_tools()
+    result = json.loads(tools["score_finding"].run(finding_id="F60"))
+    assert result["neutralized_axes"] == ["role"]
+
+
+def test_verify_raises_when_neutralized_axes_does_not_match_the_tool_result():
+    recommendation, call_log = _matching_recommendation_and_log()  # tool reports neutralized_axes=[]
+    bad = recommendation.model_copy(update={"neutralized_axes": ["role"]})
+    with pytest.raises(ScoringMismatchError):
+        verify_scoring_matches_tool(bad, call_log)
+
+
+def test_verify_passes_when_neutralized_axes_matches_the_tool_result():
+    recommendation, call_log = _matching_recommendation_and_log()
+    verify_scoring_matches_tool(recommendation, call_log)  # neutralized_axes=[] on both sides
+
+
+def _neutralized_recommendation_and_log(field_name: str, prose: str):
+    tools, call_log = _neutralized_tools()
+    tool_result = json.loads(tools["score_finding"].run(finding_id="F60"))
+    base = dict(
+        finding_id="F60",
+        cve_id="CVE-2021-26855",
+        asset_id="A60",
+        hostname="WKS-60",
+        risk_score=tool_result["risk_score"],
+        bucket=tool_result["bucket"],
+        scoring_rationale=tool_result["rationale"],
+        neutralized_axes=tool_result["neutralized_axes"],
+        verdict_summary="Contested finding requiring review.",
+        narrative="Contested finding requiring review.",
+        sources=["score_finding"],
+    )
+    base[field_name] = prose
+    return RiskRecommendation(**base), call_log
+
+
+def test_verify_raises_when_verdict_summary_states_a_neutralized_role_as_fact():
+    recommendation, call_log = _neutralized_recommendation_and_log(
+        "verdict_summary", "This asset's role is workstation, so lateral movement is limited."
+    )
+    with pytest.raises(ScoringMismatchError, match="role"):
+        verify_scoring_matches_tool(recommendation, call_log)
+
+
+def test_verify_raises_when_narrative_states_a_neutralized_role_as_fact():
+    recommendation, call_log = _neutralized_recommendation_and_log(
+        "narrative", "This asset's role is workstation, a standard corporate device."
+    )
+    with pytest.raises(ScoringMismatchError, match="role"):
+        verify_scoring_matches_tool(recommendation, call_log)
+
+
+def test_verify_does_not_false_positive_on_the_known_collision_phrase():
+    recommendation, call_log = _neutralized_recommendation_and_log(
+        "narrative", "This is a dev workstation with no other findings of note."
+    )
+    verify_scoring_matches_tool(recommendation, call_log)  # must not raise
+
+
+def test_verify_passes_when_narrative_avoids_stating_the_neutralized_value():
+    recommendation, call_log = _neutralized_recommendation_and_log(
+        "narrative", "This asset's role was never determined by its source."
+    )
+    verify_scoring_matches_tool(recommendation, call_log)  # must not raise
+
+
+# --- build_risk_task: conditional annotation + neutralized_axes wiring ------
+
+
+def test_build_risk_task_states_axis_values_plainly_when_nothing_is_neutralized():
+    tools = build_risk_tools({"F01": ENRICHED}, {"F01": RESEARCH}, [])
+    agent = build_risk_agent(tools, llm=_fake_llm())
+    task = build_risk_task(ENRICHED, RESEARCH, ENVIRONMENT, agent)
+    assert "role exchange," in task.description
+    assert "NOT COLLECTED" not in task.description
+    assert "neutralized_axes" in task.expected_output
+
+
+# --- confirmed Defender round-trip: a REAL non-provisional neutralized run --
+
+
+def test_confirmed_defender_finding_round_trips_through_verify_scoring_matches_tool():
+    """The risk.py half of the identical safety-property check
+    test_environment_agent.py's own Defender round-trip test performs --
+    the expected_output change requiring neutralized_axes to be echoed
+    must not falsely fail a REAL confirmed run against genuinely
+    neutralized axes (data/defender-sample/)."""
+    from pathlib import Path
+
+    from rhinosecure.adapters import get_adapter
+    from rhinosecure.ingest import load_batch
+
+    adapter = get_adapter("defender")
+    real_assets, real_findings = load_batch(Path("data/defender-sample"), adapter)
+    finding = next(f for f in real_findings if f.finding.finding_id == "MDVM-F3537E29A8CD2380")
+
+    research = ResearchFinding(
+        finding_id=finding.finding.finding_id, cve_id=finding.finding.cve_id,
+        scanner_severity=finding.finding.scanner_severity, is_kev=True,
+        exploitation_summary="Confirmed KEV, ZeroLogon.", sources=["nvd", "kev"],
+    )
+    call_log: list[dict] = []
+    tools = {
+        t.name: t
+        for t in build_risk_tools({finding.finding.finding_id: finding}, {finding.finding.finding_id: research}, call_log)
+    }
+    tool_result = json.loads(tools["score_finding"].run(finding_id=finding.finding.finding_id))
+    assert tool_result["neutralized_axes"] == ["data_sensitivity", "environment", "role"]
+
+    recommendation = RiskRecommendation(
+        finding_id=tool_result["finding_id"], cve_id=tool_result["cve_id"],
+        asset_id=tool_result["asset_id"], hostname=tool_result["hostname"],
+        risk_score=tool_result["risk_score"], bucket=tool_result["bucket"],
+        scoring_rationale=tool_result["rationale"],
+        constraints_applied=tool_result["constraints_applied"],
+        neutralized_axes=tool_result["neutralized_axes"],
+        verdict_summary="Confirmed KEV finding requiring urgent attention.",
+        narrative=(
+            "This asset's role, environment, and data sensitivity were never determined by this "
+            "source, so those facts are unknown; scoring reflects that honestly."
+        ),
+        sources=["Vulnerability Research", "score_finding"],
+    )
+    verify_scoring_matches_tool(recommendation, call_log)  # must not raise
+
+
+def test_build_risk_task_annotates_neutralized_axis_values_inline():
+    neutralized_environment = ENVIRONMENT.model_copy(
+        update={"role": "workstation", "neutralized_axes": ["role"]}
+    )
+    tools = build_risk_tools({"F01": ENRICHED}, {"F01": RESEARCH}, [])
+    agent = build_risk_agent(tools, llm=_fake_llm())
+    task = build_risk_task(ENRICHED, RESEARCH, neutralized_environment, agent)
+    assert "role workstation (NOT COLLECTED for this source -- placeholder, not a fact)" in task.description
+    assert "do not state any of them as an observed fact" in task.description

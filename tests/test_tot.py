@@ -250,6 +250,16 @@ def test_parse_and_check_strategy_raises_when_echoed_strategy_is_wrong():
 # --- _parse_check_strategy_and_cve (entity-consistency, on top of the above) -
 
 
+def _root_with_cve(cve_id: str) -> ToTRoot:
+    """A ToTRoot whose enriched.finding.cve_id is `cve_id` and whose asset
+    has NO neutralized axes (ASSET.not_collected is empty) -- isolates the
+    CVE-mention checks below from the neutralized-axis check, which has
+    its own dedicated tests further down this file."""
+    finding = FINDING.model_copy(update={"cve_id": cve_id})
+    enriched = ENRICHED.model_copy(update={"finding": finding})
+    return ToTRoot(enriched=enriched, research=RESEARCH, environment=ENVIRONMENT, risk=RISK)
+
+
 def test_parse_check_strategy_and_cve_passes_when_only_the_real_cve_is_named():
     task = SimpleNamespace(
         output=SimpleNamespace(
@@ -257,7 +267,7 @@ def test_parse_check_strategy_and_cve_passes_when_only_the_real_cve_is_named():
         )
     )
     result = _parse_check_strategy_and_cve(
-        task, ProposalOutput, Strategy.BUILD_CONTROL, "CVE-2021-26855", "proposal"
+        task, ProposalOutput, Strategy.BUILD_CONTROL, _root_with_cve("CVE-2021-26855"), "proposal"
     )
     assert "CVE-2021-26855" in result.proposal
 
@@ -266,7 +276,9 @@ def test_parse_check_strategy_and_cve_raises_on_a_different_cve_in_proposal():
     raw = json.dumps({"strategy": "build_control", "proposal": "Actually CVE-2020-1472 is the real issue."})
     task = SimpleNamespace(output=SimpleNamespace(raw=raw))
     with pytest.raises(AgentOutputParseError, match="CVE-2020-1472"):
-        _parse_check_strategy_and_cve(task, ProposalOutput, Strategy.BUILD_CONTROL, "CVE-2021-26855", "proposal")
+        _parse_check_strategy_and_cve(
+            task, ProposalOutput, Strategy.BUILD_CONTROL, _root_with_cve("CVE-2021-26855"), "proposal"
+        )
 
 
 def test_parse_check_strategy_and_cve_checks_justification_for_critique_output():
@@ -278,7 +290,7 @@ def test_parse_check_strategy_and_cve_checks_justification_for_critique_output()
     task = SimpleNamespace(output=SimpleNamespace(raw=raw))
     with pytest.raises(AgentOutputParseError, match="CVE-2019-1068"):
         _parse_check_strategy_and_cve(
-            task, CritiqueOutput, Strategy.BUILD_CONTROL, "CVE-2021-26855", "justification"
+            task, CritiqueOutput, Strategy.BUILD_CONTROL, _root_with_cve("CVE-2021-26855"), "justification"
         )
 
 
@@ -290,8 +302,112 @@ def test_parse_check_strategy_and_cve_still_checks_strategy_first():
     task = SimpleNamespace(output=SimpleNamespace(raw=raw))
     with pytest.raises(AgentOutputParseError, match="expected strategy"):
         _parse_check_strategy_and_cve(
-            task, ProposalOutput, Strategy.EMERGENCY_CHANGE, "CVE-2021-26855", "proposal"
+            task, ProposalOutput, Strategy.EMERGENCY_CHANGE, _root_with_cve("CVE-2021-26855"), "proposal"
         )
+
+
+# --- _describe_root: conditional neutralized-axis annotation ----------------
+
+
+def _root_with_neutralized_risk_axes(*axes: str) -> ToTRoot:
+    """A ToTRoot whose RiskRecommendation.neutralized_axes lists `axes` --
+    for _describe_root's own conditional-annotation check, which reads
+    that field directly (it is Risk's own already-verified field, not
+    re-derived from the asset here)."""
+    risk = RISK.model_copy(update={"neutralized_axes": list(axes)})
+    return ToTRoot(enriched=ENRICHED, research=RESEARCH, environment=ENVIRONMENT, risk=risk)
+
+
+def test_describe_root_states_values_plainly_when_nothing_is_neutralized():
+    text = tot_module._describe_root(ROOT)
+    assert "role workstation," in text
+    assert "environment prod," in text
+    assert "internet_exposed: False," in text
+    assert "NOT COLLECTED" not in text
+    assert "Neutralized axes" not in text
+
+
+def test_describe_root_annotates_neutralized_axis_values_inline():
+    root = _root_with_neutralized_risk_axes("role", "environment", "internet_exposed")
+    text = tot_module._describe_root(root)
+    assert "role workstation (NOT COLLECTED for this source -- placeholder, not a fact)" in text
+    assert "environment prod (NOT COLLECTED for this source -- placeholder, not a fact)" in text
+    assert "internet_exposed: False (NOT COLLECTED for this source -- placeholder, not a fact)" in text
+
+
+def test_describe_root_lists_neutralized_axes_explicitly():
+    root = _root_with_neutralized_risk_axes("criticality", "data_sensitivity")
+    text = tot_module._describe_root(root)
+    assert "Neutralized axes" in text
+    assert "criticality" in text
+    assert "data_sensitivity" in text
+    # criticality/data_sensitivity have no bald-stated value line in this
+    # template (EnvironmentAssessment doesn't carry either field) -- only
+    # role/environment/internet_exposed get the inline annotation.
+    assert "NOT COLLECTED for this source -- placeholder, not a fact" not in text.split("Neutralized axes")[0]
+
+
+# --- _parse_check_strategy_and_cve: neutralized-axis check (Track C) --------
+
+
+def _root_with_not_collected(*fields: str) -> ToTRoot:
+    """A ToTRoot whose enriched.asset.not_collected names `fields` --
+    ground truth for _parse_check_strategy_and_cve's own neutralized-axis
+    check, which derives neutralized_axes_for(root.enriched.asset)
+    directly (scoring's own ground truth), not root.risk.neutralized_axes
+    (already-model-authored output verified elsewhere)."""
+    asset = ASSET.model_copy(update={"not_collected": frozenset(fields)})
+    enriched = ENRICHED.model_copy(update={"asset": asset})
+    risk = RISK.model_copy(update={"neutralized_axes": sorted(fields)})
+    return ToTRoot(enriched=enriched, research=RESEARCH, environment=ENVIRONMENT, risk=risk)
+
+
+def test_parse_check_strategy_and_cve_passes_when_no_axis_is_neutralized():
+    # ROOT's asset has empty not_collected -- stating the real role plainly
+    # must never be flagged.
+    task = SimpleNamespace(
+        output=SimpleNamespace(
+            raw=json.dumps(
+                {"strategy": "build_control", "proposal": "The role is workstation, standard stuff."}
+            )
+        )
+    )
+    result = _parse_check_strategy_and_cve(task, ProposalOutput, Strategy.BUILD_CONTROL, ROOT, "proposal")
+    assert "workstation" in result.proposal
+
+
+def test_parse_check_strategy_and_cve_raises_on_a_neutralized_axis_stated_as_fact():
+    raw = json.dumps({
+        "strategy": "build_control",
+        "proposal": "This asset's role is workstation, so lateral movement is limited.",
+    })
+    task = SimpleNamespace(output=SimpleNamespace(raw=raw))
+    root = _root_with_not_collected("role")
+    with pytest.raises(AgentOutputParseError, match="role"):
+        _parse_check_strategy_and_cve(task, ProposalOutput, Strategy.BUILD_CONTROL, root, "proposal")
+
+
+def test_parse_check_strategy_and_cve_neutralized_check_does_not_false_positive_on_collision_prose():
+    # The known collision case (CLAUDE.md's own provisional-run entry) --
+    # "workstation" appears, "role" never does, so this must pass cleanly
+    # even though role IS neutralized for this asset.
+    raw = json.dumps({"strategy": "build_control", "proposal": "This is a dev workstation used for testing."})
+    task = SimpleNamespace(output=SimpleNamespace(raw=raw))
+    root = _root_with_not_collected("role")
+    result = _parse_check_strategy_and_cve(task, ProposalOutput, Strategy.BUILD_CONTROL, root, "proposal")
+    assert "workstation" in result.proposal
+
+
+def test_parse_check_strategy_and_cve_neutralized_check_applies_to_critique_justification_too():
+    raw = json.dumps({
+        "strategy": "build_control", "risk_reduction": 5, "operational_cost": 5,
+        "constraint_compliance": 5, "evidence_strength": 5, "contradicting_evidence": 5,
+        "justification": "Strong strategy, and note this asset's role is workstation-class.",
+    })
+    task = SimpleNamespace(output=SimpleNamespace(raw=raw))
+    root = _root_with_not_collected("role")
+    with pytest.raises(AgentOutputParseError, match="role"):
+        _parse_check_strategy_and_cve(task, CritiqueOutput, Strategy.BUILD_CONTROL, root, "justification")
 
 
 # --- ToTDispatchError.usage / .raw ---------------------------------------------

@@ -89,6 +89,12 @@ class _QueuedFakeCrew:
                         "bucket": tool_result["bucket"],
                         "scoring_rationale": tool_result["rationale"],
                         "constraints_applied": tool_result["constraints_applied"],
+                        # Echoed from the real tool result, same as every
+                        # other field here -- [] for every existing test's
+                        # fully-collected fixtures, matching what the
+                        # implicit pydantic default already produced before
+                        # this field existed.
+                        "neutralized_axes": tool_result.get("neutralized_axes", []),
                         "verdict_summary": "fake verdict summary.",
                         "narrative": "fake narrative",
                         "sources": ["fake"],
@@ -549,6 +555,319 @@ def test_run_deterministic_scores_provisionally_against_an_unconfirmed_upload_co
 
     export_data = json.loads((tmp_path / "export.json").read_text(encoding="utf-8"))
     assert export_data["provisional"] is True
+
+
+def test_run_agents_scores_provisionally_against_an_unconfirmed_upload_contract(
+    client: TestClient, tmp_path: Path, monkeypatch
+):
+    """The identical CLAUDE.md 'drop a CSV, get a plan' branch
+    `test_run_deterministic_scores_provisionally_against_an_unconfirmed_
+    upload_contract` exercises, now through the full 4-agent pipeline
+    instead of the deterministic-only one -- CLAUDE.md's provisional-run
+    entry, `_run_run_agents`'s new provisional branch. Confirms: the job
+    succeeds, provisional=True is reported (job result AND export), and
+    `plan_state.coordinator`/`.memory`/`.active_source`/`.findings` are
+    ALL left untouched -- the provisional Coordinator this dispatches is
+    never committed as "the current plan" (point 5 of that entry: this is
+    what makes constraint_submit's continued refusal against a
+    provisional plan a structural fact, not a guard this handler has to
+    add itself)."""
+    from rhinosecure.adapters.config_io import write_contract
+    from rhinosecure.adapters.probe import profile_source
+    from rhinosecure.agents.schema_inference import (
+        AdapterProposal,
+        Generator,
+        assemble_provisional_contract,
+        check_grounding,
+    )
+    from rhinosecure.scoring import neutralized_axes_for
+
+    monkeypatch.setattr(jobs_module, "REPO_ROOT", REPO_ROOT)
+
+    upload_id = "9" * 32
+    upload_dir = uploads_module.DEFAULT_UPLOADS_DIR / upload_id
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "mystery.csv").write_text(
+        "Asset_ID,Hostname,Finding_ID,Cve,Col\n"
+        "A01,EXCH01,F01,CVE-2021-26855,srv\n",
+        encoding="utf-8",
+    )
+    adapters_dir = tmp_path / "adapters"
+    monkeypatch.setattr(jobs_module, "resolve_config_path", lambda name: adapters_dir / f"{name}.json")
+    name = jobs_module._default_propose_name(upload_id)
+
+    data = _full_proposal_dict(name)
+    data["asset"]["role"] = {"status": "unresolved", "candidate_columns": [], "reason": "test"}
+    data["asset"]["criticality"] = {"status": "unresolved", "candidate_columns": [], "reason": "test"}
+    proposal = AdapterProposal.model_validate(data)
+    profiles = {p.path.name: p for p in profile_source(upload_dir)}
+    report = check_grounding(proposal, profiles)
+    generator = Generator(
+        tool="x", model="y", prompt_tokens=1, completion_tokens=1, estimated_cost_usd=0.0,
+        attempts=1, call_log_digest="sha256:" + "a" * 64,
+    )
+    contract, notes = assemble_provisional_contract(
+        proposal, profiles, report, generator=generator, generated_at="2026-01-01T00:00:00Z"
+    )
+    assert contract is not None, notes.hard_stop_reason
+    assert contract.review.state == "proposed"  # never confirmed
+    write_contract(adapters_dir / f"{contract.format}.json", contract)
+
+    # Determine what the REAL provisional adapter actually produces for
+    # this one asset -- exactly what a real model's tool call would see --
+    # so the fake environment/risk JSON below echoes true values instead
+    # of guessing at them.
+    found = jobs_module._resolve_provisional(upload_id)
+    assert found is not None
+    provisional_adapter, resolved = found
+    real_assets, _real_enriched = jobs_module.load_batch(resolved.data_dir, provisional_adapter)
+    real_asset = real_assets["A01"]
+    neutralized = sorted(neutralized_axes_for(real_asset))
+    assert neutralized  # sanity: this test is pointless if nothing is neutralized
+
+    _QueuedFakeCrew.queue = [
+        _research_json("F01", "CVE-2021-26855"),
+        json.dumps({
+            "finding_id": "F01", "cve_id": "CVE-2021-26855", "asset_id": "A01", "hostname": "EXCH01",
+            "os": real_asset.os, "os_build": real_asset.os_build, "os_build_consistent": True,
+            "os_build_consistent_provenance": "model_judgment", "role": real_asset.role,
+            "environment": real_asset.environment, "internet_exposed": real_asset.internet_exposed,
+            "compensating_controls": [], "has_patch_window": real_asset.has_patch_window,
+            "patch_window": real_asset.patch_window, "patch_restrictions": real_asset.patch_restrictions,
+            "neutralized_axes": neutralized,
+            # Deliberately generic -- never names any axis value, so the
+            # Track C entity-consistency check (which this test isn't
+            # trying to re-verify -- see test_environment_agent.py/
+            # test_risk_agent.py/test_tot.py for that) never fires here.
+            "applicability_summary": "Consistent with the reported product/version for this finding.",
+            "sources": ["fake"],
+        }),
+        "F01",
+    ]
+
+    resp = client.post("/api/jobs", json={"kind": "run_agents", "input": {"source_ref": upload_id}})
+    body = _wait_for_terminal(client, resp.json()["job_id"])
+
+    assert body["status"] == "succeeded", body.get("error")
+    assert body["result"]["provisional"] is True
+    assert body["result"]["total_findings"] == 1
+    assert body["result"]["format"] == name
+
+    export_data = json.loads((tmp_path / "export.json").read_text(encoding="utf-8"))
+    assert export_data["provisional"] is True
+    assert export_data["run"]["agents"] is True
+
+    plan_state = client.app.state.plan_state
+    assert plan_state.coordinator is None
+    assert plan_state.memory is None
+    assert plan_state.active_source is None
+    assert plan_state.findings is None
+
+
+def test_run_agents_provisional_branch_never_clobbers_an_existing_confirmed_plan(
+    tmp_path: Path, data_dir_a: Path, monkeypatch
+):
+    """The 'stale unrelated plan' case CLAUDE.md's provisional-run entry
+    (point 5) and this task's own review checklist name explicitly: a
+    provisional run_agents job dispatched AFTER a real, confirmed plan is
+    already current must leave that older plan completely untouched --
+    not just refuse to overwrite it, but never even attempt to."""
+    from rhinosecure.adapters.config_io import write_contract
+    from rhinosecure.adapters.probe import profile_source
+    from rhinosecure.agents.schema_inference import (
+        AdapterProposal,
+        Generator,
+        assemble_provisional_contract,
+        check_grounding,
+    )
+
+    monkeypatch.setattr(jobs_module, "REPO_ROOT", REPO_ROOT)
+    config = JobConfig(data_dir=None, db_path=tmp_path / "mem.db")
+    app = create_app(tmp_path / "export.json", jobs_enabled=True, job_config=config)
+    client = TestClient(app)
+
+    _queue_seed_run("F01", "CVE-2021-26855", "A01", "EXCH01")
+    first = client.post("/api/jobs", json={"kind": "run_agents", "input": {"source_ref": str(data_dir_a)}})
+    _wait_for_terminal(client, first.json()["job_id"])
+    plan_state = app.state.plan_state
+    confirmed_coordinator = plan_state.coordinator
+    assert confirmed_coordinator is not None
+    assert plan_state.active_source.data_dir == data_dir_a
+
+    upload_id = "8" * 32
+    upload_dir = uploads_module.DEFAULT_UPLOADS_DIR / upload_id
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "mystery.csv").write_text(
+        "Asset_ID,Hostname,Finding_ID,Cve,Col\nZ01,ZHOST,F99,CVE-2019-1068,srv\n", encoding="utf-8"
+    )
+    adapters_dir = tmp_path / "adapters"
+    monkeypatch.setattr(jobs_module, "resolve_config_path", lambda name: adapters_dir / f"{name}.json")
+    name = jobs_module._default_propose_name(upload_id)
+    data = _full_proposal_dict(name)
+    data["asset"]["role"] = {"status": "unresolved", "candidate_columns": [], "reason": "test"}
+    proposal = AdapterProposal.model_validate(data)
+    profiles = {p.path.name: p for p in profile_source(upload_dir)}
+    report = check_grounding(proposal, profiles)
+    generator = Generator(
+        tool="x", model="y", prompt_tokens=1, completion_tokens=1, estimated_cost_usd=0.0,
+        attempts=1, call_log_digest="sha256:" + "a" * 64,
+    )
+    contract, notes = assemble_provisional_contract(
+        proposal, profiles, report, generator=generator, generated_at="2026-01-01T00:00:00Z"
+    )
+    assert contract is not None, notes.hard_stop_reason
+    write_contract(adapters_dir / f"{contract.format}.json", contract)
+
+    found = jobs_module._resolve_provisional(upload_id)
+    assert found is not None
+    provisional_adapter, resolved = found
+    real_assets, _ = jobs_module.load_batch(resolved.data_dir, provisional_adapter)
+    real_asset = real_assets["Z01"]
+    from rhinosecure.scoring import neutralized_axes_for
+
+    neutralized = sorted(neutralized_axes_for(real_asset))
+
+    _QueuedFakeCrew.queue = [
+        _research_json("F99", "CVE-2019-1068"),
+        json.dumps({
+            "finding_id": "F99", "cve_id": "CVE-2019-1068", "asset_id": "Z01", "hostname": "ZHOST",
+            "os": real_asset.os, "os_build": real_asset.os_build, "os_build_consistent": True,
+            "os_build_consistent_provenance": "model_judgment", "role": real_asset.role,
+            "environment": real_asset.environment, "internet_exposed": real_asset.internet_exposed,
+            "compensating_controls": [], "has_patch_window": real_asset.has_patch_window,
+            "patch_window": real_asset.patch_window, "patch_restrictions": real_asset.patch_restrictions,
+            "neutralized_axes": neutralized,
+            "applicability_summary": "Consistent with the reported product/version for this finding.",
+            "sources": ["fake"],
+        }),
+        "F99",
+    ]
+
+    second = client.post("/api/jobs", json={"kind": "run_agents", "input": {"source_ref": upload_id}})
+    body = _wait_for_terminal(client, second.json()["job_id"])
+    assert body["status"] == "succeeded", body.get("error")
+    assert body["result"]["provisional"] is True
+
+    # The older, confirmed plan is completely untouched -- same Coordinator
+    # object, same asset index, same active_source.
+    assert plan_state.coordinator is confirmed_coordinator
+    assert plan_state.active_source.data_dir == data_dir_a
+    assert "A01" in plan_state.coordinator._asset_index
+    assert "Z01" not in plan_state.coordinator._asset_index
+
+    # constraint_submit dispatched now applies to the STALE, older
+    # confirmed plan (data_dir_a) -- never to the provisional one just
+    # scored above. This is the documented, accepted behavior CLAUDE.md's
+    # provisional-run entry names (point 5's "Primary" mechanism): a
+    # provisional run never assigns plan_state.coordinator, so
+    # constraint_submit's own plan_state.seed() has no path to it at all.
+    # Queue the Interpreter's response plus the environment/risk re-plan
+    # dispatch submit_constraint triggers for F01 (the confirmed plan's
+    # own, and only, finding) -- interpret_constraint dispatches a
+    # separate Crew this same fake queue serves.
+    _QueuedFakeCrew.queue = [
+        json.dumps({
+            "constraint_kind": "asset", "asset_id": "A01", "effect_kind": "compensating_control",
+            "effect_value": "WAF rule enabled", "patch_limit": None,
+            "affected_finding_ids": ["F01"], "rationale": "fake rationale", "sources": ["fake"],
+        }),
+        _environment_json("F01", "CVE-2021-26855", "A01", "EXCH01"),
+        "F01",
+    ]
+    constraint_resp = client.post(
+        "/api/jobs",
+        json={"kind": "constraint_submit", "input": {"text": "EXCH01 now sits behind a new WAF rule"}},
+    )
+    constraint_body = _wait_for_terminal(client, constraint_resp.json()["job_id"])
+    assert constraint_body["status"] == "succeeded", constraint_body.get("error")
+    # Resolved against A01/EXCH01 (the confirmed plan's own asset) -- never
+    # against Z01/ZHOST, which exists only in the provisional run's data
+    # and was never committed anywhere constraint_submit can see.
+    assert constraint_body["result"]["persisted"] is True
+    assert constraint_body["result"]["interpretation"]["asset_id"] == "A01"
+
+
+def test_constraint_submit_still_raises_plan_not_seeded_after_only_a_provisional_run_agents_job(
+    tmp_path: Path, monkeypatch
+):
+    """The empty-workspace half of the 'stays refusing' guarantee: when
+    NO confirmed plan has ever been established, a provisional run_agents
+    job still leaves nothing for constraint_submit to seed from -- it
+    raises PlanNotSeededError exactly as if no job had ever run at all,
+    not a stale-but-present provisional Coordinator."""
+    from rhinosecure.adapters.config_io import write_contract
+    from rhinosecure.adapters.probe import profile_source
+    from rhinosecure.agents.schema_inference import (
+        AdapterProposal,
+        Generator,
+        assemble_provisional_contract,
+        check_grounding,
+    )
+    from rhinosecure.scoring import neutralized_axes_for
+
+    monkeypatch.setattr(jobs_module, "REPO_ROOT", REPO_ROOT)
+    config = JobConfig(data_dir=None, db_path=tmp_path / "mem.db")
+    app = create_app(tmp_path / "export.json", jobs_enabled=True, job_config=config)
+    client = TestClient(app)
+
+    upload_id = "7" * 32
+    upload_dir = uploads_module.DEFAULT_UPLOADS_DIR / upload_id
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "mystery.csv").write_text(
+        "Asset_ID,Hostname,Finding_ID,Cve,Col\nA01,EXCH01,F01,CVE-2021-26855,srv\n", encoding="utf-8"
+    )
+    adapters_dir = tmp_path / "adapters"
+    monkeypatch.setattr(jobs_module, "resolve_config_path", lambda name: adapters_dir / f"{name}.json")
+    name = jobs_module._default_propose_name(upload_id)
+    data = _full_proposal_dict(name)
+    data["asset"]["role"] = {"status": "unresolved", "candidate_columns": [], "reason": "test"}
+    proposal = AdapterProposal.model_validate(data)
+    profiles = {p.path.name: p for p in profile_source(upload_dir)}
+    report = check_grounding(proposal, profiles)
+    generator = Generator(
+        tool="x", model="y", prompt_tokens=1, completion_tokens=1, estimated_cost_usd=0.0,
+        attempts=1, call_log_digest="sha256:" + "a" * 64,
+    )
+    contract, notes = assemble_provisional_contract(
+        proposal, profiles, report, generator=generator, generated_at="2026-01-01T00:00:00Z"
+    )
+    assert contract is not None, notes.hard_stop_reason
+    write_contract(adapters_dir / f"{contract.format}.json", contract)
+
+    found = jobs_module._resolve_provisional(upload_id)
+    assert found is not None
+    provisional_adapter, resolved = found
+    real_assets, _ = jobs_module.load_batch(resolved.data_dir, provisional_adapter)
+    real_asset = real_assets["A01"]
+    neutralized = sorted(neutralized_axes_for(real_asset))
+
+    _QueuedFakeCrew.queue = [
+        _research_json("F01", "CVE-2021-26855"),
+        json.dumps({
+            "finding_id": "F01", "cve_id": "CVE-2021-26855", "asset_id": "A01", "hostname": "EXCH01",
+            "os": real_asset.os, "os_build": real_asset.os_build, "os_build_consistent": True,
+            "os_build_consistent_provenance": "model_judgment", "role": real_asset.role,
+            "environment": real_asset.environment, "internet_exposed": real_asset.internet_exposed,
+            "compensating_controls": [], "has_patch_window": real_asset.has_patch_window,
+            "patch_window": real_asset.patch_window, "patch_restrictions": real_asset.patch_restrictions,
+            "neutralized_axes": neutralized,
+            "applicability_summary": "Consistent with the reported product/version for this finding.",
+            "sources": ["fake"],
+        }),
+        "F01",
+    ]
+
+    run_resp = client.post("/api/jobs", json={"kind": "run_agents", "input": {"source_ref": upload_id}})
+    run_body = _wait_for_terminal(client, run_resp.json()["job_id"])
+    assert run_body["status"] == "succeeded", run_body.get("error")
+    assert run_body["result"]["provisional"] is True
+
+    constraint_resp = client.post(
+        "/api/jobs", json={"kind": "constraint_submit", "input": {"text": "anything"}}
+    )
+    constraint_body = _wait_for_terminal(client, constraint_resp.json()["job_id"])
+    assert constraint_body["status"] == "failed"
+    assert constraint_body["error"]["type"] == "PlanNotSeededError"
 
 
 # ---------------- run_agents: PlanState really replaces the current plan ----------------

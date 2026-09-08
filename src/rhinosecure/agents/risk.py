@@ -81,7 +81,11 @@ from crewai.tools import BaseTool, tool
 from pydantic import BaseModel
 
 from rhinosecure.agents.constraint_intake import apply_constraints
-from rhinosecure.agents.entity_consistency import find_wrong_cve_mentions
+from rhinosecure.agents.entity_consistency import (
+    find_neutralized_axis_assertions,
+    find_wrong_cve_mentions,
+    neutralized_axis_note,
+)
 from rhinosecure.agents.environment import EnvironmentAssessment
 from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.prompt_safety import UNTRUSTED_TEXT_NOTICE, fence
@@ -89,7 +93,7 @@ from rhinosecure.agents.research import ResearchFinding
 from rhinosecure.llm import get_llm
 from rhinosecure.memory import Memory
 from rhinosecure.schema import AttackTechniqueRef, EnrichedFinding
-from rhinosecure.scoring import score_finding
+from rhinosecure.scoring import neutralized_axes_for, score_finding
 
 ROLE = "Risk & Recommendation"
 
@@ -119,6 +123,14 @@ class RiskRecommendation(BaseModel):
     # when no memory was configured or none were active. See module
     # docstring: this is separate from scoring_rationale on purpose.
     constraints_applied: list[str] = []
+    # Which of criticality/environment/data_sensitivity/role/internet_exposed
+    # this finding's asset SOURCE never determined at all
+    # (scoring.neutralized_axes_for), copied verbatim from score_finding's
+    # result. Defaults to [] so every existing fixture/test is unaffected;
+    # expected_output requires a model to echo it explicitly for the same
+    # reason agents/environment.py's identical field does -- see that
+    # module's docstring.
+    neutralized_axes: list[str] = []
     verdict_summary: str
     narrative: str
     sources: list[str]
@@ -182,10 +194,14 @@ def build_risk_tools(
         bucket. This is the ONLY way to get either -- never estimate them
         yourself. Returns risk_score, bucket, a fully cited rationale
         (severity source, exposure, EPSS/KEV, ATT&CK, impact factors,
-        compensating controls, patch window), and constraints_applied
+        compensating controls, patch window), constraints_applied
         (any active human-supplied constraints that were folded into the
-        asset used for this computation, separate from rationale) to use
-        verbatim."""
+        asset used for this computation, separate from rationale), and
+        neutralized_axes -- any of role/environment/data_sensitivity/
+        criticality/internet_exposed this asset's SOURCE never determined
+        at all. A value returned for an axis named in neutralized_axes is
+        a PLACEHOLDER, not a fact -- never state it as an observed fact in
+        narrative or verdict_summary, not even hedged."""
         enriched = merge_research_into_enriched(
             enriched_by_id[finding_id], research_by_id[finding_id]
         )
@@ -205,6 +221,19 @@ def build_risk_tools(
             "bucket": scored.bucket.value,
             "rationale": list(scored.rationale),
             "constraints_applied": constraints_applied,
+            # Which axes are neutralized (scoring.neutralized_axes_for) plus
+            # the raw values in effect for all five -- needed so
+            # verify_scoring_matches_tool's find_neutralized_axis_assertions
+            # check (below) has value-tokens to check narrative/
+            # verdict_summary against without changing that function's
+            # signature (it only receives recommendation+call_log; this
+            # tool's own logged result is where value-tokens belong).
+            "neutralized_axes": sorted(neutralized_axes_for(enriched.asset)),
+            "role": enriched.asset.role,
+            "environment": enriched.asset.environment,
+            "data_sensitivity": enriched.asset.data_sensitivity,
+            "criticality": enriched.asset.criticality,
+            "internet_exposed": enriched.asset.internet_exposed,
         }
         call_log.append(
             {"tool": "score_finding", "args": {"finding_id": finding_id}, "result": result}
@@ -247,6 +276,24 @@ def build_risk_task(
     agent: Agent,
 ) -> Task:
     finding = enriched.finding
+    neutralized = environment.neutralized_axes
+    role_note = neutralized_axis_note("role", neutralized)
+    env_note = neutralized_axis_note("environment", neutralized)
+    exposed_note = neutralized_axis_note("internet_exposed", neutralized)
+    neutralized_instruction = (
+        (
+            "The following axis/axes were never determined by this asset's "
+            f"source and are marked NOT COLLECTED above: {sorted(neutralized)}. "
+            "Their values shown above are inert PLACEHOLDERS, not facts -- do "
+            "not state any of them as an observed fact in verdict_summary or "
+            "narrative, not even hedged. Copy neutralized_axes from the "
+            "score_finding tool's result verbatim into your own "
+            "neutralized_axes field."
+        )
+        if neutralized
+        else "Copy neutralized_axes from the score_finding tool's result "
+        "verbatim into your own neutralized_axes field (empty list if none)."
+    )
     return Task(
         description=(
             f"{UNTRUSTED_TEXT_NOTICE}\n\n"
@@ -257,12 +304,13 @@ def build_risk_task(
             f"KEV-listed: {research.is_kev}, EPSS: {research.epss_score}.\n"
             f"{fence('RESEARCH EXPLOITATION SUMMARY', research.exploitation_summary)}\n\n"
             "From Environment Analysis: OS "
-            f"{environment.os} (build {environment.os_build}), role {environment.role}, "
-            f"environment {environment.environment}, internet_exposed: "
-            f"{environment.internet_exposed}, has_patch_window: {environment.has_patch_window}.\n"
+            f"{environment.os} (build {environment.os_build}), role {environment.role}{role_note}, "
+            f"environment {environment.environment}{env_note}, internet_exposed: "
+            f"{environment.internet_exposed}{exposed_note}, has_patch_window: {environment.has_patch_window}.\n"
             f"{fence('ENVIRONMENT COMPENSATING_CONTROLS', str(environment.compensating_controls))}\n"
             f"{fence('ENVIRONMENT PATCH_WINDOW', environment.patch_window)}\n"
             f"{fence('ENVIRONMENT APPLICABILITY_SUMMARY', environment.applicability_summary)}\n\n"
+            f"{neutralized_instruction}\n\n"
             f"Call score_finding with finding_id={finding.finding_id!r} exactly once "
             "and copy its risk_score, bucket, rationale, and constraints_applied "
             "into your output verbatim -- do not adjust, round, or reinterpret "
@@ -290,10 +338,14 @@ def build_risk_task(
             "exactly from score_finding), scoring_rationale (its rationale "
             "list, copied verbatim as an array of strings), constraints_applied "
             "(its constraints_applied list, copied verbatim -- empty list if "
-            "the tool returned none), verdict_summary "
+            "the tool returned none), neutralized_axes (its neutralized_axes "
+            "list, copied verbatim -- empty list if the tool returned none; "
+            "REQUIRED even when empty, never omitted), verdict_summary "
             "(exactly two sentences -- the verdict and its main driver, "
-            "skimmable on its own), narrative (the full prose synthesis "
-            "citing Research, Environment, and the scoring rationale), and "
+            "skimmable on its own, and never stating a neutralized axis's "
+            "value as fact), narrative (the full prose synthesis citing "
+            "Research, Environment, and the scoring rationale, and likewise "
+            "never stating a neutralized axis's value as fact), and "
             "sources (a list of strings)."
         ),
         agent=agent,
@@ -347,12 +399,27 @@ def verify_scoring_matches_tool(
             f"{recommendation.finding_id}: constraints_applied does not match the "
             "tool's constraints_applied verbatim"
         )
+    if sorted(recommendation.neutralized_axes) != sorted(tool_result.get("neutralized_axes", [])):
+        raise ScoringMismatchError(
+            f"{recommendation.finding_id}: neutralized_axes does not match the "
+            "tool's neutralized_axes verbatim"
+        )
 
     # verdict_summary/narrative are the two fields this agent actually
     # authors (see RiskRecommendation's own docstring) -- free prose with
     # nothing to diff against byte-for-byte. But a mention of a DIFFERENT
     # CVE ID in either is essentially always wrong, and checkable without
-    # the tool result at all (agents/entity_consistency.py).
+    # the tool result at all (agents/entity_consistency.py). Likewise, a
+    # neutralized axis's placeholder value stated as though it were an
+    # observed fact (Track C) is checkable the same mechanical way.
+    neutralized = tool_result.get("neutralized_axes") or []
+    axis_values = {
+        "role": tool_result.get("role"),
+        "environment": tool_result.get("environment"),
+        "data_sensitivity": tool_result.get("data_sensitivity"),
+        "criticality": tool_result.get("criticality"),
+        "internet_exposed": tool_result.get("internet_exposed"),
+    }
     for field_name, prose in (("verdict_summary", recommendation.verdict_summary), ("narrative", recommendation.narrative)):
         wrong_cves = find_wrong_cve_mentions(prose, recommendation.cve_id)
         if wrong_cves:
@@ -360,3 +427,11 @@ def verify_scoring_matches_tool(
                 f"{recommendation.finding_id}: {field_name} mentions {sorted(wrong_cves)}, a "
                 "different CVE than this finding is about"
             )
+        if neutralized:
+            violated = find_neutralized_axis_assertions(prose, neutralized, axis_values)
+            if violated:
+                raise ScoringMismatchError(
+                    f"{recommendation.finding_id}: {field_name} states a value for neutralized "
+                    f"axis/axes {sorted(violated)} as though it were an observed fact -- this "
+                    "source never determined it (see neutralized_axes)"
+                )

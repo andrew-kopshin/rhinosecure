@@ -12,16 +12,20 @@ DEMO_DIR = Path(__file__).resolve().parents[1] / "data" / "demo"
 
 FINDING_KEYS = {
     "finding_id", "cve_id", "asset_id", "hostname", "bucket", "risk_score",
-    "threat_score", "impact_score", "is_kev", "asset", "rationale", "verdict_summary",
-    "narrative", "constraints_applied", "cited_text", "sources", "not_collected",
-    "asset_not_collected", "has_tot",
+    "threat_score", "impact_score", "is_kev", "asset", "rationale", "decomposition",
+    "verdict_summary", "narrative", "constraints_applied", "cited_text", "sources",
+    "not_collected", "asset_not_collected", "has_tot",
 }
-# The deterministic path ALONE gets a structured decomposition (CLAUDE.md's
-# "drop a CSV, get a plan" spec: "This must come from the deterministic
-# scorer, with no LLM involved") -- agents/risk.py's own scoring_rationale
-# is prose, not scoring.ScoreDecomposition, and _agents_finding_entry
-# (export.py) deliberately does not carry one.
-DET_FINDING_KEYS = FINDING_KEYS | {"decomposition"}
+# Both the deterministic AND agents paths carry a structured decomposition.
+# The deterministic path's comes straight off its own ScoredFinding
+# (already computed); the agents path's is a LIVE recompute
+# (export._agents_decomposition, mirroring agents/risk.py's
+# score_finding_tool exactly, constraint overlay included) -- see that
+# function's own docstring for why it can't just reuse a stored value
+# (RiskRecommendation carries no ScoreDecomposition of its own). Both
+# shapes are identical -- see DECOMPOSITION_THREAT_KEYS/
+# DECOMPOSITION_IMPACT_KEYS below -- so one constant now covers both.
+DET_FINDING_KEYS = FINDING_KEYS
 DECOMPOSITION_THREAT_KEYS = {
     "severity_base", "severity_source", "internet_exposed", "internet_exposed_neutralized",
     "epss", "is_kev", "likelihood_multiplier", "attack_prevalence",
@@ -223,6 +227,7 @@ def test_agents_export_carries_contract_provenance_for_a_config_driven_run(tmp_p
     coordinator = SimpleNamespace(
         contract=contract,
         cache=SnapshotCache(),
+        memory=None,
         _asset_index={},
         state=SimpleNamespace(
             enriched_by_id={}, research_by_id={}, research_failures={},
@@ -570,6 +575,7 @@ class _QueuedFakeCrew:
                     "risk_score": tool_result["risk_score"], "bucket": tool_result["bucket"],
                     "scoring_rationale": tool_result["rationale"],
                     "constraints_applied": tool_result["constraints_applied"],
+                    "neutralized_axes": tool_result.get("neutralized_axes", []),
                     "verdict_summary": "fake verdict summary.", "narrative": "fake narrative",
                     "sources": ["risk-source"],
                 })
@@ -674,7 +680,12 @@ def test_agents_export_full_shape_with_contested_finding_and_constraint(monkeypa
 
     assert data["run"]["agents"] is True
     assert data["provenance"] is None  # this Coordinator was built with no contract (native)
-    assert data["provisional"] is False  # run_agents never runs against an unconfirmed contract
+    # provisional=False because this Coordinator was built directly against a
+    # native fixture with contract=None -- not routed through web/jobs.py's
+    # `_run_run_agents`, which does have a provisional branch that runs the
+    # full agent pipeline against an unconfirmed upload contract (CLAUDE.md's
+    # "Provisional scoring reaches run_agents and Tree-of-Thought" entry).
+    assert data["provisional"] is False
     assert data["pipeline"]["agents"]["status"] == "completed"
     assert data["pipeline"]["tot"]["status"] == "completed"
     assert "1 contested finding(s) resolved, 0 failed" in data["pipeline"]["tot"]["detail"]
@@ -691,6 +702,34 @@ def test_agents_export_full_shape_with_contested_finding_and_constraint(monkeypa
         assert entry["threat_score"] is None  # RiskRecommendation carries no such field
         assert entry["impact_score"] is None
         assert set(entry["asset"].keys()) == ASSET_SUMMARY_KEYS
+        assert set(entry["decomposition"]["threat"].keys()) == DECOMPOSITION_THREAT_KEYS
+        assert set(entry["decomposition"]["impact"].keys()) == DECOMPOSITION_IMPACT_KEYS
+
+    # The load-bearing check: F02's exported decomposition is a LIVE
+    # recompute that folds in the active compensating_control constraint
+    # -- not export.py's OTHER, deliberately constraint-free "before"
+    # pattern (_asset_constraint_deltas). If it used that pattern instead,
+    # this would show empty compensating_controls here, silently
+    # disagreeing with what score_finding_tool actually used to produce
+    # F02's own displayed risk_score/bucket.
+    f02_decomposition = by_id["F02"]["decomposition"]
+    assert f02_decomposition["impact"]["compensating_controls"] == ["WAF rule enabled"]
+    # And it must AGREE with the real, live score_finding_tool result for
+    # F02 -- reconstructed here the identical way agents/risk.py's tool
+    # does, so this is a genuine cross-check, not a tautology against
+    # export.py's own code.
+    from rhinosecure.agents.risk import merge_research_into_enriched
+    from rhinosecure.agents.constraint_intake import apply_constraints
+    from rhinosecure.scoring import score_finding
+
+    f02_enriched = coordinator.state.enriched_by_id["F02"]
+    f02_research = coordinator.state.research_by_id["F02"]
+    f02_merged = merge_research_into_enriched(f02_enriched, f02_research)
+    active = memory.constraints_for_asset(f02_merged.asset.asset_id)
+    f02_merged = f02_merged.model_copy(update={"asset": apply_constraints(f02_merged.asset, active)})
+    expected_decomposition = score_finding(f02_merged).decomposition
+    assert f02_decomposition["impact"]["composite"] == pytest.approx(expected_decomposition.impact_composite)
+    assert by_id["F02"]["risk_score"] == coordinator.state.risk_by_id["F02"].risk_score
 
     f01 = by_id["F01"]
     assert f01["is_kev"] is False  # _research_json's default
@@ -750,6 +789,72 @@ def test_agents_export_full_shape_with_contested_finding_and_constraint(monkeypa
     assert delta["after_risk_score"] < delta["before_risk_score"]  # the control lowers impact
     assert delta["changed"] is True
     assert "WAF rule enabled" in delta["rationale_added"][0]
+
+
+# --- agents path: memory-less (provisional-shaped) coordinator ----------
+
+
+def test_agents_export_constraints_section_notes_a_memory_less_coordinator(monkeypatch, agents_data_dir, tmp_path):
+    """CLAUDE.md's provisional-run entry, point 3: a Coordinator built
+    with memory=None (a provisional run_agents job never gets a real
+    Memory) must never show an active constraint as "applied" with a
+    no-op delta -- that would misrepresent a constraint that was never
+    actually live for this run's own scoring. The constraint here is real
+    (added to a genuine Memory) and genuinely applies to an asset with
+    findings in this run -- the only thing making it inert is that THIS
+    coordinator was never given that Memory instance at all, exactly the
+    provisional-run shape."""
+    from rhinosecure.agents import coordinator as coordinator_module
+    from rhinosecure.agents.coordinator import Coordinator
+    from rhinosecure.ingest import join_findings
+    from rhinosecure.export import write_run_export
+
+    monkeypatch.setattr(coordinator_module, "Crew", _QueuedFakeCrew)
+
+    # A real Memory, with a real, otherwise-applicable constraint -- but
+    # never passed to the Coordinator below, only to write_run_export
+    # itself (mirroring _run_run_agents' own provisional branch: a
+    # throwaway Memory for read-only constraints-section display, while
+    # the Coordinator that actually scored this run got memory=None).
+    memory = Memory(tmp_path / "mem.db")
+    memory.add_constraint(
+        "A02", "the finance workstation now sits behind a WAF",
+        effect_kind="compensating_control", effect_value="WAF rule enabled",
+    )
+
+    findings = list(join_findings(agents_data_dir / "findings.csv", agents_data_dir / "assets.csv"))
+    _QueuedFakeCrew.queue = [
+        _research_json("F01", "CVE-2021-26855"),
+        _research_json("F02", "CVE-2018-8410"),
+        _research_json("F03", "CVE-2020-1472"),
+        _environment_json("F01", "CVE-2021-26855", "A01", "EXCH01"),
+        _environment_json("F02", "CVE-2018-8410", "A02", "WKS01"),
+        _environment_json("F03", "CVE-2020-1472", "A03", "WKS02"),
+        "F01", "F02", "F03",
+    ]
+
+    coordinator = Coordinator(agents_data_dir, memory=None)  # the provisional shape
+    coordinator.run(findings)
+
+    export_path = tmp_path / "export.json"
+    write_run_export(
+        export_path, fmt="native", data_dir=agents_data_dir, seed=42, offline=False,
+        agents=True, coordinator=coordinator, memory=memory,
+    )
+    data = json.loads(export_path.read_text(encoding="utf-8"))
+
+    # F02's own recommendation never saw the constraint -- score_finding_
+    # tool's `if memory is not None` guard never fired.
+    by_id = {f["finding_id"]: f for f in data["findings"]}
+    assert by_id["F02"]["constraints_applied"] == []
+
+    [constraint] = data["constraints"]["asset_scoped"]
+    assert constraint["asset_id"] == "A02"
+    assert constraint["applies_to_current_run"] is True  # A02 genuinely has findings in this run
+    assert constraint["deltas"] == []  # never computed -- would be a live recompute lie otherwise
+    assert constraint["note"] is not None
+    assert "never given a Memory instance" in constraint["note"]
+    assert "not applied on the deterministic path" not in constraint["note"]  # the WRONG (old, blanket) note
 
 
 def test_agents_export_records_a_tot_failure_without_usage(monkeypatch, agents_data_dir, tmp_path):

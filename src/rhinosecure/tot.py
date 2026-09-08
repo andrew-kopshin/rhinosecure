@@ -115,7 +115,11 @@ from crewai.llms.base_llm import BaseLLM
 from crewai.types.usage_metrics import UsageMetrics
 from pydantic import BaseModel, Field
 
-from rhinosecure.agents.entity_consistency import find_wrong_cve_mentions
+from rhinosecure.agents.entity_consistency import (
+    find_neutralized_axis_assertions,
+    find_wrong_cve_mentions,
+    neutralized_axis_note,
+)
 from rhinosecure.agents.environment import EnvironmentAssessment
 from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.parsing import AgentOutputParseError, parse_structured_output
@@ -123,6 +127,7 @@ from rhinosecure.agents.research import ResearchFinding
 from rhinosecure.agents.risk import RiskRecommendation
 from rhinosecure.llm import get_llm
 from rhinosecure.schema import EnrichedFinding
+from rhinosecure.scoring import neutralized_axes_for
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -388,20 +393,39 @@ def _describe_root(root: ToTRoot) -> str:
     research = root.research
     kev_note = f" (added {research.kev_date_added})" if research.kev_date_added else ""
     rationale = "\n".join(f"  - {line}" for line in root.risk.scoring_rationale)
+    # Same fix as agents/risk.py's build_risk_task, same root cause: a
+    # bald-stated possibly-placeholder value with its caveat buried
+    # elsewhere in the same prompt (scoring_rationale, above) is what
+    # produced confidently-wrong prose in a live test. neutralized_axes
+    # comes from Risk's own already-verified field (root.risk), which
+    # itself was copied verbatim from the score_finding tool.
+    neutralized = root.risk.neutralized_axes
+    role_note = neutralized_axis_note("role", neutralized)
+    env_note = neutralized_axis_note("environment", neutralized)
+    exposed_note = neutralized_axis_note("internet_exposed", neutralized)
+    neutralized_line = (
+        f"\nNeutralized axes (this asset's source never determined these -- their "
+        f"values above are inert placeholders, not facts; never state one of them "
+        f"as an observed fact in your proposal/justification, not even hedged): "
+        f"{sorted(neutralized)}"
+        if neutralized
+        else ""
+    )
     return (
         f"Finding {finding.finding_id}: CVE {research.cve_id} on {env.hostname} "
         f"({env.asset_id}).\n"
         f"Research: NVD severity {research.nvd_severity or 'unknown'} (base score "
         f"{research.nvd_base_score}), KEV-listed: {research.is_kev}{kev_note}, EPSS: "
         f"{research.epss_score}. {research.exploitation_summary}\n"
-        f"Environment: OS {env.os} (build {env.os_build}), role {env.role}, "
-        f"environment {env.environment}, internet_exposed: {env.internet_exposed}, "
+        f"Environment: OS {env.os} (build {env.os_build}), role {env.role}{role_note}, "
+        f"environment {env.environment}{env_note}, internet_exposed: {env.internet_exposed}{exposed_note}, "
         f"compensating_controls: {env.compensating_controls or 'none'}, "
         f"has_patch_window: {env.has_patch_window} "
         f"({env.patch_window or 'none declared'}). {env.applicability_summary}\n"
         f"Deterministic scoring: risk_score={root.risk.risk_score:.1f}/100, "
         "bucket=contested. Rationale:\n"
         f"{rationale}"
+        f"{neutralized_line}"
     )
 
 
@@ -522,17 +546,28 @@ def _parse_and_check_strategy(task: Task, model: type[ModelT], expected: Strateg
 
 
 def _parse_check_strategy_and_cve(
-    task: Task, model: type[ModelT], expected: Strategy, real_cve_id: str, prose_field: str
+    task: Task, model: type[ModelT], expected: Strategy, root: ToTRoot, prose_field: str
 ) -> ModelT:
-    """`_parse_and_check_strategy`, extended with `agents/entity_
-    consistency.py`'s narrow CVE-mention check on `prose_field`
-    (`proposal` for Strategist output, `justification` for Critic
-    output) -- CLAUDE.md's Safety and guardrails "Grounding validation"
-    open item names ToT's Strategist/Critic as the fifth LLM surface
-    with no citation-vs-evidence check at all; this closes the one
-    narrow, mechanical slice of that gap this project can reach without
-    a second, unreliable LLM opinion (see that module's own docstring
-    for what it does and does not catch).
+    """`_parse_and_check_strategy`, extended with two mechanical grounding
+    checks on `prose_field` (`proposal` for Strategist output,
+    `justification` for Critic output), both from `agents/entity_
+    consistency.py` and both derived from `root` internally so every call
+    site passes the same one object rather than unpacking fields by hand:
+
+    1. The narrow CVE-mention check -- CLAUDE.md's Safety and guardrails
+       "Grounding validation" open item names ToT's Strategist/Critic as
+       the fifth LLM surface with no citation-vs-evidence check at all;
+       this closes the one narrow, mechanical slice of that gap this
+       project can reach without a second, unreliable LLM opinion (see
+       that module's own docstring for what it does and does not catch).
+    2. `find_neutralized_axis_assertions` (Track C) -- the identical
+       check `agents/risk.py`'s `verify_scoring_matches_tool` and
+       `agents/environment.py`'s `verify_environment_matches_tool` already
+       run against their own agents' prose, extended to ToT's Strategist/
+       Critic prose. Ground truth comes from `root.enriched.asset`
+       directly (not re-derived from `root.risk.neutralized_axes`, which
+       is itself model output already verified elsewhere, not scoring's
+       own ground truth) via `scoring.neutralized_axes_for`.
 
     Reuses `AgentOutputParseError`, not a new exception type -- the same
     way `_parse_and_check_strategy` itself already reuses that type for
@@ -540,6 +575,7 @@ def _parse_check_strategy_and_cve(
     except clause without widening it."""
     result = _parse_and_check_strategy(task, model, expected)
     prose = getattr(result, prose_field)
+    real_cve_id = root.enriched.finding.cve_id
     wrong_cves = find_wrong_cve_mentions(prose, real_cve_id)
     if wrong_cves:
         raise AgentOutputParseError(
@@ -547,6 +583,23 @@ def _parse_check_strategy_and_cve(
             f"finding ({real_cve_id!r}) is about",
             raw=task.output.raw,
         )
+    asset = root.enriched.asset
+    neutralized = neutralized_axes_for(asset)
+    if neutralized:
+        axis_values = {
+            "role": asset.role,
+            "environment": asset.environment,
+            "data_sensitivity": asset.data_sensitivity,
+            "criticality": asset.criticality,
+            "internet_exposed": asset.internet_exposed,
+        }
+        violated = find_neutralized_axis_assertions(prose, neutralized, axis_values)
+        if violated:
+            raise AgentOutputParseError(
+                f"{prose_field} states a value for neutralized axis/axes {sorted(violated)} "
+                "as though it were an observed fact -- this source never determined it",
+                raw=task.output.raw,
+            )
     return result
 
 
@@ -666,7 +719,7 @@ def _propose_initial(
         lambda i: _build_propose_task(root, strategies[i], agent),
         len(strategies),
         lambda task, i: _parse_check_strategy_and_cve(
-            task, ProposalOutput, strategies[i], root.enriched.finding.cve_id, "proposal"
+            task, ProposalOutput, strategies[i], root, "proposal"
         ),
         max_parse_attempts=max_parse_attempts,
         verbose=verbose,
@@ -693,7 +746,7 @@ def _critique(
         lambda i: _build_critique_task(root, raw_thoughts[i], agent),
         len(raw_thoughts),
         lambda task, i: _parse_check_strategy_and_cve(
-            task, CritiqueOutput, raw_thoughts[i].strategy, root.enriched.finding.cve_id, "justification"
+            task, CritiqueOutput, raw_thoughts[i].strategy, root, "justification"
         ),
         max_parse_attempts=max_parse_attempts,
         verbose=verbose,
@@ -736,7 +789,7 @@ def _refine(
         lambda i: _build_refine_task(root, beam[i], agent),
         len(beam),
         lambda task, i: _parse_check_strategy_and_cve(
-            task, RefinementOutput, beam[i].strategy, root.enriched.finding.cve_id, "proposal"
+            task, RefinementOutput, beam[i].strategy, root, "proposal"
         ),
         max_parse_attempts=max_parse_attempts,
         verbose=verbose,

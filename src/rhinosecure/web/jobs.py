@@ -394,11 +394,12 @@ def _upload_id_from_source_ref(source_ref: str) -> str | None:
 def _find_upload_contract(upload_id: str, data_dir: Path) -> tuple[Path, Contract] | None:
     """The contract-lookup half of `_resolve_upload_source` -- factored out
     so a caller that needs to know "is there ANY contract at all, confirmed
-    or not" (the provisional-run branch of `_run_run_deterministic`) doesn't
-    duplicate the candidate-name search, and `_resolve_upload_source`'s own
-    refusal wording for an unconfirmed contract stays in exactly one place.
-    `None` means nothing has ever been proposed for this upload -- not an
-    error; every caller decides what that means for itself."""
+    or not" (`_resolve_provisional`, shared by `_run_run_deterministic` and
+    `_run_run_agents`) doesn't duplicate the candidate-name search, and
+    `_resolve_upload_source`'s own refusal wording for an unconfirmed
+    contract stays in exactly one place. `None` means nothing has ever been
+    proposed for this upload -- not an error; every caller decides what
+    that means for itself."""
     candidate_names = list(
         dict.fromkeys(
             n
@@ -510,6 +511,78 @@ def resolve_source_ref(source_ref: str) -> ResolvedSource:
     raise IngestError(f"no such data set: {source_ref!r} (looked for {named} and {literal})")
 
 
+def _resolve_provisional(source_ref: str) -> tuple[ConfiguredAdapter, ResolvedSource] | None:
+    """The provisional-run gate shared by `_run_run_deterministic` and
+    `_run_run_agents` (CLAUDE.md's provisional-run entry): an upload whose
+    contract exists but was never confirmed gets scored PROVISIONALLY
+    instead of refused outright -- ordinarily `resolve_source_ref`'s own
+    refusal ("confirmation stays outside this system's automated
+    routing"). Returns `None` when this gate doesn't apply at all -- not
+    an upload (by shape), no upload directory, no contract ever proposed
+    for it, or the contract IS already confirmed -- collapsing all four
+    into the identical "fall through to the ordinary `resolve_source_ref`
+    call" signal every caller already uses the same way.
+
+    Takes the RAW `source_ref`, not a pre-split `upload_id`/`upload_dir`,
+    so every caller shares the ENTIRE gate, including the upload-shape
+    check -- not just the contract-building tail of it. Returns the
+    already-built `ResolvedSource` too (derived from `contract.format`) so
+    neither caller has to reconstruct it a second time."""
+    upload_id = _upload_id_from_source_ref(source_ref)
+    if upload_id is None:
+        return None
+    upload_dir = uploads_module.DEFAULT_UPLOADS_DIR / upload_id
+    if not upload_dir.is_dir():
+        return None
+    found = _find_upload_contract(upload_id, upload_dir)
+    if found is None or found[1].review.state == "confirmed":
+        return None
+    contract = found[1]
+    # `role` gets a `literal` placeholder ONLY via the provisional-
+    # assembly auto-fill (assemble_provisional_contract) -- a real,
+    # confident model proposal never uses `literal` for a per-asset field
+    # like role. Checking the contract itself (rather than trusting stale
+    # state from whatever job proposed it) means this is correct even if
+    # the contract was hand-edited or resolved through the browser
+    # slot-resolution form after the fact.
+    force_not_collected = (
+        frozenset({"role"}) if contract.asset["role"].kind == "literal" else frozenset()
+    )
+    # `ConfiguredAdapter.load_assets`/`.load_findings` run the real
+    # `validate_contract` on every load (docs/adapter-generation.md's
+    # "Order, which is not negotiable"), which includes V18: a
+    # scoring-relevant slot the model mapped at below
+    # `LOW_CONFIDENCE_THRESHOLD` (a REAL mapping, just an unconfident one
+    # -- a different case from an unresolved slot, and not something
+    # assemble_provisional_contract touches at all) requires a
+    # `low_confidence_mappings` attestation. `_provisional()`'s own stamp
+    # clears `review` entirely, so this contract carries none --
+    # confirmed live: a real run against a model output with
+    # asset.environment/internet_exposed both at 0.55 confidence failed
+    # here with exactly this ContractValidationError before this fix.
+    # Placeholder attestations -- the identical "propose-time structural
+    # check only, not a real one" text and mechanism
+    # `_assemble_and_validate`'s own pre-check already uses -- satisfy
+    # V18 without claiming a human reviewed anything; they are attached
+    # to THIS in-memory copy only, never written, exactly like
+    # assemble_contract's placeholder attestations never reach the file
+    # it writes either.
+    placeholder_attestations = [
+        Attestation(item=item, text="provisional run -- not a real attestation", at=_now())
+        for item in missing_attestations(contract)
+    ]
+    contract = contract.model_copy(
+        update={"attestations": list(contract.attestations) + placeholder_attestations}
+    )
+    adapter = ConfiguredAdapter(
+        provisional_stamp(contract),
+        excluding_targets=SCORING_ENUM_TARGETS,
+        force_not_collected=force_not_collected,
+    )
+    resolved = ResolvedSource(data_dir=upload_dir, fmt=contract.format, adapter_config=None)
+    return adapter, resolved
+
+
 class PlanState:
     """One server process's one CURRENT plan: a long-lived `Coordinator` +
     `Memory` pair, seeded lazily rather than at server startup. `export_
@@ -559,24 +632,39 @@ class PlanState:
             on_stage,
         )
 
-    def run_agents_pipeline(self, resolved: ResolvedSource, on_stage: Callable[[str], None] | None = None) -> Coordinator:
-        """The full agent pipeline against `resolved`, REPLACING whatever
-        plan was current before -- the generalized form of what `seed()`
-        used to do only against the server's fixed startup source. Left
-        with the OLD `self.coordinator` still in place if this raises
-        (assignment happens last, same as the original `seed()`), so a
-        failed `run_agents` job never leaves `constraint_submit` pointed
-        at a half-built plan -- it just keeps working against whatever
-        plan was current before the failed attempt."""
+    def _build_and_run_coordinator(
+        self,
+        resolved: ResolvedSource,
+        adapter: Any,
+        *,
+        memory: Memory | None,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> tuple[Coordinator, list[EnrichedFinding]]:
+        """The build-and-run sequence `run_agents_pipeline` (below) and a
+        PROVISIONAL `run_agents` job (`_run_run_agents`'s provisional
+        branch) both need: ingest, build a `Coordinator`, dispatch
+        `run()`. Deliberately does NOT touch `self.coordinator`/`.memory`/
+        `.active_source`/`.findings` -- the caller decides whether and how
+        to commit the result. `run_agents_pipeline` commits unconditionally
+        (see its own docstring); the provisional branch never does at all
+        (CLAUDE.md's provisional-run entry, point 5 -- `constraint_submit`
+        stays refusing against a provisional plan precisely BECAUSE this
+        method's result is never assigned onto `self` for one).
+
+        `memory=None` is what makes a provisional run's `Coordinator`
+        durably constraint-blind, not a convention this method has to
+        enforce itself: `Coordinator.submit_constraint`'s own `if self
+        .memory is None: raise CoordinatorError` guard fires on anything
+        that tries, and `agents/risk.py`'s `score_finding_tool` never
+        queries constraints at all when `memory is None` (`if memory is
+        not None:`) -- both pre-existing guards, doing double duty."""
         if on_stage is not None:
             on_stage("seeding")
         random.seed(self.config.seed)
-        adapter = load_config_adapter(resolved.adapter_config) if resolved.adapter_config else get_adapter(resolved.fmt)
         assets, enriched = load_batch(resolved.data_dir, adapter)
         findings = list(enriched)
         _log_exclusions(adapter, adapter.format)
 
-        memory = Memory(self.config.db_path)
         coordinator = Coordinator(
             resolved.data_dir,
             cache=SnapshotCache(offline=self.config.offline),
@@ -586,6 +674,28 @@ class PlanState:
             contract=getattr(adapter, "contract", None),
         )
         coordinator.run(findings, on_stage=on_stage)
+        return coordinator, findings
+
+    def run_agents_pipeline(self, resolved: ResolvedSource, on_stage: Callable[[str], None] | None = None) -> Coordinator:
+        """The full agent pipeline against `resolved`, REPLACING whatever
+        plan was current before -- the generalized form of what `seed()`
+        used to do only against the server's fixed startup source. Left
+        with the OLD `self.coordinator` still in place if this raises
+        (assignment happens last, same as the original `seed()`), so a
+        failed `run_agents` job never leaves `constraint_submit` pointed
+        at a half-built plan -- it just keeps working against whatever
+        plan was current before the failed attempt.
+
+        Always builds a REAL `Memory` (unlike the provisional branch,
+        which passes `memory=None` to `_build_and_run_coordinator`
+        directly and never calls this method at all) -- this is the
+        CONFIRMED-contract path, where persisting constraints/decisions/
+        runs against this plan is exactly what's supposed to happen."""
+        adapter = load_config_adapter(resolved.adapter_config) if resolved.adapter_config else get_adapter(resolved.fmt)
+        memory = Memory(self.config.db_path)
+        coordinator, findings = self._build_and_run_coordinator(
+            resolved, adapter, memory=memory, on_stage=on_stage
+        )
 
         self.memory = memory
         self.findings = findings
@@ -909,64 +1019,17 @@ def _run_run_deterministic(job: Job, plan_state: PlanState, on_stage: Callable[[
     # routing") -- gets a PROVISIONAL run instead, here and only here. This
     # check runs BEFORE calling resolve_source_ref, never around a refusal
     # it raised: resolve_source_ref itself, and every other caller of it
-    # (run_agents, constraint_submit), is completely untouched. A confirmed
-    # contract, a known built-in format match, or no contract proposed for
-    # this upload at all fall straight through to the identical
-    # resolve_source_ref call this function has always made.
-    provisional_adapter: ConfiguredAdapter | None = None
-    upload_id = _upload_id_from_source_ref(source_ref)
-    if upload_id is not None:
-        upload_dir = uploads_module.DEFAULT_UPLOADS_DIR / upload_id
-        if upload_dir.is_dir():
-            found = _find_upload_contract(upload_id, upload_dir)
-            if found is not None and found[1].review.state != "confirmed":
-                contract = found[1]
-                # `role` gets a `literal` placeholder ONLY via the
-                # provisional-assembly auto-fill (assemble_provisional_
-                # contract) -- a real, confident model proposal never uses
-                # `literal` for a per-asset field like role. Checking the
-                # contract itself (rather than trusting stale state from
-                # whatever job proposed it) means this is correct even if
-                # the contract was hand-edited or resolved through the
-                # browser slot-resolution form after the fact.
-                force_not_collected = (
-                    frozenset({"role"}) if contract.asset["role"].kind == "literal" else frozenset()
-                )
-                # `ConfiguredAdapter.load_assets`/`.load_findings` run the
-                # real `validate_contract` on every load (docs/adapter-
-                # generation.md's "Order, which is not negotiable"), which
-                # includes V18: a scoring-relevant slot the model mapped at
-                # below `LOW_CONFIDENCE_THRESHOLD` (a REAL mapping, just an
-                # unconfident one -- a different case from an unresolved
-                # slot, and not something assemble_provisional_contract
-                # touches at all) requires a `low_confidence_mappings`
-                # attestation. `_provisional()`'s own stamp clears `review`
-                # entirely, so this contract carries none -- confirmed live:
-                # a real run against a model output with asset.environment/
-                # internet_exposed both at 0.55 confidence failed here with
-                # exactly this ContractValidationError before this fix.
-                # Placeholder attestations -- the identical "propose-time
-                # structural check only, not a real one" text and mechanism
-                # `_assemble_and_validate`'s own pre-check already uses --
-                # satisfy V18 without claiming a human reviewed anything;
-                # they are attached to THIS in-memory copy only, never
-                # written, exactly like assemble_contract's placeholder
-                # attestations never reach the file it writes either.
-                placeholder_attestations = [
-                    Attestation(item=item, text="provisional run -- not a real attestation", at=_now())
-                    for item in missing_attestations(contract)
-                ]
-                contract = contract.model_copy(
-                    update={"attestations": list(contract.attestations) + placeholder_attestations}
-                )
-                provisional_adapter = ConfiguredAdapter(
-                    provisional_stamp(contract),
-                    excluding_targets=SCORING_ENUM_TARGETS,
-                    force_not_collected=force_not_collected,
-                )
-                resolved = ResolvedSource(data_dir=upload_dir, fmt=contract.format, adapter_config=None)
-
-    if provisional_adapter is None:
+    # (constraint_submit), is completely untouched. A confirmed contract, a
+    # known built-in format match, or no contract proposed for this upload
+    # at all fall straight through to the identical resolve_source_ref call
+    # this function has always made. `_resolve_provisional` is the SAME
+    # gate `_run_run_agents`'s own provisional branch uses -- see that
+    # function and CLAUDE.md's provisional-run entry.
+    found_provisional = _resolve_provisional(source_ref)
+    if found_provisional is not None:
+        provisional_adapter, resolved = found_provisional
+    else:
+        provisional_adapter = None
         resolved = resolve_source_ref(source_ref)
 
     on_stage("scoring")
@@ -1011,12 +1074,55 @@ def _run_run_agents(job: Job, plan_state: PlanState, on_stage: Callable[[str], N
     """The Router's `run_agents` operation -- the full agent pipeline
     against a resolved `source_ref`, REPLACING whatever plan was current
     on this `PlanState` before (see `PlanState.run_agents_pipeline`'s own
-    docstring on why replacing, not accumulating, is correct here)."""
+    docstring on why replacing, not accumulating, is correct here) --
+    UNLESS `source_ref` names an upload with a proposed-but-unconfirmed
+    contract, in which case this runs the identical PROVISIONAL branch
+    `_run_run_deterministic` has (CLAUDE.md's provisional-run entry,
+    "drop a CSV, get a plan"): the same `_resolve_provisional` gate, the
+    same `excluding_targets=SCORING_ENUM_TARGETS`/`force_not_collected`
+    adapter, but through the full 4-agent pipeline (Research/Environment/
+    Risk/ToT) instead of the deterministic-only one.
+
+    The provisional branch deliberately NEVER commits onto `plan_state`
+    (`self.coordinator`/`.memory`/`.active_source`/`.findings` all stay
+    whatever they were before this job) -- `PlanState._build_and_run_
+    coordinator` is called directly instead of `run_agents_pipeline`,
+    with `memory=None`. This is what makes `constraint_submit` against a
+    provisional plan a structural non-issue rather than a special case
+    this handler has to guard against itself: with nothing committed,
+    the next `constraint_submit` job either finds no plan at all
+    (`PlanNotSeededError`) or re-plans whatever OLDER, confirmed plan was
+    already current -- never this provisional run. See CLAUDE.md's
+    provisional-run entry, point 5, for the full reasoning and the
+    backstop (`Coordinator.submit_constraint`'s own `if self.memory is
+    None: raise CoordinatorError`) that holds even if something ever DID
+    hold a direct reference to this provisional Coordinator.
+
+    `run_agents` still never auto-fires from `ingest_propose` or
+    `run_deterministic` -- this is dispatched only as its own explicit
+    job (or Router `RUN_AGENTS` step, gated by `assert_step_approved`),
+    exactly as before this branch existed."""
     on_stage("resolving source")  # before validation -- a bad input's error must not carry stage=null
     source_ref = _require_source_ref(job, "run_agents")
-    resolved = resolve_source_ref(source_ref)
 
-    coordinator = plan_state.run_agents_pipeline(resolved, on_stage)
+    found_provisional = _resolve_provisional(source_ref)
+    if found_provisional is not None:
+        provisional_adapter, resolved = found_provisional
+        coordinator, _findings = plan_state._build_and_run_coordinator(
+            resolved, provisional_adapter, memory=None, on_stage=on_stage
+        )
+        # Mirrors _run_run_deterministic's own export_memory pattern:
+        # read-only, for the constraints section's display ONLY -- this
+        # coordinator's own scoring never touched memory at all
+        # (memory=None above), so no constraint from this file was ever
+        # actually folded into what was just scored.
+        export_memory = plan_state.memory if plan_state.memory is not None else Memory(plan_state.config.db_path)
+        provisional = True
+    else:
+        resolved = resolve_source_ref(source_ref)
+        coordinator = plan_state.run_agents_pipeline(resolved, on_stage)
+        export_memory = plan_state.memory
+        provisional = False
 
     on_stage("exporting")
     export.write_run_export(
@@ -1027,7 +1133,7 @@ def _run_run_agents(job: Job, plan_state: PlanState, on_stage: Callable[[str], N
         offline=plan_state.config.offline,
         agents=True,
         coordinator=coordinator,
-        memory=plan_state.memory,
+        memory=export_memory,
     )
 
     recommendations = coordinator.ranked()
@@ -1038,6 +1144,7 @@ def _run_run_agents(job: Job, plan_state: PlanState, on_stage: Callable[[str], N
             "format": coordinator.contract.format if coordinator.contract else coordinator.ingest_format,
             "total_findings": len(recommendations),
             "bucket_distribution": dict(bucket_counts),
+            "provisional": provisional,
         },
         export_written=True,
     )

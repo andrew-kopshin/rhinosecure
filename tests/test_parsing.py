@@ -76,3 +76,66 @@ def test_schema_violation_also_carries_raw():
         parse_structured_output(raw, Widget)
     assert exc_info.value.raw == raw
     assert "count" in str(exc_info.value)  # the short message still names what's wrong
+
+
+# --- str-typed field coercion: a real incident from live verification -------
+#
+# A source whose finding_id is naturally numeric (a scanner's "Plugin ID")
+# produced a model response with `"finding_id": 148676` (a JSON number)
+# instead of `"finding_id": "148676"` (a JSON string) -- pydantic v2's
+# default mode does not coerce int->str, so this failed validation
+# identically on every one of coordinator.py's 3 retry attempts (that loop
+# rebuilds the SAME task with no error-specific correction), taking every
+# finding on that source down with it. Regression-tested here directly
+# against parse_structured_output, the shared seam every agent routes
+# through.
+
+
+class IdLike(BaseModel):
+    finding_id: str
+    count: int
+
+
+def test_numeric_json_value_is_coerced_for_a_str_typed_field():
+    result = parse_structured_output('{"finding_id": 148676, "count": 3}', IdLike)
+    assert result == IdLike(finding_id="148676", count=3)
+
+
+def test_float_json_value_is_also_coerced_for_a_str_typed_field():
+    result = parse_structured_output('{"finding_id": 148676.0, "count": 3}', IdLike)
+    assert result.finding_id == "148676.0"
+
+
+def test_numeric_coercion_also_applies_inside_a_single_key_wrapper():
+    result = parse_structured_output('{"finding": {"finding_id": 148676, "count": 3}}', IdLike)
+    assert result == IdLike(finding_id="148676", count=3)
+
+
+def test_coercion_never_touches_a_genuinely_int_typed_field():
+    """count is legitimately typed int -- a wrong type there must still
+    raise, not be silently coerced into something else."""
+    with pytest.raises(AgentOutputParseError):
+        parse_structured_output('{"finding_id": "F01", "count": "not a number"}', IdLike)
+
+
+def test_coercion_never_stringifies_a_bool_for_a_str_typed_field():
+    """bool is an int subclass in Python -- must not be swept up by the
+    int/float coercion, since that would hide a real type mistake
+    (a bool value can never be a legitimate encoding of a str field)."""
+    with pytest.raises(AgentOutputParseError):
+        parse_structured_output('{"finding_id": true, "count": 3}', IdLike)
+
+
+def test_a_correctly_str_typed_value_is_unaffected():
+    result = parse_structured_output('{"finding_id": "F01", "count": 3}', IdLike)
+    assert result.finding_id == "F01"
+
+
+class OptionalIdLike(BaseModel):
+    finding_id: str | None = None
+    count: int
+
+
+def test_coercion_applies_to_an_optional_str_typed_field_too():
+    result = parse_structured_output('{"finding_id": 148676, "count": 3}', OptionalIdLike)
+    assert result.finding_id == "148676"

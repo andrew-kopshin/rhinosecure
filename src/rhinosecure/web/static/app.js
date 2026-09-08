@@ -493,11 +493,28 @@ function decompositionHtml(f) {
     ? `<p class="hint">Excluded axes were never trusted for this score at all -- not defaulted, not guessed. See the coverage summary on the Overview tab.</p>`
     : "";
 
+  /* impact_score/threat_score are the deterministic path's RAW
+   * (pre-percentage) ScoredFinding terms -- RiskRecommendation (the
+   * agents path) carries no equivalent, so _agents_finding_entry sets
+   * both to null on purpose (export.py's own docstring: "never
+   * fabricated"). Before this function's `decomposition` argument could
+   * ever be non-null on the agents path (an earlier gap, now closed --
+   * see CLAUDE.md's provisional-run entry), this branch was unreachable
+   * there; guard rather than assume a number exists, so an agents-path
+   * finding's breakdown renders without the raw header number instead of
+   * throwing on `null.toFixed`. */
+  const impactHeader = f.impact_score !== null && f.impact_score !== undefined
+    ? `Impact ${f.impact_score.toFixed(2)} `
+    : "Impact ";
+  const threatHeader = f.threat_score !== null && f.threat_score !== undefined
+    ? `Threat ${f.threat_score.toFixed(2)} `
+    : "Threat ";
+
   return `
     <div class="detail-block decomposition-block">
       <h4>Score decomposition</h4>
-      <p class="decomposition-line"><strong>Impact ${f.impact_score.toFixed(2)}</strong> (${impactParts.join(", ")}${controlsPart})</p>
-      <p class="decomposition-line"><strong>Threat ${f.threat_score.toFixed(2)}</strong> (${threatParts.join(", ")})</p>
+      <p class="decomposition-line"><strong>${impactHeader}</strong>(${impactParts.join(", ")}${controlsPart})</p>
+      <p class="decomposition-line"><strong>${threatHeader}</strong>(${threatParts.join(", ")})</p>
       ${neutralizedNote}
     </div>
   `;

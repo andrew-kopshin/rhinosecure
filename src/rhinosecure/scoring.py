@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from rhinosecure.schema import (
+    Asset,
     AssetRole,
     DataSensitivity,
     EnrichedFinding,
@@ -323,6 +324,23 @@ IMPACT_AXIS_TARGETS: frozenset[str] = frozenset(IMPACT_COMPOSITE_WEIGHTS)
 #: applies to; kept as a frozenset anyway so callers use the identical
 #: `in`/intersection idiom for both axes rather than two different shapes.
 THREAT_AXIS_TARGETS: frozenset[str] = frozenset({"internet_exposed"})
+
+
+def neutralized_axes_for(asset: Asset) -> frozenset[str]:
+    """Which scoring axes this asset's SOURCE never determined at all --
+    the same union `score_finding` computes inline, extracted so callers
+    outside this module (agents/environment.py's and agents/risk.py's tool
+    results, chiefly) can compute the identical set without duplicating the
+    union or importing Asset.not_collected semantics themselves.
+
+    Pure extraction, not a behavior change: IMPACT_AXIS_TARGETS and
+    THREAT_AXIS_TARGETS are disjoint (four Impact-composite terms, one
+    Threat term), so `(IMPACT_AXIS_TARGETS | THREAT_AXIS_TARGETS) &
+    asset.not_collected` is mathematically identical to the
+    impact_neutralized | threat_neutralized union score_finding already
+    builds -- see CLAUDE.md's provisional-run entry for why this needed a
+    shared, importable name instead of staying inlined."""
+    return (IMPACT_AXIS_TARGETS | THREAT_AXIS_TARGETS) & asset.not_collected
 
 
 def impact_composite(inputs: ImpactInputs, *, neutralized_axes: frozenset[str] = frozenset()) -> float:
@@ -652,7 +670,7 @@ def score_finding(enriched: EnrichedFinding) -> ScoredFinding:
     # contract run.
     impact_neutralized = IMPACT_AXIS_TARGETS & asset.not_collected
     threat_neutralized = THREAT_AXIS_TARGETS & asset.not_collected
-    neutralized_axes = impact_neutralized | threat_neutralized
+    neutralized_axes = neutralized_axes_for(asset)
 
     threat_inputs = build_threat_inputs(enriched)
     impact_inputs = build_impact_inputs(enriched)

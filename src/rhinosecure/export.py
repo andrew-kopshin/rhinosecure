@@ -399,6 +399,43 @@ def _det_finding_entry(
     }
 
 
+def _agents_decomposition(coordinator: Coordinator, enriched: Any, research: Any | None) -> dict[str, Any] | None:
+    """Live recompute of one agents-path finding's `ScoreDecomposition` --
+    mirrors `agents/risk.py`'s `score_finding_tool` EXACTLY: merge
+    Research's enrichment signals into the ground-truth `EnrichedFinding`
+    (`merge_research_into_enriched`), fold in any active constraint via
+    `coordinator.memory` (identical `constraints_for_asset`/
+    `apply_constraints` calls, same condition -- `if coordinator.memory is
+    not None`), then `scoring.score_finding`.
+
+    Deliberately NOT `_asset_constraint_deltas`'s constraint-free "before"
+    pattern -- that pattern exists specifically to isolate a constraint's
+    own effect for a diff, so reusing it here would silently disagree
+    with the actual displayed `risk_score`/`bucket` whenever a real
+    constraint is active on a confirmed run (a new bug this function must
+    not introduce). For the provisional case this is moot either way --
+    `coordinator.memory` is `None`, so the constraint branch below is
+    always skipped, matching what `score_finding_tool` itself would have
+    done had it been reachable at all.
+
+    `None` when `research` is `None`: Research failed upstream for this
+    finding, so `score_finding_tool` could never have been called for it
+    either -- there is nothing honest to recompute, the same "absent, not
+    fabricated" rule this module's docstring states for every other
+    path-conditional field."""
+    if research is None:
+        return None
+    from rhinosecure.agents.constraint_intake import apply_constraints
+    from rhinosecure.agents.risk import merge_research_into_enriched
+
+    merged = merge_research_into_enriched(enriched, research)
+    if coordinator.memory is not None:
+        active = coordinator.memory.constraints_for_asset(merged.asset.asset_id)
+        if active:
+            merged = merged.model_copy(update={"asset": apply_constraints(merged.asset, active)})
+    return _decomposition_dict(score_finding(merged).decomposition)
+
+
 def _agents_finding_entry(
     recommendation: Any,
     cache: SnapshotCache,
@@ -424,6 +461,14 @@ def _agents_finding_entry(
         "is_kev": research.is_kev if research is not None else False,
         "asset": _asset_summary(enriched.asset),
         "rationale": list(recommendation.scoring_rationale),
+        # Closes a pre-existing gap unrelated to provisional-ness: before
+        # this, the per-finding neutralized-axis UI note never rendered
+        # for ANY agents-path finding, including a confirmed Defender run
+        # -- see _agents_decomposition's own docstring for why this is a
+        # live recompute, not a second copy of _det_finding_entry's
+        # "already have a ScoredFinding" pattern (RiskRecommendation
+        # carries no ScoreDecomposition of its own).
+        "decomposition": _agents_decomposition(coordinator, enriched, research),
         "verdict_summary": recommendation.verdict_summary,
         "narrative": recommendation.narrative,
         "constraints_applied": list(recommendation.constraints_applied),
@@ -547,19 +592,46 @@ _DETERMINISTIC_NOTE = (
     "constraints are not applied on the deterministic path (memory.py is never touched there) -- "
     "run rhino run --agents to see live effect"
 )
+#: The agents-path analog of _DETERMINISTIC_NOTE, for a PROVISIONAL run
+#: (CLAUDE.md's provisional-run entry) -- the 4-agent pipeline DID
+#: dispatch, but its Coordinator was built with memory=None (point 5 of
+#: that entry: nothing provisional writes durable state), so
+#: agents/risk.py's score_finding_tool never queried a constraint either.
+#: Without this, a memory-less coordinator's constraints section would
+#: otherwise fall through to the "applies, deltas computed" branch below
+#: and show a real constraint as live with a no-op delta -- misrepresenting
+#: one that was never actually folded into what was scored.
+_PROVISIONAL_NO_MEMORY_NOTE = (
+    "this run used a provisional (unconfirmed) contract, whose Coordinator is never given a Memory "
+    "instance (CLAUDE.md's provisional-run entry) -- constraints are not applied on a provisional run; "
+    "confirm the contract, then re-run --agents to see live effect"
+)
 _NO_FINDINGS_NOTE = "no findings for this asset in the current dataset"
 
 
 def _asset_scoped_constraints(
-    memory: Memory, *, agents: bool, coordinator: Coordinator | None, current_asset_ids: set[str]
+    memory: Memory,
+    *,
+    live: bool,
+    not_live_note: str,
+    coordinator: Coordinator | None,
+    current_asset_ids: set[str],
 ) -> list[dict[str, Any]]:
+    """`live` replaces the old blanket `agents: bool` -- a confirmed
+    agents run and a PROVISIONAL agents run both have `agents=True` in
+    the caller's own sense (the 4-agent pipeline really did dispatch),
+    but only the confirmed one actually folded a constraint into scoring
+    (`coordinator.memory is not None`). `not_live_note` lets each caller
+    supply the honest reason ("deterministic path never touches memory.py
+    at all" vs. "this run's Coordinator was never given one") instead of
+    this function guessing which applies."""
     entries = []
     for c in memory.all_active_constraints():
         applies = c.asset_id in current_asset_ids
         deltas: list[dict[str, Any]] = []
         note: str | None
-        if not agents:
-            note = _DETERMINISTIC_NOTE
+        if not live:
+            note = not_live_note
         elif not applies:
             note = _NO_FINDINGS_NOTE
         else:
@@ -647,7 +719,8 @@ def _constraints_section(
     memory: Memory | None,
     data_dir: Path,
     run_label: str,
-    agents: bool,
+    live: bool,
+    not_live_note: str,
     coordinator: Coordinator | None,
     current_asset_ids: set[str],
 ) -> dict[str, Any]:
@@ -655,7 +728,11 @@ def _constraints_section(
         return {"asset_scoped": [], "capacity": []}
     return {
         "asset_scoped": _asset_scoped_constraints(
-            memory, agents=agents, coordinator=coordinator, current_asset_ids=current_asset_ids
+            memory,
+            live=live,
+            not_live_note=not_live_note,
+            coordinator=coordinator,
+            current_asset_ids=current_asset_ids,
         ),
         "capacity": _capacity_history(memory, data_dir=data_dir, run_label=run_label),
     }
@@ -703,7 +780,8 @@ def _build_deterministic_export(
         memory=memory,
         data_dir=data_dir,
         run_label=run_label,
-        agents=False,
+        live=False,
+        not_live_note=_DETERMINISTIC_NOTE,
         coordinator=None,
         current_asset_ids={s.asset_id for s in scored},
     )
@@ -807,7 +885,14 @@ def _build_agents_export(
         memory=memory,
         data_dir=data_dir,
         run_label=run_label,
-        agents=True,
+        # A confirmed agents run and a PROVISIONAL one both dispatch the
+        # full 4-agent pipeline, but only a confirmed run's Coordinator
+        # was ever given a real Memory instance -- coordinator.memory is
+        # the one honest signal for whether a constraint could have been
+        # live during THIS run's own scoring, not the blanket "agents"
+        # bool this used to be.
+        live=coordinator.memory is not None,
+        not_live_note=_PROVISIONAL_NO_MEMORY_NOTE,
         coordinator=coordinator,
         current_asset_ids={e.asset.asset_id for e in state.enriched_by_id.values()},
     )
@@ -817,11 +902,19 @@ def _build_agents_export(
         "generated_at": _now_iso(),
         "run": {"data_dir": str(data_dir), "format": fmt, "seed": seed, "offline": offline, "agents": True},
         "provenance": _provenance_dict(contract, report),
-        # Always False on this path -- run_agents/Coordinator never runs
-        # against an unconfirmed contract (resolve_source_ref's own refusal
-        # is untouched for it; only run_deterministic's dedicated
-        # provisional branch can produce True). Present unconditionally so
-        # a reader never has to treat a missing key as "assume False."
+        # No longer always False on this path -- web/jobs.py's
+        # _run_run_agents now has its OWN provisional branch (CLAUDE.md's
+        # provisional-run entry), mirroring run_deterministic's: an upload
+        # whose contract exists but was never confirmed can reach the full
+        # 4-agent pipeline too, via a Coordinator built with memory=None
+        # and never committed as plan_state's current plan. `contract`
+        # here is that branch's provisional-stamped contract
+        # (`Coordinator.contract`, set from the adapter `_resolve_
+        # provisional` builds), so `is_provisional` correctly reports True
+        # for it -- exactly the same check the deterministic path already
+        # relied on, extended to a second caller rather than duplicated.
+        # Still False for every ordinary confirmed --adapter-config run
+        # and every built-in --format run (contract is None there).
         "provisional": is_provisional(contract),
         "pipeline": pipeline,
         "summary": {
