@@ -10,6 +10,9 @@ context declared in the asset inventory (criticality, internet exposure, environ
 sensitivity, operational patching constraints). The same CVE on three different hosts lands
 in three different remediation buckets, and every verdict comes with cited evidence for why.
 
+**Actively in development, not a finished product** — see [Status](#status) near the bottom for
+what's solid today and what's still rough.
+
 Scoring is deterministic and LLM-free. An optional agent layer (CrewAI, Claude) wraps it to
 produce cited narrative rationale, escalate genuinely contested findings to a Tree-of-Thought
 search over remediation strategies, and accept human operational constraints in plain English
@@ -34,7 +37,7 @@ cp .env.example .env             # then fill in ANTHROPIC_API_KEY (agent path on
 
 `NVD_API_KEY` in `.env` is optional — it raises NVD's rate limit but every CVE in the demo
 fixture already has a committed snapshot, so `--offline` never touches the network for it.
-Run `pytest` to confirm the install (389 tests, no network or API key required).
+Run `pytest` to confirm the install (1,433 tests, no network or API key required).
 
 Everything below runs against data checked into the repo: `data/demo/` (the frozen
 24-finding fixture), `data/demo-anchor/` (three of those findings, for a cheap agent-path
@@ -72,8 +75,9 @@ to guess — that's what the agent path's Tree-of-Thought search and constraint 
 
 ## The agent path
 
-Wraps the same scoring in three CrewAI roles (Research → Environment → Risk) that produce
-cited narrative rationale on top of the identical deterministic verdict — makes real Claude
+Wraps the same scoring in four agents (Coordinator, Vulnerability Research, Environment
+Analysis, Risk & Recommendation) that produce cited narrative rationale on top of the identical
+deterministic verdict — makes real Claude
 API calls (a few cents, well under a minute for a handful of findings). Requires
 `ANTHROPIC_API_KEY` in `.env`. `data/demo-anchor/` is the same three ProxyLogon hosts pulled
 out of the full fixture, kept small so this is cheap and fast to actually run rather than
@@ -180,9 +184,37 @@ because the constraint changed what's *known* about the asset, not how risky the
 The constraint persists in `rhinosecure.db` (SQLite, gitignored) and is picked up
 automatically by every later `--agents` run, no need to restate it.
 
+## Web UI
+
+`rhino web` serves a browser UI over a plan: pipeline status (Ingest / Enrichment / Scoring /
+Agents / Tree-of-Thought), the ranked findings table with cited rationale, contested findings
+and their ToT branches, data gaps, and a constraint form.
+
+```bash
+rhino web --data demo --offline
+```
+
+On Windows, Smart App Control blocks the unsigned `rhino.exe` console shim — run
+`python -m rhinosecure.cli web --data demo --offline` instead.
+
+With `--enable-jobs`, it also accepts CSV uploads and dispatches ingest, scoring, and the agent
+crew itself as background jobs from the browser — no CLI needed at all, including against a
+mapping nobody's confirmed yet (see Status).
+
 ## Status
 
-All four build slices are done: deterministic scoring, live enrichment with an offline
-snapshot cache, the three-agent crew, and Tree-of-Thought plus constraint intake. Built as a
-Carnegie Mellon Agentic AI capstone project — see [CLAUDE.md](CLAUDE.md) for the full spec,
-scoring model, and open items.
+Actively in development — built as a Carnegie Mellon Agentic AI capstone project, not a
+finished product. The deterministic path, the four-agent crew, Tree-of-Thought, and constraint
+intake described above all work end to end and are exercised by the test suite. Also built
+since: LLM-assisted adapter generation (`rhino adapt propose`/`confirm`) that maps an arbitrary
+CSV onto the scoring schema behind a human attestation gate, a schema target registry backing
+that generation, a provisional run path that scores an unconfirmed mapping anyway — drop a CSV,
+get a scored plan, no signature required — remediation tracking (`rhino remediation
+mark`/`log`), and the web UI above.
+
+Known rough edges, named rather than hidden: ingesting an unfamiliar CSV format can still fail
+in specific, sometimes hard-to-predict ways depending on how far its shape diverges from what
+the schema-inference model expects; and Tree-of-Thought currently reports a near-tie on
+essentially every contested finding it runs against, surfacing both branches to a human rather
+than the ranking it actually computed. See [CLAUDE.md](CLAUDE.md) for the full spec, scoring
+model, and open items.
