@@ -72,6 +72,8 @@ from rhinosecure.adapters.config_model import (
     NotCollectedMapping,
     ParsedMapping,
     VocabularyMapping,
+    _ASSET_TYPE_HINTS,  # the exact target->real-type introspection config_model's own _target_vocabulary uses
+    _FINDING_TYPE_HINTS,
     assert_confirmed,
     validate_contract,
 )
@@ -180,6 +182,63 @@ def _parse_scalar(kind: str, cased: str, params: dict[str, Any] | None) -> Any:
     if kind == "cve_id":
         return _parse_cve_id(cased)
     raise AssertionError(f"parser {kind!r} has no scalar resolver (timestamp is order_by-only)")
+
+
+#: `target -> its real declared Python type`, for every Asset/Finding field a
+#: `parsed` mapping could ever be attached to. Reused, not re-derived, from
+#: config_model.py's own `get_type_hints(Asset)`/`get_type_hints(Finding)` --
+#: the identical introspection `_target_vocabulary` already uses there to
+#: decide a target's legal ENUM values; here it decides a target's legal
+#: PYTHON TYPE, for `_coerce_for_target` below. No name collides between the
+#: two models with a different type (`asset_id: str` on both), so one merged
+#: dict is safe.
+_TARGET_TYPES: dict[str, Any] = {**_ASSET_TYPE_HINTS, **_FINDING_TYPE_HINTS}
+
+
+def _coerce_for_target(value: Any, target: str) -> Any:
+    """`_parse_scalar`'s five parsers each return whatever Python type is
+    natural for them (bool/float/str) with no regard for `target`'s OWN
+    declared type -- harmless for every parser/target pairing this schema
+    actually has EXCEPT "float": no `ASSET_SLOTS`/`FINDING_SLOTS` field is
+    itself `float`-typed (`severity_score`, the one genuinely float field
+    in this schema, is resolved through the separate `_resolve_enrichment`
+    path, never through here), so a `parsed`/`"float"` mapping's only
+    legitimate use is a numeric-LOOKING str-typed field (e.g. `port`) where
+    the source's own value happens to be a number and the mapping author
+    wants `min`/`max` bounds-checked -- there is no other parser in the
+    closed grammar that could validate "is this a well-formed number in
+    range" while also emitting a string.
+
+    Reproduced live against a real proposal (northgate_flat_2.csv,
+    `finding.port` mapped `{kind:"parsed", parser:"float", params:{min:0,
+    max:65535}}`): `Finding(port=445.0)` raised a pydantic `string_type`
+    error, discarding a legitimate, in-range port number as a false
+    data-quality refusal. This is a lossless, deterministic
+    normalization the engine should always have performed -- not a new
+    guess about the source's data -- so it corrects the value rather than
+    refusing the mapping outright (which would leave `port` with no
+    numeric-validation option in the grammar at all, a real loss of
+    expressiveness for a case CLAUDE.md's own contract-generation design
+    otherwise supports). Formats a whole-number float without a spurious
+    trailing ".0" (a port is always a whole number); a genuinely
+    fractional float (out of place for `port`, but not this function's
+    job to police) is still rendered, not dropped.
+
+    Deliberately narrower than "coerce anything non-str": only a `float`
+    is normalized. `bool`-parser-into-a-str-target has no real occurrence
+    to design a convention against (the grammar's own prompt guidance
+    steers a boolean-shaped source value toward `internet_exposed` or
+    `enrichment.known_exploited`, both genuinely bool-typed) -- rendering
+    `str(True)` as `"True"` would be inventing a representation for a case
+    that has never actually happened, rather than fixing the one that
+    has. Left uncoerced, that combination still fails loudly at
+    `Finding`/`Asset` construction with a clear pydantic error, the same
+    honest refusal this whole module already gives any other genuinely
+    incompatible mapping -- exactly what should happen for a case this
+    function has no evidence to design around."""
+    if _TARGET_TYPES.get(target) is not str or not isinstance(value, float):
+        return value
+    return str(int(value)) if value.is_integer() else str(value)
 
 
 def _render_composed(mapping: ComposedMapping, row: dict[str, str]) -> str:
@@ -485,7 +544,7 @@ class ConfiguredAdapter(IngestAdapter):
             if value is None:
                 problems.add(f"row {row_no}: {mapping.column} {raw!r} is not a valid {mapping.parser}")
                 return _FAIL
-            return value
+            return _coerce_for_target(value, target)
 
         raise AssertionError(f"unexpected mapping kind on target {target!r}: {mapping!r}")
 

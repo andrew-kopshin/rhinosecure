@@ -20,10 +20,11 @@ from rhinosecure.adapters.config_model import (
     ContractDigestMismatchError,
     ContractNotConfirmedError,
     ContractValidationError,
+    ParsedMapping,
     compute_content_digest,
     compute_decision_digest,
 )
-from rhinosecure.adapters.configured import _FAIL, ConfiguredAdapter, _render_composed
+from rhinosecure.adapters.configured import _FAIL, ConfiguredAdapter, _coerce_for_target, _render_composed
 from rhinosecure.ingest import load_batch
 
 from test_adapters_bluepeak import COLUMNS as BP_COLUMNS
@@ -201,6 +202,61 @@ def test_composed_always_emits_the_first_bluepeak_part_even_with_blank_detection
         "Exploit_Maturity": "", "Business_Impact": "", "Assigned_Team": "",
     }
     assert _render_composed(evidence_mapping, row) == "[Server] A bug."
+
+
+# --- _coerce_for_target: float-parser output vs. a str-typed schema field --
+#
+# The real bug: finding.port (and every other Asset/Finding field, except
+# criticality/internet_exposed) is str-typed, but "float" is the only
+# bounds-checked numeric parser in the closed grammar (there is no "int"
+# parser) -- so a mapping author reaching for min/max validation on a
+# numeric-looking str field naturally produces a raw Python float, which
+# Finding(port=...)/Asset(...) then refuses as a pydantic string_type error.
+
+
+def test_coerce_for_target_strips_a_spurious_trailing_zero_for_a_str_target():
+    assert _coerce_for_target(445.0, "port") == "445"
+
+
+def test_coerce_for_target_preserves_a_genuine_fraction_for_a_str_target():
+    assert _coerce_for_target(445.5, "port") == "445.5"
+
+
+def test_coerce_for_target_leaves_a_string_value_untouched():
+    assert _coerce_for_target("445", "port") == "445"
+
+
+def test_coerce_for_target_leaves_non_str_targets_untouched():
+    # criticality is int-typed and internet_exposed is bool-typed -- pydantic
+    # already accepts a float/bool there; stringifying would BREAK it.
+    assert _coerce_for_target(3.0, "criticality") == 3.0
+    assert _coerce_for_target(True, "internet_exposed") is True
+
+
+def test_coerce_for_target_does_not_invent_a_convention_for_bool_into_str():
+    # No real proposal has ever paired a bool parser with a str target --
+    # left alone, so an actually-incompatible mapping still fails loudly at
+    # Finding/Asset construction instead of silently rendering "True"/"False".
+    assert _coerce_for_target(True, "port") is True
+
+
+def test_resolve_target_coerces_a_float_parser_result_for_a_str_typed_target():
+    """Reproduced against a real ConfiguredAdapter instance: `finding.port`
+    mapped via `{kind:"parsed", parser:"float", params:{min:0,max:100}}`
+    (the exact shape a real proposal used against northgate_flat_2.csv,
+    substituting a synthetic column since neither committed contract has
+    a port column) must resolve to a string Finding(port=...) accepts, not
+    the raw float `_parse_scalar` itself returns. A whole-number source
+    value (9.0) pins the "no spurious .0" formatting specifically."""
+    adapter = ConfiguredAdapter(_bluepeak_gen())
+    mapping = ParsedMapping(
+        kind="parsed", column="Score", case="exact", blank="absent_fact", optional=False,
+        parser="float", params={"min": 0, "max": 100},
+    )
+    problems = ProblemCollector(Path("data.csv"))
+    value = adapter._resolve_target(mapping, "port", {"Score": "9.0"}, 1, problems, {}, None)
+    assert value == "9"
+    assert problems.fatal == []
 
 
 def test_excluding_targets_defaults_to_role_only():
