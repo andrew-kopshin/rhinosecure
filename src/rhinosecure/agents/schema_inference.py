@@ -57,8 +57,10 @@ verify, and it must never read as a trailing footnote.
 
 from __future__ import annotations
 
+import ast
 import csv
 import hashlib
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Literal, Union
@@ -101,6 +103,7 @@ from rhinosecure.adapters.config_model import (
     _compute_not_collected,  # the exact V09 recomputation validate_contract itself uses
     _composed_columns,  # the exact placeholder-extraction validate_contract itself uses
     _FORMAT_PATTERN,  # the exact pattern Contract.format itself is checked against
+    check_slot_mapping_legality,  # the exact per-mapping legality checks validate_contract itself runs
     ContractValidationError,
     missing_attestations,
     validate_contract,
@@ -190,7 +193,21 @@ class ProposalGenerationError(RuntimeError):
 class ProposalIncompleteError(RuntimeError):
     """`assemble_contract` refuses: at least one slot is `unresolved`, or
     failed a grounding check. Never raised for a caveat (a distinct_overflow
-    caveat does not block assembly -- see module docstring)."""
+    caveat does not block assembly -- see module docstring).
+
+    `problems` mirrors `ContractValidationError.problems` verbatim when the
+    underlying cause was a real `validate_contract` failure (a fully mapped,
+    fully grounded proposal whose ASSEMBLED contract is still illegal --
+    `_assemble_and_validate`'s own safety net) -- empty for the other raise
+    site (unresolved slots / grounding failures, `assemble_contract`'s own
+    check, which needs no `validate_contract` call to detect). Read by
+    `assemble_provisional_contract`'s own degrade-on-validation-failure path
+    to identify exactly which slot(s) are individually at fault, without
+    re-parsing this exception's formatted message text."""
+
+    def __init__(self, message: str, *, problems: tuple[str, ...] = ()):
+        super().__init__(message)
+        self.problems = problems
 
 
 # ---------------------------------------------------------------------------
@@ -766,7 +783,8 @@ def _assemble_and_validate(
     except ContractValidationError as exc:
         raise ProposalIncompleteError(
             f"every slot was mapped and grounded, but the assembled contract fails the real contract "
-            f"validator (the same check `rhino adapt confirm` would run): {exc}"
+            f"validator (the same check `rhino adapt confirm` would run): {exc}",
+            problems=exc.problems,
         ) from exc
 
     return contract
@@ -847,6 +865,164 @@ PROVISIONAL_ROLE_PLACEHOLDER = "workstation"
 _PROVISIONAL_HARD_STOP_TARGETS = frozenset({"asset_id", "hostname", "finding_id", "cve_id", "scanner_severity"})
 
 
+def _provisional_placeholder_for(target: str) -> "tuple[Mapping, bool] | None":
+    """The per-target provisional-degrade decision -- shared by BOTH cases
+    that need it: (1) a slot the model left genuinely `unresolved` (the
+    main loop below), and (2) a slot the model DID map, but whose mapping
+    individually fails `validate_contract` (an illegal `blank` policy, a
+    misplaced `timestamp` parser, ...) -- see `_degrade_invalid_slots`. For
+    this function's purposes the two are the same problem: no mapping this
+    run can honestly trust exists for this target, so the identical
+    ordered fallback applies to both. Returns `(placeholder mapping,
+    whether to neutralize this axis for scoring)`, or `None` when no legal
+    placeholder exists for this target at all -- a hard stop, in both
+    callers. See `assemble_provisional_contract`'s own docstring for the
+    ordered rule list this implements."""
+    if target in _PROVISIONAL_HARD_STOP_TARGETS:
+        return None
+    if target == "role":
+        return LiteralMapping(kind="literal", value=PROVISIONAL_ROLE_PLACEHOLDER), True
+    if target in GAP_LEGAL_TARGETS:
+        return NotCollectedMapping(kind="not_collected"), (target in IMPACT_AXIS_TARGETS or target in THREAT_AXIS_TARGETS)
+    if target in ABSENT_FACT_LEGAL_TARGETS:
+        return LiteralMapping(kind="literal", value=""), False
+    return None
+
+
+_SLOT_PROBLEM_PATTERN = re.compile(r"^(asset|finding)\.([A-Za-z0-9_]+):")
+
+
+def _slot_scoped_problems(problems: tuple[str, ...]) -> "tuple[dict[str, list[str]], list[str]]":
+    """Split a `ProposalIncompleteError.problems` tuple into (a) violations
+    attributable to exactly one `asset.<target>`/`finding.<target>` slot --
+    keyed by that slot name -- and (b) every other, cross-cutting violation
+    (a `not_collected`/V09 mismatch, a missing attestation, a digest
+    mismatch, ...) that dropping one mapping cannot fix. `validate_contract`
+    always prefixes a per-slot violation with this exact `"asset.X: "`/
+    `"finding.X: "` text (its own `where` variable, used verbatim as every
+    per-slot problem's prefix -- see `check_slot_mapping_legality`) --
+    reused here rather than a second classification scheme, so this stays
+    in sync with whatever validate_contract actually checks, including any
+    new per-slot rule added later."""
+    by_slot: dict[str, list[str]] = {}
+    unattributed: list[str] = []
+    for problem in problems:
+        match = _SLOT_PROBLEM_PATTERN.match(problem)
+        if match:
+            by_slot.setdefault(f"{match.group(1)}.{match.group(2)}", []).append(problem)
+        else:
+            unattributed.append(problem)
+    return by_slot, unattributed
+
+
+def _dropped_slot_column(mapping: "Mapping") -> str | None:
+    """The column a dropped mapping used to read, if it read one at all.
+    Every mapping kind `check_slot_mapping_legality` can flag -- column,
+    vocabulary, parsed -- carries a plain `.column` attribute; every other
+    kind either isn't blank-bearing or isn't a `parsed` mapping, so it can
+    never be the offending mapping `_degrade_invalid_slots` is degrading."""
+    return getattr(mapping, "column", None)
+
+
+def _degrade_invalid_slots(
+    exc: "ProposalIncompleteError",
+    asset_mappings: "dict[str, Mapping]",
+    finding_mappings: "dict[str, Mapping]",
+    mapping_confidence: dict[str, float],
+    neutralized_axes: set[str],
+    dropped: set[str],
+    dropped_columns: dict[str, set[str]],
+    assets_filename: str,
+    findings_filename: str,
+) -> str | None:
+    """The sibling of the main per-slot loop below, for a `SlotMapped`
+    mapping that turns out to be individually illegal rather than genuinely
+    unresolved. Mutates `asset_mappings`/`finding_mappings`/
+    `mapping_confidence`/`neutralized_axes`/`dropped`/`dropped_columns` in
+    place; returns `None` on success, or a human-readable hard-stop reason
+    when a violation cannot be attributed to a single slot (a whole-contract
+    problem no per-mapping change can fix) or a named slot has no legal
+    placeholder at all (`_provisional_placeholder_for` returns `None`).
+
+    Validates every named slot has a legal placeholder BEFORE mutating
+    anything, so a hard stop never leaves `asset_mappings`/`finding_mappings`
+    partially degraded for no benefit."""
+    by_slot, unattributed = _slot_scoped_problems(exc.problems)
+    if not by_slot or unattributed:
+        return str(exc)
+
+    resolved: dict[str, "tuple[Mapping, bool]"] = {}
+    for slot in sorted(by_slot):
+        _, target = slot.split(".", 1)
+        placeholder = _provisional_placeholder_for(target)
+        if placeholder is None:
+            return (
+                f"{slot} individually fails contract validation and has no legal provisional "
+                f"placeholder: {'; '.join(by_slot[slot])}"
+            )
+        resolved[slot] = placeholder
+
+    mapping_dicts = {"asset": asset_mappings, "finding": finding_mappings}
+    filenames = {"asset": assets_filename, "finding": findings_filename}
+    for slot, (new_mapping, neutralize) in resolved.items():
+        section, target = slot.split(".", 1)
+        old_mapping = mapping_dicts[section][target]
+        column = _dropped_slot_column(old_mapping)
+        if column is not None:
+            dropped_columns.setdefault(filenames[section], set()).add(column)
+        mapping_dicts[section][target] = new_mapping
+        mapping_confidence.pop(slot, None)
+        dropped.add(slot)
+        if neutralize:
+            neutralized_axes.add(target)
+    return None
+
+
+_ORPHANED_COLUMN_PATTERN = re.compile(
+    r"^(?P<filename_repr>'(?:[^'\\]|\\.)*'): column\(s\) (?P<cols>\[.*\]) are neither mapped nor in unmapped_columns$"
+)
+
+
+def _reconcile_orphaned_columns(
+    problems: tuple[str, ...], dropped_columns: dict[str, set[str]]
+) -> "dict[str, dict[str, ProposedUnmappedColumn]] | None":
+    """Dropping a mapping that read a real column (`_degrade_invalid_slots`)
+    can orphan that column: `validate_contract`'s own V08 rule refuses a
+    contract with a column neither mapped nor listed in `unmapped_columns`.
+    This recovers ONLY that exact, predictable side effect of OUR OWN drop
+    -- every remaining problem must be a V08 "neither mapped nor in
+    unmapped_columns" message, and every column it names must be one this
+    pass itself just orphaned (`dropped_columns`). Anything else (a
+    genuinely new problem, or a column this pass has no explanation for) is
+    refused, not guessed at -- this is a mechanical accounting fix for a
+    column we know the story of, never a judgment call about a column we
+    don't. Returns new `unmapped_columns` entries to merge in, or `None` if
+    this failure isn't that exact recoverable shape."""
+    additions: "dict[str, dict[str, ProposedUnmappedColumn]]" = {}
+    for problem in problems:
+        match = _ORPHANED_COLUMN_PATTERN.match(problem)
+        if not match:
+            return None
+        try:
+            filename = ast.literal_eval(match.group("filename_repr"))
+            columns = ast.literal_eval(match.group("cols"))
+        except (ValueError, SyntaxError):
+            return None
+        known = dropped_columns.get(filename, set())
+        if not columns or any(c not in known for c in columns):
+            return None
+        for column in columns:
+            additions.setdefault(filename, {})[column] = ProposedUnmappedColumn(
+                disposition="deliberately_dropped",
+                reason=(
+                    "this column fed a mapping that was dropped during provisional assembly because "
+                    "that mapping individually failed contract validation"
+                ),
+                profile_cited="(provisional auto-drop -- no human-reviewed profile citation)",
+            )
+    return additions or None
+
+
 @dataclass(frozen=True)
 class ProvisionalAssemblyNotes:
     """What `assemble_provisional_contract` had to do to produce a
@@ -861,6 +1037,18 @@ class ProvisionalAssemblyNotes:
     #: those two sets, never anything outside them). Empty when nothing
     #: needed it.
     neutralized_axes: frozenset[str] = frozenset()
+    #: `"asset.<target>"`/`"finding.<target>"` slot names whose ORIGINAL
+    #: `SlotMapped` mapping was dropped and replaced with a placeholder
+    #: because it individually failed `validate_contract` (an illegal
+    #: `blank` policy, a misplaced `timestamp` parser, ...) --
+    #: `_degrade_invalid_slots`' own doing. Distinct from `neutralized_axes`:
+    #: not every dropped slot is a scoring axis (e.g. `finding.detected_date`
+    #: is dropped here but never fed scoring in the first place), so this is
+    #: the honest "what did we actually throw away" report the coverage
+    #: summary needs, independent of whether scoring cares. Empty when
+    #: nothing needed it -- including every unresolved-slot degrade, which
+    #: was never something the model actually mapped in the first place.
+    invalid_mappings_dropped: frozenset[str] = frozenset()
     #: Set only when assembly could not proceed at all -- a target in
     #: `_PROVISIONAL_HARD_STOP_TARGETS` was unresolved, or the real
     #: `validate_contract` safety net refused for an unrelated reason. When
@@ -889,10 +1077,33 @@ def assemble_provisional_contract(
     A real grounding FAILURE (a cited column/table-key that isn't real, or a
     hallucinated value) is a data-quality problem, not a coverage gap -- it
     stays a hard stop here exactly like it already is in `assemble_contract`,
-    never silently degraded around. Only genuinely UNRESOLVED slots (the
-    model proposed no mapping at all) get the degrade treatment below.
+    never silently degraded around.
 
-    Per-slot treatment for an unresolved target, in order:
+    Two, structurally different things get the degrade treatment below,
+    both resolved through the identical `_provisional_placeholder_for`
+    ordered fallback:
+
+    (A) A genuinely UNRESOLVED slot (the model proposed no mapping at all)
+        -- the main loop, immediately below.
+    (B) A `SlotMapped` slot whose mapping individually fails
+        `validate_contract` on the FIRST assembly attempt (an illegal
+        `blank` policy, e.g. `blank='gap'` on `role`, which has no
+        `NOT_COLLECTED_DEFAULTS` entry; a misplaced `timestamp` parser,
+        legal only inside `asset_grouping.order_by`) -- a fully-mapped,
+        fully-grounded proposal can still reach this: grounding only checks
+        that a CITED column/table-key is real, never that a mapping's
+        `blank`/`parser` choice is legal for its target (`check_grounding`'s
+        own docstring). `_degrade_invalid_slots` handles this, reusing the
+        SAME `_provisional_placeholder_for` fallback as case (A) -- for
+        this purpose a mapped-but-illegal slot is exactly as unusable as
+        one the model never proposed. Dropping a column-reading mapping can
+        orphan the column it used to read (`validate_contract`'s own V08
+        column-accounting rule); `_reconcile_orphaned_columns` recovers
+        ONLY that exact, predictable side effect of our own drop, never any
+        other new problem.
+
+    Ordered fallback (`_provisional_placeholder_for`), applied to both (A)
+    and (B):
     1. In `_PROVISIONAL_HARD_STOP_TARGETS` (an identity field, or
        scanner_severity) -- hard stop, no contract, no guessing.
     2. `role` specifically -- `literal(PROVISIONAL_ROLE_PLACEHOLDER)`,
@@ -932,26 +1143,22 @@ def assemble_provisional_contract(
                 mapping_confidence[f"{section}.{target}"] = sp.confidence
                 continue
             # SlotUnresolved from here on.
-            if target in _PROVISIONAL_HARD_STOP_TARGETS:
-                hard_stop_targets.append(f"{section}.{target}")
-            elif target == "role":
-                mapping_dict[target] = LiteralMapping(kind="literal", value=PROVISIONAL_ROLE_PLACEHOLDER)
-                neutralized_axes.add("role")
-            elif target in GAP_LEGAL_TARGETS:
-                mapping_dict[target] = NotCollectedMapping(kind="not_collected")
-                if target in IMPACT_AXIS_TARGETS or target in THREAT_AXIS_TARGETS:
-                    neutralized_axes.add(target)
-            elif target in ABSENT_FACT_LEGAL_TARGETS:
-                mapping_dict[target] = LiteralMapping(kind="literal", value="")
-            else:
+            placeholder = _provisional_placeholder_for(target)
+            if placeholder is None:
                 # No legal placeholder exists for this target at all --
                 # narrower than _PROVISIONAL_HARD_STOP_TARGETS only in that
                 # nothing in this schema is actually expected to land here
                 # today (every real ASSET_SLOTS/FINDING_SLOTS member is
-                # covered by one of the branches above); kept as an honest
-                # refusal rather than a silent `pass` in case the schema
-                # ever grows a field none of them cover.
+                # covered by one of _provisional_placeholder_for's
+                # branches); kept as an honest refusal rather than a silent
+                # `pass` in case the schema ever grows a field none of them
+                # cover.
                 hard_stop_targets.append(f"{section}.{target}")
+                continue
+            mapping, neutralize = placeholder
+            mapping_dict[target] = mapping
+            if neutralize:
+                neutralized_axes.add(target)
 
     if hard_stop_targets:
         return None, ProvisionalAssemblyNotes(
@@ -963,15 +1170,55 @@ def assemble_provisional_contract(
             )
         )
 
+    dropped_slots: set[str] = set()
+    dropped_columns: dict[str, set[str]] = {}
     try:
         contract = _assemble_and_validate(
             proposal, profiles, asset_mappings, finding_mappings, mapping_confidence,
             generator=generator, generated_at=generated_at,
         )
     except ProposalIncompleteError as exc:
-        return None, ProvisionalAssemblyNotes(hard_stop_reason=str(exc))
+        # Case (B), first attempt failed: at least one FULLY MAPPED slot is
+        # individually illegal. Degrade exactly the slot(s) validate_contract
+        # named and retry once with the identical proposal otherwise
+        # unchanged.
+        hard_stop = _degrade_invalid_slots(
+            exc, asset_mappings, finding_mappings, mapping_confidence, neutralized_axes,
+            dropped_slots, dropped_columns, proposal.meta.assets_filename, proposal.meta.findings_filename,
+        )
+        if hard_stop is not None:
+            return None, ProvisionalAssemblyNotes(hard_stop_reason=hard_stop)
 
-    return contract, ProvisionalAssemblyNotes(neutralized_axes=frozenset(neutralized_axes))
+        retry_proposal = proposal
+        try:
+            contract = _assemble_and_validate(
+                retry_proposal, profiles, asset_mappings, finding_mappings, mapping_confidence,
+                generator=generator, generated_at=generated_at,
+            )
+        except ProposalIncompleteError as exc2:
+            # The degrade above can orphan the column(s) the dropped
+            # mapping(s) used to read (validate_contract's own V08 column-
+            # accounting rule) -- recover ONLY that exact, predictable side
+            # effect of our own drop, then retry once more.
+            additions = _reconcile_orphaned_columns(exc2.problems, dropped_columns)
+            if additions is None:
+                return None, ProvisionalAssemblyNotes(hard_stop_reason=str(exc2))
+
+            merged_unmapped = {filename: dict(cols) for filename, cols in retry_proposal.unmapped_columns.items()}
+            for filename, cols in additions.items():
+                merged_unmapped.setdefault(filename, {}).update(cols)
+            retry_proposal = retry_proposal.model_copy(update={"unmapped_columns": merged_unmapped})
+            try:
+                contract = _assemble_and_validate(
+                    retry_proposal, profiles, asset_mappings, finding_mappings, mapping_confidence,
+                    generator=generator, generated_at=generated_at,
+                )
+            except ProposalIncompleteError as exc3:
+                return None, ProvisionalAssemblyNotes(hard_stop_reason=str(exc3))
+
+    return contract, ProvisionalAssemblyNotes(
+        neutralized_axes=frozenset(neutralized_axes), invalid_mappings_dropped=frozenset(dropped_slots),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1272,6 +1519,59 @@ def _check_meta_matches(proposal: AdapterProposal, name: str, layout: str, asset
         raise ValueError("; ".join(problems))
 
 
+class MappingLegalityError(ValueError):
+    """Raised by `_check_mapped_slots_legal` -- a `ValueError` subclass so
+    the retry loop's existing `except (AgentOutputParseError, ValueError)`
+    still catches it unchanged, but distinguishable from a plain
+    `_check_meta_matches` mismatch for `attempt_usage`'s own `outcome`
+    label."""
+
+
+def _check_mapped_slots_legal(proposal: AdapterProposal) -> None:
+    """Closes the grammar at GENERATION for a FRESH, LLM-driven candidate --
+    not only at final contract validation (CLAUDE.md's own framing of this
+    gap). Called only from `propose_contract`'s own retry loop, immediately
+    after `_check_meta_matches` (never for `from_proposal`-supplied input --
+    see that call site's own comment for why): a `SlotMapped` whose mapping
+    individually violates a per-target rule `validate_contract` already
+    enforces (`blank='gap'` on a target with no `NOT_COLLECTED_DEFAULTS`
+    entry, e.g. `role`; a `timestamp` parser outside
+    `asset_grouping.order_by`) raises here, exactly like `_check_meta_matches`
+    does for a meta-fact mismatch -- caught by the identical
+    `except (AgentOutputParseError, ValueError)` handler, so the model gets
+    a genuine retry with the SPECIFIC violation fed back
+    (`build_propose_task`'s `previous_error`), a real chance to produce a
+    CORRECT mapping (e.g. `default_by`/`ROLE_DEFAULT_BY_OS_CLASS` for role,
+    or `parser:"date"` for a timestamp-shaped column) instead of losing the
+    column entirely to a provisional placeholder. Reuses
+    `check_slot_mapping_legality`, the identical function
+    `validate_contract`'s own per-slot loops call, so this can never drift
+    from what the real engine will eventually refuse anyway.
+
+    Deliberately NOT a blanket check on every `AdapterProposal`
+    construction (e.g. a pydantic model validator): a `--from-proposal`
+    file -- exactly the mechanism this project already uses for a human to
+    review and hand-fix a proposal that previously failed to assemble --
+    must still be LOADABLE even when it carries this exact violation, so it
+    can reach `assemble_provisional_contract`'s own degrade-on-validation-
+    failure path (or `assemble_contract`'s ordinary, clearly-worded
+    refusal). Gating construction itself would make that review loop
+    impossible: the very file a human needs to open and fix would refuse to
+    load at all."""
+    problems: list[str] = []
+    for target, sp in proposal.asset.items():
+        if isinstance(sp, SlotMapped):
+            problems.extend(check_slot_mapping_legality(f"asset.{target}", target, sp.mapping))
+    for target, sp in proposal.finding.items():
+        if isinstance(sp, SlotMapped):
+            problems.extend(check_slot_mapping_legality(f"finding.{target}", target, sp.mapping))
+    if problems:
+        raise MappingLegalityError(
+            f"{len(problems)} mapped slot(s) violate the closed contract grammar (the identical "
+            f"checks validate_contract itself runs): {problems}"
+        )
+
+
 def _estimate_cost_usd(usage: UsageMetrics | None) -> float:
     if usage is None:
         return 0.0
@@ -1359,6 +1659,7 @@ def propose_contract(
             try:
                 candidate = parse_structured_output(task.output.raw, AdapterProposal)
                 _check_meta_matches(candidate, name, layout, resolved_assets, resolved_findings)
+                _check_mapped_slots_legal(candidate)
                 proposal = candidate
                 attempt_usage_list.append(
                     {
@@ -1376,7 +1677,11 @@ def propose_contract(
                         "attempt": attempt,
                         "prompt_tokens": attempt_prompt_tokens,
                         "completion_tokens": attempt_completion_tokens,
-                        "outcome": "parse_error" if isinstance(exc, AgentOutputParseError) else "meta_mismatch",
+                        "outcome": (
+                            "parse_error" if isinstance(exc, AgentOutputParseError)
+                            else "illegal_mapping" if isinstance(exc, MappingLegalityError)
+                            else "meta_mismatch"
+                        ),
                     }
                 )
 

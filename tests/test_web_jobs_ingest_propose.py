@@ -457,6 +457,65 @@ def test_a_genuinely_unrecoverable_gap_still_writes_nothing(client: TestClient, 
     assert not (isolated_dirs / "upload-incomplete.json").exists()
 
 
+def test_a_fully_mapped_but_individually_illegal_slot_still_writes_a_provisional_contract(
+    client: TestClient, isolated_dirs: Path
+):
+    """The real bug this fix closes, exercised end to end through the real
+    job substrate: EVERY slot mapped and grounded (zero unresolved_slots),
+    but asset.role's mapping declares blank='gap', illegal for role (no
+    NOT_COLLECTED_DEFAULTS entry) -- a legality problem check_grounding
+    cannot see, so it used to reach assemble_contract's real
+    validate_contract call and refuse with nothing written and no recovery
+    path (assemble_provisional_contract only ever degraded genuinely
+    unresolved slots). It must now write a provisional contract, reporting
+    exactly which slot was dropped.
+
+    Submitted via `edited_saved_proposal`, not a fresh LLM attempt: a FRESH
+    generation now gets this exact illegal shape rejected and retried at
+    the source (`_check_mapped_slots_legal`, schema_inference.py's own
+    generation-time closure) -- `edited_saved_proposal` is the one path
+    that must still tolerate it, since it is also how a human resubmits a
+    hand-reviewed proposal (the same reason `--from-proposal` must stay
+    loadable), and it is what makes this degrade path reachable at all."""
+    upload_id = _upload(client, "inventory.csv", _csv_bytes(_ROWS))["upload_id"]
+    data = _full_proposal_dict(
+        name="upload-illegal-mapping",
+        overrides_asset={
+            "role": _mapped(
+                {"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "gap", "table": {"srv": "dc"}},
+                columns_cited=["Col"],
+            ),
+        },
+    )
+    edited_saved_proposal = {
+        "proposal": data,
+        "generator": {
+            "tool": "rhino-adapt-propose", "model": "claude-sonnet-5", "prompt_tokens": 100,
+            "completion_tokens": 50, "estimated_cost_usd": 0.001, "attempts": 1,
+            "call_log_digest": "sha256:" + "a" * 64,
+        },
+    }
+    assert _QueuedFakeCrew.queue == []  # nothing queued -- proves no LLM call happens below
+
+    job = _submit(client, upload_id=upload_id, name="upload-illegal-mapping", edited_saved_proposal=edited_saved_proposal)
+    body = _wait_for_terminal(client, job["job_id"])
+
+    assert body["status"] == "succeeded"
+    result = body["result"]
+    assert result["unresolved_slots"] == []  # the model mapped every slot -- this is NOT an unresolved-slot case
+    assert result["contract_written"] is True
+    assert result["provisional"] is True
+    assert result["neutralized_axes"] == ["role"]
+    assert result["invalid_mappings_dropped"] == ["asset.role"]
+    assert result["next_step"] is not None
+
+    contract_path = Path(result["contract_path"])
+    assert contract_path.exists()
+    on_disk = json.loads(contract_path.read_text(encoding="utf-8"))
+    assert on_disk["asset"]["role"] == {"kind": "literal", "value": "workstation"}
+    assert on_disk["review"]["state"] == "proposed"
+
+
 # ---------------- ingest_propose: not silently overwriting a signature ----------------
 
 

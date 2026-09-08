@@ -187,7 +187,17 @@ class ContractError(AdapterError):
 class ContractValidationError(ContractError):
     """Every violation `validate_contract` found, named at once -- the same
     "refuse loudly, name every offender in one message" discipline as
-    `ProblemCollector.raise_if_fatal` (adapters/base.py)."""
+    `ProblemCollector.raise_if_fatal` (adapters/base.py). `problems` carries
+    the identical violations as a raw tuple of strings, each one prefixed
+    `"asset.<target>: "`/`"finding.<target>: "` when it is attributable to
+    exactly one slot -- so a caller that needs to ACT on individual
+    violations (agents/schema_inference.py's provisional-assembly degrade
+    path) can do so without re-parsing this exception's own formatted
+    `str(self)` message."""
+
+    def __init__(self, message: str, *, problems: tuple[str, ...] = ()):
+        super().__init__(message)
+        self.problems = problems
 
 
 # ---------------------------------------------------------------------------
@@ -1206,7 +1216,8 @@ def validate_contract(contract: Contract, headers: "dict[str, list[str]]") -> No
     if assets_header is None or findings_header is None:
         raise ContractValidationError(
             f"{len(problems)} problem(s) validating contract {contract.format!r}:\n"
-            + "\n".join(f"  - {p}" for p in problems)
+            + "\n".join(f"  - {p}" for p in problems),
+            problems=tuple(problems),
         )
 
     assets_header_set, findings_header_set = set(assets_header), set(findings_header)
@@ -1254,13 +1265,10 @@ def validate_contract(contract: Contract, headers: "dict[str, list[str]]") -> No
         column = _column_of(mapping)
         if column is not None:
             check_column(where, column, assets_header_set, accounted_assets, "assets", optional=mapping.optional)
-        if isinstance(mapping, _BLANK_BEARING_KINDS):
-            _check_blank_policy(problems, where, mapping.blank, target)
+        problems.extend(check_slot_mapping_legality(where, target, mapping))
         if isinstance(mapping, VocabularyMapping):
             for value in mapping.table.values():
                 _check_vocabulary_value(problems, where, target, value)
-        if isinstance(mapping, ParsedMapping) and mapping.parser == "timestamp":
-            problems.append(f"{where}: parser 'timestamp' is legal only inside asset_grouping.order_by")
 
     for target, mapping in contract.finding.items():
         where = f"finding.{target}"
@@ -1297,13 +1305,10 @@ def validate_contract(contract: Contract, headers: "dict[str, list[str]]") -> No
                         f"{where}: column {placeholder!r} is in the assets header, not findings -- "
                         "composed has no cross-file join; a finding cannot read a column from the other file"
                     )
-        if isinstance(mapping, _BLANK_BEARING_KINDS):
-            _check_blank_policy(problems, where, mapping.blank, target)
+        problems.extend(check_slot_mapping_legality(where, target, mapping))
         if isinstance(mapping, VocabularyMapping):
             for value in mapping.table.values():
                 _check_vocabulary_value(problems, where, target, value)
-        if isinstance(mapping, ParsedMapping) and mapping.parser == "timestamp":
-            problems.append(f"{where}: parser 'timestamp' is legal only inside asset_grouping.order_by")
 
     check_column("asset_grouping.key", contract.asset_grouping.key, assets_header_set, accounted_assets, "assets")
     if contract.asset_grouping.order_by is not None:
@@ -1433,7 +1438,8 @@ def validate_contract(contract: Contract, headers: "dict[str, list[str]]") -> No
     if problems:
         raise ContractValidationError(
             f"{len(problems)} problem(s) validating contract {contract.format!r}:\n"
-            + "\n".join(f"  - {p}" for p in problems)
+            + "\n".join(f"  - {p}" for p in problems),
+            problems=tuple(problems),
         )
 
 
@@ -1448,6 +1454,39 @@ def _check_blank_policy(problems: list[str], where: str, blank: BlankPolicy, tar
             f"{where}: blank='absent_fact' is not legal for target {target!r} (schema default is not \"\"; "
             f"legal targets: {sorted(ABSENT_FACT_LEGAL_TARGETS)})"
         )
+
+
+def _check_parser_placement(problems: list[str], where: str, mapping: Any) -> None:
+    """`parser: "timestamp"` is legal only inside `asset_grouping.order_by`
+    (`AssetGroupingOrderBy.parser` has its own, separate Literal for that)
+    -- never on a plain per-row `parsed` mapping. Factored out of
+    `validate_contract`'s own per-slot loops so `check_slot_mapping_legality`
+    (below) -- and, through it, `agents/schema_inference.py`'s construction-
+    time proposal check -- runs the identical rule rather than a second,
+    hand-copied one."""
+    if isinstance(mapping, ParsedMapping) and mapping.parser == "timestamp":
+        problems.append(f"{where}: parser 'timestamp' is legal only inside asset_grouping.order_by")
+
+
+def check_slot_mapping_legality(where: str, target: str, mapping: Any) -> list[str]:
+    """Every per-mapping legality rule that depends only on `(target,
+    mapping)` -- not on the real header, another contract block, or
+    anything else needing full contract context. `validate_contract`'s own
+    per-slot loops call this so it stays the single source of truth; more
+    importantly, `agents/schema_inference.py`'s `AdapterProposal` ALSO runs
+    it, at model-construction time, on every `SlotMapped` the model
+    proposes -- closing the grammar at generation, not only at final
+    contract validation. A proposal that emits `blank='gap'` on a target
+    with no `NOT_COLLECTED_DEFAULTS` entry (e.g. `role`), or a `timestamp`
+    parser outside `asset_grouping.order_by`, is rejected immediately and
+    retried with the specific violation fed back to the model, rather than
+    accepted as "resolved" and only failing later when the assembled
+    contract reaches this exact same check."""
+    problems: list[str] = []
+    if isinstance(mapping, _BLANK_BEARING_KINDS):
+        _check_blank_policy(problems, where, mapping.blank, target)
+    _check_parser_placement(problems, where, mapping)
+    return problems
 
 
 def _check_default_by(problems: list[str], where: str, mapping: DefaultByMapping, target: str, contract: Contract) -> None:

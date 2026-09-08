@@ -23,11 +23,13 @@ from rhinosecure.agents.schema_inference import (
     PROVISIONAL_ROLE_PLACEHOLDER,
     AdapterProposal,
     Generator,
+    MappingLegalityError,
     ProposalGenerationError,
     ProposalIncompleteError,
     ProvisionalAssemblyNotes,
     SavedProposal,
     SchemaInferenceError,
+    _check_mapped_slots_legal,
     _resolve_layout,
     _validate_format_name,
     assemble_contract,
@@ -483,6 +485,177 @@ def test_provisional_assembly_of_a_fully_resolved_proposal_behaves_like_assemble
     strict_contract = assemble_contract(proposal, profiles, report, generator=_generator(), generated_at=_GENERATED_AT)
     assert contract.asset == strict_contract.asset
     assert contract.finding == strict_contract.finding
+
+
+# --- assemble_provisional_contract: a SlotMapped mapping that is individually
+# illegal (the real bug: every slot mapped and grounded, but the assembled
+# contract still fails validate_contract) -------------------------------------
+
+
+def test_provisional_assembly_drops_a_mapped_but_illegal_blank_policy_and_reports_it(tmp_path):
+    """The real bug this fix closes: the model fully MAPPED asset.role (a
+    real vocabulary reading a real column) but declared blank='gap',
+    illegal for role (no NOT_COLLECTED_DEFAULTS entry). check_grounding
+    cannot catch this -- it only checks that cited columns/table-keys are
+    real -- so this reaches assemble_provisional_contract as a SlotMapped,
+    not an unresolved one. The dropped mapping's own column
+    ("RoleColUnique", read by nothing else here) becomes orphaned; the fix
+    must reconcile that too, not just replace the mapping."""
+    header = _HEADER + ["RoleColUnique"]
+    _write_csv(tmp_path, header, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "srv", "Workstation"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "wks", "Workstation"],
+    ])
+    profiles_map = {p.path.name: p for p in profile_source(tmp_path)}
+
+    data = _full_proposal_dict(overrides_asset={
+        "role": _mapped(
+            {"kind": "vocabulary", "column": "RoleColUnique", "case": "exact", "blank": "gap", "optional": True,
+             "table": {"Workstation": "workstation"}},
+            columns_cited=["RoleColUnique"],
+        ),
+    })
+    proposal = AdapterProposal.model_validate(data)  # must NOT raise -- --from-proposal must stay loadable
+    report = check_grounding(proposal, profiles_map)
+    assert report.failures == []  # grounding cannot see this; it's a legality problem, not a hallucination
+
+    with pytest.raises(ProposalIncompleteError, match="asset.role"):
+        assemble_contract(proposal, profiles_map, report, generator=_generator(), generated_at=_GENERATED_AT)
+
+    contract, notes = assemble_provisional_contract(proposal, profiles_map, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract is not None
+    assert notes.hard_stop_reason is None
+    assert notes.invalid_mappings_dropped == frozenset({"asset.role"})
+    assert notes.neutralized_axes == frozenset({"role"})
+    role_mapping = contract.asset["role"]
+    assert role_mapping.kind == "literal"
+    assert role_mapping.value == PROVISIONAL_ROLE_PLACEHOLDER
+    assert "RoleColUnique" in contract.unmapped_columns["data.csv"]
+    assert contract.unmapped_columns["data.csv"]["RoleColUnique"].disposition == "deliberately_dropped"
+    validate_contract(contract, {"data.csv": header})
+
+
+def test_provisional_assembly_drops_a_mapped_but_illegal_parser_and_reports_it(tmp_path):
+    """finding.detected_date mapped with parser='timestamp' -- legal ONLY
+    inside asset_grouping.order_by, illegal on a plain per-row `parsed`
+    mapping. detected_date is gap-legal but not a scoring axis, so it is
+    dropped (not_collected) WITHOUT being neutralized -- distinct from
+    role, and exactly why invalid_mappings_dropped exists separately from
+    neutralized_axes."""
+    header = _HEADER + ["DateColUnique"]
+    _write_csv(tmp_path, header, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "srv", "2026-01-01T00:00:00Z"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "wks", "2026-01-02T00:00:00Z"],
+    ])
+    profiles_map = {p.path.name: p for p in profile_source(tmp_path)}
+
+    data = _full_proposal_dict(overrides_finding={
+        "detected_date": _mapped(
+            {"kind": "parsed", "column": "DateColUnique", "case": "exact", "blank": "gap", "optional": True, "parser": "timestamp"},
+            columns_cited=["DateColUnique"],
+        ),
+    })
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles_map)
+    assert report.failures == []
+
+    contract, notes = assemble_provisional_contract(proposal, profiles_map, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract is not None
+    assert notes.hard_stop_reason is None
+    assert notes.invalid_mappings_dropped == frozenset({"finding.detected_date"})
+    assert notes.neutralized_axes == frozenset()
+    assert contract.finding["detected_date"].kind == "not_collected"
+    assert "DateColUnique" in contract.unmapped_columns["data.csv"]
+    validate_contract(contract, {"data.csv": header})
+
+
+def test_provisional_assembly_drops_multiple_illegal_mappings_in_one_pass(tmp_path):
+    """The real bug, reproduced directly: a proposal with EVERY slot mapped
+    and grounded, but TWO independently illegal mappings (role's blank
+    policy, detected_date's parser placement), each orphaning its own
+    column. validate_contract's own "name every offender in one message"
+    discipline means both are reported together; one degrade pass must fix
+    both and reconcile both orphaned columns in the same retry."""
+    header = _HEADER + ["RoleColUnique", "DateColUnique"]
+    _write_csv(tmp_path, header, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "srv", "Workstation", "2026-01-01T00:00:00Z"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "wks", "Workstation", "2026-01-02T00:00:00Z"],
+    ])
+    profiles_map = {p.path.name: p for p in profile_source(tmp_path)}
+
+    data = _full_proposal_dict(
+        overrides_asset={
+            "role": _mapped(
+                {"kind": "vocabulary", "column": "RoleColUnique", "case": "exact", "blank": "gap", "optional": True,
+                 "table": {"Workstation": "workstation"}},
+                columns_cited=["RoleColUnique"],
+            ),
+        },
+        overrides_finding={
+            "detected_date": _mapped(
+                {"kind": "parsed", "column": "DateColUnique", "case": "exact", "blank": "gap", "optional": True, "parser": "timestamp"},
+                columns_cited=["DateColUnique"],
+            ),
+        },
+    )
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles_map)
+    assert report.failures == []
+
+    with pytest.raises(ProposalIncompleteError) as excinfo:
+        assemble_contract(proposal, profiles_map, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert "asset.role" in str(excinfo.value)
+    assert "finding.detected_date" in str(excinfo.value)
+
+    contract, notes = assemble_provisional_contract(proposal, profiles_map, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract is not None
+    assert notes.hard_stop_reason is None
+    assert notes.invalid_mappings_dropped == frozenset({"asset.role", "finding.detected_date"})
+    assert notes.neutralized_axes == frozenset({"role"})
+    assert contract.asset["role"].kind == "literal"
+    assert contract.finding["detected_date"].kind == "not_collected"
+    assert set(contract.unmapped_columns["data.csv"]) >= {"RoleColUnique", "DateColUnique"}
+    validate_contract(contract, {"data.csv": header})
+
+
+def test_provisional_assembly_hard_stops_when_an_illegal_mapping_has_no_placeholder(tmp_path):
+    """finding.cve_id is a hard-stop identity target -- an illegal mapping
+    on it (parser='timestamp', legal only in asset_grouping.order_by)
+    cannot be silently dropped to a placeholder the way role/detected_date
+    can; assemble_provisional_contract must hard-stop, not guess."""
+    _write_csv(tmp_path, _HEADER, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "srv"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "wks"],
+    ])
+    profiles_map = {p.path.name: p for p in profile_source(tmp_path)}
+    data = _full_proposal_dict(overrides_finding={
+        "cve_id": _mapped({"kind": "parsed", "column": "Cve", "case": "upper", "blank": "fatal", "parser": "timestamp"}, columns_cited=["Cve"]),
+    })
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles_map)
+    assert report.failures == []
+
+    contract, notes = assemble_provisional_contract(proposal, profiles_map, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract is None
+    assert "finding.cve_id" in notes.hard_stop_reason
+    assert "no legal provisional placeholder" in notes.hard_stop_reason
+
+
+# --- _check_mapped_slots_legal: closing the grammar at FRESH generation ------
+
+
+def test_check_mapped_slots_legal_flags_an_illegal_mapping():
+    data = _full_proposal_dict(overrides_asset={
+        "role": _mapped({"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "gap", "table": {"srv": "dc"}}, columns_cited=["Col"]),
+    })
+    proposal = AdapterProposal.model_validate(data)  # must NOT raise -- see module docstring
+    with pytest.raises(MappingLegalityError, match="asset.role"):
+        _check_mapped_slots_legal(proposal)
+
+
+def test_check_mapped_slots_legal_passes_the_valid_fixture():
+    proposal = AdapterProposal.model_validate(_full_proposal_dict())
+    _check_mapped_slots_legal(proposal)  # must not raise
 
 
 def test_assemble_contract_a_caveat_alone_does_not_block(tmp_path):

@@ -26,6 +26,10 @@ from rhinosecure.adapters.config_model import (
     SCORING_ENUM_TARGETS,
     Contract,
     ContractValidationError,
+    NotCollectedMapping,
+    ParsedMapping,
+    VocabularyMapping,
+    check_slot_mapping_legality,
     compute_content_digest,
     compute_decision_digest,
     low_confidence_scoring_slots,
@@ -748,6 +752,72 @@ def test_timestamp_parser_outside_order_by_is_refused():
     contract = Contract.model_validate(d)
     with pytest.raises(ContractValidationError, match="legal only inside asset_grouping.order_by"):
         validate_contract(contract, BLUEPEAK_HEADERS)
+
+
+def test_blank_gap_on_role_via_a_real_vocabulary_mapping_is_refused():
+    """A REAL bug this fix closes: a mapping can be otherwise perfectly
+    legitimate (a real column, a real vocabulary table) and still be
+    illegal solely because of its `blank` policy -- role has no
+    NOT_COLLECTED_DEFAULTS entry, so `blank='gap'` is illegal for it even
+    though the identical mapping with `blank='fatal'` (the fixture's own
+    real value) is fine. This is the exact shape check_grounding cannot
+    catch (it only verifies cited columns/table-keys are real), so it
+    reaches validate_contract as the last line of defense."""
+    d = copy.deepcopy(bluepeak_gen_dict())
+    d["asset"]["role"]["blank"] = "gap"
+    contract = Contract.model_validate(d)
+    with pytest.raises(ContractValidationError, match="blank='gap' is not legal for target 'role'"):
+        validate_contract(contract, BLUEPEAK_HEADERS)
+
+
+def test_contract_validation_error_carries_the_raw_problems_tuple():
+    """`.problems` is what lets a caller (agents/schema_inference.py's
+    provisional-assembly degrade path) act on individual violations
+    without re-parsing the formatted message -- it must carry the exact
+    same violations the message text reports, each still prefixed by its
+    `asset.<target>`/`finding.<target>` scope."""
+    d = copy.deepcopy(bluepeak_gen_dict())
+    d["asset"]["role"]["blank"] = "gap"
+    contract = Contract.model_validate(d)
+    with pytest.raises(ContractValidationError) as excinfo:
+        validate_contract(contract, BLUEPEAK_HEADERS)
+    assert isinstance(excinfo.value.problems, tuple)
+    assert any(p.startswith("asset.role: blank='gap'") for p in excinfo.value.problems)
+
+
+# --- check_slot_mapping_legality: the reusable per-mapping check itself ------
+#
+# validate_contract's own per-slot loops call this; agents/schema_inference.py
+# ALSO calls it directly, at proposal-construction time, for a fresh LLM
+# candidate -- so it's tested standalone here rather than only indirectly
+# through validate_contract, to pin the exact contract callers on both sides
+# depend on.
+
+
+def test_check_slot_mapping_legality_flags_illegal_blank_for_role():
+    mapping = VocabularyMapping(kind="vocabulary", column="Asset_Type", blank="gap", table={"Workstation": "workstation"})
+    problems = check_slot_mapping_legality("asset.role", "role", mapping)
+    assert len(problems) == 1
+    assert "blank='gap' is not legal for target 'role'" in problems[0]
+
+
+def test_check_slot_mapping_legality_flags_timestamp_parser_outside_order_by():
+    mapping = ParsedMapping(kind="parsed", column="First_Detected", blank="fatal", parser="timestamp")
+    problems = check_slot_mapping_legality("finding.detected_date", "detected_date", mapping)
+    assert len(problems) == 1
+    assert "legal only inside asset_grouping.order_by" in problems[0]
+
+
+def test_check_slot_mapping_legality_passes_a_legal_mapping():
+    mapping = VocabularyMapping(kind="vocabulary", column="Asset_Type", blank="fatal", table={"Workstation": "workstation"})
+    assert check_slot_mapping_legality("asset.role", "role", mapping) == []
+
+
+def test_check_slot_mapping_legality_ignores_kinds_with_no_blank_or_parser():
+    # not_collected has neither a `blank` field nor a `parser` -- must be a
+    # silent no-op here (its own legality -- whether `role` may be
+    # not_collected at all -- is a DIFFERENT check, not this function's job).
+    assert check_slot_mapping_legality("asset.role", "role", NotCollectedMapping(kind="not_collected")) == []
 
 
 def test_not_collected_target_cannot_be_mapped():

@@ -824,6 +824,7 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
         "next_step": None,
         "provisional": False,
         "neutralized_axes": [],
+        "invalid_mappings_dropped": [],
     }
 
     if result.contract is None:
@@ -853,6 +854,7 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
         result_dict["incomplete_reason"] = None
         result_dict["provisional"] = True
         result_dict["neutralized_axes"] = sorted(notes.neutralized_axes)
+        result_dict["invalid_mappings_dropped"] = sorted(notes.invalid_mappings_dropped)
         result_dict["next_step"] = f'rhino adapt confirm {name} --data uploads/{upload_id} --by "<you>"'
         return JobOutcome(result=result_dict)
 

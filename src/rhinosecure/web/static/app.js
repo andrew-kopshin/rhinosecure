@@ -1962,6 +1962,26 @@ function describeIngestProposeIncomplete(result) {
   return "not written, and the backend reported no reason for it -- this is itself a bug; please report it.";
 }
 
+/* The coverage-summary half of a PROVISIONAL write: `invalid_mappings_
+ * dropped` names slot(s) the model actually MAPPED, but whose mapping
+ * individually failed contract validation (an illegal blank policy, a
+ * misplaced timestamp parser, ...) -- schema_inference.assemble_
+ * provisional_contract dropped these and replaced them with a placeholder,
+ * distinct from `neutralized_axes` (a scoring-axis concern -- not every
+ * dropped slot feeds scoring, e.g. finding.detected_date). Empty string
+ * for a non-provisional write, or a provisional one that needed neither. */
+function describeProvisionalCoverage(r) {
+  if (!r.provisional) return "";
+  const parts = [];
+  if (r.invalid_mappings_dropped && r.invalid_mappings_dropped.length) {
+    parts.push(`dropped (individually invalid): ${r.invalid_mappings_dropped.join(", ")}`);
+  }
+  if (r.neutralized_axes && r.neutralized_axes.length) {
+    parts.push(`neutralized for scoring: ${r.neutralized_axes.join(", ")}`);
+  }
+  return parts.length ? ` Provisional -- ${esc(parts.join("; "))}.` : " Provisional.";
+}
+
 async function openResolvePanel(name, uploadId) {
   const card = appendFollowUpCard(`<span class="spinner"></span> Loading unresolved slot(s)…`);
   let data;
@@ -2647,7 +2667,7 @@ function formatStepResult(step) {
     }
     case "ingest_propose":
       return r.contract_written
-        ? `Contract written to ${esc(baseName(r.contract_path))}. Next: ${r.next_step}`
+        ? `Contract written to ${esc(baseName(r.contract_path))}.${describeProvisionalCoverage(r)} Next: ${r.next_step}`
         : `Not written yet -- ${esc(describeIngestProposeIncomplete(r))}`;
     case "constraint_submit":
       return r.persisted ? "Constraint applied." : "Nothing to apply.";
