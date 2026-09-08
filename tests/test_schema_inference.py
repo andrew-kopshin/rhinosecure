@@ -33,6 +33,7 @@ from rhinosecure.agents.schema_inference import (
     SlotUnresolved,
     _apply_registry_aliases,
     _check_mapped_slots_legal,
+    _reconcile_redundant_structural_columns,
     _resolve_layout,
     _validate_format_name,
     assemble_contract,
@@ -622,6 +623,122 @@ def test_provisional_assembly_drops_multiple_illegal_mappings_in_one_pass(tmp_pa
     validate_contract(contract, {"data.csv": header})
 
 
+def test_reconcile_redundant_structural_columns_only_drops_genuinely_structural_columns():
+    """`_reconcile_redundant_structural_columns` never guesses: every
+    remaining problem must be the exact V08 "both mapped and listed"
+    message, for the assets file specifically, naming only columns
+    `structural_site_columns` actually recognizes -- anything else declines
+    (`None`), the same "recover only the exact known shape" discipline
+    `_reconcile_orphaned_columns` already applies to the mirror-image
+    case."""
+    from rhinosecure.adapters.config_model import AssetGrouping, AssetGroupingOrderBy
+
+    ag = AssetGrouping(key="Asset_ID", order_by=AssetGroupingOrderBy(column="Last_Observed", parser="timestamp"))
+
+    assert _reconcile_redundant_structural_columns(
+        ("column(s) ['Last_Observed'] are both mapped and listed in unmapped_columns['data.csv']",),
+        ag, "data.csv",
+    ) == frozenset({"Last_Observed"})
+
+    # wrong file -- asset_grouping has no finding-side equivalent
+    assert _reconcile_redundant_structural_columns(
+        ("column(s) ['Last_Observed'] are both mapped and listed in unmapped_columns['other.csv']",),
+        ag, "data.csv",
+    ) is None
+
+    # a column that is NOT actually a structural site -- a real, different
+    # mistake, never silently absorbed
+    assert _reconcile_redundant_structural_columns(
+        ("column(s) ['Something_Else'] are both mapped and listed in unmapped_columns['data.csv']",),
+        ag, "data.csv",
+    ) is None
+
+    # a genuinely unrelated (differently-shaped) problem alongside a real
+    # match -- PARTITIONS rather than declining entirely: the redundant
+    # column is still resolved, the unrelated problem is simply left for
+    # whatever the caller runs next (_degrade_invalid_slots). This is the
+    # real, live shape: both problems in the SAME validate_contract failure.
+    assert _reconcile_redundant_structural_columns(
+        (
+            "column(s) ['Last_Observed'] are both mapped and listed in unmapped_columns['data.csv']",
+            "finding.detected_date: parser 'timestamp' is legal only inside asset_grouping.order_by, "
+            "never on a per-row mapping -- for a per-row target, use one of these parsers instead: "
+            "['bool', 'cve_id', 'date', 'float']",
+        ),
+        ag, "data.csv",
+    ) == frozenset({"Last_Observed"})
+
+    # a "both mapped and listed" problem that DOES match the shape but
+    # names a non-structural column ALONGSIDE an unrelated one -- still
+    # refused outright (unlike the case above): this is a real, different
+    # contradiction this function has no business silently resolving.
+    assert _reconcile_redundant_structural_columns(
+        (
+            "column(s) ['Something_Else'] are both mapped and listed in unmapped_columns['data.csv']",
+            "finding.detected_date: parser 'timestamp' is legal only inside asset_grouping.order_by, "
+            "never on a per-row mapping -- for a per-row target, use one of these parsers instead: "
+            "['bool', 'cve_id', 'date', 'float']",
+        ),
+        ag, "data.csv",
+    ) is None
+
+
+def test_provisional_assembly_degrades_a_redundant_order_by_column_alongside_an_illegal_slot(tmp_path):
+    """The exact real, live-reported shape (job a03c6bf6289346e1b84d48ef0a4cab64,
+    northgate_flat_3.csv): a column used ONLY by asset_grouping.order_by
+    (parser='timestamp', legal there) is ALSO redundantly listed in
+    unmapped_columns, in the SAME proposal as a genuinely illegal per-row
+    mapping (finding.detected_date, parser='timestamp', illegal there).
+    Before structural_site_columns existed, the redundant-column problem
+    was UNATTRIBUTED, so _degrade_invalid_slots's own gate ("if not by_slot
+    or unattributed: return str(exc)") refused the WHOLE batch outright --
+    even though the slot-level problem was, on its own, exactly as
+    mechanically recoverable as any other illegal mapping. Both are now
+    resolved in one pass, and assembly succeeds."""
+    header = _HEADER + ["Last_Observed"]
+    _write_csv(tmp_path, header, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "srv", "2026-01-01T00:00:00Z"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "wks", "2026-01-02T00:00:00Z"],
+    ])
+    profiles_map = {p.path.name: p for p in profile_source(tmp_path)}
+
+    data = _full_proposal_dict(overrides_finding={
+        "detected_date": _mapped(
+            {"kind": "parsed", "column": "Col", "case": "exact", "blank": "gap", "parser": "timestamp"},
+            columns_cited=["Col"],
+        ),
+    })
+    data["asset_grouping"] = {
+        "key": "Asset_ID",
+        "order_by": {"column": "Last_Observed", "parser": "timestamp", "required": False},
+        "resolution": "agree_or_recency",
+    }
+    data["unmapped_columns"] = {
+        "data.csv": {
+            "Last_Observed": {
+                "disposition": "evidence_only",
+                "reason": "Used only as the order_by column -- not mapped to any target field directly.",
+                "profile_cited": "test",
+            },
+        },
+    }
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles_map)
+    assert report.failures == []  # purely a legality/accounting problem, not a grounding one
+
+    with pytest.raises(ProposalIncompleteError) as excinfo:
+        assemble_contract(proposal, profiles_map, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert "both mapped and listed" in str(excinfo.value)
+    assert "finding.detected_date" in str(excinfo.value)
+
+    contract, notes = assemble_provisional_contract(proposal, profiles_map, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract is not None
+    assert notes.hard_stop_reason is None
+    assert notes.invalid_mappings_dropped == frozenset({"finding.detected_date"})
+    assert "Last_Observed" not in contract.unmapped_columns.get("data.csv", {})
+    validate_contract(contract, {"data.csv": header})
+
+
 def test_provisional_assembly_hard_stops_when_an_illegal_mapping_has_no_placeholder(tmp_path):
     """finding.cve_id is a hard-stop identity target -- an illegal mapping
     on it (parser='timestamp', legal only in asset_grouping.order_by)
@@ -822,6 +939,52 @@ def test_propose_contract_gives_up_after_max_attempts(data_dir):
     _QueuedFakeCrew.queue = [UNPARSEABLE, UNPARSEABLE]
     with pytest.raises(ProposalGenerationError, match="gave up after 2 attempt"):
         propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, max_attempts=2)
+
+
+def test_propose_contract_degrades_instead_of_raising_when_retries_exhaust_on_an_illegal_mapping(data_dir):
+    """The regression this guards against: `_check_mapped_slots_legal` now
+    catches an individually-illegal mapping INSIDE the retry loop, before
+    `_check_mapped_slots_legal` existed the same mapping would sail through
+    to `assemble_contract`'s own `validate_contract` safety net, which
+    already treats this as a normal, non-raising 'incomplete' `ProposeResult`
+    (see `test_propose_contract_reports_an_incomplete_proposal_without_
+    raising`) -- never a hard `ProposalGenerationError`. Catching the
+    problem EARLIER must not make a degradable failure FATAL: if the model
+    keeps re-proposing the same illegal mapping across every attempt (no
+    legal alternative in view -- see the parser-placement message fix
+    below), retry exhaustion must fall through to that identical
+    non-raising outcome, not kill the job. That is what lets a caller's
+    provisional-path degrade mechanism (`assemble_provisional_contract`)
+    drop just this one slot and keep the rest of the run -- a bad mapping
+    should cost one field, not the job. Reproduces the real reported shape
+    exactly: `finding.detected_date` mapped with `parser='timestamp'`, legal
+    only inside `asset_grouping.order_by`, never on a per-row mapping."""
+    illegal = json.dumps(_full_proposal_dict(overrides_finding={
+        "detected_date": _mapped(
+            {"kind": "parsed", "column": "Col", "case": "exact", "blank": "gap", "parser": "timestamp"},
+            columns_cited=["Col"],
+        ),
+    }))
+    _QueuedFakeCrew.queue = [illegal, illegal, illegal]
+    result = propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, max_attempts=3)
+    assert result.contract is None
+    assert result.incomplete_reason is not None
+    assert "finding.detected_date" in result.incomplete_reason
+    assert "parser 'timestamp'" in result.incomplete_reason
+    assert result.generator.attempts == 3
+    assert _QueuedFakeCrew.instantiations == 3
+    assert [entry["outcome"] for entry in result.attempt_usage] == ["illegal_mapping"] * 3
+
+
+def test_propose_contract_still_raises_when_no_attempt_ever_produced_a_usable_candidate(data_dir):
+    """The degrade fallback is scoped to `MappingLegalityError` specifically
+    -- a candidate that parsed and matched the requested meta facts, just
+    with one individually-illegal slot. A genuine parse failure never
+    produces an `AdapterProposal` at all, so there is nothing to degrade;
+    this must still raise exactly as before."""
+    _QueuedFakeCrew.queue = [UNPARSEABLE, UNPARSEABLE, UNPARSEABLE]
+    with pytest.raises(ProposalGenerationError, match="gave up after 3 attempt"):
+        propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, max_attempts=3)
 
 
 def test_a_total_failure_still_reports_what_every_discarded_attempt_cost(data_dir):

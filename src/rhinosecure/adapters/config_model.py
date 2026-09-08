@@ -1173,6 +1173,41 @@ def _compute_not_collected(contract: Contract, assets_header: set[str], findings
     )
 
 
+def structural_site_columns(asset_grouping: AssetGrouping) -> frozenset[str]:
+    """Every column a NON-TARGET-SLOT structural site of `asset_grouping`
+    reads directly: `.key` (always) and `.order_by.column` (when declared).
+    These sites cite a column exactly as much as any asset.*/finding.*
+    mapping does -- a column consumed ONLY here is just as "accounted for"
+    as one fed to a real target, and can therefore never ALSO legally
+    appear in `unmapped_columns` (`validate_contract`'s own "both mapped
+    and listed" refusal, below, already enforces this for a target-slot
+    column; reading THIS function is what makes it enforce the identical
+    rule for a structural-site column too).
+
+    The single, canonical definition of that fact. Before this function
+    existed, `validate_contract`'s own accounting (which always counted
+    these two columns) and `agents/schema_inference.py`'s provisional-
+    degrade reconciliation (which counted neither -- nor did the browser
+    slot-resolution form's own JS mirror, `app.js`'s
+    `_isColumnUsedElsewhere`) silently disagreed about what "accounted for"
+    means. A column used ONLY by `asset_grouping.order_by` fell between the
+    two: `validate_contract` correctly refused it as "both mapped and
+    listed," but nothing on the recovery side knew this was a mechanically
+    safe contradiction to resolve rather than a genuine, unattributed
+    data-quality problem -- so a real live run hit exactly this and hard-
+    stopped instead of degrading. `validate_contract` now reads this
+    function directly for its own accounting (see its own body, below);
+    `agents/schema_inference.py`'s `_reconcile_redundant_structural_columns`
+    reads the identical function to recognize the mirror-image case -- a
+    column the proposal redundantly listed in `unmapped_columns` despite it
+    already being cited here -- as a safe, mechanical cleanup instead of an
+    unattributed hard stop."""
+    columns = {asset_grouping.key}
+    if asset_grouping.order_by is not None:
+        columns.add(asset_grouping.order_by.column)
+    return frozenset(columns)
+
+
 def validate_contract(contract: Contract, headers: "dict[str, list[str]]") -> None:
     """Every cross-field and header-dependent rule this design names (V01,
     V03, V05-V10, V14-V16, V18-V19). Raises `ContractValidationError` naming
@@ -1315,6 +1350,13 @@ def validate_contract(contract: Contract, headers: "dict[str, list[str]]") -> No
             "asset_grouping.order_by", order_by.column, assets_header_set, accounted_assets, "assets",
             optional=not order_by.required,
         )
+    # Redundant with the two calls above (both already `accounted.add()` the
+    # identical columns) -- deliberately so. This line is what makes this
+    # function PROVABLY use `structural_site_columns`'s own definition for
+    # its accounting, rather than one that merely happens to agree with it;
+    # a set union is a safe no-op today and stays one automatically if a
+    # future structural site is ever added to that function.
+    accounted_assets |= structural_site_columns(contract.asset_grouping)
 
     for field in contract.asset_grouping.union_fields:
         if field not in UNIONABLE_TARGETS:
@@ -1441,16 +1483,31 @@ def validate_contract(contract: Contract, headers: "dict[str, list[str]]") -> No
         )
 
 
+def _legal_blank_policies_clause(target: str) -> str:
+    """The positive half of a blank-policy refusal: not just which OTHER
+    targets share the rejected policy (the old wording -- a fact about a
+    global list, not about THIS target's own options), but what IS legal
+    for `target` specifically, read straight from the one place that
+    already knows (`TARGET_REGISTRY[target].legal_blank_policies`). A
+    retry-loop caller (`agents/schema_inference._check_mapped_slots_legal`)
+    feeds this problem text back to the model verbatim -- naming a real
+    alternative is what turns a rejection into a mapping it can actually
+    fix, instead of a fact it has no legal move in response to."""
+    legal = sorted(TARGET_REGISTRY[target].legal_blank_policies)
+    noun = "policy is" if len(legal) == 1 else "policies are"
+    return f"this target's legal blank {noun} {legal}"
+
+
 def _check_blank_policy(problems: list[str], where: str, blank: BlankPolicy, target: str) -> None:
     if blank == "gap" and target not in GAP_LEGAL_TARGETS:
         problems.append(
-            f"{where}: blank='gap' is not legal for target {target!r} (not a key of NOT_COLLECTED_DEFAULTS; "
-            f"legal targets: {sorted(GAP_LEGAL_TARGETS)})"
+            f"{where}: blank='gap' is not legal for target {target!r} (not a key of "
+            f"NOT_COLLECTED_DEFAULTS) -- {_legal_blank_policies_clause(target)}"
         )
     elif blank == "absent_fact" and target not in ABSENT_FACT_LEGAL_TARGETS:
         problems.append(
-            f"{where}: blank='absent_fact' is not legal for target {target!r} (schema default is not \"\"; "
-            f"legal targets: {sorted(ABSENT_FACT_LEGAL_TARGETS)})"
+            f"{where}: blank='absent_fact' is not legal for target {target!r} (schema default is not "
+            f"\"\") -- {_legal_blank_policies_clause(target)}"
         )
 
 
@@ -1483,7 +1540,19 @@ def _check_parser_placement(problems: list[str], where: str, mapping: Any) -> No
     if "row" in positions:
         return
     legal_elsewhere = ", ".join(sorted(_PARSER_POSITION_LABELS.get(p, p) for p in positions))
-    problems.append(f"{where}: parser {mapping.parser!r} is legal only inside {legal_elsewhere}")
+    # The positive half: which parser TO use instead, not just which one is
+    # wrong here. A retry-loop caller (agents/schema_inference._check_mapped_
+    # slots_legal) feeds this back to the model verbatim -- without this, the
+    # feedback is a pure negative constraint ("timestamp is illegal here")
+    # with nothing pointing the model anywhere else, and a model with no
+    # legal alternative in view just re-emits the same illegal parser on
+    # every retry. Read straight from PARSER_POSITIONS, the same registry
+    # that already knows the answer -- never a second, hand-maintained list.
+    row_legal = sorted(name for name, pos in PARSER_POSITIONS.items() if "row" in pos)
+    problems.append(
+        f"{where}: parser {mapping.parser!r} is legal only inside {legal_elsewhere}, never on a "
+        f"per-row mapping -- for a per-row target, use one of these parsers instead: {row_legal}"
+    )
 
 
 def _is_string_shaped_type(python_type: Any) -> bool:

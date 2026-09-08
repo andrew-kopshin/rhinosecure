@@ -2200,11 +2200,19 @@ function _mappingColumns(mapping) {
 }
 
 /* Whether `column` is read by some OTHER mapping in this proposal (or a
- * `derived` block another mapping keys off) -- so resolving one slot never
- * un-declares a column a different slot still genuinely uses. A missed
- * case here still surfaces loudly as validate_contract's own "mapped AND
- * unmapped" contradiction rather than silently corrupting anything -- this
- * is bookkeeping, not a semantic judgment call. */
+ * `derived` block another mapping keys off, or a structural site of
+ * asset_grouping -- `.key`/`.order_by.column`, the same two sites
+ * config_model.py's `structural_site_columns` names as the canonical,
+ * single definition of "accounted for" outside a target-slot mapping; a
+ * miss here is exactly the gap a real live run hit: a column used ONLY by
+ * asset_grouping.order_by was invisible to this check, so resolving an
+ * unrelated slot could leave it declared unmapped despite validate_contract
+ * already counting it as accounted for) -- so resolving one slot never
+ * un-declares a column a different slot, or asset_grouping itself, still
+ * genuinely uses. A missed case here still surfaces loudly as
+ * validate_contract's own "mapped AND unmapped" contradiction rather than
+ * silently corrupting anything -- this is bookkeeping, not a semantic
+ * judgment call. */
 function _isColumnUsedElsewhere(proposal, column, excludeSlotKey) {
   for (const section of ["asset", "finding"]) {
     for (const [target, sp] of Object.entries(proposal[section] || {})) {
@@ -2212,7 +2220,10 @@ function _isColumnUsedElsewhere(proposal, column, excludeSlotKey) {
       if (sp.status === "mapped" && _mappingColumns(sp.mapping).includes(column)) return true;
     }
   }
-  return Object.values(proposal.derived || {}).some((d) => d.column === column);
+  if (Object.values(proposal.derived || {}).some((d) => d.column === column)) return true;
+  const grouping = proposal.asset_grouping || {};
+  if (grouping.key === column) return true;
+  return !!(grouping.order_by && grouping.order_by.column === column);
 }
 
 function applySlotEditToProposal(proposal, slot, row) {

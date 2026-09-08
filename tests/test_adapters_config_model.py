@@ -538,6 +538,41 @@ def test_describe_target_vocabulary_return_shape_is_unchanged():
     assert describe_target_vocabulary("hostname") is None
 
 
+def test_structural_site_columns_includes_key_and_order_by():
+    """The single, canonical definition of "which columns does asset_grouping
+    itself structurally cite" -- both validate_contract's own accounting
+    and agents/schema_inference.py's provisional-degrade reconciliation now
+    read this same function, closing the gap where a column used ONLY by
+    asset_grouping.order_by fell between two different, disagreeing
+    definitions of "accounted for" (the real, live-reported bug this
+    closes)."""
+    from rhinosecure.adapters.config_model import AssetGrouping, AssetGroupingOrderBy, structural_site_columns
+
+    no_order_by = AssetGrouping(key="Asset_ID")
+    assert structural_site_columns(no_order_by) == frozenset({"Asset_ID"})
+
+    with_order_by = AssetGrouping(
+        key="Asset_ID", order_by=AssetGroupingOrderBy(column="Last_Observed", parser="timestamp"),
+    )
+    assert structural_site_columns(with_order_by) == frozenset({"Asset_ID", "Last_Observed"})
+
+
+def test_order_by_only_column_redundantly_listed_as_unmapped_is_refused():
+    """A column used ONLY by asset_grouping.order_by is just as "accounted
+    for" as a target-slot column -- listing it AGAIN in unmapped_columns is
+    the identical "both mapped and listed" contradiction validate_contract
+    already refuses for a target-slot column, not a new rule; the real gap
+    was that nothing on the RECOVERY side (agents/schema_inference.py) knew
+    this, which is what the sibling test suite there fixes."""
+    d = copy.deepcopy(bluepeak_gen_dict())
+    d["unmapped_columns"]["synthetic_cve_inventory_50.csv"]["Last_Observed"] = {
+        "disposition": "evidence_only", "reason": "test",
+    }
+    contract = Contract.model_validate(d)
+    with pytest.raises(ContractValidationError, match=r"Last_Observed.*both mapped and listed"):
+        validate_contract(contract, BLUEPEAK_HEADERS)
+
+
 def test_check_parser_placement_is_sourced_from_parser_positions():
     from rhinosecure.adapters.schema_registry import PARSER_POSITIONS
 
@@ -853,6 +888,7 @@ def test_check_slot_mapping_legality_flags_illegal_blank_for_role():
     problems = check_slot_mapping_legality("asset.role", "role", mapping)
     assert len(problems) == 1
     assert "blank='gap' is not legal for target 'role'" in problems[0]
+    assert "this target's legal blank" in problems[0]
 
 
 def test_check_slot_mapping_legality_flags_timestamp_parser_outside_order_by():
@@ -860,6 +896,37 @@ def test_check_slot_mapping_legality_flags_timestamp_parser_outside_order_by():
     problems = check_slot_mapping_legality("finding.detected_date", "detected_date", mapping)
     assert len(problems) == 1
     assert "legal only inside asset_grouping.order_by" in problems[0]
+    assert "use one of these parsers instead" in problems[0]
+
+
+def test_blank_policy_refusal_names_the_targets_own_legal_policies():
+    """The positive half of the fix: not just which OTHER targets share the
+    rejected policy, but what IS legal for THIS target, sourced from
+    TARGET_REGISTRY directly -- a retry-loop caller
+    (agents/schema_inference._check_mapped_slots_legal) feeds this text
+    back to the model verbatim, and a rejection with no legal alternative
+    named just gets re-proposed identically on the next attempt (the exact,
+    reported live failure this fix closes)."""
+    from rhinosecure.adapters.schema_registry import TARGET_REGISTRY
+
+    mapping = VocabularyMapping(kind="vocabulary", column="Col", blank="gap", table={"x": "workstation"})
+    problems = check_slot_mapping_legality("asset.role", "role", mapping)
+    assert len(problems) == 1
+    legal = sorted(TARGET_REGISTRY["role"].legal_blank_policies)
+    assert str(legal) in problems[0]
+
+
+def test_parser_placement_refusal_names_every_row_legal_parser():
+    """Sourced from PARSER_POSITIONS directly, not a second, hand-maintained
+    list -- if a future parser is ever added that is order_by-only too,
+    this message updates itself with zero code change here."""
+    from rhinosecure.adapters.schema_registry import PARSER_POSITIONS
+
+    mapping = ParsedMapping(kind="parsed", column="Col", blank="fatal", parser="timestamp")
+    problems = check_slot_mapping_legality("finding.detected_date", "detected_date", mapping)
+    assert len(problems) == 1
+    row_legal = sorted(name for name, pos in PARSER_POSITIONS.items() if "row" in pos)
+    assert str(row_legal) in problems[0]
 
 
 def test_check_slot_mapping_legality_passes_a_legal_mapping():

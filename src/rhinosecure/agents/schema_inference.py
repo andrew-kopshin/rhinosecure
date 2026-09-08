@@ -107,6 +107,7 @@ from rhinosecure.adapters.config_model import (
     _composed_columns,  # the exact placeholder-extraction validate_contract itself uses
     _FORMAT_PATTERN,  # the exact pattern Contract.format itself is checked against
     check_slot_mapping_legality,  # the exact per-mapping legality checks validate_contract itself runs
+    structural_site_columns,  # the exact "accounted for" definition validate_contract itself now reads
     ContractValidationError,
     missing_attestations,
     validate_contract,
@@ -1313,6 +1314,64 @@ def _reconcile_orphaned_columns(
     return additions or None
 
 
+_REDUNDANT_STRUCTURAL_COLUMN_PATTERN = re.compile(
+    r"^column\(s\) (?P<cols>\[.*\]) are both mapped and listed in unmapped_columns\[(?P<filename_repr>'(?:[^'\\]|\\.)*')\]$"
+)
+
+
+def _reconcile_redundant_structural_columns(
+    problems: tuple[str, ...], asset_grouping: AssetGrouping, assets_filename: str
+) -> frozenset[str] | None:
+    """The mirror image of `_reconcile_orphaned_columns`, above: instead of
+    a column ORPHANED by a drop THIS module made, this recovers a column
+    the PROPOSAL's own `unmapped_columns` redundantly names despite it
+    already being cited by a structural site of `asset_grouping`
+    (`config_model.structural_site_columns` -- `.key`/`.order_by.column`;
+    see that function's own docstring for the definitional gap this
+    closes). Not something this module drops; present in the proposal from
+    the start, and mechanically resolvable the moment `validate_contract`
+    and this reconciliation agree on what "accounted for" means -- which,
+    now that both read `structural_site_columns`, they always do.
+
+    Unlike `_reconcile_orphaned_columns` (an all-or-nothing match over the
+    WHOLE problem list -- appropriate for its own, LATER position in the
+    retry sequence, by which point every remaining problem SHOULD already
+    be its exact shape), this function runs FIRST, possibly alongside a
+    genuinely different, unrelated problem in the SAME `validate_contract`
+    failure -- the real, live case this closes had exactly that (a
+    redundant order_by column AND an illegal per-row parser, together).
+    So it PARTITIONS rather than requiring a total match: a problem
+    matching this exact V08 "both mapped and listed" shape, for
+    `assets_filename` specifically (`asset_grouping` has no finding-side
+    equivalent), naming ONLY columns `structural_site_columns` recognizes,
+    is resolved; a problem of any OTHER shape is simply not this
+    function's concern and is left untouched for whatever the caller runs
+    next (`_degrade_invalid_slots`). It still never guesses within its own
+    shape: a "both mapped and listed" problem for `assets_filename` naming
+    even ONE column that ISN'T actually a structural site is refused
+    outright (`None`) -- that is a real, different contradiction (a
+    target-slot mapping's own mistake, say), not something this function
+    has any business silently resolving. Returns the columns to REMOVE
+    from `unmapped_columns[assets_filename]` (the opposite direction from
+    `_reconcile_orphaned_columns`, which returns entries to ADD), or `None`
+    if nothing matched or a match couldn't be trusted."""
+    structural = structural_site_columns(asset_grouping)
+    to_remove: set[str] = set()
+    for problem in problems:
+        match = _REDUNDANT_STRUCTURAL_COLUMN_PATTERN.match(problem)
+        if not match:
+            continue  # not this function's shape -- leave it for the caller's other reconciliation steps
+        try:
+            filename = ast.literal_eval(match.group("filename_repr"))
+            columns = ast.literal_eval(match.group("cols"))
+        except (ValueError, SyntaxError):
+            return None
+        if filename != assets_filename or not columns or any(c not in structural for c in columns):
+            return None
+        to_remove.update(columns)
+    return frozenset(to_remove) or None
+
+
 @dataclass(frozen=True)
 class ProvisionalAssemblyNotes:
     """What `assemble_provisional_contract` had to do to produce a
@@ -1468,6 +1527,43 @@ def assemble_provisional_contract(
             generator=generator, generated_at=generated_at,
         )
     except ProposalIncompleteError as exc:
+        # A column the proposal both feeds to a structural site
+        # (asset_grouping.key/.order_by) AND redundantly lists in
+        # unmapped_columns is a mechanical contradiction, not a data-quality
+        # problem -- recover it FIRST, before Case (B) below: the real,
+        # live case this closes had it alongside a genuine per-slot
+        # problem in the SAME proposal, and _degrade_invalid_slots refuses
+        # outright the moment ANY unattributed problem is present
+        # (`_slot_scoped_problems`'s own gate) -- an unresolved redundant-
+        # column contradiction would block slot-level degrading from ever
+        # being attempted, even though it has nothing to do with any slot.
+        redundant = _reconcile_redundant_structural_columns(
+            exc.problems, proposal.asset_grouping, proposal.meta.assets_filename
+        )
+        if redundant is not None:
+            pruned_unmapped = {filename: dict(cols) for filename, cols in proposal.unmapped_columns.items()}
+            # `.setdefault`, not `.get(..., {})` -- the latter would `.pop`
+            # from a throwaway dict on a miss, silently mutating nothing.
+            # In practice the key always exists here (every column in
+            # `redundant` came from a real `unmapped_columns[assets_filename]`
+            # entry `_reconcile_redundant_structural_columns` just matched),
+            # but the code should be correct on its own terms, not merely
+            # lucky about which branch it happens to take.
+            for column in redundant:
+                pruned_unmapped.setdefault(proposal.meta.assets_filename, {}).pop(column, None)
+            proposal = proposal.model_copy(update={"unmapped_columns": pruned_unmapped})
+            try:
+                contract = _assemble_and_validate(
+                    proposal, profiles, asset_mappings, finding_mappings, mapping_confidence,
+                    generator=generator, generated_at=generated_at,
+                )
+            except ProposalIncompleteError as exc_after_reconcile:
+                exc = exc_after_reconcile
+            else:
+                return contract, ProvisionalAssemblyNotes(
+                    neutralized_axes=frozenset(neutralized_axes), invalid_mappings_dropped=frozenset(dropped_slots),
+                )
+
         # Case (B), first attempt failed: at least one FULLY MAPPED slot is
         # individually illegal. Degrade exactly the slot(s) validate_contract
         # named and retry once with the identical proposal otherwise
@@ -2018,6 +2114,12 @@ def propose_contract(
         attempt_usage_list: list[dict[str, object]] = []
         last_error: Exception | None = None
         proposal = None
+        #: The most recent candidate that parsed, matched the requested meta
+        #: facts, but still failed `_check_mapped_slots_legal` -- kept around
+        #: (overwritten each time, so only the LAST such candidate survives)
+        #: so retry EXHAUSTION on this specific failure class can degrade
+        #: instead of dying. See the `if proposal is None` handling below.
+        last_illegal_candidate: AdapterProposal | None = None
         task: Task | None = None
         # `agent` (and so `agent.llm`) is deliberately built ONCE and reused
         # across every attempt below, but `crew.usage_metrics` is NOT a
@@ -2066,6 +2168,13 @@ def propose_contract(
                 break
             except (AgentOutputParseError, ValueError) as exc:
                 last_error = exc
+                if isinstance(exc, MappingLegalityError):
+                    # `candidate` is guaranteed bound and meta-matching here --
+                    # `_check_mapped_slots_legal` is the LAST check in the try
+                    # block, so reaching this branch for THIS exception type
+                    # means parsing and `_check_meta_matches` both already
+                    # succeeded for it.
+                    last_illegal_candidate = candidate
                 attempt_usage_list.append(
                     {
                         "attempt": attempt,
@@ -2087,12 +2196,35 @@ def propose_contract(
         # would have overcounted per attempt.
         total_usage = usage_baseline
 
-        if proposal is None:
+        if proposal is None and last_illegal_candidate is None:
             raise ProposalGenerationError(
                 f"gave up after {max_attempts} attempt(s): {last_error}",
                 attempt_usage=attempt_usage,
                 estimated_cost_usd=_estimate_cost_usd(total_usage),
             ) from last_error
+
+        if proposal is None:
+            # Every attempt parsed and matched the requested facts, but kept
+            # re-proposing an individually illegal mapping the model
+            # apparently has no legal alternative for -- distinct from a
+            # genuine parse/meta failure (nothing usable was ever produced),
+            # which still raises above. This is the SAME failure class
+            # `assemble_contract`'s own `validate_contract` safety net
+            # already handles as a normal, non-raising "incomplete" outcome
+            # for a candidate that made it PAST this loop on an earlier
+            # commit of this grammar (before `_check_mapped_slots_legal`
+            # existed to catch it here first) -- catching the problem
+            # earlier must not make a degradable failure fatal. Proceeding
+            # with the last illegal candidate lets `check_grounding`/
+            # `assemble_contract` run their own real `validate_contract`
+            # check on it (which will refuse it identically, producing the
+            # same clearly-worded `incomplete_reason` a human already sees
+            # for any other validate_contract failure) and, on the
+            # provisional path, lets the caller's EXISTING degrade
+            # mechanism (`assemble_provisional_contract`'s `_degrade_
+            # invalid_slots`) drop just this one slot and keep the rest of
+            # the run -- a bad mapping should cost one field, not the job.
+            proposal = last_illegal_candidate
 
         generator = Generator(
             tool="rhino-adapt-propose",
