@@ -613,10 +613,11 @@ def review_contract(
         )
 
     if sign and not reset_identity and drift.decisions_moved:
-        # The identity freeze. `check_identity_recipe_unchanged` (config_io)
-        # cannot be used here: it needs the OLD contract and the NEW one, and
-        # both verbs read a single file -- its real caller is the propose
-        # step, which holds both at the moment it mints a revision.
+        # The identity freeze. An equivalent two-contract check was drafted
+        # once as `config_io.check_identity_recipe_unchanged`, but nothing
+        # here ever holds both an OLD and a NEW contract at once -- both
+        # verbs read a single file -- so it had no real caller and was
+        # deleted; this gate is the actual, single-file-shaped mechanism.
         #
         # Phrased as "refuse unless the identity slot is PROVABLY unchanged",
         # never "refuse when it is known to have changed". The difference is

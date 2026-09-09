@@ -23,7 +23,6 @@ from pathlib import Path
 from rhinosecure.adapters.config_model import (
     Contract,
     ContractError,
-    ContentAddressMapping,
     compute_content_digest,
     compute_decision_digest,
     compute_slot_digests,
@@ -32,12 +31,6 @@ from rhinosecure.adapters.config_model import (
 
 class ContractIOError(ContractError):
     """A contract file could not be read or parsed."""
-
-
-class IdentityRecipeChangedError(ContractError):
-    """`finding.finding_id`'s content-address recipe differs between two
-    revisions of a contract without an explicit override -- see
-    `check_identity_recipe_unchanged`."""
 
 
 def read_contract(path: Path) -> Contract:
@@ -170,46 +163,4 @@ def confirm_contract(contract: Contract, *, at: str, by: str) -> Contract:
                 slot_digests=slot_digests,
             )
         }
-    )
-
-
-#: The `ContentAddressMapping` fields that make up the actual hashing
-#: recipe -- `recipe_version` is deliberately excluded: it is the field a
-#: contract author bumps to acknowledge an intentional change, not part of
-#: what is being compared for one.
-_IDENTITY_RECIPE_FIELDS = ("algorithm", "columns", "join", "prefix", "hex_len", "case")
-
-
-def check_identity_recipe_unchanged(old: Contract, new: Contract, *, allow_reset: bool = False) -> None:
-    """Refuses a `new` contract whose `finding.finding_id` content-address
-    recipe differs from `old`'s, unless `allow_reset=True` (a later slice's
-    `--reset-identity` flag). `memory.decisions` (not built yet, but its
-    schema is already fixed) keys on the rendered `finding_id` -- changing
-    which columns feed it, their order, the join byte, the prefix, or the
-    truncation length re-keys every finding this format has ever produced
-    a decision for, silently orphaning that history. This is a one-way
-    door a reviewer should have to open on purpose, not a mapping edit that
-    looks like any other.
-
-    A no-op whenever neither contract's `finding_id` is a `content_address`
-    (nothing to freeze), or the recipe is unchanged apart from
-    `recipe_version` (the field that exists specifically to record that a
-    reset happened)."""
-    old_mapping = old.finding.get("finding_id")
-    new_mapping = new.finding.get("finding_id")
-    if not isinstance(old_mapping, ContentAddressMapping) or not isinstance(new_mapping, ContentAddressMapping):
-        return
-    changed = [
-        field
-        for field in _IDENTITY_RECIPE_FIELDS
-        if getattr(old_mapping, field) != getattr(new_mapping, field)
-    ]
-    if not changed or allow_reset:
-        return
-    raise IdentityRecipeChangedError(
-        f"finding.finding_id's content_address recipe changed ({changed}) since this contract was "
-        f"confirmed (old: {old_mapping.model_dump(mode='json')}, new: {new_mapping.model_dump(mode='json')}). "
-        "memory.decisions keys on the rendered finding_id, so this change orphans every decision this "
-        "format has recorded so far -- pass allow_reset=True (a later slice's --reset-identity) to "
-        "confirm you understand that and proceed anyway."
     )

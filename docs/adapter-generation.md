@@ -217,10 +217,11 @@ digests, so `slot_digests` is unsigned evidence that can be absent (the
 state of both committed contracts today), missing just that one entry, or
 removed entirely, and each of those used to let a changed content-address
 recipe through in silence, re-keying every `memory.decisions` row for the
-format (the hardening round below). `config_io.check_identity_recipe_unchanged`
-(Slice 3) isn't used here — it needs both the old and new contract, and both
-verbs read one file; comparing against the committed history (`git show
-HEAD:<path>`) is on the human.
+format (the hardening round below). An equivalent two-contract check was once
+drafted as `config_io.check_identity_recipe_unchanged`, but neither verb here
+ever had both an old and a new contract in hand at once (each reads a single
+file), so it had no real caller and was deleted; comparing against the
+committed history (`git show HEAD:<path>`) is on the human.
 
 **Known limitation, flagged not fixed:** `enrichment` and `union`
 attestations cannot carry forward once any decision moves, because no stored
@@ -258,7 +259,7 @@ contract's declared dialect; a slot-digest key with no `.` in it crashed a
 printer; and the value-distribution report truncated to four values per
 field with no indication it had.
 
-## Rule 1: fatal-vs-exclude forward-traces to `role`, not a config key
+## Rule 1: fatal-vs-exclude is a flat membership check, not a config key
 
 There is deliberately **no `on_unmapped` field anywhere in the grammar**.
 Making disposition configurable would let either the model or a human
@@ -266,33 +267,31 @@ classify an inconvenient refusal as "exclude" to make it go away — exactly
 the failure mode the whole not-collected/refuse-rather-than-guess discipline
 exists to prevent (`config_model.py`'s own module docstring).
 
-Instead, the engine decides structurally. `ConfiguredAdapter._role_reference()`
-inspects how `contract.asset["role"]` is itself mapped and returns what would
-have to miss for the exclusion path to be legitimate:
-
-- `asset["role"]` is a `VocabularyMapping` → `("vocabulary", "role")`
-- `asset["role"]` is a `DefaultByMapping` → `("derivation", <the derivation
-  feeding it>)`
-- anything else → `("none", "")` — an invalid role value fails at
-  `Asset(...)` construction as an ordinary pydantic error, never through
-  `ProblemCollector`.
-
-At the two places a vocabulary or derivation-table *lookup* can miss
-(`_resolve_target`'s vocabulary branch, `_resolve_derivation`), a miss is
-compared against that tuple. Only a miss that *is* the thing feeding `role`
-becomes `problems.exclude(...)` — a scope-boundary skip, reported but not
-fatal (BluePeak's Kubernetes cluster, firewall, etc. are this case). Every
-other vocabulary or derivation miss, anywhere else in the contract, is
-always `problems.add(...)` — a fatal, whole-batch refusal. A third,
-separate `exclude` call exists in `_validate_findings`: once an asset is
-excluded, every finding on it is excluded too, cascading rather than
-raising a second, confusing "orphan" error for the same root cause — that
-site doesn't re-run the role trace itself, it just inherits whatever reason
-its asset was already excluded for. `EXCLUDING_TARGETS = frozenset({"role"})`
-exists in `config_model.py` purely as a documented decision; it is not read
-by any runtime code — `_role_reference()`'s live structural trace is the
-actual mechanism, computed fresh on every miss rather than looked up from a
-stored set.
+Instead, the engine decides with a flat set-membership check, not a
+structural trace. `config_model.EXCLUDING_TARGETS = frozenset({"role"})` is
+read by runtime code: it's the default value of `ConfiguredAdapter.__init__`'s
+`excluding_targets` parameter, stored as `self.excluding_targets`. At the two
+places a vocabulary or derivation-table *lookup* can miss (`_resolve_target`'s
+vocabulary branch, `_resolve_derivation`), the resolver already knows which
+target is asking — `target` is threaded through as a plain parameter from
+whichever `asset.*`/`finding.*` slot triggered the resolution (directly for a
+`VocabularyMapping`, or as the *outer* target for a `DefaultByMapping`/
+`DerivedMapping` that consults a `derived` table on that target's behalf) — so
+the miss handler just checks `target in self.excluding_targets`. No separate
+inspection of *how* `role` itself is mapped ever runs; the outcome matches
+"only a miss that is the thing feeding `role` becomes exclude" purely because
+every call site is already scoped to the target it's resolving for, and
+`role` is the only member of the set today. A miss on any other target is
+always `problems.add(...)` — a fatal, whole-batch refusal. A third, separate
+`exclude` call exists in `_validate_findings`: once an asset is excluded,
+every finding on it is excluded too, cascading rather than raising a second,
+confusing "orphan" error for the same root cause — that site doesn't
+re-check `excluding_targets` at all, it just inherits whatever reason its
+asset was already excluded for. `self.excluding_targets` is also the one
+place this decision can be widened per-run without touching the contract
+(the provisional-run path, `web/jobs.py`, passes every `SCORING_ENUM_TARGETS`
+member instead of just `{"role"}`) — the contract itself carries no such
+knob; only the caller constructing `ConfiguredAdapter` does.
 
 ## Rule 2: patterns are code-owned, never model-authored
 

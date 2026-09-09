@@ -50,8 +50,11 @@ scope. Making that disposition a config key would let either the model or a
 human classify a check as "exclude" to make a refusal go away -- exactly the
 silent-absorption failure mode this project's whole `ProblemCollector`
 discipline exists to prevent. `EXCLUDING_TARGETS` below names the one target
-this applies to; the engine (a later slice) forward-traces which vocabulary
-feeds it and treats an unmapped value there as scope-exclusion, and every
+this applies to; the engine (`adapters/configured.py`'s `_resolve_target`/
+`_resolve_derivation`) checks `target in self.excluding_targets` at each
+vocabulary/derivation-table miss -- `target` is already whichever slot is
+asking, threaded through as a plain parameter, so this flat membership check
+alone is what treats an unmapped value there as scope-exclusion and every
 other vocabulary miss as a fatal, whole-batch refusal -- policy the config
 cannot override.
 """
@@ -123,11 +126,12 @@ ABSENT_FACT_LEGAL_TARGETS: frozenset[str] = frozenset(
 )
 
 #: See the module docstring's "Fatal vs. exclude" section. Not consumed by
-#: anything in this module -- the engine (a later slice) is what forward-
-#: traces which vocabulary feeds this target and applies the exclude
-#: disposition there and nowhere else. Defined here because it is a decision
-#: about the schema, made once, in the same place every other schema-derived
-#: constant lives.
+#: anything in this module -- the engine (`adapters/configured.py`) is what
+#: applies the exclude disposition, via a flat `target in self.excluding_
+#: targets` check at each vocabulary/derivation-table miss (`_resolve_target`/
+#: `_resolve_derivation`), and nowhere else. Defined here because it is a
+#: decision about the schema, made once, in the same place every other
+#: schema-derived constant lives.
 EXCLUDING_TARGETS: frozenset[str] = frozenset({"role"})
 
 #: `asset_grouping.union_fields` may only ever contain this one target.

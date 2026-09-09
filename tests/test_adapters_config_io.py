@@ -15,8 +15,6 @@ from pydantic import ValidationError
 
 from rhinosecure.adapters.config_io import (
     ContractIOError,
-    IdentityRecipeChangedError,
-    check_identity_recipe_unchanged,
     confirm_contract,
     overwrite_contract,
     read_contract,
@@ -244,73 +242,3 @@ def test_write_contract_after_confirming_would_invalidate_the_signature(tmp_path
         from rhinosecure.adapters.configured import ConfiguredAdapter
 
         ConfiguredAdapter(read_contract(path))
-
-
-# --- check_identity_recipe_unchanged -----------------------------------------
-
-
-def test_no_op_when_finding_id_is_not_content_address_on_either_side():
-    old = _unconfirmed_bluepeak()  # finding_id is a plain column, not content_address
-    new = old.model_copy()
-    check_identity_recipe_unchanged(old, new)  # must not raise
-
-
-def test_no_op_when_the_recipe_is_identical():
-    old = _unconfirmed_mdvm()
-    new = old.model_copy(deep=True)
-    check_identity_recipe_unchanged(old, new)  # must not raise
-
-
-def test_no_op_when_only_recipe_version_differs():
-    old = _unconfirmed_mdvm()
-    bumped_mapping = old.finding["finding_id"].model_copy(update={"recipe_version": 2})
-    new = old.model_copy(update={"finding": {**old.finding, "finding_id": bumped_mapping}})
-    check_identity_recipe_unchanged(old, new)  # must not raise
-
-
-def test_changing_hex_len_on_a_confirmed_contract_is_refused():
-    """The exit criterion, literally: hex_len changes -> refused, naming
-    memory.decisions."""
-    old = _unconfirmed_mdvm()
-    changed_mapping = old.finding["finding_id"].model_copy(update={"hex_len": 24})
-    new = old.model_copy(update={"finding": {**old.finding, "finding_id": changed_mapping}})
-    with pytest.raises(IdentityRecipeChangedError, match="memory.decisions"):
-        check_identity_recipe_unchanged(old, new)
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("columns", ["DeviceId", "CveId"]),
-        ("join", "-"),
-        ("prefix", "MDVM2-"),
-        ("case", "lower"),
-        ("algorithm", "sha256"),  # only legal value today, but exercises the field-name path
-    ],
-)
-def test_changing_any_recipe_field_is_refused(field, value):
-    old = _unconfirmed_mdvm()
-    changed_mapping = old.finding["finding_id"].model_copy(update={field: value})
-    new = old.model_copy(update={"finding": {**old.finding, "finding_id": changed_mapping}})
-    if getattr(old.finding["finding_id"], field) == value:
-        pytest.skip("value identical to the original -- not a real change for this field")
-    with pytest.raises(IdentityRecipeChangedError):
-        check_identity_recipe_unchanged(old, new)
-
-
-def test_allow_reset_permits_a_changed_recipe():
-    old = _unconfirmed_mdvm()
-    changed_mapping = old.finding["finding_id"].model_copy(update={"hex_len": 24})
-    new = old.model_copy(update={"finding": {**old.finding, "finding_id": changed_mapping}})
-    check_identity_recipe_unchanged(old, new, allow_reset=True)  # must not raise
-
-
-def test_error_names_the_changed_fields():
-    old = _unconfirmed_mdvm()
-    changed_mapping = old.finding["finding_id"].model_copy(update={"hex_len": 24, "prefix": "X-"})
-    new = old.model_copy(update={"finding": {**old.finding, "finding_id": changed_mapping}})
-    with pytest.raises(IdentityRecipeChangedError) as excinfo:
-        check_identity_recipe_unchanged(old, new)
-    message = str(excinfo.value)
-    assert "hex_len" in message
-    assert "prefix" in message
