@@ -356,6 +356,15 @@ def _review_outcome_dict(outcome: ReviewOutcome) -> dict[str, Any]:
         "ok": outcome.ok,
         "written": outcome.written,
         "measurement": _measurement_dict(outcome.measurement),
+        # Mirrors cli.py's `_print_review_header` "dialect:" line -- both
+        # are MEASURED (schema_inference.py's _assemble_and_validate), never
+        # model-authored, and both decide what every count/sample below
+        # even means. Shown here, not just in the CLI, because this is the
+        # payload the confirm form itself reads before a human signs
+        # (app.js's renderConfirmPanel) -- the one browser-side surface a
+        # signer actually looks at, same as _print_review_header is the
+        # first thing a CLI signer sees.
+        "source": {"encoding": outcome.contract.source.encoding, "delimiter": outcome.contract.source.delimiter},
         "required_attestations": dict(outcome.required),
         "still_missing": list(outcome.still_missing),
         "refusals": list(outcome.refusals),
@@ -463,6 +472,11 @@ def mount_adapter_routes(app: FastAPI) -> None:
                 "ok": False,
                 "written": False,
                 "measurement": None,
+                # The dialect is a structural fact of the contract itself,
+                # not something the real measurement below computes -- a
+                # signer still filling in attestation text should see it
+                # too, not only once every attestation is supplied.
+                "source": {"encoding": contract.source.encoding, "delimiter": contract.source.delimiter},
                 "required_attestations": required,
                 "still_missing": still_missing,
                 "refusals": [],

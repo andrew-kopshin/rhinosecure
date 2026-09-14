@@ -397,6 +397,45 @@ def test_get_review_reports_a_clean_measurement_with_nothing_required(client: Te
     assert body["measurement"]["assets_loaded"] == 2
 
 
+def test_get_review_reports_the_measured_dialect(client: TestClient):
+    """The confirm form's own surface (app.js's renderConfirmPanel reads
+    this) -- encoding/delimiter are measured, not asserted, and a signer
+    must see them before signing, the same reason cli.py's `_print_review_
+    header` shows a `dialect:` line first."""
+    upload_id = _upload(client)
+    _propose(client, upload_id, "upload-dialect", _proposal_dict(name="upload-dialect"))
+    resp = client.get("/api/adapters/upload-dialect/review", params={"upload_id": upload_id})
+    assert resp.json()["source"] == {"encoding": "utf-8", "delimiter": ","}
+
+
+def test_get_review_reports_a_detected_non_comma_delimiter(client: TestClient):
+    semicolon_csv = (
+        "Asset_ID;Hostname;Finding_ID;Cve;Col;Env\n"
+        "A01;HOST01;F01;CVE-2021-0001;srv;Production\n"
+        "A02;HOST02;F02;CVE-2021-0002;wks;Corporate\n"
+    ).encode("utf-8")
+    upload_id = _upload(client, content=semicolon_csv)
+    job = _propose(client, upload_id, "upload-semicolon", _proposal_dict(name="upload-semicolon"))
+    assert job["result"]["contract_written"] is True
+
+    resp = client.get("/api/adapters/upload-semicolon/review", params={"upload_id": upload_id})
+    assert resp.json()["source"] == {"encoding": "utf-8", "delimiter": ";"}
+
+
+def test_get_review_reports_the_dialect_even_before_attestations_are_supplied(client: TestClient):
+    """The early-return path (still_missing non-empty, no real measurement
+    run yet) must carry `source` too -- a signer filling in attestation
+    text shouldn't have to submit first just to see what dialect they're
+    about to sign off on."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-dialect-pre-attest", content_address_finding_id=True)
+    _propose(client, upload_id, "upload-dialect-pre-attest", proposal)
+    resp = client.get("/api/adapters/upload-dialect-pre-attest/review", params={"upload_id": upload_id})
+    body = resp.json()
+    assert body["still_missing"] == ["finding_id.synthesized"]
+    assert body["source"] == {"encoding": "utf-8", "delimiter": ","}
+
+
 def test_get_review_names_a_required_attestation(client: TestClient):
     upload_id = _upload(client)
     proposal = _proposal_dict(name="upload-needs-attest", content_address_finding_id=True)

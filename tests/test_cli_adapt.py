@@ -285,6 +285,15 @@ def test_confirm_signs_a_scratch_contract_and_exits_zero(tmp_path, capsys):
     assert written.observed["assets_loaded"] > 0
 
 
+def test_confirm_reports_the_measured_dialect_before_signing(tmp_path, capsys):
+    """A signer must see encoding/delimiter -- both measured, not asserted
+    -- before they sign, not only in the raw contract JSON afterward."""
+    path = _scratch_contract(tmp_path)
+    main(["adapt", "confirm", str(path), "--data", BLUEPEAK_DATA, "--by", "r@example.com"])
+    out = capsys.readouterr().out
+    assert "dialect: encoding 'auto', delimiter ','" in out
+
+
 def test_confirm_refuses_an_already_confirmed_contract_and_exits_one(tmp_path, capsys):
     path = _scratch_contract(tmp_path)
     main(["adapt", "confirm", str(path), "--data", BLUEPEAK_DATA, "--by", "r@example.com"])

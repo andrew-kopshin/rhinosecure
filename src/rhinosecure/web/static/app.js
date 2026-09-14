@@ -2411,6 +2411,18 @@ async function openConfirmPanel(name, uploadId) {
 function renderConfirmPanel(card, name, uploadId, review, lowConfidence = []) {
   const m = review.measurement;
   const attestItems = Object.entries(review.required_attestations);
+  // encoding/delimiter are both MEASURED (schema_inference.py's
+  // _assemble_and_validate), never model-authored, and both decide what
+  // every count/sample value below even means -- shown unconditionally
+  // (review.source is always present, even before attestations are filled
+  // in) rather than folded into measurementHtml below, which IS gated on a
+  // real measurement existing. JSON.stringify, not the raw character,
+  // because a tab or other whitespace delimiter would otherwise render as
+  // invisible blank space -- the one place this value needs to be
+  // unambiguous, not merely present.
+  const dialectHtml = review.source
+    ? `<p class="hint">Reading as: encoding ${esc(review.source.encoding)}, delimiter ${esc(JSON.stringify(review.source.delimiter))} — measured from the file, not asserted.</p>`
+    : "";
   // `measurement` is null when this contract still needs an attestation it
   // doesn't have yet -- the server can't measure past that gate any more
   // than `rhino adapt confirm` itself could (web/adapters.py's own note on
@@ -2445,6 +2457,7 @@ function renderConfirmPanel(card, name, uploadId, review, lowConfidence = []) {
 
   card.innerHTML = `
     <h3>Review &amp; confirm — ${esc(name)}</h3>
+    ${dialectHtml}
     ${measurementHtml}
     <label class="confirm-identity-label">Signed by <input type="text" class="confirm-identity-input" placeholder="your name" /></label>
     ${attestHtml}

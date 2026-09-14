@@ -1094,9 +1094,67 @@ def _assemble_and_validate(
     placeholder) -- everything after that point is identical, and drifting
     the two would silently reopen exactly the gaps an adversarial review of
     this module already found and closed once (see the validate_contract
-    call below's own comment)."""
+    call below's own comment).
+
+    `Source.encoding`/`Source.delimiter` are both copied from
+    `assets_profile` -- MEASURED facts (`ingest.detect_encoding`/
+    `probe.detect_delimiter`, via `profile_source`), never something a
+    proposal declares: the model has no raw, undelimited evidence to reason
+    from and no business authoring either value. Safe to read from
+    `assets_profile` alone only because of the two checks immediately
+    below -- a genuine assets/findings disagreement on either fact is
+    refused rather than silently resolved by picking one side.
+
+    `Source` has exactly one `encoding` and one `delimiter` for both files
+    (configured.py's engine reads `contract.source.*` for whichever file it
+    opens, assets or findings, with nothing to tell them apart) -- so
+    either can only ever be right for BOTH files when they agree. For a
+    single_file layout, neither check below can ever fire:
+    `assets_filename == findings_filename` means `assets_profile`/
+    `findings_profile` are the same dict lookup, the same object, trivially
+    equal. For a genuine two-file source, silently preferring
+    `assets_profile`'s value would misread whichever file disagrees --
+    exactly the silent-wrong-value failure `detect_delimiter`'s own
+    within-file ambiguity handling refuses to produce, reintroduced one
+    level up if this weren't checked. A real mismatch here is a fact about
+    the SOURCE, not a proposal defect no slot-editing can fix, so it is
+    reported as its own clear refusal rather than folded into
+    `check_grounding`'s (per-slot) or `_check_mapped_slots_legal`'s
+    (per-mapping) failure shapes."""
     assets_profile = profiles[proposal.meta.assets_filename]
     findings_profile = profiles[proposal.meta.findings_filename]
+
+    # Compared RAW, before the `_VALID_SOURCE_ENCODINGS` fallback below ever
+    # runs -- deliberately, even though that fallback means a rare corner
+    # case (assets detected as "utf-32", which has no Source.encoding
+    # Literal member, findings detected as a genuinely different but VALID
+    # encoding) could in principle have fallen back to "auto" and still read
+    # both files correctly (per-file live redetection at ingest time is
+    # exactly what "auto" means -- configured.py's `_open_csv`). Refusing
+    # here anyway, rather than special-casing that interaction, keeps this
+    # check identical in shape to the delimiter one below, and a raw
+    # encoding disagreement between two files in one batch is itself worth
+    # a human's attention regardless of whether this specific fallback
+    # would have happened to paper over it.
+    if assets_profile.encoding != findings_profile.encoding:
+        raise ProposalIncompleteError(
+            f"{proposal.meta.assets_filename!r} was detected as encoding {assets_profile.encoding!r} "
+            f"but {proposal.meta.findings_filename!r} was detected as {findings_profile.encoding!r}. "
+            "A contract has one Source.encoding for both files, so a genuine mismatch here can't be "
+            "assembled automatically -- picking one side would misread the other. If these two files "
+            "really do use different encodings, hand-author or hand-edit the contract (docs/"
+            "adapter-generation.md's two committed contracts were both built this way)."
+        )
+
+    if assets_profile.delimiter != findings_profile.delimiter:
+        raise ProposalIncompleteError(
+            f"{proposal.meta.assets_filename!r} was detected as delimiter {assets_profile.delimiter!r} "
+            f"but {proposal.meta.findings_filename!r} was detected as {findings_profile.delimiter!r}. "
+            "A contract has one Source.delimiter for both files, so a genuine mismatch here can't be "
+            "assembled automatically -- picking one side would misread the other. If these two files "
+            "really do use different dialects, hand-author or hand-edit the contract (docs/"
+            "adapter-generation.md's two committed contracts were both built this way)."
+        )
 
     unmapped_columns = {
         filename: {col: UnmappedColumnEntry(disposition=e.disposition, reason=e.reason) for col, e in entries.items()}
@@ -1119,8 +1177,14 @@ def _assemble_and_validate(
         # detect_encoding (ingest.py) can return "utf-32" on a BOM this Source.encoding Literal has
         # no member for; falling back to "auto" there is honest (nothing this contract declares
         # contradicts what open_csv would detect fresh) rather than a Contract construction error
-        # over a provenance-only mismatch.
+        # over a provenance-only mismatch. Guaranteed to agree with findings_profile.encoding by
+        # the check above, so this fallback (or the real value) is equally correct for both files.
         encoding=assets_profile.encoding if assets_profile.encoding in _VALID_SOURCE_ENCODINGS else "auto",
+        # Measured by detect_delimiter (probe.py), guaranteed to agree with
+        # findings_profile.delimiter by the check above -- no fallback needed
+        # the way encoding has one: Source.delimiter is a plain single-char
+        # str, not a closed Literal detect_delimiter could ever exceed.
+        delimiter=assets_profile.delimiter,
     )
 
     contract = Contract(

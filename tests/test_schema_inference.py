@@ -1516,6 +1516,213 @@ def test_two_file_layout_assembles_and_validates_end_to_end(two_file_profiles):
     })
 
 
+# --- Source.delimiter: measured from profile_source, never model-authored --
+
+
+def test_single_file_delimiter_is_copied_from_the_detected_profile(tmp_path):
+    path = tmp_path / "data.csv"
+    path.write_text("Asset_ID;Hostname;Finding_ID;Cve;Col\nA01;HOST01;F01;CVE-2021-0001;srv\n", encoding="utf-8")
+    profiles_map = {p.path.name: p for p in profile_source(tmp_path)}
+    assert profiles_map["data.csv"].delimiter == ";"
+    proposal = AdapterProposal.model_validate(_full_proposal_dict())
+    report = check_grounding(proposal, profiles_map)
+    assert report.failures == []
+    contract = assemble_contract(proposal, profiles_map, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract.source.delimiter == ";"
+
+
+def test_two_file_layout_delimiter_is_copied_when_both_files_agree(tmp_path):
+    (tmp_path / "assets.csv").write_text(
+        "Asset_ID;Hostname;Asset_Col\nA01;HOST01;srv\nA02;HOST02;wks\n", encoding="utf-8"
+    )
+    (tmp_path / "findings.csv").write_text(
+        "Finding_ID;Asset_ID;Cve;Finding_Col\nF01;A01;CVE-2021-0001;srv\nF02;A02;CVE-2021-0002;wks\n",
+        encoding="utf-8",
+    )
+    profiles_map = {p.path.name: p for p in profile_source(tmp_path)}
+    assert profiles_map["assets.csv"].delimiter == profiles_map["findings.csv"].delimiter == ";"
+    proposal = AdapterProposal.model_validate(_two_file_proposal_dict())
+    report = check_grounding(proposal, profiles_map)
+    assert report.failures == []
+    contract = assemble_contract(proposal, profiles_map, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract.source.delimiter == ";"
+
+
+def test_two_file_layout_refuses_to_assemble_when_delimiters_disagree(tmp_path):
+    """Source has one delimiter for both files -- a genuine, individually
+    confident disagreement between the two profiles is a fact about the
+    SOURCE, not something re-mapping a slot could ever fix, so this must
+    refuse rather than silently prefer the assets side (the same silent-
+    wrong-value failure detect_delimiter's own within-file ambiguity
+    handling exists to avoid, one level up)."""
+    (tmp_path / "assets.csv").write_text(
+        "Asset_ID;Hostname;Asset_Col\nA01;HOST01;srv\nA02;HOST02;wks\n", encoding="utf-8"
+    )
+    (tmp_path / "findings.csv").write_text(
+        "Finding_ID,Asset_ID,Cve,Finding_Col\nF01,A01,CVE-2021-0001,srv\nF02,A02,CVE-2021-0002,wks\n",
+        encoding="utf-8",
+    )
+    profiles_map = {p.path.name: p for p in profile_source(tmp_path)}
+    assert profiles_map["assets.csv"].delimiter == ";"
+    assert profiles_map["findings.csv"].delimiter == ","
+    proposal = AdapterProposal.model_validate(_two_file_proposal_dict())
+    report = check_grounding(proposal, profiles_map)
+    assert report.failures == []
+    with pytest.raises(ProposalIncompleteError) as excinfo:
+        assemble_contract(proposal, profiles_map, report, generator=_generator(), generated_at=_GENERATED_AT)
+    message = str(excinfo.value)
+    assert "assets.csv" in message and "findings.csv" in message
+    assert "';'" in message and "','" in message
+
+
+# --- Source.encoding: the same cross-file check, closing the pre-existing --
+# gap Source.delimiter's own equality check above didn't touch (it was left
+# unchecked deliberately, then closed in a follow-up pass) ------------------
+
+# Two of test_ingest_csv_source.py's real-producer fixtures, reused here
+# rather than re-encoded synthetically: a genuine Windows PowerShell 5.1
+# `Export-Csv -Encoding Unicode` output (real UTF-16LE bytes, a real BOM) and
+# a genuine Excel 16.0 "CSV UTF-8 (Comma delimited)" export (real UTF-8 BOM)
+# -- both committed, tracked fixtures, not `.encode()` simulations. Chosen
+# over the THIRD real fixture (cp1252-sample) specifically because
+# `detect_encoding` can never return "cp1252" at all (no BOM exists for a
+# single-byte encoding -- ingest.py's own docstring): profiling a cp1252 file
+# through profile_source always reports it as the BOM-less default, "utf-8",
+# identical to any other undeclared file, so it could never produce a
+# DETECTED disagreement through this layer. utf-16 vs. utf-8-sig are each
+# individually BOM-detected, genuinely different, and both already committed
+# for an unrelated reason (test_ingest_csv_source.py's own encoding-handling
+# coverage) -- a real mismatch already sitting in this repository, not one
+# constructed for this test.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_POWERSHELL_UTF16_SAMPLE = _REPO_ROOT / "data" / "powershell-utf16-sample" / "assets.csv"
+_EXCEL_UTF8SIG_SAMPLE = _REPO_ROOT / "data" / "excel-utf8sig-sample" / "assets.csv"
+#: Both real fixtures' own header -- the native asset schema (CLAUDE.md
+#: Section 2), 14 columns. Used both to build the proposal below and to
+#: compute unmapped_columns for whatever it doesn't cite.
+_REAL_FIXTURE_HEADER = [
+    "asset_id", "hostname", "os", "os_build", "role", "business_function", "criticality",
+    "internet_exposed", "environment", "data_sensitivity", "patch_window", "patch_restrictions",
+    "compensating_controls", "owner",
+]
+
+
+def _unmapped(used: set[str]) -> dict:
+    return {
+        col: {"disposition": "ignored", "reason": "not needed for this test", "profile_cited": col}
+        for col in _REAL_FIXTURE_HEADER
+        if col not in used
+    }
+
+
+def _real_asset_schema_proposal_dict() -> dict:
+    """Both real fixtures happen to share the native asset-schema header
+    (asset_id/hostname/os/role/...) -- this proposal cites real columns from
+    each, enough to clear check_grounding AND validate_contract's own
+    completeness check (every real column mapped or explicitly declared
+    unmapped), without needing the reused "findings.csv" file's content to
+    be semantically finding-shaped: nothing here ever reaches real ingest
+    (Finding/Asset construction), only check_grounding and validate_contract,
+    both of which check contract STRUCTURE, not row-value meaning."""
+    asset: dict = {}
+    asset_used = {"asset_id", "hostname", "role"}
+    for slot in ASSET_SLOTS:
+        if slot == "asset_id":
+            asset[slot] = _mapped({"kind": "column", "column": "asset_id", "case": "exact", "blank": "fatal"}, columns_cited=["asset_id"])
+        elif slot == "hostname":
+            asset[slot] = _mapped({"kind": "column", "column": "hostname", "case": "exact", "blank": "fatal"}, columns_cited=["hostname"])
+        elif slot == "role":
+            # Both real fixtures' role values ("workstation", "file") are
+            # already legal AssetRole spellings -- a plain column mapping,
+            # no vocabulary table needed.
+            asset[slot] = _mapped({"kind": "column", "column": "role", "case": "lower", "blank": "fatal"}, columns_cited=["role"])
+        else:
+            asset[slot] = _mapped({"kind": "not_collected"})
+    finding: dict = {}
+    # "environment" is NOT included here even though cve_id's literal cites
+    # it as grounding evidence -- an evidence-only citation doesn't count as
+    # "used" for validate_contract's own structural completeness check (the
+    # earlier failure this comment replaces confirmed it live), so it still
+    # needs its own unmapped_columns entry below.
+    finding_used = {"asset_id", "role", "os"}
+    for slot in FINDING_SLOTS:
+        if slot == "finding_id":
+            finding[slot] = _mapped({"kind": "column", "column": "asset_id", "case": "exact", "blank": "fatal"}, columns_cited=["asset_id"])
+        elif slot == "asset_id":
+            finding[slot] = _mapped({"kind": "column", "column": "asset_id", "case": "exact", "blank": "fatal"}, columns_cited=["asset_id"])
+        elif slot == "cve_id":
+            # Neither real fixture's columns hold CVE-shaped values --
+            # check_grounding's parsed-mapping check (this session's own
+            # earlier work) would correctly reject a "parsed"/cve_id
+            # mapping over "os" ("Windows 10" doesn't parse as a CVE id).
+            # A literal must cite a real column check_grounding's own
+            # profiling tags "constant", AND its value must match that
+            # column's real observed value -- both real fixtures' rows
+            # agree on environment="prod", so the literal is "prod" too.
+            # Semantically meaningless as a CVE id, but grounding has no
+            # opinion on that, and this test never reaches real ingest
+            # (Finding(cve_id=...) construction) -- only check_grounding
+            # and validate_contract, both structural, run here.
+            finding[slot] = _mapped({"kind": "literal", "value": "prod"}, columns_cited=["environment"])
+        elif slot == "scanner_severity":
+            finding[slot] = _mapped(
+                {"kind": "vocabulary", "column": "role", "case": "lower", "blank": "fatal", "table": {"workstation": "low", "file": "low"}},
+                columns_cited=["role"],
+            )
+        elif slot in ("product", "evidence"):
+            finding[slot] = _mapped({"kind": "column", "column": "os", "case": "exact", "blank": "absent_fact"}, columns_cited=["os"])
+        else:
+            finding[slot] = _mapped({"kind": "not_collected"})
+    return {
+        "meta": {
+            "format": "encoding-mismatch-test", "description": "real-fixture encoding mismatch", "source_layout": "two_file",
+            "assets_filename": "assets.csv", "findings_filename": "findings.csv", "reasoning_summary": "test",
+        },
+        "asset": asset, "finding": finding, "derived": {},
+        "asset_grouping": {"key": "asset_id", "resolution": "agree_or_recency"},
+        "finding_dedup": {"content_targets": ["scanner_severity"], "on_identical": "collapse_and_count", "on_conflict": "fatal"},
+        "unmapped_columns": {"assets.csv": _unmapped(asset_used), "findings.csv": _unmapped(finding_used)},
+        "open_questions": [],
+    }
+
+
+def test_two_file_layout_refuses_to_assemble_when_encodings_disagree(tmp_path):
+    """A real PowerShell Export-Csv (UTF-16LE+BOM) and a real Excel "CSV
+    UTF-8" export (UTF-8+BOM) side by side -- genuinely different, BOM-
+    detected encodings, not a constructed mismatch. Source has one encoding
+    for both files, so this must refuse the same way the delimiter check
+    does, rather than silently reading findings.csv as UTF-16 (or assets.csv
+    as UTF-8-sig)."""
+    (tmp_path / "assets.csv").write_bytes(_POWERSHELL_UTF16_SAMPLE.read_bytes())
+    (tmp_path / "findings.csv").write_bytes(_EXCEL_UTF8SIG_SAMPLE.read_bytes())
+    profiles_map = {p.path.name: p for p in profile_source(tmp_path)}
+    assert profiles_map["assets.csv"].encoding == "utf-16"
+    assert profiles_map["findings.csv"].encoding == "utf-8-sig"
+    proposal = AdapterProposal.model_validate(_real_asset_schema_proposal_dict())
+    report = check_grounding(proposal, profiles_map)
+    assert report.failures == []
+    with pytest.raises(ProposalIncompleteError) as excinfo:
+        assemble_contract(proposal, profiles_map, report, generator=_generator(), generated_at=_GENERATED_AT)
+    message = str(excinfo.value)
+    assert "assets.csv" in message and "findings.csv" in message
+    assert "'utf-16'" in message and "'utf-8-sig'" in message
+
+
+def test_two_file_layout_assembles_when_the_real_encodings_agree(tmp_path):
+    """The same real UTF-16 fixture used for BOTH files must not spuriously
+    refuse -- confirms the check compares, rather than always firing on a
+    two-file layout."""
+    (tmp_path / "assets.csv").write_bytes(_POWERSHELL_UTF16_SAMPLE.read_bytes())
+    (tmp_path / "findings.csv").write_bytes(_POWERSHELL_UTF16_SAMPLE.read_bytes())
+    profiles_map = {p.path.name: p for p in profile_source(tmp_path)}
+    assert profiles_map["assets.csv"].encoding == profiles_map["findings.csv"].encoding == "utf-16"
+    proposal = AdapterProposal.model_validate(_real_asset_schema_proposal_dict())
+    report = check_grounding(proposal, profiles_map)
+    assert report.failures == []
+    contract = assemble_contract(proposal, profiles_map, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract.source.encoding == "utf-16"
+
+
 def test_assemble_contract_succeeds_with_a_content_address_finding_id_and_no_attestations(profiles):
     """A real-world regression, caught only by actually running propose
     against the Defender fixture: `validate_contract`'s V18 requires a

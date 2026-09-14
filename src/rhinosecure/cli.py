@@ -1211,6 +1211,14 @@ def _print_review_header(outcome: ReviewOutcome, data_dir: Path) -> None:
     contract = outcome.contract
     print(f"Reviewing {contract.format!r} v{contract.version} ({outcome.path})")
     print(f"  source: {data_dir}")
+    # encoding/delimiter are both MEASURED (agents/schema_inference.py's
+    # _assemble_and_validate), never model-authored -- shown here, first,
+    # because they decide what every count and sample value below even
+    # means. A signer who never sees this can still sign a contract whose
+    # dialect is wrong for their file; nothing else in this report would
+    # tell them, since a wrong delimiter doesn't fail grounding (it just
+    # quietly re-slices every column).
+    print(f"  dialect: encoding {contract.source.encoding!r}, delimiter {contract.source.delimiter!r}")
 
 
 def _print_measurement(m: Measurement) -> None:
