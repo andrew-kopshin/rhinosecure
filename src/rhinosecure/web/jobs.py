@@ -134,7 +134,6 @@ from rhinosecure.adapters import (
 from rhinosecure.adapters.config_io import read_contract, write_contract
 from rhinosecure.adapters.config_model import SCORING_ENUM_TARGETS, Attestation, Contract, missing_attestations
 from rhinosecure.adapters.configured import ConfiguredAdapter
-from rhinosecure.adapters.review import _provisional as provisional_stamp
 from rhinosecure.agents.constraint_intake import ConstraintInterpretationError
 from rhinosecure.agents.coordinator import Coordinator, CoordinatorError, ConstraintReplanFailedError
 from rhinosecure.agents.schema_inference import (
@@ -145,6 +144,7 @@ from rhinosecure.agents.schema_inference import (
     SavedProposal,
     assemble_provisional_contract,
     dump_saved_proposal,
+    placeholder_axes,
     propose_contract,
     saved_proposal_from_dict,
     unresolved_slots,
@@ -538,16 +538,14 @@ def _resolve_provisional(source_ref: str) -> tuple[ConfiguredAdapter, ResolvedSo
     if found is None or found[1].review.state == "confirmed":
         return None
     contract = found[1]
-    # `role` gets a `literal` placeholder ONLY via the provisional-
-    # assembly auto-fill (assemble_provisional_contract) -- a real,
-    # confident model proposal never uses `literal` for a per-asset field
-    # like role. Checking the contract itself (rather than trusting stale
-    # state from whatever job proposed it) means this is correct even if
-    # the contract was hand-edited or resolved through the browser
-    # slot-resolution form after the fact.
-    force_not_collected = (
-        frozenset({"role"}) if contract.asset["role"].kind == "literal" else frozenset()
-    )
+    # `placeholder_axes` recognizes a `role` mapping shaped like the
+    # provisional-assembly auto-fill (assemble_provisional_contract) --
+    # see its own docstring (agents/schema_inference.py). Checking the
+    # contract itself (rather than trusting stale state from whatever job
+    # proposed it) means this is correct even if the contract was
+    # hand-edited or resolved through the browser slot-resolution form
+    # after the fact.
+    force_not_collected = placeholder_axes(contract)
     # `ConfiguredAdapter.load_assets`/`.load_findings` run the real
     # `validate_contract` on every load (docs/adapter-generation.md's
     # "Order, which is not negotiable"), which includes V18: a
@@ -555,16 +553,17 @@ def _resolve_provisional(source_ref: str) -> tuple[ConfiguredAdapter, ResolvedSo
     # `LOW_CONFIDENCE_THRESHOLD` (a REAL mapping, just an unconfident one
     # -- a different case from an unresolved slot, and not something
     # assemble_provisional_contract touches at all) requires a
-    # `low_confidence_mappings` attestation. `_provisional()`'s own stamp
-    # clears `review` entirely, so this contract carries none --
-    # confirmed live: a real run against a model output with
-    # asset.environment/internet_exposed both at 0.55 confidence failed
-    # here with exactly this ContractValidationError before this fix.
-    # Placeholder attestations -- the identical "propose-time structural
-    # check only, not a real one" text and mechanism
-    # `_assemble_and_validate`'s own pre-check already uses -- satisfy
-    # V18 without claiming a human reviewed anything; they are attached
-    # to THIS in-memory copy only, never written, exactly like
+    # `low_confidence_mappings` attestation. This contract has never been
+    # confirmed (we would not be here at all otherwise -- see
+    # `_resolve_provisional`'s own docstring), so its own attestations may
+    # not satisfy V18 at all -- confirmed live: a real run against a model
+    # output with asset.environment/internet_exposed both at 0.55
+    # confidence failed here with exactly this ContractValidationError
+    # before this fix. Placeholder attestations -- the identical
+    # "propose-time structural check only, not a real one" text and
+    # mechanism `_assemble_and_validate`'s own pre-check already uses --
+    # satisfy V18 without claiming a human reviewed anything; they are
+    # attached to THIS in-memory copy only, never written, exactly like
     # assemble_contract's placeholder attestations never reach the file
     # it writes either.
     placeholder_attestations = [
@@ -574,8 +573,14 @@ def _resolve_provisional(source_ref: str) -> tuple[ConfiguredAdapter, ResolvedSo
     contract = contract.model_copy(
         update={"attestations": list(contract.attestations) + placeholder_attestations}
     )
-    adapter = ConfiguredAdapter(
-        provisional_stamp(contract),
+    # `unconfirmed_preview`, not the ordinary constructor -- `contract.
+    # review.state` is genuinely NOT "confirmed" here and stays that way:
+    # this run is marked provisional through `is_provisional()` reading
+    # that real state, never through a stamped state that would need to
+    # be specially recognized as fake. See
+    # ConfiguredAdapter.unconfirmed_preview's own docstring.
+    adapter = ConfiguredAdapter.unconfirmed_preview(
+        contract,
         excluding_targets=SCORING_ENUM_TARGETS,
         force_not_collected=force_not_collected,
     )
@@ -653,11 +658,16 @@ class PlanState:
 
         `memory=None` is what makes a provisional run's `Coordinator`
         durably constraint-blind, not a convention this method has to
-        enforce itself: `Coordinator.submit_constraint`'s own `if self
-        .memory is None: raise CoordinatorError` guard fires on anything
-        that tries, and `agents/risk.py`'s `score_finding_tool` never
-        queries constraints at all when `memory is None` (`if memory is
-        not None:`) -- both pre-existing guards, doing double duty."""
+        enforce itself: `Coordinator.__init__` itself now refuses to pair
+        a non-`None` `memory` with a contract `adapters.review.
+        is_provisional()` on (Coordinator's own docstring), so passing a
+        provisional `adapter` here together with a real `memory` would
+        fail loudly at construction rather than silently persist against
+        an unsigned mapping. `Coordinator.submit_constraint`'s own `if
+        self.memory is None: raise CoordinatorError` guard and `agents/
+        risk.py`'s `score_finding_tool` (which never queries constraints
+        at all when `memory is None`) are further, independent backstops
+        on top of that -- all three doing double duty."""
         if on_stage is not None:
             on_stage("seeding")
         random.seed(self.config.seed)

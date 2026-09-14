@@ -794,12 +794,13 @@ def _build_deterministic_export(
         # True only for the provisional-run path (CLAUDE.md's "drop a CSV,
         # get a plan" spec). False (never absent) for a built-in --format
         # run (contract is None) and for a real --adapter-config run
-        # against a genuinely confirmed contract. Deliberately NOT
-        # `contract.review.state != "confirmed"` -- review._provisional
-        # (which ConfiguredAdapter.__init__'s own assert_confirmed gate
-        # requires to even construct) stamps state="confirmed" with a
-        # sentinel identity on purpose; is_provisional checks THAT
-        # identity, not the state, which the stamp deliberately fakes.
+        # against a genuinely confirmed contract. is_provisional() reads
+        # review.state directly -- a contract scored via
+        # ConfiguredAdapter.unconfirmed_preview() (the provisional-run
+        # path's own adapter) keeps its real, honest state throughout,
+        # never a faked "confirmed" -- see adapters/review.py's
+        # is_provisional() and adapters/configured.py's
+        # unconfirmed_preview() for the mechanism.
         "provisional": is_provisional(contract),
         "pipeline": pipeline,
         "summary": {
@@ -908,13 +909,15 @@ def _build_agents_export(
         # whose contract exists but was never confirmed can reach the full
         # 4-agent pipeline too, via a Coordinator built with memory=None
         # and never committed as plan_state's current plan. `contract`
-        # here is that branch's provisional-stamped contract
-        # (`Coordinator.contract`, set from the adapter `_resolve_
-        # provisional` builds), so `is_provisional` correctly reports True
-        # for it -- exactly the same check the deterministic path already
-        # relied on, extended to a second caller rather than duplicated.
-        # Still False for every ordinary confirmed --adapter-config run
-        # and every built-in --format run (contract is None there).
+        # here is that branch's provisional-run contract (`Coordinator.
+        # contract`, set from the adapter `_resolve_provisional` builds
+        # via ConfiguredAdapter.unconfirmed_preview()), so `is_provisional`
+        # correctly reports True for it, reading its real, unconfirmed
+        # review.state directly -- exactly the same check the
+        # deterministic path already relies on, extended to a second
+        # caller rather than duplicated. Still False for every ordinary
+        # confirmed --adapter-config run and every built-in --format run
+        # (contract is None there).
         "provisional": is_provisional(contract),
         "pipeline": pipeline,
         "summary": {

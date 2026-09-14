@@ -2370,3 +2370,93 @@ record. Resolved lighter than it might seem to need: it doesn't, for now — `Jo
 existing bounded history and `GET /api/jobs` already make every dispatched step durably
 recoverable; only the *grouping* of steps into one decision is ephemeral. If a browser tab
 closes mid-sequence, re-asking is cheap and safe — the export from step one already exists.
+
+---
+
+## `_provisional()`'s fail-open sentinel replaced with `ConfiguredAdapter.unconfirmed_preview()` (2026-09-13)
+
+**The bug, stated plainly.** `adapters/review.py`'s `_provisional()` (introduced for Slice 7,
+"Provisional scoring reaches `run_agents`" above) was designed to stay function-local — its own
+docstring said so: "never returned by any public name here, never written, and never handed to
+scoring." It worked by *satisfying* `ConfiguredAdapter.__init__`'s `assert_confirmed` gate rather
+than bypassing it: clone the contract with `review` reset, re-run it through the real
+`config_io.confirm_contract` under a sentinel identity (`PROVISIONAL_BY`), so `review.state` read
+`"confirmed"` — to any code that checked it directly. `web/jobs.py`'s provisional-run path
+(`_resolve_provisional`, built the same day) violated that premise on day one: it imported the
+"private" helper directly (`from rhinosecure.adapters.review import _provisional as
+provisional_stamp`) and used it to build the adapter behind *real* scoring, not a review-only
+measurement. From that point on, a genuinely unsigned contract carried a `review.state` that read
+`"confirmed"` to any code that checked it the natural way — `assert_confirmed`'s own gate, the ONE
+mechanism that's supposed to make "nothing provisional escapes" (the trust-boundary section
+above) a structural fact, was satisfied by a fake signature instead of refusing one. The only thing
+still enforcing the real distinction was `is_provisional()` remembering to compare
+`confirmed_by` against the sentinel instead of reading `review.state` like everything else does —
+one future call site checking the state directly instead of routing through `is_provisional()`
+would have silently treated an unsigned mapping as signed. A fail-open guard, not a safety
+mechanism, exactly the "distributes knowledge about its own rules across components that don't
+share it" pattern named in the handoff that started this fix.
+
+**The fix reverses `adapters/review.py`'s own prior "Rejected, deliberately" decision, on
+purpose.** `review.py`'s module docstring had explicitly rejected "extracting the engine's
+constructor body so a review could call it on an `__new__`'d instance" as a second, weaker
+construction path guarded only by naming discipline — the exact class of protection
+`config_model.py`'s own docstring already refuses to rely on when it argues against an
+`on_unmapped` key. That rejection's reasoning was sound in isolation; its premise (containment)
+was what broke. `ConfiguredAdapter.unconfirmed_preview()` (`adapters/configured.py`) is now
+exactly that previously-rejected second construction path — built deliberately, loudly named, and
+documented (in its own docstring) as having exactly two audited callers: `adapters/review.py`'s
+`measure()` and `web/jobs.py`'s `_resolve_provisional`. It skips `assert_confirmed` outright and
+never touches `review` at all — a contract run through it keeps reporting its real, honest
+`review.state`, so `is_provisional()` (`adapters/review.py`) now reads `review.state !=
+"confirmed"` directly, with nothing to fake and nothing to check for instead. `_provisional()` and
+its sentinel constants (`PROVISIONAL_AT`/`PROVISIONAL_BY`) are deleted. `measure()` still resets a
+LOCAL copy's `review` (so re-reviewing an already-confirmed, drifted contract can't trip
+`validate_contract`'s own V19 digest check) and clears `observed` (so a stale prior measurement
+can't make the fresh one refuse itself under V18) before building the preview adapter — both
+load-bearing, both unchanged in effect from the removed mechanism, neither touching the contract
+`review_contract` computed `drift` against, which already ran first.
+
+**A second, structural backstop, asked for explicitly rather than assumed.** Before implementing,
+three things were checked, not assumed: (1) whether "never-signed" and "which slots were
+auto-filled with a placeholder" were two different facts the single old `is_provisional()` check
+conflated — they are. `agents/schema_inference.placeholder_axes(contract)` is now the separate,
+narrower predicate (today, only `role` — the one `SCORING_ENUM_TARGETS` slot with no
+`not_collected` default, so `assemble_provisional_contract` must give it a real, fabricated
+`literal` value to keep the contract constructible), extracted out of `web/jobs.py`'s
+`_resolve_provisional`, which used to compute it inline. A fully-resolved proposal that simply
+hasn't been confirmed yet is provisional (`is_provisional` — never-signed) but carries zero
+placeholder axes (`placeholder_axes` — nothing was fabricated) —
+`test_provisional_assembly_of_a_fully_resolved_proposal_behaves_like_assemble_contract`
+(tests/test_schema_inference.py) is the existing, unmodified regression test proving that case
+was always real. (2) Whether the provisional-run path can ever reach a `Coordinator` with a real
+`Memory` — it structurally cannot today (`_build_and_run_coordinator`'s provisional branch always
+passes `memory=None`), but that was a convention documented in a docstring, not enforced anywhere.
+`Coordinator.__init__` now refuses outright — `raise CoordinatorError` — if handed a non-`None`
+`memory` together with a contract `is_provisional()` returns `True` for, so the invariant is a
+constructor-time fact rather than something every future caller has to remember, on top of the
+two pre-existing backstops (`submit_constraint`'s own `memory is None` guard, `score_finding_tool`
+never querying constraints without one). (3) The test blast radius — grepped and read before
+touching any code: only `adapters/review.py`'s own internal `measure()`/`is_provisional()` tests
+and `web/jobs.py`'s provisional-run integration tests reference the removed names at all; nothing
+in `agents/schema_inference.py`'s own `assemble_provisional_contract` test suite does (that
+function, and its tests, are untouched — this fix is entirely about what happens to its OUTPUT
+after the contract is written to disk and later reloaded for scoring, not about how the contract
+gets assembled).
+
+**Verified.** New tests: `ConfiguredAdapter.unconfirmed_preview` constructs over both a
+never-confirmed contract and a drifted-but-previously-confirmed one (either of which
+`ConfiguredAdapter(...)` still correctly refuses), never mutates `review.state`, and scores real
+rows identically to the ordinary constructor (`tests/test_adapters_configured.py`). `is_provisional`
+and the new `placeholder_axes` split (`tests/test_adapters_review.py`,
+`tests/test_schema_inference.py`), including a live re-review of the real, committed, already-
+CONFIRMED `bluepeak-gen.json` through `measure()` without a spurious V19 digest mismatch — the
+exact case the removed `_provisional()`'s `review`-clearing existed to handle, now handled by
+`measure()` itself. `Coordinator.__init__`'s new guard, both directions (refuses an unconfirmed
+contract with a real `Memory`; allows one with `memory=None`; allows a confirmed contract with a
+real `Memory`) (`tests/test_coordinator.py`). Confirmed live, not just in tests: `rhino adapt
+rereview bluepeak-gen --data data/bluepeak` and `rhino adapt rereview mdvm-gen --data
+data/defender-sample` — the two real, committed, confirmed contracts — both still report "digests
+match" and "No drift and no problems." against the real files; `rhino run --data demo --seed 42
+--offline` still reproduces `Contested: 3/24 (12.5%)` unchanged; `rhino run --data data/bluepeak
+--adapter-config bluepeak-gen --seed 42 --offline` still reproduces `Contested: 1/50 (2.0%)`,
+0 excluded, unchanged. Full suite: 1449 passed (up from 1433), zero regressions.

@@ -22,16 +22,16 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 from test_adapters_config_model import bluepeak_gen_dict, mdvm_gen_dict
 
-from rhinosecure.adapters.config_io import read_contract, write_contract
+from rhinosecure.adapters.config_io import confirm_contract, read_contract, write_contract
 from rhinosecure.adapters.config_model import Contract, assert_confirmed, required_attestations
 from rhinosecure.adapters.configured import ConfiguredAdapter
 from rhinosecure.adapters.review import (
-    PROVISIONAL_BY,
     Measurement,
     ReviewError,
     build_observed,
     carried_attestations,
     compute_drift,
+    is_provisional,
     measure,
     parse_attestations,
     partition_slots,
@@ -114,14 +114,53 @@ def test_measure_matches_what_a_real_run_reports(tmp_path):
     assert m.asset_gaps == result.report.asset_gaps
 
 
+def test_measure_re_reviews_an_already_confirmed_drifted_contract_without_a_spurious_digest_mismatch(tmp_path):
+    """The other reason `measure()` resets `review` before building its
+    preview adapter, distinct from the `observed`-staleness case below:
+    `validate_contract`'s own V19 check compares `review.content_digest`/
+    `decision_digest` against the contract's CURRENT content whenever they
+    are non-None. A contract under RE-review is already `state=
+    "confirmed"` and still carries its OLD digests -- unreset, `measure()`
+    would raise a spurious V19 mismatch on exactly the contract a
+    re-review exists to inspect, since `observed` (which `measure()` also
+    clears) is about to move."""
+    path = _bluepeak(tmp_path)
+    proposed = read_contract(path)
+    assert proposed.review.state == "proposed"
+    confirmed = confirm_contract(proposed, at=AT, by=BY)
+    assert confirmed.review.state == "confirmed"
+    assert confirmed.review.content_digest is not None
+
+    m = measure(confirmed, BLUEPEAK_DIR)
+    assert m.halted_by is None, m.halted_by
+    assert m.is_clean
+    assert m.assets_loaded > 0
+    # measure() must not have mutated the object it was handed, either.
+    assert confirmed.review.state == "confirmed"
+
+
+def test_is_provisional_reads_review_state_directly(tmp_path):
+    """The 'never-signed' predicate: True for a contract never confirmed,
+    False once it is, False for None (a built-in --format run has no
+    contract at all). No sentinel identity involved anymore."""
+    assert is_provisional(None) is False
+    unconfirmed = read_contract(_bluepeak(tmp_path))
+    assert unconfirmed.review.state == "proposed"
+    assert is_provisional(unconfirmed) is True
+
+    confirmed = confirm_contract(unconfirmed, at=AT, by=BY)
+    assert is_provisional(confirmed) is False
+
+
 def test_a_stale_observed_does_not_make_the_fresh_measurement_refuse_itself(tmp_path):
-    """`_provisional` clears `observed`, and the module docstring calls that
-    load-bearing. It is: `ConfiguredAdapter.load_assets` runs
-    `validate_contract` on every load, and V18 reads the STORED exclusion
-    count -- so a contract carrying a previous run's exclusions without a
-    matching attestation would refuse to measure, which is exactly the
-    contract most in need of re-measuring. Added after a mutation run showed
-    removing the clearing broke nothing."""
+    """`measure()` clears `observed` before building its preview adapter,
+    and the module docstring calls that load-bearing. It is:
+    `ConfiguredAdapter.load_assets` runs `validate_contract` on every load,
+    and V18 reads the STORED exclusion count -- so a contract carrying a
+    previous run's exclusions without a matching attestation would refuse
+    to measure, which is exactly the contract most in need of
+    re-measuring. Added after a mutation run showed removing the clearing
+    broke nothing."""
     on_disk = read_contract(_bluepeak(tmp_path))
     assert "exclusions" not in {a.item for a in on_disk.attestations}
     contract = on_disk.model_copy(
@@ -137,12 +176,22 @@ def test_a_stale_observed_does_not_make_the_fresh_measurement_refuse_itself(tmp_
     assert m.assets_loaded > 0
 
 
-def test_measure_never_writes_and_never_returns_the_provisional_contract(tmp_path):
+def test_measure_never_writes_and_never_confirms_the_contract(tmp_path):
+    """`measure()` must never claim -- to the file on disk, or to the
+    object it was handed -- that an unconfirmed contract became confirmed.
+    There is no sentinel identity to check for anymore
+    (`ConfiguredAdapter.unconfirmed_preview` bypasses `assert_confirmed`
+    rather than satisfying it, adapters/configured.py); the honest
+    replacement property is that `review.state` never moves, on disk or
+    in memory."""
     path = _bluepeak(tmp_path)
     before = path.read_bytes()
-    m = measure(read_contract(path), BLUEPEAK_DIR)
+    contract = read_contract(path)
+    assert contract.review.state == "proposed"
+    measure(contract, BLUEPEAK_DIR)
     assert path.read_bytes() == before
-    assert PROVISIONAL_BY not in json.dumps(m.__dict__, default=str)
+    assert contract.review.state == "proposed"
+    assert read_contract(path).review.state == "proposed"
 
 
 def test_measure_collects_every_problem_rather_than_stopping_at_the_first(tmp_path):

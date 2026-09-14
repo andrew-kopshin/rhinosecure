@@ -17,35 +17,65 @@ Measuring a contract the engine refuses to construct
 ------------------------------------------------------
 `ConfiguredAdapter.__init__` calls `assert_confirmed` before it sets a
 single attribute -- so the object that must measure an UNCONFIRMED contract
-is the one object that refuses to exist for it. Resolved by SATISFYING the
-gate rather than routing around it: `_provisional` returns an in-memory copy
-stamped by the ordinary `config_io.confirm_contract`, with a sentinel
-identity that says what it is. That copy is function-local -- it is never
-returned by any public name here, never written, and never handed to
-scoring; the public results are counts, gap maps and problem strings.
+is the one object that refuses to exist for it. `measure()` below uses
+`ConfiguredAdapter.unconfirmed_preview()` -- a second, loudly-named
+constructor on the engine itself that skips `assert_confirmed` outright,
+never fakes `review.state`, and (per its own docstring) has exactly two
+audited callers, this module being one.
 
-Rejected, deliberately: extracting the engine's constructor body so a
-review could call it on an `__new__`'d instance. That adds a second,
-supported construction path around a gate whose whole value is being the
-only one, and then guards it with naming discipline -- the same class of
-protection `config_model.py`'s own docstring refuses to rely on when it
-argues against an `on_unmapped` key. Also rejected: a `review_only=` flag on
-`ConfiguredAdapter.__init__`, which would put the bypass on the exact
-constructor the ingest path calls, one keyword away from disabling the gate.
-The provisional stamp leaves `configured.py`'s gate a single unconditional
-statement with no parameter and no branch.
+**This reverses an earlier decision here, on purpose, after that decision's
+own premise turned out false.** The original mechanism (`_provisional()`,
+removed) SATISFIED the gate instead of bypassing it: it cloned `contract`
+with `review` reset, then re-ran it through the real `confirm_contract`
+under a sentinel identity, so `review.state` read `"confirmed"` -- to
+anyone who didn't specifically compare `confirmed_by` against the sentinel.
+That was deliberately preferred at the time over exactly the "second
+construction path" `unconfirmed_preview` now is, reasoned as guarding the
+gate with naming discipline (a leading underscore, a docstring promise)
+rather than weakening it structurally. The premise was that `_provisional`
+'s result stays function-local -- "never returned by any public name here,
+never written, and never handed to scoring." That premise was false the
+moment `web/jobs.py`'s provisional-run path (CLAUDE.md's "drop a CSV, get
+a plan") needed the identical capability for REAL scoring and imported the
+"private" helper directly rather than duplicating it -- at which point a
+stamped-`"confirmed"` contract WAS handed to scoring, on purpose, and the
+only thing distinguishing it from a real confirmation was
+`is_provisional()` remembering to check the sentinel identity instead of
+the state everyone else checks directly. A fake signature that reads as
+real to any code that doesn't know to look for a sentinel is a fail-open
+gate: an unsigned mapping is supposed to be unable to be exported,
+dispatched, or recorded as remediation, and that guarantee held only for
+as long as every single downstream check remembered to route through
+`is_provisional()` instead of reading `review.state` -- one uncaught case
+away from silently treating an unsigned mapping as signed.
+`unconfirmed_preview` is honest instead: the adapter it builds keeps
+whatever `review.state` `contract` already had, so `is_provisional()`
+(below) can go back to asking the real question directly rather than
+checking for evidence of a specific historical workaround.
 
-Two details of `_provisional` are load-bearing, not cosmetic:
+Two details `measure()` still handles explicitly before constructing the
+preview adapter -- both load-bearing, not cosmetic, and both survive from
+the removed `_provisional()` unchanged in effect:
 
-- **`review` is cleared first**, so `confirm_contract` recomputes digests
-  over the contract's CURRENT content. A contract that has drifted since it
-  was confirmed is refused by `rhino run --adapter-config` (correctly), which
-  leaves `rereview` as the only command that can still inspect it -- exactly
-  the case a human needs most.
+- **`review` is reset to its default** (`Review()`) before the preview
+  adapter is built. Not for `assert_confirmed`'s sake anymore --
+  `unconfirmed_preview` never calls it -- but because `validate_contract`
+  itself (V19, run unconditionally inside `load_assets`) separately
+  compares `review.content_digest`/`decision_digest` against the
+  contract's CURRENT content whenever they are non-None, and a contract
+  under RE-review (already `state="confirmed"`, possibly drifted) still
+  carries its OLD digests. Left unreset, re-reviewing a genuinely drifted
+  contract would raise a spurious V19 mismatch during the very
+  measurement a re-review exists to produce, because `observed` has moved
+  while `review` still carries the pre-drift digest.
 - **`observed` is cleared**, because `ConfiguredAdapter.load_assets` runs
   `validate_contract` on every load and V18 reads the STORED `observed`'s
   exclusion counts. A stale measurement would make the fresh measurement
   refuse itself.
+
+Neither reset touches `contract` itself -- both build a local copy handed
+only to the preview adapter; `review_contract` (below) computes `drift`
+against the real, on-disk `contract` before `measure()` ever runs.
 
 Getting every problem instead of the first
 --------------------------------------------
@@ -123,23 +153,31 @@ from rhinosecure.adapters.config_model import (
 from rhinosecure.adapters.configured import ConfiguredAdapter
 from rhinosecure.adapters.probe import NonRaisingProblemCollector, profile_csv
 
-#: What the in-memory provisional stamp records as its signer. It exists so
-#: that if such an object ever did escape into a log or a debugger, it says
-#: what it is rather than impersonating a reviewer. It is never written.
-PROVISIONAL_AT = "0000-00-00T00:00:00Z"
-PROVISIONAL_BY = "rhino adapt (provisional, in memory, never written)"
-
-
 def is_provisional(contract: Contract | None) -> bool:
-    """True for a contract that went through `_provisional()` -- `review.
-    state == "confirmed"` is NOT the right check here: that is exactly what
-    `_provisional()` stamps, on purpose, so `ConfiguredAdapter`'s own
-    `assert_confirmed` gate lets it construct at all. The sentinel identity
-    (`PROVISIONAL_BY`), never a real reviewer's name, is what actually
-    distinguishes it. `None` (a built-in `--format` run has no contract at
+    """The 'never-signed' predicate: true whenever `contract` has not
+    actually been through a human confirmation -- `review.state !=
+    "confirmed"`. `None` (a built-in `--format` run has no contract at
     all) is False, not an error -- the same "absent means no, never
-    guessed" convention `export.py`'s own provenance fields already use."""
-    return contract is not None and contract.review.confirmed_by == PROVISIONAL_BY
+    guessed" convention `export.py`'s own provenance fields already use.
+
+    Deliberately the ONLY thing this function checks, and safe to check
+    this directly now: nothing in this codebase can produce a contract
+    that SAYS `"confirmed"` without actually being confirmed anymore.
+    `ConfiguredAdapter.unconfirmed_preview()` (adapters/configured.py),
+    the one sanctioned way to run an unconfirmed contract through the real
+    engine, never touches `review` at all, so a contract scored through it
+    keeps reporting its real, honest state here -- see that method's own
+    docstring for why this function used to need a sentinel instead.
+
+    Distinct from whether any individual scoring-relevant slot was
+    auto-filled with a placeholder rather than mapped for real -- that is
+    a separate, narrower fact about WHICH values in an unsigned contract
+    are fabricated, not about whether the contract is signed at all (see
+    `agents.schema_inference.placeholder_axes`). A fully-resolved,
+    fully-confident proposal that simply has not been confirmed yet is
+    provisional by this function's definition and carries zero placeholder
+    axes."""
+    return contract is not None and contract.review.state != "confirmed"
 
 
 class ReviewError(ContractError):
@@ -288,17 +326,6 @@ class ReviewOutcome:
         )
 
 
-def _provisional(contract: Contract) -> Contract:
-    """See the module docstring's "Measuring a contract the engine refuses
-    to construct". Deliberately private and function-local at every call
-    site: never returned by a public name here, never written."""
-    return confirm_contract(
-        contract.model_copy(update={"review": Review(), "observed": None}),
-        at=PROVISIONAL_AT,
-        by=PROVISIONAL_BY,
-    )
-
-
 def _value_distribution(assets: dict) -> dict[str, dict[str, int]]:
     distribution: dict[str, dict[str, int]] = {}
     for target in SCORING_ENUM_TARGETS:
@@ -363,7 +390,14 @@ def measure(contract: Contract, data_dir: Path) -> Measurement:
     """Run the real mapping over the real files and report what happened.
     Never raises for a source problem -- that is the return value."""
     recording = _RecordingCollectors()
-    adapter = ConfiguredAdapter(_provisional(contract), collector_factory=recording)
+    # See this module's own docstring: `review` is reset (so a re-review of
+    # an already-confirmed, possibly-drifted contract can't trip V19's
+    # digest check) and `observed` is cleared (so a stale prior measurement
+    # can't make the fresh one refuse itself under V18) -- purely local to
+    # building the preview adapter; `contract` itself, and whatever `drift`
+    # was already computed against it, are untouched.
+    preview_contract = contract.model_copy(update={"review": Review(), "observed": None})
+    adapter = ConfiguredAdapter.unconfirmed_preview(preview_contract, collector_factory=recording)
 
     tally = ingest.GapTally()
     assets: dict = {}
@@ -598,8 +632,9 @@ def review_contract(
     # refusal blamed the source. That is the normal state of a
     # freshly-proposed contract, so it would have blocked the whole
     # propose -> confirm flow. (`exclusions` is different -- it depends on
-    # the measurement, and `_provisional` clears `observed` so a stale count
-    # cannot make the fresh measurement refuse itself.)
+    # the measurement, and `measure()` clears `observed` before building
+    # its preview adapter so a stale count cannot make the fresh
+    # measurement refuse itself.)
     base = contract.model_copy(update={"attestations": merged})
     measurement = measure(base, data_dir)
     refusals: list[str] = []

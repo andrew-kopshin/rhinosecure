@@ -165,6 +165,7 @@ from rhinosecure.agents.risk import (
 )
 from rhinosecure.adapters import DEFAULT_FORMAT
 from rhinosecure.adapters.config_model import Contract
+from rhinosecure.adapters.review import is_provisional
 from rhinosecure.enrich.attack import load_index as load_attack_index
 from rhinosecure.enrich.cache import SnapshotCache
 from rhinosecure.enrich.kev import load_catalog as load_kev_catalog
@@ -556,10 +557,27 @@ class Coordinator:
 
         `contract` is the confirmed ingest contract behind a config-driven
         run (`adapters.ConfiguredAdapter.contract`), or `None` for a
-        built-in `--format`. Purely informational -- cli.py reads it to
-        print which reviewed mapping produced a plan; nothing in this
-        class's own behavior depends on it.
+        built-in `--format`. Mostly informational -- cli.py reads it to
+        print which reviewed mapping produced a plan -- except for one
+        refusal this constructor enforces itself, immediately below: a
+        `contract` `adapters.review.is_provisional()` on (never actually
+        confirmed) may not be paired with a real `memory`. Persisting
+        decisions or constraints against a mapping nobody has signed is
+        exactly what CLAUDE.md's "nothing provisional escapes" forbids,
+        and the provisional-run path (`web/jobs.py`'s `_build_and_run_
+        coordinator`) always passes `memory=None` for precisely this
+        reason -- this is the structural backstop, not a policy this
+        class trusts every caller to already follow correctly.
         """
+        if memory is not None and is_provisional(contract):
+            raise CoordinatorError(
+                f"refusing to construct: contract {contract.format!r} is unconfirmed "
+                f"(review.state={contract.review.state!r}) but a real Memory instance was "
+                "supplied. Persisting decisions or constraints against a mapping nobody has "
+                "signed would violate CLAUDE.md's 'nothing provisional escapes'. Score this "
+                "contract with memory=None (see web/jobs.py's provisional-run path), or "
+                "confirm it first (`rhino adapt confirm`) to use a real Memory."
+            )
         self.data_dir = data_dir
         self.cache = cache or SnapshotCache()
         self.memory = memory

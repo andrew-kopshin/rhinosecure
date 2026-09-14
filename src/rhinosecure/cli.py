@@ -272,10 +272,10 @@ def run_with_report(
 
     # `adapter`, when given, wins outright and skips resolution entirely --
     # the provisional-run path (web/jobs.py) already built one (a
-    # ConfiguredAdapter over an UNCONFIRMED contract via review._provisional,
-    # since load_config_adapter below refuses anything but a confirmed one).
-    # Every other caller passes `None` and gets exactly today's resolution,
-    # unchanged.
+    # ConfiguredAdapter over an UNCONFIRMED contract via
+    # ConfiguredAdapter.unconfirmed_preview, since load_config_adapter below
+    # refuses anything but a confirmed one). Every other caller passes
+    # `None` and gets exactly today's resolution, unchanged.
     #
     # adapter_config, when given, wins outright over `fmt` -- cli.py's
     # argparse group already makes --format/--adapter-config mutually

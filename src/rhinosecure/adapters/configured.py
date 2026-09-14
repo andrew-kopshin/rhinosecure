@@ -370,7 +370,11 @@ class ConfiguredAdapter(IngestAdapter):
     `collector_factory` defaults to the real `ProblemCollector`; a probe (a
     later slice) passes a non-raising recording subclass instead, so the
     review a human reads is produced by exactly this code, not a second
-    implementation of it."""
+    implementation of it.
+
+    `unconfirmed_preview()` (below) is the one, loudly-named exception to
+    "refuses to construct against anything else" -- see its own docstring
+    before reaching for it."""
 
     def __init__(
         self,
@@ -381,6 +385,91 @@ class ConfiguredAdapter(IngestAdapter):
         force_not_collected: frozenset[str] = frozenset(),
     ) -> None:
         assert_confirmed(contract)
+        self._init_unchecked(
+            contract,
+            collector_factory=collector_factory,
+            excluding_targets=excluding_targets,
+            force_not_collected=force_not_collected,
+        )
+
+    @classmethod
+    def unconfirmed_preview(
+        cls,
+        contract: Contract,
+        *,
+        collector_factory: Callable[[Path], ProblemCollector] = ProblemCollector,
+        excluding_targets: frozenset[str] = EXCLUDING_TARGETS,
+        force_not_collected: frozenset[str] = frozenset(),
+    ) -> "ConfiguredAdapter":
+        """The one loudly-named way to construct this class without
+        `assert_confirmed`'s gate -- skips it entirely, for any `contract`
+        regardless of `review.state` or whether its digests still match
+        (a drifted, previously-confirmed contract included). `__init__`
+        itself carries no flag or parameter that reaches this behavior:
+        reaching it requires calling this method, by this exact name.
+
+        This replaces an earlier design (`adapters/review.py`'s
+        `_provisional()`, removed) that SATISFIED `assert_confirmed`
+        instead of bypassing it -- by cloning `contract` with `review`
+        reset and re-running it through the real `confirm_contract`, under
+        a sentinel identity, so `review.state` read `"confirmed"` to any
+        code that checked it directly. That worked exactly until a caller
+        outside `adapters/review.py` (`web/jobs.py`'s provisional-run path)
+        needed the identical capability for REAL scoring and imported the
+        "private" helper rather than duplicating it -- at which point any
+        code checking `contract.review.state == "confirmed"` instead of
+        routing through `adapters.review.is_provisional()` would silently
+        treat an unsigned mapping as a signed one. A fake signature that
+        reads as real to anyone who doesn't know to check for a sentinel is
+        a fail-open gate, not a safety mechanism: CLAUDE.md's "nothing
+        provisional escapes" held only for as long as every downstream
+        check remembered `is_provisional()` instead of the state everyone
+        else reads directly -- one missed check away from silently
+        promoting an unsigned mapping. This constructor makes the bypass a
+        structural, greppable fact instead of a value indistinguishable
+        from the real thing: a contract built this way keeps whatever
+        `review.state` it already had (never faked to `"confirmed"`), so
+        `is_provisional()` asks the one question that actually matters --
+        was this contract ever really signed -- directly, with nothing to
+        fake and nothing to check for instead.
+
+        Two audited callers, both intentional, both expected to remain the
+        only two: `adapters/review.py`'s `measure()`, which must run the
+        real engine over a contract before or during the human review that
+        will (or won't) confirm it -- including a RE-review of a contract
+        that IS already `state="confirmed"` but has since drifted, where
+        `assert_confirmed`'s digest check would otherwise refuse the very
+        measurement a re-review exists to produce; and `web/jobs.py`'s
+        `_resolve_provisional`, CLAUDE.md's "drop a CSV, get a plan"
+        provisional-run path, which scores a genuinely never-confirmed
+        contract and marks the result provisional through
+        `is_provisional()` reading its real state, never through a state
+        that lies about being signed. A third caller should be treated
+        with the same suspicion as adding a second `assert_confirmed`
+        bypass anywhere else in this codebase -- if one seems needed, the
+        right question is why the existing two aren't enough, not whether
+        to add a flag to `__init__` instead."""
+        self = cls.__new__(cls)
+        self._init_unchecked(
+            contract,
+            collector_factory=collector_factory,
+            excluding_targets=excluding_targets,
+            force_not_collected=force_not_collected,
+        )
+        return self
+
+    def _init_unchecked(
+        self,
+        contract: Contract,
+        *,
+        collector_factory: Callable[[Path], ProblemCollector],
+        excluding_targets: frozenset[str],
+        force_not_collected: frozenset[str],
+    ) -> None:
+        """Every field `__init__`/`unconfirmed_preview` both set. Carries
+        no confirmation check of its own -- whether `assert_confirmed` ran
+        (or was deliberately skipped) is entirely the CALLER's decision,
+        already made before this runs."""
         super().__init__()
         self.contract = contract
         self.format = contract.format

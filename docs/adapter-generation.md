@@ -130,17 +130,41 @@ with a literal.
 **Measuring a contract the engine refuses to construct.**
 `ConfiguredAdapter.__init__` calls `assert_confirmed` before it sets an
 attribute, so the object that must measure an *unconfirmed* contract is the
-one object that refuses to exist for it. Resolved by satisfying the gate,
-not routing around it: `_provisional` stamps an in-memory copy through the
-ordinary `confirm_contract` with a sentinel identity, and that copy is
-function-local — never returned by a public name, never written. Rejected:
-extracting the constructor body to call it on an `__new__`'d instance (a
-second construction path around a gate whose value is being the only one),
-and a `review_only=` flag on the constructor the ingest path itself calls.
-`_provisional` clears `review` (so a *drifted* contract is still
-measurable — `rereview` is the only command left that can inspect one) and
-clears `observed` (or V18 reads a stale exclusion count and the fresh
-measurement refuses itself).
+one object that refuses to exist for it. `measure()` uses
+`ConfiguredAdapter.unconfirmed_preview()` — a second, loudly-named
+constructor on the engine itself that skips `assert_confirmed` outright and
+never touches `review` at all, with exactly two audited callers (this
+module's `measure()`, and `web/jobs.py`'s provisional-run path).
+
+This reverses an earlier decision, on purpose. The original mechanism
+(`_provisional()`, removed) *satisfied* the gate instead of bypassing it: it
+cloned the contract with `review` reset and re-ran it through the real
+`confirm_contract` under a sentinel identity, so `review.state` read
+`"confirmed"` to any code that checked it directly — reasoned at the time as
+guarding the gate with naming discipline (private, function-local, "never
+handed to scoring") rather than weakening it structurally. That premise held
+only until `web/jobs.py`'s provisional-run path needed the identical
+capability for *real* scoring and imported the "private" helper directly —
+at which point a stamped-`"confirmed"` contract genuinely reached scoring,
+and the only thing distinguishing it from a real confirmation was
+`adapters.review.is_provisional()` remembering to check a sentinel identity
+instead of the state everyone else reads directly. A fake signature that
+reads as real to any code that doesn't know to check for a sentinel is a
+fail-open gate. `unconfirmed_preview()` is honest instead: the contract it
+builds over keeps whatever `review.state` it already had, so
+`is_provisional()` now reads `review.state != "confirmed"` directly, with
+nothing to fake and nothing special to check for.
+
+`measure()` still clears two things locally before building the preview
+adapter, both load-bearing: `review` is reset to its default (not for
+`assert_confirmed`'s sake anymore, but because `validate_contract`'s own V19
+check separately compares stored digests against current content whenever
+they're non-None — a *drifted*, already-confirmed contract under re-review
+would otherwise fail that on the very measurement a re-review exists to
+produce), and `observed` is cleared (or V18 reads a stale exclusion count
+and the fresh measurement refuses itself). Neither touches the contract
+`review_contract` computed `drift` against — that already ran on the
+original, unmodified object.
 
 **Order, which is not negotiable.** merge attestations (carried-forward plus
 `--attest`) → measure → build `observed` → `confirm_contract` (stamp) →

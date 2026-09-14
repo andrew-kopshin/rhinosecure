@@ -411,6 +411,65 @@ def test_digest_mismatch_refuses_before_any_file_is_opened(tmp_path):
         ConfiguredAdapter(edited)  # never touches tmp_path -- proves the gate needs no directory
 
 
+# --- unconfirmed_preview ---------------------------------------------------
+
+
+def test_unconfirmed_preview_constructs_over_a_contract_init_would_refuse():
+    """The one loudly-named escape hatch from assert_confirmed's gate --
+    used by adapters/review.py's measure() and web/jobs.py's provisional-
+    run path, never by the ordinary ingest path."""
+    contract = _bluepeak_gen().model_copy(update={"review": type(_bluepeak_gen().review)(state="proposed")})
+    with pytest.raises(ContractNotConfirmedError):
+        ConfiguredAdapter(contract)
+
+    adapter = ConfiguredAdapter.unconfirmed_preview(contract)
+    assert isinstance(adapter, ConfiguredAdapter)
+    assert isinstance(adapter, IngestAdapter)
+    assert adapter.format == "bluepeak-gen"
+
+
+def test_unconfirmed_preview_also_accepts_a_digest_mismatched_contract():
+    """The re-review case: a contract that IS review.state == "confirmed"
+    but has since drifted -- assert_confirmed refuses this too, and
+    unconfirmed_preview must accept it just as readily as a never-
+    confirmed one, since adapters/review.py's measure() needs to run the
+    real engine over a drifted, already-confirmed contract too."""
+    contract = _bluepeak_gen()
+    edited = contract.model_copy(
+        update={"asset": {**contract.asset, "role": contract.asset["role"].model_copy(
+            update={"table": {**contract.asset["role"].table, "Domain Controller": "sql"}}
+        )}}
+    )
+    with pytest.raises(ContractDigestMismatchError):
+        ConfiguredAdapter(edited)
+
+    adapter = ConfiguredAdapter.unconfirmed_preview(edited)
+    assert adapter.contract is edited
+
+
+def test_unconfirmed_preview_never_mutates_review_state():
+    """The whole point, versus the removed _provisional() sentinel-stamp
+    approach: the contract keeps reporting whatever review.state it
+    already had -- never faked to "confirmed"."""
+    contract = _bluepeak_gen().model_copy(update={"review": type(_bluepeak_gen().review)(state="proposed")})
+    adapter = ConfiguredAdapter.unconfirmed_preview(contract)
+    assert adapter.contract.review.state == "proposed"
+    assert adapter.contract.review.confirmed_by is None
+    assert contract.review.state == "proposed"  # the object passed in is untouched too
+
+
+def test_unconfirmed_preview_scores_real_rows_exactly_like_the_real_constructor():
+    """Not just a construction-time technicality -- the same engine, doing
+    the same work, over a contract __init__ would have refused."""
+    contract = _bluepeak_gen().model_copy(update={"review": type(_bluepeak_gen().review)(state="proposed")})
+    preview_adapter = ConfiguredAdapter.unconfirmed_preview(contract)
+    confirmed_adapter = ConfiguredAdapter(_bluepeak_gen())
+    preview_assets, preview_findings = load_batch(DATA_ROOT / "bluepeak", preview_adapter)
+    confirmed_assets, confirmed_findings = load_batch(DATA_ROOT / "bluepeak", confirmed_adapter)
+    assert set(preview_assets) == set(confirmed_assets)
+    assert len(list(preview_findings)) == len(list(confirmed_findings))
+
+
 def test_not_collected_hand_edited_without_touching_the_mapping_refuses_end_to_end(tmp_path):
     """V09 (config_model.validate_contract) already pins this at the unit
     level (test_adapters_config_model.py); this confirms it still holds

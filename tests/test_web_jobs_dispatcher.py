@@ -489,7 +489,7 @@ def test_run_deterministic_scores_provisionally_against_an_unconfirmed_upload_co
     (exactly the state test_resolve_source_ref_refuses_an_upload_with_a_
     proposed_but_unconfirmed_contract shows resolve_source_ref itself still
     refuses), now scores provisionally instead of refusing -- the
-    ConfiguredAdapter(review._provisional(...), excluding_targets=
+    ConfiguredAdapter.unconfirmed_preview(contract, excluding_targets=
     SCORING_ENUM_TARGETS) branch web/jobs.py's _run_run_deterministic
     takes before ever calling resolve_source_ref. CVE-2021-26855 (ProxyLogon)
     is a real, already-snapshotted demo anchor CVE, so this exercises a

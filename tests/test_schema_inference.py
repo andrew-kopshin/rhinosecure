@@ -42,6 +42,7 @@ from rhinosecure.agents.schema_inference import (
     check_grounding,
     dump_saved_proposal,
     load_saved_proposal,
+    placeholder_axes,
     propose_contract,
     unresolved_slots,
 )
@@ -490,6 +491,36 @@ def test_provisional_assembly_of_a_fully_resolved_proposal_behaves_like_assemble
     strict_contract = assemble_contract(proposal, profiles, report, generator=_generator(), generated_at=_GENERATED_AT)
     assert contract.asset == strict_contract.asset
     assert contract.finding == strict_contract.finding
+    # The 'auto-filled-slots' predicate, distinct from is_provisional's
+    # 'never-signed' one: a fully-resolved proposal that just hasn't been
+    # confirmed carries zero placeholder axes.
+    assert placeholder_axes(contract) == frozenset()
+
+
+# --- placeholder_axes --------------------------------------------------------
+
+
+def test_placeholder_axes_reports_role_when_it_carries_the_provisional_literal(profiles):
+    """Mirrors test_provisional_assembly_gives_role_a_literal_placeholder_
+    and_neutralizes_it -- placeholder_axes is the code
+    web/jobs.py's _resolve_provisional actually calls to recognize this
+    shape, extracted so it's independently testable."""
+    data = _full_proposal_dict(overrides_asset={"role": _unresolved()})
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles)
+    contract, notes = assemble_provisional_contract(proposal, profiles, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract is not None
+    assert placeholder_axes(contract) == frozenset({"role"})
+
+
+def test_placeholder_axes_is_empty_when_role_is_a_real_column_mapping(profiles):
+    """A genuinely mapped role (not a literal at all) is never mistaken
+    for a placeholder."""
+    proposal = AdapterProposal.model_validate(_full_proposal_dict())
+    report = check_grounding(proposal, profiles)
+    contract = assemble_contract(proposal, profiles, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract.asset["role"].kind != "literal"
+    assert placeholder_axes(contract) == frozenset()
 
 
 # --- assemble_provisional_contract: a SlotMapped mapping that is individually

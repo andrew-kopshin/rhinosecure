@@ -1227,6 +1227,60 @@ def test_without_an_inventory_and_without_assets_csv_it_fails_loudly(tmp_path: P
         Coordinator(tmp_path)
 
 
+def _unconfirmed_contract():
+    """A real Contract whose review.state is "proposed" -- built from the
+    committed, confirmed bluepeak-gen.json with review reset, rather than
+    a hand-rolled stand-in, so `is_provisional()` sees a genuine Contract
+    object exactly like the provisional-run path does."""
+    from rhinosecure.adapters.config_io import read_contract
+
+    committed = Path(__file__).resolve().parents[1] / "data" / "adapters" / "bluepeak-gen.json"
+    confirmed = read_contract(committed)
+    assert confirmed.review.state == "confirmed"
+    unconfirmed = confirmed.model_copy(update={"review": type(confirmed.review)()})
+    assert unconfirmed.review.state == "proposed"
+    return unconfirmed
+
+
+def test_construction_refuses_a_real_memory_paired_with_an_unconfirmed_contract(tmp_path: Path):
+    """The structural backstop `_build_and_run_coordinator`'s docstring
+    (web/jobs.py) names: an unconfirmed contract and a real Memory must
+    never reach a Coordinator together, since persisting decisions or
+    constraints against a mapping nobody has signed would violate
+    CLAUDE.md's 'nothing provisional escapes'. This is what makes the
+    provisional-run path's memory=None a structural fact rather than a
+    convention every caller has to remember."""
+    from rhinosecure.memory import Memory
+
+    memory = Memory(tmp_path / "m.db")
+    asset = _defender_asset()
+    with pytest.raises(CoordinatorError, match="unconfirmed"):
+        Coordinator(tmp_path, assets={asset.asset_id: asset}, memory=memory, contract=_unconfirmed_contract())
+
+
+def test_construction_allows_an_unconfirmed_contract_paired_with_no_memory(tmp_path: Path):
+    """The provisional-run path's own real shape -- memory=None with an
+    unconfirmed contract is exactly what web/jobs.py's
+    _build_and_run_coordinator always does, and must keep working."""
+    asset = _defender_asset()
+    coordinator = Coordinator(tmp_path, assets={asset.asset_id: asset}, memory=None, contract=_unconfirmed_contract())
+    assert coordinator.memory is None
+    assert coordinator.contract.review.state == "proposed"
+
+
+def test_construction_allows_a_confirmed_contract_paired_with_a_real_memory(tmp_path: Path):
+    """The ordinary --adapter-config path -- unaffected by the new guard."""
+    from rhinosecure.adapters.config_io import read_contract
+    from rhinosecure.memory import Memory
+
+    committed = Path(__file__).resolve().parents[1] / "data" / "adapters" / "bluepeak-gen.json"
+    confirmed = read_contract(committed)
+    memory = Memory(tmp_path / "m.db")
+    asset = _defender_asset()
+    coordinator = Coordinator(tmp_path, assets={asset.asset_id: asset}, memory=memory, contract=confirmed)
+    assert coordinator.memory is memory
+
+
 def test_the_injected_inventory_reaches_the_environment_and_constraint_tools(tmp_path: Path):
     """The inventory is not just stored -- it is what Environment's
     lookup_asset_context and the Interpreter's search_assets read."""

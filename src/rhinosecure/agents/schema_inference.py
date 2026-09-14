@@ -1248,6 +1248,42 @@ def assemble_contract(
 #: would do, since none of them is ever read for scoring here.
 PROVISIONAL_ROLE_PLACEHOLDER = "workstation"
 
+
+def placeholder_axes(contract: Contract) -> frozenset[str]:
+    """Which `SCORING_ENUM_TARGETS` slots (if any) carry a value THIS
+    PROJECT fabricated -- via `_provisional_placeholder_for`'s `role`
+    branch, below -- rather than one the model or a human actually mapped
+    from the source. `role` is the only member today: it is the one
+    `SCORING_ENUM_TARGETS` slot with no `not_collected` default
+    (`GAP_LEGAL_TARGETS` excludes it -- `adapters/base.py`'s
+    `NOT_COLLECTED_DEFAULTS` has no `"role"` key), so `assemble_
+    provisional_contract` is forced to give it a real, schema-legal VALUE
+    (`literal(PROVISIONAL_ROLE_PLACEHOLDER)`) instead of the honest gap
+    encoding every other neutralized axis gets.
+
+    Distinct from `adapters.review.is_provisional`: that answers whether
+    `contract` has ever been signed at all; this answers which specific
+    values, if any, this project invented to keep an otherwise-unresolved
+    contract constructible. An unsigned contract can carry ZERO placeholder
+    axes -- a fully-resolved, fully-confident proposal nobody has clicked
+    "confirm" on yet (`test_provisional_assembly_of_a_fully_resolved_
+    proposal_behaves_like_assemble_contract`, tests/test_schema_
+    inference.py) -- and this function does not itself check whether
+    `contract` is confirmed; it only recognizes what a placeholder `role`
+    mapping looks like, in any contract, regardless of context.
+
+    Checking mapping KIND (`literal`) rather than the specific placeholder
+    VALUE is a deliberate, known-imprecise heuristic: a genuinely
+    confident, human-authored mapping could in principle also choose
+    `literal` for `role` (e.g. a batch where every asset really does share
+    one role) -- this function cannot distinguish that case from a
+    fabricated placeholder by inspecting the contract alone, and does not
+    try to. Its one caller, `web/jobs.py`'s `_resolve_provisional`, only
+    ever applies it to a contract already known to be unconfirmed, where
+    the ambiguity does not arise in practice."""
+    return frozenset({"role"}) if contract.asset["role"].kind == "literal" else frozenset()
+
+
 #: Targets whose whole-slot absence CANNOT be represented honestly at all --
 #: no `not_collected` default (identity fields are always `blank="fatal"`;
 #: `scanner_severity` has no NOT_COLLECTED_DEFAULTS entry and, unlike role,
