@@ -1831,6 +1831,17 @@ _REGISTRY_GUIDANCE = "\n\n".join(
      _render_enum_target_guidance("data_sensitivity"), _render_criticality_guidance()]
 )
 
+#: The subset of PARSER_NAMES legal on an ordinary per-row `parsed` mapping --
+#: excludes "timestamp", which is legal only inside asset_grouping.order_by
+#: (PARSER_POSITIONS, schema_registry.py; config_model.py's own
+#: _check_parser_placement reads the identical registry). A model proposing
+#: parser="timestamp" for a per-row target was a real, repeated failure mode
+#: (finding.detected_date, KEV-critical) -- the prompt's own per-target menu
+#: must not offer an option it will refuse. Sourced from the registry rather
+#: than hand-listed, so a future order_by-only parser updates this with zero
+#: prompt-text change.
+_ROW_LEGAL_PARSER_NAMES = sorted(name for name, pos in PARSER_POSITIONS.items() if "row" in pos)
+
 
 _GRAMMAR_REFERENCE = f"""
 TARGET SCHEMA -- every asset.<field> and finding.<field> below must be addressed, each with
@@ -1872,14 +1883,17 @@ MAPPING KINDS (kind, and required fields):
     (you are told each enumerated target's allowed values below).
   derived: {{kind:"derived", from:<name in your own "derived" block>, output:<one of that
     derivation's declared outputs>}} -- pulls one output of a `derived[name]` block (see below).
-  parsed: {{kind:"parsed", column, case, blank, optional, parser:<one of {sorted(PARSER_NAMES)}>,
+  parsed: {{kind:"parsed", column, case, blank, optional, parser:<one of {_ROW_LEGAL_PARSER_NAMES}>,
     params}} -- parser MUST be one of these names, nothing else: there is no way to supply your own
     regex or date format string anywhere in this grammar. `params` per parser: "bool" takes
     {{"true":[tokens meaning true], "false":[tokens meaning false]}}; "float" takes optional
     {{"min":..., "max":...}}; "date" takes {{"format": one of {sorted(DATE_FORMATS)}}} (default
-    "iso"); "timestamp" and "cve_id" take no params. If none of these five fit the column's real
-    shape, mark the slot unresolved instead -- do not force the closest-sounding one onto data it
-    cannot actually parse.
+    "iso") -- use "iso_prefix" instead of the default when the column holds a full timestamp
+    (a date and a time together) rather than a bare date-only value: it extracts just the date
+    portion; the default "iso" format has no tolerance for a trailing time component and will
+    fail to parse every row. "cve_id" takes no params. If none of these four fit the column's
+    real shape, mark the slot unresolved instead -- do not force the closest-sounding one onto
+    data it cannot actually parse.
   literal: {{kind:"literal", value}} -- a constant, never read from a column. ONLY use this when
     `evidence.columns_cited` names a column your own profile data below shows tagged "constant"
     (every row has one identical value) -- a literal not grounded in an observed constant will be
