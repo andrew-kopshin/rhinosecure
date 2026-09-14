@@ -484,28 +484,49 @@ def profile_csv(
 
 def _row_shape(
     path: Path, *, encoding: str, delimiter: str, quotechar: str, skip_lines: int, sample_rows: int
-) -> tuple[int, bool] | None:
+) -> tuple[int, bool] | OSError | UnicodeDecodeError | None:
     """`(header field count, whether every one of the first `sample_rows`
     data rows agrees with it)` for `path` read with `delimiter` -- quote-
     aware (`csv.reader`, the identical reader `profile_csv` itself builds),
     so a delimiter character that only ever appears inside a quoted value
-    is correctly never counted as a split point. `None` means the header
-    itself couldn't be read at all (an empty file, or a decode failure
-    before any content) -- `profile_csv`'s own subsequent real pass already
-    raises a clear `ProbeError` for that; this function only needs to not
-    crash on it, never to explain it.
+    is correctly never counted as a split point.
 
-    A file with zero data rows (header only) can never make any candidate
-    "consistent" -- `saw_row` stays `False` and the returned flag is
-    `False` regardless of the header's own shape, so a header's shape alone
-    (with nothing behind it to confirm it) can never win a candidate the
-    "beats comma" comparison in `detect_delimiter`. Comma's OWN field count
-    is read from this function's return value too, but -- deliberately --
-    only ever `[0]`, never `[1]`: comma is `profile_csv`'s literal default
-    regardless of whether it is internally consistent, exactly as it always
-    has been (a genuinely ragged real file still profiles with comma today,
-    reported via `ragged_rows`, never refused); only a CHALLENGER to comma
-    has to prove consistency to be preferred over it."""
+    Two DIFFERENT things can stop this from producing a shape, and this
+    function reports them differently on purpose -- `detect_delimiter`
+    (below) treats them as opposite outcomes, not the same "inconclusive"
+    result:
+
+    - The real `OSError`/`UnicodeDecodeError` is returned -- not swallowed
+      into `None` -- when `path` could not even be OPENED or DECODED as
+      `encoding` at all. This is a fact about the file's BYTES, independent
+      of which `delimiter` was being tried: decoding happens on the
+      underlying text stream before any candidate-specific splitting ever
+      runs, so every one of `COMMON_DELIMITERS` hits the IDENTICAL
+      exception at the IDENTICAL byte position for a given `path`/
+      `encoding`/`skip_lines` -- there is no such thing as "undecodable
+      under comma but fine under tab." Real bytes handed a non-text file
+      (confirmed live against a real `.xlsx`, a ZIP container, not a
+      decode-declaration mismatch a human could fix by re-exporting).
+    - `None` means the file decoded FINE but had no header row at all (a
+      genuinely empty text file) -- ordinary, and semantically nothing like
+      the case above. `StopIteration` is deliberately NOT caught alongside
+      the decode exceptions, so it can never be mistaken for one;
+      `profile_csv`'s own subsequent real pass already raises a clear,
+      specific `ProbeError` for an empty file, so this function has nothing
+      useful to add about that case beyond not crashing on it.
+
+    A file with zero data rows (header only, but not empty) can never make
+    any candidate "consistent" -- `saw_row` stays `False` and the returned
+    flag is `False` regardless of the header's own shape, so a header's
+    shape alone (with nothing behind it to confirm it) can never win a
+    candidate the "beats comma" comparison in `detect_delimiter`. Comma's
+    OWN field count is read from this function's return value too, but --
+    deliberately -- only ever `[0]`, never `[1]`: comma is `profile_csv`'s
+    literal default regardless of whether it is internally consistent,
+    exactly as it always has been (a genuinely ragged real file still
+    profiles with comma today, reported via `ragged_rows`, never refused);
+    only a CHALLENGER to comma has to prove consistency to be preferred
+    over it."""
     try:
         with path.open(newline="", encoding=encoding) as f:
             for _ in range(skip_lines):
@@ -526,8 +547,8 @@ def _row_shape(
                     consistent = False
                     break
             return (header_count, consistent and saw_row)
-    except (OSError, UnicodeDecodeError):
-        return None
+    except (OSError, UnicodeDecodeError) as exc:
+        return exc
 
 
 def detect_delimiter(
@@ -569,6 +590,21 @@ def detect_delimiter(
     what keeps a bare CVE-ID list from being treated as a detection
     failure.
 
+    That silence is deliberately NOT what happens when every candidate is
+    inconclusive because the file couldn't be decoded at all (`_row_shape`
+    returning the real exception, not `None`, for every one of
+    `COMMON_DELIMITERS` -- they agree, always, per that function's own
+    docstring). Those are two different situations that both end up
+    "nothing beat comma," and conflating them was the actual bug here: a
+    genuine single-column CSV decodes fine and has an honest, quiet answer
+    (comma); a file that isn't text at all (confirmed live against a real
+    `.xlsx`) never even reaches the point of having an opinion about
+    delimiters, and returning "," for it with no signal reads as that same
+    honest quiet answer when it is not one. Reported via `problems` the
+    same way genuine ambiguity is (below) -- one exception, real and
+    specific, is what distinguishes the two, not a guess about the file's
+    shape.
+
     Two or more non-comma candidates each independently clearing that bar
     is genuine ambiguity -- this function cannot tell which is really the
     delimiter, so, matching every other refusal in this codebase's ingest
@@ -583,12 +619,24 @@ def detect_delimiter(
     LLM's structured output declares -- see this module's own "Delimiter
     detection" section comment for the scope boundary."""
     shapes: dict[str, tuple[int, bool]] = {}
+    decode_error: OSError | UnicodeDecodeError | None = None
     for char, _name in COMMON_DELIMITERS:
         shape = _row_shape(
             path, encoding=encoding, delimiter=char, quotechar=quotechar, skip_lines=skip_lines, sample_rows=sample_rows
         )
-        if shape is not None:
+        if isinstance(shape, (OSError, UnicodeDecodeError)):
+            decode_error = shape
+        elif shape is not None:
             shapes[char] = shape
+
+    if decode_error is not None:
+        if problems is not None:
+            problems.add(
+                f"delimiter: could not be determined -- {path.name} could not be read as text under "
+                f"encoding {encoding!r} at all ({decode_error}), independent of which delimiter was "
+                "tried; this may not be a CSV/text file. Defaulted to comma."
+            )
+        return ","
 
     comma_count = shapes.get(",", (0, False))[0]
     detected = [

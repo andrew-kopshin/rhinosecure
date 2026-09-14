@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
+import openpyxl
 import pytest
 
 from rhinosecure.adapters.base import ProblemCollector
@@ -415,12 +416,41 @@ def test_detect_delimiter_is_quote_aware_not_a_frequency_count(tmp_path):
 def test_detect_delimiter_leaves_a_genuinely_single_column_file_alone(tmp_path):
     """No candidate can beat comma's own column count without appearing as
     a real separator -- a bare CVE-ID list has none of them, so this is the
-    ordinary case (comma, unchanged), never a reported fallback."""
+    ordinary case (comma, unchanged), never a reported fallback. The file
+    still decodes fine -- contrast test_detect_delimiter_reports_when_the_
+    file_cannot_be_decoded_at_all, where nothing decodes at all and that
+    IS reported. Conflating the two was the actual bug: both end up
+    returning comma, but only one of them is an honest "nothing to say"."""
     path = tmp_path / "data.csv"
     path.write_text("CVE_ID\nCVE-2023-21554\nCVE-2023-23397\nCVE-2019-1068\n", encoding="utf-8")
     collector = NonRaisingProblemCollector(path)
     assert detect_delimiter(path, encoding="utf-8", problems=collector) == ","
     assert collector.fatal == []  # not a failure -- nothing to fall back FROM
+
+
+def test_detect_delimiter_reports_when_the_file_cannot_be_decoded_at_all(tmp_path):
+    """A real .xlsx (a ZIP container, not text) handed to detect_delimiter
+    used to degrade in silence: every one of the four candidates hit the
+    identical UnicodeDecodeError, each was swallowed to None, and nothing
+    beat comma, so the function returned "," exactly as it does for an
+    honest single-column CSV -- a meaningful failure wearing the same face
+    as the ordinary case. This is the OTHER outcome: every candidate is
+    inconclusive because the file could not be decoded under `encoding` at
+    all, never because it decoded fine and genuinely has one column."""
+    path = tmp_path / "data.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["asset_id", "hostname", "role"])
+    ws.append(["A01", "DC01", "dc"])
+    wb.save(path)
+
+    collector = NonRaisingProblemCollector(path)
+    assert detect_delimiter(path, encoding="utf-8", problems=collector) == ","
+    assert len(collector.fatal) == 1
+    message = collector.fatal[0]
+    assert "could not be determined" in message
+    assert "data.xlsx" in message
+    assert "may not be a CSV/text file" in message
 
 
 def test_detect_delimiter_reports_genuine_ambiguity_and_falls_back_to_comma(tmp_path):
