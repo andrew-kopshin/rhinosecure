@@ -1245,6 +1245,103 @@ def test_grounding_refuses_composed_on_an_asset_slot(profiles):
     assert any("legal only for a finding.* target" in i.message for i in report.failures)
 
 
+# --- finding.detected_date vs a real full-timestamp column -------------------
+#
+# Reproduces the live failure on northgate_fleet_14.csv's own "First
+# Discovered" column: the schema-inference agent proposed parser="timestamp"
+# for finding.detected_date on every attempt against this real upload, which
+# is illegal outside asset_grouping.order_by and gets dropped by the
+# provisional-degrade path. The two sample values below are copied verbatim
+# from that real file's own "First Discovered" column (they are also the
+# exact two values the model's own saved proposal cited as
+# sample_values_cited for this slot) -- not invented. No LLM call anywhere
+# in this section; every mapping is constructed directly.
+
+_REAL_FIRST_DISCOVERED_VALUES = ["2026-07-02T04:10:00Z", "2026-06-18T01:05:00Z"]
+
+
+def _detected_date_data_dir(tmp_path) -> Path:
+    header = _HEADER + ["First Discovered"]
+    rows = [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "srv", _REAL_FIRST_DISCOVERED_VALUES[0]],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "wks", _REAL_FIRST_DISCOVERED_VALUES[1]],
+    ]
+    _write_csv(tmp_path, header, rows)
+    return tmp_path
+
+
+def test_1_timestamp_parser_on_detected_date_fails_check_slot_mapping_legality():
+    """1. The reported shape exactly: parser='timestamp' on
+    finding.detected_date, against the real column name from
+    northgate_fleet_14.csv, fails check_slot_mapping_legality with the
+    order_by-only message. This mechanism already exists and is expected
+    to PASS."""
+    from rhinosecure.adapters.config_model import ParsedMapping, check_slot_mapping_legality
+
+    mapping = ParsedMapping(kind="parsed", column="First Discovered", blank="fatal", parser="timestamp")
+    problems = check_slot_mapping_legality("finding.detected_date", "detected_date", mapping)
+    assert len(problems) == 1
+    assert "legal only inside asset_grouping.order_by" in problems[0]
+    assert "use one of these parsers instead" in problems[0]
+
+
+def test_2_iso_prefix_resolves_the_real_timestamp_values_to_a_date_string():
+    """2. The correct mapping -- parser='date', format='iso_prefix' -- against
+    the file's own real sample values, run through the exact _apply_case +
+    _parse_date pair the real engine calls at row-resolution time. Expected
+    to PASS: this is the fix the design-question report already identified
+    as already working, just never reached by the model."""
+    from rhinosecure.adapters.configured import _apply_case, _parse_date
+
+    expected = {"2026-07-02T04:10:00Z": "2026-07-02", "2026-06-18T01:05:00Z": "2026-06-18"}
+    for raw, expected_date in expected.items():
+        cased = _apply_case(raw.strip(), "exact")
+        assert _parse_date(cased, {"format": "iso_prefix"}) == expected_date
+
+
+def test_3a_default_iso_format_fails_to_resolve_the_same_real_timestamp_values():
+    """3a. parser='date' with the DEFAULT format (params omitted -> "iso",
+    the schema default) rejects every one of these real values --
+    date.fromisoformat has no tolerance for a full ISO-8601 timestamp.
+    Expected to PASS: this is a genuine, real resolution failure, not a
+    hypothetical one."""
+    from rhinosecure.adapters.configured import _apply_case, _parse_date
+
+    for raw in _REAL_FIRST_DISCOVERED_VALUES:
+        cased = _apply_case(raw.strip(), "exact")
+        assert _parse_date(cased, None) is None
+
+
+def test_3b_grounding_now_catches_the_unparseable_default_format(tmp_path):
+    """3b. Was FAILING (no fix applied): check_grounding previously had no
+    code path that ever called a "parsed" mapping's own parser against the
+    column's real profiled values -- _ground_slot's `kind in ("column",
+    "parsed")` branch only checked column EXISTENCE for "parsed", and the
+    deeper check_column_mapping_legal_values call was gated `if kind ==
+    "column"`, explicitly excluding "parsed". Now fixed by
+    _ground_parsed_value (schema_inference.py), wired into _ground_slot's
+    "parsed" branch: the mis-formatted mapping from test_3a -- individually
+    broken, every real row's detected_date would fail to parse at actual
+    ingestion -- is now reported as a real grounding failure instead of
+    passing clean. See _ground_parsed_value's own docstring for the
+    any-not-all-values-must-fail decision this asserts against."""
+    data_dir = _detected_date_data_dir(tmp_path)
+    profiles = {p.path.name: p for p in profile_source(data_dir)}
+    data = _full_proposal_dict(overrides_finding={
+        "detected_date": _mapped(
+            {"kind": "parsed", "column": "First Discovered", "case": "exact", "blank": "fatal", "parser": "date"},
+            columns_cited=["First Discovered"],
+        ),
+    })
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles)
+    assert "finding.detected_date" in report.failed_slots, (
+        "check_grounding currently reports no failure for a parsed mapping whose "
+        "declared format cannot parse the column's own real observed values -- "
+        f"got issues: {report.issues}"
+    )
+
+
 # --- assemble_contract now runs the real validator (Fix 2) -------------------
 
 

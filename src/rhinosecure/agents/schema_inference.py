@@ -98,6 +98,7 @@ from rhinosecure.adapters.config_model import (
     Mapping,
     NotCollectedDerived,
     NotCollectedMapping,
+    ParsedMapping,
     Review,
     Source,
     UnmappedColumnEntry,
@@ -113,7 +114,9 @@ from rhinosecure.adapters.config_model import (
     validate_contract,
 )
 from rhinosecure.adapters.configured import _apply_case  # the exact case transform applied before any table lookup
+from rhinosecure.adapters.configured import _parse_scalar  # the exact per-row parser the engine resolves a value with
 from rhinosecure.adapters.schema_registry import (
+    PARSER_POSITIONS,
     TARGET_REGISTRY,
     alias_table_for_column,
     full_alias_coverage,
@@ -498,6 +501,76 @@ def _ground_table(
         )
 
 
+def _ground_parsed_value(issues: list[GroundingIssue], slot: str, mapping: ParsedMapping, profile: FileProfile) -> None:
+    """The parser NAME being one of the five closed, code-owned values
+    (config_model.py's own Literal) says nothing about whether the
+    DECLARED PARAMS actually resolve this column's real data. `parser=
+    "date"` with the schema-default `params=None` (format "iso") is
+    structurally legal for ANY column, but fails every row of a column
+    that is actually full ISO-8601 timestamps -- the live reported case,
+    northgate_fleet_14.csv's "First Discovered": proposed with parser=
+    "timestamp" (illegal, already caught by check_slot_mapping_legality),
+    but a correction to parser="date" without ALSO setting format=
+    "iso_prefix" would have passed every check that existed before this
+    one, and only failed at real CSV ingestion (configured.py's own
+    _resolve_target). Runs the identical `_apply_case` + `configured.
+    _parse_scalar` pair the real engine calls at row-resolution time,
+    against every one of the column's real profiled distinct values --
+    never invented ones.
+
+    Scoped to parsers legal on a per-row mapping at all (`PARSER_POSITIONS
+    [parser]` contains `"row"`) -- `"timestamp"` is deliberately excluded:
+    it is ALWAYS illegal on a per-row mapping regardless of what it
+    resolves to, already reported -- more specifically, as a placement
+    problem rather than a value one -- by check_slot_mapping_legality.
+    Calling `configured._parse_scalar("timestamp", ...)` would raise
+    `AssertionError` (it has no scalar resolver at all, by design -- see
+    that function's own docstring), not return `None`, so running this
+    check against it would crash rather than report; skipping it here is
+    correct, not a gap, because the placement check already owns that
+    failure mode completely.
+
+    Decision, made once here rather than re-litigated per caller: a
+    mapping fails grounding if it fails to resolve ANY of the column's
+    real observed distinct values -- not only if it fails ALL of them --
+    and this is never downgraded to a caveat merely because the column's
+    distinct-value tracking overflowed its cap. That differs from
+    `_ground_table`'s own overflow caveat on purpose: overflow there means
+    "this specific cited key might exist in the untracked tail" -- genuine
+    uncertainty about something never observed. Here, every value this
+    check inspects WAS actually observed; whether it parses is a fact
+    already in hand, not a guess about the unobserved tail, so a confirmed
+    failure among the tracked values stays a fail regardless of the cap.
+    The any-not-all choice mirrors what real ingestion actually does:
+    `configured._resolve_target` treats ANY unparseable non-blank value as
+    fatal to the WHOLE BATCH, for every target, with no per-row or
+    per-target exclusion path the way a vocabulary-table miss sometimes
+    has (config_model.py's own Rule 1 / `EXCLUDING_TARGETS`). A parser
+    that resolves 9 of 10 real values and silently fails the 10th is not a
+    partial success by that measure -- it is exactly the shape that would
+    abort the whole run on the one row it can't parse, so it is reported
+    the same as a parser that resolves none of them: one grounding
+    failure, naming every value that failed."""
+    if "row" not in PARSER_POSITIONS.get(mapping.parser, frozenset()):
+        return  # order_by-only (e.g. "timestamp"): check_slot_mapping_legality's job, not this one's
+    col = profile.columns[mapping.column]
+    failed = [
+        raw for raw in col.distinct_values
+        if _parse_scalar(mapping.parser, _apply_case(raw, mapping.case), mapping.params) is None
+    ]
+    if not failed:
+        return
+    shown = sorted(failed)[:5]
+    more = f", +{len(failed) - 5} more" if len(failed) > 5 else ""
+    issues.append(
+        GroundingIssue(
+            slot, "fail",
+            f"{mapping.column!r}: parser {mapping.parser!r} (params={mapping.params!r}) does not resolve "
+            f"{len(failed)} of {len(col.distinct_values)} real observed value(s): {shown}{more}",
+        )
+    )
+
+
 def _ground_literal(issues: list[GroundingIssue], slot: str, value: object, evidence: SlotEvidence, profile: FileProfile) -> None:
     """A `literal` must be grounded in an observed constant -- not merely
     citing SOME constant-tagged column (any column, any value, would have
@@ -679,14 +752,20 @@ def _ground_slot(
         return
     if kind in ("column", "parsed"):
         exists = _check_column_exists(issues, slot, mapping.column, own_profile, optional=mapping.optional)
-        if kind == "column" and exists:
-            # A "parsed" mapping's output type is already enforced by its
-            # own parser (bool/float/date/timestamp/cve_id) -- this concern
-            # (a raw column value passed through verbatim to a closed
-            # vocabulary target) is specific to "column".
+        if exists and kind == "column":
+            # A "parsed" mapping's declared PARSER NAME is a closed,
+            # code-owned enum (config_model.py's own Literal) -- this
+            # column-mapping-legal-values concern (a raw column value
+            # passed through verbatim to a closed vocabulary target) is
+            # specific to "column". A "parsed" mapping's own value
+            # legality -- do its declared parser AND params actually
+            # resolve this column's real data, not just carry a legal
+            # parser name -- is checked separately, below.
             target = slot.split(".", 1)[1]
             for problem in check_column_mapping_legal_values(slot, target, mapping, own_profile):
                 issues.append(GroundingIssue(slot, "fail", problem))
+        elif exists and kind == "parsed":
+            _ground_parsed_value(issues, slot, mapping, own_profile)
     elif kind == "vocabulary":
         if _check_column_exists(issues, slot, mapping.column, own_profile, optional=mapping.optional):
             _ground_table(issues, slot, mapping.column, list(mapping.table), mapping.case, own_profile)

@@ -1281,20 +1281,35 @@ succeeded, and a hand-edited `--from-proposal` file's schema error crashing inst
 refusing cleanly. Same discipline as Slice 7's own hardening round, applied before this
 slice's first commit rather than across two.
 
-**Rule 1 — `exclude` is legal only for a check feeding `Asset.role`, and only the
-validator gets to decide that, never a config key.** The mapping grammar has no
-`on_unmapped` field. Making a value's disposition (fatal — refuse the whole batch — vs.
-scope-exclude the one record) a contract setting would let either the model or a human
-reclassify an inconvenient refusal as "exclude" to make it disappear — the exact silent-
-absorption failure the not-collected/refuse-rather-than-guess discipline (Section 1)
-exists to prevent. Instead the engine decides structurally: `ConfiguredAdapter
-._role_reference()` inspects how `contract.asset["role"]` is itself mapped — a direct
-`VocabularyMapping`, or a `DefaultByMapping` keyed off a `derived` table — and forward-
-traces which vocabulary or derivation-table lookup actually feeds that field. Only a miss
-at *that specific* lookup becomes `problems.exclude(...)`, a scope-boundary skip that's
-reported but not fatal (a Kubernetes cluster with no honest blast-radius role, say).
-Every other vocabulary or derivation-table miss anywhere else in the contract is always
-`problems.add(...)`, a fatal, whole-batch refusal.
+**Rule 1 — fatal-vs-exclude is a flat membership check, never a config key.** The
+mapping grammar has no `on_unmapped` field. Making a value's disposition (fatal — refuse
+the whole batch — vs. scope-exclude the one record) a contract setting would let either
+the model or a human reclassify an inconvenient refusal as "exclude" to make it
+disappear — the exact silent-absorption failure the not-collected/refuse-rather-than-guess
+discipline (Section 1) exists to prevent. Instead the engine decides with a flat
+set-membership check, not a structural trace. `config_model.EXCLUDING_TARGETS =
+frozenset({"role"})` is read by runtime code: it's the default value of
+`ConfiguredAdapter.__init__`'s `excluding_targets` parameter, stored as
+`self.excluding_targets`. At the two places a vocabulary or derivation-table lookup can
+miss (`_resolve_target`'s vocabulary branch, `_resolve_derivation`), the resolver already
+knows which target is asking — `target` is threaded through as a plain parameter from
+whichever `asset.*`/`finding.*` slot triggered the resolution (directly for a
+`VocabularyMapping`, or as the *outer* target for a `DefaultByMapping`/`DerivedMapping`
+that consults a `derived` table on that target's behalf) — so the miss handler just
+checks `target in self.excluding_targets`. No separate inspection of *how* `role` itself
+is mapped ever runs; the outcome matches "only a miss feeding `role` becomes exclude"
+purely because every call site is already scoped to the target it's resolving for, and
+`role` is the only member of the set today (a Kubernetes cluster with no honest
+blast-radius role, say). A miss on any other target is always `problems.add(...)`, a
+fatal, whole-batch refusal. A third, separate `exclude` call exists in
+`_validate_findings`: once an asset is excluded, every finding on it is excluded too,
+cascading rather than raising a second, confusing "orphan" error for the same root
+cause — that site doesn't re-check `excluding_targets` at all, it just inherits whatever
+reason its asset was already excluded for. `self.excluding_targets` is also the one place
+this decision can be widened per-run without touching the contract (the provisional-run
+path, `web/jobs.py`, passes every `SCORING_ENUM_TARGETS` member instead of just
+`{"role"}`) — the contract itself carries no such knob; only the caller constructing
+`ConfiguredAdapter` does.
 
 **Rule 2 — every pattern a contract can invoke is a closed, code-owned catalog; nothing
 lets an LLM author or select a regex at runtime.** `ParsedMapping.parser` is a fixed
