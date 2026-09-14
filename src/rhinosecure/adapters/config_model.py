@@ -468,7 +468,36 @@ class Source(BaseModel):
     layout: Literal["single_file", "two_file"]
     assets_filename: str
     findings_filename: str
-    encoding: Literal["auto", "utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be"] = "auto"
+    # "cp1252" is the one legacy single-byte member, deliberately alone --
+    # see this field's own note below for why "latin-1" is not offered
+    # alongside it. Never returned by `detect_encoding` (no BOM exists for a
+    # single-byte encoding, so there is nothing to sniff): reachable ONLY by
+    # a human declaring it here, on purpose, for a file they already know is
+    # a legacy Windows export -- never a guess this engine makes for them.
+    #
+    # Why cp1252 and not "latin-1" too: every real producer this project's
+    # own environment actually uses for a non-UTF export -- Excel's older
+    # CSV, Windows PowerShell 5.1's `Export-Csv -Encoding Default` on a
+    # Western-locale machine -- writes cp1252, confirmed live against this
+    # machine's own `[System.Text.Encoding]::Default` (WebName: Windows-1252,
+    # CodePage 1252), never genuine ISO-8859-1. cp1252 is also a strict
+    # superset of Latin-1 for every byte an actual CSV would ever carry as
+    # text: the two encodings disagree only on 0x80-0x9F, which Latin-1
+    # reserves for C1 control characters that never appear as literal
+    # spreadsheet content, while cp1252 uses that exact range for the
+    # printable characters (curly quotes, en/em dash, €) a legacy Windows
+    # export actually contains. So cp1252 alone already reads a genuine
+    # Latin-1 file correctly in every case that matters, and NOT adding a
+    # second "latin-1" member closes a real foot-gun: Latin-1 decoding never
+    # raises (every byte 0x00-0xFF is a legal Latin-1 codepoint), so a human
+    # who mistakenly declared "latin-1" for what is actually a cp1252 file
+    # (the likely case in practice) would get a silent, wrong decode of
+    # exactly the printable-character range cp1252 and Latin-1 disagree on --
+    # precisely the "wrong guess at a single-byte encoding corrupts
+    # silently" failure this project does not otherwise have anywhere in its
+    # CSV layer, and the one an offered-but-wrong option would reintroduce
+    # by a different door than auto-detection.
+    encoding: Literal["auto", "utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be", "cp1252"] = "auto"
     delimiter: str = ","
     quotechar: str = '"'
     first_data_row: int = Field(default=2, ge=2)

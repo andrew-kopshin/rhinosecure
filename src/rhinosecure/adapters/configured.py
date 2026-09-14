@@ -273,11 +273,38 @@ def _render_composed_join_part(part: ComposedPartJoin, row: dict[str, str]) -> s
 
 
 def _open_csv(contract: Contract, path: Path) -> tuple[IO[str], csv.DictReader]:
+    """`contract.source.encoding == "auto"` defers to `detect_encoding`'s
+    BOM sniffing exactly as before; anything else (including "cp1252",
+    legal since `Source.encoding`'s own docstring) is used verbatim -- this
+    ternary already "honours" a declared legacy encoding correctly with no
+    change of its own, since it was always written as "auto, or whatever
+    was declared" rather than enumerating the other legal values by name.
+
+    What DID need fixing: a decode failure here used to escape as a bare
+    `UnicodeDecodeError`, uncaught anywhere in this module -- unlike
+    `ingest.open_csv`, which forces the header read inside itself so a
+    wrong codec is reported by the one function that knows the path and
+    the encoding, instead of surfacing later from whatever code happens to
+    touch `fieldnames` first (that function's own docstring). This module
+    reused `ingest.iter_csv_rows` for every ROW loop (its own decode
+    handling already covered a bad byte mid-file), but never forced the
+    HEADER read itself -- confirmed live: a mis-declared encoding against a
+    small real file decoded the bad byte on the very first buffered read,
+    inside `_read_header`'s bare `reader.fieldnames`, with no try/except in
+    this whole module to catch it. Forcing it here, wrapped, closes that
+    the same way `ingest.open_csv` already does."""
     encoding = ingest.detect_encoding(path) if contract.source.encoding == "auto" else contract.source.encoding
     f = path.open(newline="", encoding=encoding)
-    for _ in range(contract.source.first_data_row - 2):
-        f.readline()  # a banner line above the real header, if the source declares one
-    reader = csv.DictReader(f, delimiter=contract.source.delimiter, quotechar=contract.source.quotechar)
+    try:
+        for _ in range(contract.source.first_data_row - 2):
+            f.readline()  # a banner line above the real header, if the source declares one
+        reader = csv.DictReader(f, delimiter=contract.source.delimiter, quotechar=contract.source.quotechar)
+        reader.fieldnames  # force the header read now, not on whatever touches it first
+    except UnicodeDecodeError as exc:
+        f.close()
+        raise AdapterError(
+            ingest._decode_error_message(path, encoding, exc, declared=contract.source.encoding != "auto")
+        ) from exc
     return f, reader
 
 

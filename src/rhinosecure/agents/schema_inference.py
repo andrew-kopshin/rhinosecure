@@ -202,7 +202,13 @@ _DISPOSITION_LITERAL = UnmappedColumnEntry.model_fields["disposition"].annotatio
 #: reflection) so a value `detect_encoding` can return but this Literal
 #: cannot represent (e.g. "utf-32") is caught explicitly rather than
 #: raising a confusing pydantic error deep inside Contract construction.
-_VALID_SOURCE_ENCODINGS = frozenset({"auto", "utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be"})
+#: "cp1252" is included for completeness with `Source.encoding`'s own set --
+#: it has no effect on what this constant is actually used for below, since
+#: `detect_encoding` can never return it (no BOM exists for a single-byte
+#: encoding, Source.encoding's own docstring) -- an LLM-authored proposal
+#: can never declare cp1252 either way; that stays a human, contract-editing
+#: decision, never something `rhino adapt propose` infers.
+_VALID_SOURCE_ENCODINGS = frozenset({"auto", "utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be", "cp1252"})
 
 
 class SchemaInferenceError(RuntimeError):

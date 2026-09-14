@@ -414,6 +414,40 @@ def mdvm_gen_dict() -> dict:
     }
 
 
+# --- Source.encoding: cp1252 is legal, no other single-byte encoding is ---
+
+
+def test_cp1252_is_a_legal_source_encoding():
+    data = bluepeak_gen_dict()
+    data["source"]["encoding"] = "cp1252"
+    contract = Contract.model_validate(data)
+    assert contract.source.encoding == "cp1252"
+
+
+def test_latin1_is_deliberately_not_offered():
+    """Not an oversight -- Source.encoding's own docstring: cp1252 alone
+    already reads a genuine Latin-1 file correctly for every byte real CSV
+    text ever carries, and a second "latin-1" member would be a foot-gun --
+    Latin-1 decoding never raises, so declaring it for what is actually a
+    cp1252 file (the likely real-world case) would silently misdecode the
+    exact printable-character range the two encodings disagree on, instead
+    of refusing loudly the way a wrong "cp1252" declaration does."""
+    data = bluepeak_gen_dict()
+    data["source"]["encoding"] = "latin-1"
+    with pytest.raises(ValidationError):
+        Contract.model_validate(data)
+
+
+def test_windows_1252_spelling_is_not_accepted_only_cp1252_is():
+    """One canonical spelling, not two aliases for the same codec -- the
+    Literal names exactly what Source.encoding's docstring and
+    _decode_error_message's remedy text both say, nothing else."""
+    data = bluepeak_gen_dict()
+    data["source"]["encoding"] = "windows-1252"
+    with pytest.raises(ValidationError):
+        Contract.model_validate(data)
+
+
 def _confirmed(contract_dict: dict) -> dict:
     """Stamp a real, self-consistent `review` block onto a contract dict --
     computed from THIS contract's own content, not copied from the design

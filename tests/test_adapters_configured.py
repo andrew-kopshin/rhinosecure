@@ -143,6 +143,106 @@ def test_load_assets_refuses_a_renamed_column(tmp_path):
         load_batch(data_dir, ConfiguredAdapter(_bluepeak_gen()))
 
 
+# --- Source.encoding="cp1252": declared, never sniffed --------------------
+
+CP1252_SAMPLE = DATA_ROOT / "cp1252-sample" / "assets.csv"
+
+
+def _with_source(contract: Contract, **overrides) -> Contract:
+    return contract.model_copy(update={"source": contract.source.model_copy(update=overrides)})
+
+
+def test_a_declared_cp1252_contract_reads_the_real_powershell_export_correctly():
+    """The real fixture (data/cp1252-sample/assets.csv), produced by a real
+    Windows PowerShell 5.1 `Export-Csv -Encoding Default` run, not a Python
+    .encode() simulation -- see that file's own header comment. Declaring
+    source.encoding="cp1252" is the ONLY way this file is readable at all;
+    the default "auto" (BOM sniffing) can never find it, on purpose."""
+    from rhinosecure.adapters.configured import _open_csv
+
+    contract = _with_source(
+        _bluepeak_gen(),
+        encoding="cp1252",
+        assets_filename="assets.csv",
+        findings_filename="assets.csv",
+    )
+    f, reader = _open_csv(contract, CP1252_SAMPLE)
+    with f:
+        rows = list(reader)
+    assert rows[0]["business_function"] == "Finance “reporting” workstation — legacy"
+    assert rows[0]["owner"] == "IT Ops – Northgate"
+    assert rows[1]["business_function"] == "ERP backend – vendor “Contoso ERP”"
+
+
+def test_auto_never_reads_the_cp1252_fixture_correctly():
+    """No sniffing was added -- "auto" on this real file still falls
+    through detect_encoding's BOM check to utf-8 and refuses loudly,
+    exactly like it did before cp1252 became a legal declaration. Pins the
+    negative: cp1252 support must never become an auto-detected guess."""
+    from rhinosecure.adapters.configured import _open_csv
+    from rhinosecure.adapters.base import AdapterError
+
+    contract = _with_source(
+        _bluepeak_gen(),
+        encoding="auto",
+        assets_filename="assets.csv",
+        findings_filename="assets.csv",
+    )
+    with pytest.raises(AdapterError) as excinfo:
+        _open_csv(contract, CP1252_SAMPLE)
+    message = str(excinfo.value)
+    assert "utf-8" in message
+    assert "cp1252" in message
+
+
+def test_a_wrong_declared_encoding_against_the_real_file_refuses_cleanly_not_a_raw_exception():
+    """The bug this fix closes, not just the feature it adds: before this,
+    a decode failure inside _open_csv (this module's own header-forcing
+    step, added alongside cp1252 support) had no try/except anywhere in
+    configured.py at all and escaped as a bare UnicodeDecodeError --
+    confirmed live against this exact file before the fix existed."""
+    from rhinosecure.adapters.configured import _open_csv
+    from rhinosecure.adapters.base import AdapterError
+
+    contract = _with_source(
+        _bluepeak_gen(),
+        encoding="utf-8",  # wrong -- the real file is cp1252
+        assets_filename="assets.csv",
+        findings_filename="assets.csv",
+    )
+    with pytest.raises(AdapterError) as excinfo:
+        _open_csv(contract, CP1252_SAMPLE)
+    message = str(excinfo.value)
+    assert str(CP1252_SAMPLE) in message
+    assert "source.encoding='utf-8'" in message
+    assert "cp1252" in message
+
+
+def test_a_wrong_declared_encoding_refuses_through_the_real_adapter_construction_path(tmp_path):
+    """End to end, not just at the _open_csv helper: a mis-declared
+    encoding must still refuse cleanly when reached through
+    ConfiguredAdapter.load_assets, the path a real `rhino run
+    --adapter-config` invocation actually takes.
+
+    Builds a FRESH contract (bluepeak_gen_dict -> mutate source -> confirm)
+    rather than mutating an already-confirmed one via _with_source: editing
+    a signed Contract's `source` block after `_confirmed()` stamped its
+    digests would make ConfiguredAdapter's own construction-time
+    assert_confirmed refuse it for a DIFFERENT reason (a digest mismatch,
+    not the encoding) before this test's real assertion is ever reached."""
+    from rhinosecure.adapters.base import AdapterError
+
+    data = bluepeak_gen_dict()
+    data["source"]["encoding"] = "utf-8"  # wrong -- the real file is cp1252
+    data["source"]["assets_filename"] = "assets.csv"
+    data["source"]["findings_filename"] = "assets.csv"
+    contract = Contract.model_validate(_confirmed(data))
+
+    with pytest.raises(AdapterError) as excinfo:
+        load_batch(CP1252_SAMPLE.parent, ConfiguredAdapter(contract))
+    assert "cp1252" in str(excinfo.value)
+
+
 # --- mapping-kind mechanics, exercised directly ---------------------------
 
 

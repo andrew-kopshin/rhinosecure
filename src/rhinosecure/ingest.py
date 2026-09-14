@@ -242,11 +242,37 @@ def open_csv(path: Path) -> tuple[IO[str], csv.DictReader]:
     return f, reader
 
 
-def _decode_error_message(path: Path, encoding: str, exc: UnicodeDecodeError) -> str:
+def _decode_error_message(path: Path, encoding: str, exc: UnicodeDecodeError, *, declared: bool = False) -> str:
+    """`declared=True` when `encoding` came from an explicit, human-authored
+    `Source.encoding` (a contract) rather than this module's own BOM-based
+    fallback -- the two need different wording, since "the file declares no
+    byte-order mark, so it was read as UTF-8" is only true of the fallback;
+    a declared encoding that fails means the DECLARATION was wrong (or the
+    file has a genuinely bad byte), not that nothing was declared at all.
+
+    Both name "cp1252" as a remedy: no BOM exists for a single-byte
+    encoding, so `detect_encoding` can never recognize a legacy Windows
+    export on its own (`Source.encoding`'s own docstring on why that stays
+    a human's declaration, never a guess). `open_csv`'s own callers
+    (native/defender/bluepeak) have no `Source` to declare anything in --
+    the remedy still names the option, pointed at the ingest-contract path
+    that does."""
+    if declared:
+        cause = f"the contract declares source.encoding={encoding!r}"
+        fix = (
+            "Re-export the file as UTF-8 or UTF-16 with a BOM, or correct source.encoding if this "
+            'file is actually a different encoding ("cp1252" is also legal).'
+        )
+    else:
+        cause = "the file declares no byte-order mark, so it was read as UTF-8"
+        fix = (
+            "Re-export it as UTF-8, or as UTF-8/UTF-16 with a BOM -- or, if this is a legacy "
+            "Windows export in a single-byte encoding no BOM can identify, read it through an "
+            'ingest contract that declares source.encoding="cp1252" instead.'
+        )
     return (
-        f"{path}: could not be decoded as {encoding} (byte {exc.object[exc.start:exc.end]!r} "
-        f"at position {exc.start}: {exc.reason}). The file declares no byte-order mark, so it "
-        "was read as UTF-8. Re-export it as UTF-8, or as UTF-8/UTF-16 with a BOM."
+        f"{path}: could not be decoded as {encoding} ({cause}) -- byte "
+        f"{exc.object[exc.start:exc.end]!r} at position {exc.start}: {exc.reason}. {fix}"
     )
 
 

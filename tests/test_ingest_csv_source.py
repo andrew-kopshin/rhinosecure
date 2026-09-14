@@ -23,6 +23,17 @@ from rhinosecure.adapters import get_adapter
 from rhinosecure.ingest import IngestError, load_batch
 
 DEFENDER_SAMPLE = Path(__file__).resolve().parents[1] / "data" / "defender-sample"
+# A REAL Windows PowerShell 5.1 `Export-Csv -Encoding Default` output, not a
+# Python .encode() simulation -- produced live on this project's own stated
+# environment (Windows, PowerShell 5.1) via
+# `$rows | Export-Csv -Path assets.csv -NoTypeInformation -Encoding Default`,
+# confirmed against this machine's own `[System.Text.Encoding]::Default`
+# (WebName: Windows-1252, CodePage 1252) before being committed. Carries
+# curly quotes (U+201C/U+201D), an em dash (U+2014), and an en dash
+# (U+2013) in free-text fields -- exactly the cp1252-only byte range
+# (0x80-0x9F) a legacy Windows export puts real content in, confirmed to
+# fail strict UTF-8 decoding at that exact byte (see the tests below).
+CP1252_SAMPLE = Path(__file__).resolve().parents[1] / "data" / "cp1252-sample" / "assets.csv"
 
 
 def _write(path: Path, rows: list[dict[str, str]], columns: list[str], encoding: str = "utf-8") -> Path:
@@ -86,6 +97,43 @@ def test_a_utf32_file_is_not_mistaken_for_utf16(tmp_path):
     with f:
         assert reader.fieldnames == ["header"]
         assert [row for _n, row in ingest.iter_csv_rows(path, reader)] == [{"header": "value"}]
+
+
+# --- cp1252: never sniffed, refused loudly, naming the one remedy that ----
+# --- did not exist before Source.encoding grew a legacy-encoding member ---
+
+
+def test_detect_encoding_never_returns_cp1252_on_the_real_file(tmp_path):
+    """No BOM exists for a single-byte encoding, so there is nothing to
+    sniff -- confirmed against the real PowerShell-produced fixture, not a
+    synthetic one, so this is the genuine byte-for-byte case a human would
+    actually hit."""
+    assert ingest.detect_encoding(CP1252_SAMPLE) == "utf-8"
+
+
+def test_the_real_cp1252_fixture_fails_strict_utf8_decoding(tmp_path):
+    """Pins WHY detect_encoding's utf-8 fallback cannot silently succeed on
+    this file -- the curly-quote byte is not a valid UTF-8 lead byte, so
+    open_csv's own decode failure below is not a coincidence of this
+    particular fixture, it is the whole reason cp1252 needs a declared
+    remedy at all."""
+    with pytest.raises(UnicodeDecodeError):
+        CP1252_SAMPLE.read_text(encoding="utf-8")
+
+
+def test_the_real_cp1252_fixture_refuses_loudly_through_open_csv_and_names_the_remedy(tmp_path):
+    """`ingest.open_csv` has no `Source` to declare anything in (native/
+    defender/bluepeak have no per-run config surface at all) -- it still
+    fails loudly, and the message now points at the path that DOES have
+    one, rather than only naming the two encodings that existed before
+    this fixture could ever be read at all."""
+    with pytest.raises(IngestError) as excinfo:
+        ingest.open_csv(CP1252_SAMPLE)
+    message = str(excinfo.value)
+    assert str(CP1252_SAMPLE) in message
+    assert "utf-8" in message
+    assert "cp1252" in message
+    assert "source.encoding" in message
 
 
 @pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig", "utf-16", "utf-32"])
