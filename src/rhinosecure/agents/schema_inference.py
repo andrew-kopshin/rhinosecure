@@ -1852,9 +1852,12 @@ EXACTLY one status:
   "unresolved": you could NOT confidently identify a mapping. Supply `candidate_columns` (columns
     you considered, even if you rejected them) and a `reason`. NEVER fabricate a mapping just to
     avoid this status -- an honest "unresolved" is always preferred to a guess, and a human will
-    complete it by hand. This is true even for a field where "not_collected" would be legal: only
-    use "not_collected" when you have positively determined the source has no such concept at
-    all, never merely because you are unsure.
+    complete it by hand. This is true even for a field where "not_collected" would be legal:
+    "not_collected" and "unresolved" are different claims that must not be conflated.
+    "not_collected" is NOT a third status value -- it is a mapping KIND (one of the 9 below), so
+    using it means status:"mapped" with mapping:{{kind:"not_collected"}}, never status:
+    "not_collected" directly. Only use it when you have positively determined the source has no
+    such concept at all, never merely because you are unsure.
 
 asset.* targets ({len(ASSET_SLOTS)}): {sorted(ASSET_SLOTS)}
 finding.* targets ({len(FINDING_SLOTS)}): {sorted(FINDING_SLOTS)}
