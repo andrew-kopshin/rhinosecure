@@ -2338,7 +2338,12 @@ async function submitResolvedProposal(card, unresolved) {
     submitBtn.disabled = false;
     return;
   }
-  statusEl.innerHTML = `Contract written. <button type="button" class="secondary-btn resolve-confirm-btn">Review &amp; confirm →</button>`;
+  // describeProvisionalCoverage (shared with formatStepResult's Router/chat
+  // rendering of this same job kind) is the one place that already knows how
+  // to say "a mapping you typed didn't survive" -- reused verbatim rather
+  // than a second copy of that message here. Returns "" for a non-
+  // provisional write, so this is a no-op string splice on the happy path.
+  statusEl.innerHTML = `Contract written.${describeProvisionalCoverage(result)} <button type="button" class="secondary-btn resolve-confirm-btn">Review &amp; confirm →</button>`;
   statusEl.querySelector(".resolve-confirm-btn").addEventListener("click", () =>
     openConfirmPanel(card.dataset.name, card.dataset.uploadId)
   );
