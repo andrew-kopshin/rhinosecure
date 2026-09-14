@@ -1056,8 +1056,8 @@ def _print_probe_report(data_dir: Path, profiles: list[FileProfile]) -> None:
     for profile in profiles:
         status = " -- STOPPED EARLY, see observations below" if profile.truncated else ""
         print(
-            f"\n{profile.path.name} -- {profile.encoding}, {profile.row_count} row(s), "
-            f"{len(profile.columns)} column(s){status}"
+            f"\n{profile.path.name} -- {profile.encoding}, delimiter {profile.delimiter!r}, "
+            f"{profile.row_count} row(s), {len(profile.columns)} column(s){status}"
         )
         headers = ("column", "blank", "distinct", "len", "looks_like", "samples")
         rows = [_column_row(profile.columns[name], profile.row_count) for name in dict.fromkeys(profile.header)]

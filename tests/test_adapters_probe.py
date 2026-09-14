@@ -20,6 +20,7 @@ from rhinosecure.adapters.probe import (
     ColumnProfile,
     NonRaisingProblemCollector,
     ProbeError,
+    detect_delimiter,
     profile_csv,
     profile_source,
 )
@@ -364,6 +365,139 @@ def test_utf16_bom_is_detected_via_ingest_detect_encoding(tmp_path):
     profile = profile_csv(path)
     assert profile.encoding == "utf-16"
     assert profile.row_count == 1
+
+
+def test_profile_csv_records_the_delimiter_it_was_actually_called_with(tmp_path):
+    path = tmp_path / "data.csv"
+    path.write_text("a;b\n1;2\n", encoding="utf-8")
+    assert profile_csv(path).delimiter == ","  # still the literal default, unaffected by detection
+    assert profile_csv(path, delimiter=";").delimiter == ";"
+
+
+# --- delimiter detection (profile_source only -- profile_csv itself never
+# auto-detects, per test_a_non_comma_delimiter_can_be_declared above) -------
+
+
+def test_detect_delimiter_finds_semicolon(tmp_path):
+    path = tmp_path / "data.csv"
+    path.write_text(
+        "AssetID;Hostname;Role;Criticality\n"
+        "A01;dc01.corp.example.com;dc;5\n"
+        "A02;sql02.corp.example.com;sql;4\n"
+        "A03;ws-fin12.corp.example.com;workstation;2\n",
+        encoding="utf-8",
+    )
+    collector = NonRaisingProblemCollector(path)
+    assert detect_delimiter(path, encoding="utf-8", problems=collector) == ";"
+    assert collector.fatal == []
+
+
+def test_detect_delimiter_is_quote_aware_not_a_frequency_count(tmp_path):
+    """A naive raw-character count over tab vs. comma would lose to comma
+    here -- three quoted, comma-BEARING description values outnumber the
+    file's real tab separators. Quote-aware row-shape consistency doesn't:
+    every row still splits into the SAME 3 fields under tab, while under
+    comma the header (no comma at all) and a description-bearing row (one
+    embedded comma) disagree in field count."""
+    path = tmp_path / "data.csv"
+    path.write_text(
+        'Hostname\tRole\tDescription\n'
+        'dc01.corp.example.com\tdc\t"Access control, broken"\n'
+        'sql02.corp.example.com\tsql\t"Legacy vendor lock, no patch"\n'
+        'ws-fin12.corp.example.com\tworkstation\t"Finance laptop, unmanaged"\n',
+        encoding="utf-8",
+    )
+    collector = NonRaisingProblemCollector(path)
+    assert detect_delimiter(path, encoding="utf-8", problems=collector) == "\t"
+    assert collector.fatal == []
+
+
+def test_detect_delimiter_leaves_a_genuinely_single_column_file_alone(tmp_path):
+    """No candidate can beat comma's own column count without appearing as
+    a real separator -- a bare CVE-ID list has none of them, so this is the
+    ordinary case (comma, unchanged), never a reported fallback."""
+    path = tmp_path / "data.csv"
+    path.write_text("CVE_ID\nCVE-2023-21554\nCVE-2023-23397\nCVE-2019-1068\n", encoding="utf-8")
+    collector = NonRaisingProblemCollector(path)
+    assert detect_delimiter(path, encoding="utf-8", problems=collector) == ","
+    assert collector.fatal == []  # not a failure -- nothing to fall back FROM
+
+
+def test_detect_delimiter_reports_genuine_ambiguity_and_falls_back_to_comma(tmp_path):
+    """Semicolon and tab each independently split the header and every
+    sampled row into a consistent (but different) field count, and each
+    beats comma -- neither can be preferred over the other, so this is
+    reported, not silently resolved."""
+    path = tmp_path / "data.csv"
+    path.write_text(
+        "Col1;Col2\tCol3;Col4\n"
+        "a;b\tc;d\n"
+        "e;f\tg;h\n"
+        "i;j\tk;l\n",
+        encoding="utf-8",
+    )
+    collector = NonRaisingProblemCollector(path)
+    assert detect_delimiter(path, encoding="utf-8", problems=collector) == ","
+    assert len(collector.fatal) == 1
+    message = collector.fatal[0]
+    assert "ambiguous" in message
+    assert "semicolon" in message and "tab" in message
+    assert "3 column" in message and "2 column" in message
+
+
+def test_detect_delimiter_without_a_collector_still_falls_back_safely(tmp_path):
+    """`problems` is optional -- a caller that doesn't pass one still gets
+    the safe comma fallback, it just loses the explanation."""
+    path = tmp_path / "data.csv"
+    path.write_text("Col1;Col2\tCol3;Col4\na;b\tc;d\n", encoding="utf-8")
+    assert detect_delimiter(path, encoding="utf-8") == ","
+
+
+# --- profile_source: delimiter detection wired in ---------------------------
+
+
+def test_profile_source_uses_the_detected_delimiter(tmp_path):
+    path = tmp_path / "data.csv"
+    path.write_text(
+        "AssetID;Hostname;Role\nA01;dc01.corp.example.com;dc\nA02;sql02.corp.example.com;sql\n",
+        encoding="utf-8",
+    )
+    profile = profile_source(tmp_path)[0]
+    assert profile.delimiter == ";"
+    assert profile.header == ["AssetID", "Hostname", "Role"]
+    assert profile.columns["Hostname"].sample_values == ["dc01.corp.example.com", "sql02.corp.example.com"]
+
+
+def test_profile_source_reports_ambiguity_on_the_resulting_file_profile(tmp_path):
+    path = tmp_path / "data.csv"
+    path.write_text("Col1;Col2\tCol3;Col4\na;b\tc;d\ne;f\tg;h\ni;j\tk;l\n", encoding="utf-8")
+    profile = profile_source(tmp_path)[0]
+    assert profile.delimiter == ","  # the safe fallback
+    assert any("ambiguous" in p for p in profile.problems)
+
+
+def test_profile_source_preserves_profile_csvs_own_problems_alongside_ambiguity(tmp_path):
+    """The ambiguity message and profile_csv's own observations (a ragged
+    row under the resolved fallback, comma, here -- an embedded comma that
+    leaves the semicolon/tab shape both candidates agree on untouched)
+    both survive -- merging one collector's output into the other's
+    FileProfile.problems must not silently drop either."""
+    path = tmp_path / "data.csv"
+    path.write_text("Col1;Col2\tCol3;Col4\na;b\tc;d\ne,x;f\tg;h\ni;j\tk;l\n", encoding="utf-8")
+    profile = profile_source(tmp_path)[0]
+    assert profile.delimiter == ","  # the ambiguous fallback
+    assert any("ambiguous" in p for p in profile.problems)
+    assert any("expected" in p and "found" in p for p in profile.problems)
+
+
+def test_demo_fixture_delimiter_detection_does_not_change_real_output(tmp_path):
+    """Regression guard for CLAUDE.md Section 8 rule 1: the real, frozen
+    demo fixture is comma-delimited and must stay detected as comma, with
+    no new problems, exactly as before delimiter detection existed."""
+    profiles = profile_source(DEMO_DIR)
+    for profile in profiles:
+        assert profile.delimiter == ","
+        assert profile.problems == []
 
 
 # --- profile_csv / profile_source: failure modes ----------------------------

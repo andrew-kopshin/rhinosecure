@@ -73,17 +73,27 @@ flow (Slices 7-8), not something this mechanical pass decides on its own.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from pathlib import Path
 import csv
 import re
 
 from rhinosecure.adapters.base import MAX_PROBLEMS_SHOWN, AdapterError, ProblemCollector
+from rhinosecure.adapters.configured import COMMON_DELIMITERS
 from rhinosecure.ingest import detect_encoding
 
 MAX_DISTINCT_TRACKED = 500
 MAX_SAMPLE_VALUES = 8
+
+#: Relocated from `agents/schema_inference.py` (which now imports it back
+#: under the identical name -- the same relocate-not-duplicate move
+#: `schema_registry.py` did for `ASSET_SLOTS`/`FINDING_SLOTS`, PROGRESS.md
+#: 2026-09-07) once this module gained a second consumer for it:
+#: `detect_delimiter`'s own pre-pass (below) is bounded to the same row
+#: count schema_inference.py already bounds its LLM sample rows to, so the
+#: two stay governed by one number instead of two that could drift apart.
+DEFAULT_SAMPLE_ROWS = 20
 
 # Deliberately duplicated from configured.py's own constants of the same
 # name rather than imported -- config_model.py's own module docstring notes
@@ -306,10 +316,20 @@ class FileProfile:
     read it -- see `profile_csv`'s own comment on this. `truncated=True`
     means a mid-file decode error stopped the scan early; `row_count` and
     every column's counts then describe only the rows read before that
-    point, not the whole file."""
+    point, not the whole file.
+
+    `delimiter` is whatever `profile_csv` actually read this file with --
+    the literal default, an explicit caller-supplied value (`review.py`'s
+    `measure`, re-profiling against a confirmed contract's own declared
+    dialect), or `profile_source`'s own `detect_delimiter` result. Recorded
+    so a caller that re-opens the file itself (`agents/schema_inference.py`'s
+    `_sample_rows`, for the model's literal sample rows) reads it back
+    instead of re-detecting -- the two are then structurally unable to
+    disagree, rather than merely unlikely to."""
 
     path: Path
     encoding: str
+    delimiter: str
     header: list[str]
     duplicate_header_names: list[str]
     row_count: int
@@ -422,6 +442,7 @@ def profile_csv(
     return FileProfile(
         path=path,
         encoding=encoding,
+        delimiter=delimiter,
         header=header,
         duplicate_header_names=duplicate_header_names,
         row_count=row_count,
@@ -432,10 +453,192 @@ def profile_csv(
     )
 
 
+# ---------------------------------------------------------------------------
+# Delimiter detection -- `profile_source` only. `profile_csv` itself is
+# unchanged above: its `delimiter` parameter still defaults to a literal
+# comma and nothing about it auto-detects anything, exactly as before this
+# was added (test_a_non_comma_delimiter_can_be_declared, tests/
+# test_adapters_probe.py, pins this: `profile_csv(path)` with no delimiter
+# argument on a semicolon file still profiles as one giant column). That
+# call is what `adapters/review.py`'s `measure()` depends on -- it always
+# knows the real delimiter already (a confirmed contract's own
+# `contract.source.delimiter`) and must never have it silently second-
+# guessed. Detection belongs only where nothing is known yet: the propose
+# path, via `profile_source`.
+#
+# Scope, stated so it isn't assumed wider by omission: this decides which
+# delimiter `profile_source` profiles WITH -- it makes the resulting
+# `FileProfile` (and so the model's rendered column summary and its literal
+# sample rows) correct for a non-comma source. It does not write anywhere
+# into `AdapterProposal` or `Source.delimiter` -- both still exist only as
+# the literal comma default `_assemble_and_validate` (agents/
+# schema_inference.py) has always used, and nothing here changes that. A
+# contract assembled from a correctly-detected semicolon file still
+# declares `delimiter=","` today; wiring the detected value through to the
+# contract, and rendering it somewhere a human confirms, is separate,
+# not-yet-started work (see the module docstring's own "Also not attempted
+# here" convention, immediately above -- this section is that same kind of
+# disclosure for what THIS addition does and does not do).
+# ---------------------------------------------------------------------------
+
+
+def _row_shape(
+    path: Path, *, encoding: str, delimiter: str, quotechar: str, skip_lines: int, sample_rows: int
+) -> tuple[int, bool] | None:
+    """`(header field count, whether every one of the first `sample_rows`
+    data rows agrees with it)` for `path` read with `delimiter` -- quote-
+    aware (`csv.reader`, the identical reader `profile_csv` itself builds),
+    so a delimiter character that only ever appears inside a quoted value
+    is correctly never counted as a split point. `None` means the header
+    itself couldn't be read at all (an empty file, or a decode failure
+    before any content) -- `profile_csv`'s own subsequent real pass already
+    raises a clear `ProbeError` for that; this function only needs to not
+    crash on it, never to explain it.
+
+    A file with zero data rows (header only) can never make any candidate
+    "consistent" -- `saw_row` stays `False` and the returned flag is
+    `False` regardless of the header's own shape, so a header's shape alone
+    (with nothing behind it to confirm it) can never win a candidate the
+    "beats comma" comparison in `detect_delimiter`. Comma's OWN field count
+    is read from this function's return value too, but -- deliberately --
+    only ever `[0]`, never `[1]`: comma is `profile_csv`'s literal default
+    regardless of whether it is internally consistent, exactly as it always
+    has been (a genuinely ragged real file still profiles with comma today,
+    reported via `ragged_rows`, never refused); only a CHALLENGER to comma
+    has to prove consistency to be preferred over it."""
+    try:
+        with path.open(newline="", encoding=encoding) as f:
+            for _ in range(skip_lines):
+                f.readline()
+            reader = csv.reader(f, delimiter=delimiter, quotechar=quotechar)
+            try:
+                header = next(reader)
+            except StopIteration:
+                return None
+            header_count = len(header)
+            consistent = True
+            saw_row = False
+            for i, row in enumerate(reader):
+                if i >= sample_rows:
+                    break
+                saw_row = True
+                if len(row) != header_count:
+                    consistent = False
+                    break
+            return (header_count, consistent and saw_row)
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def detect_delimiter(
+    path: Path,
+    *,
+    encoding: str,
+    quotechar: str = '"',
+    skip_lines: int = 0,
+    sample_rows: int = DEFAULT_SAMPLE_ROWS,
+    problems: ProblemCollector | None = None,
+) -> str:
+    """The delimiter `profile_source` should profile `path` with, decided
+    from a cheap pre-pass over the header plus the first `sample_rows` data
+    rows -- never a second full-file scan; the one expensive pass stays
+    `profile_csv`'s own, made exactly once, with whatever this function
+    returns.
+
+    Verification, not a frequency count. A raw character count over the raw
+    line text would pick comma for a tab-delimited file whose values
+    legitimately contain commas (a free-text description column, say) --
+    counting doesn't know a quoted or merely-incidental comma from a real
+    separator. Instead: a candidate is accepted only when splitting the
+    header AND every one of the sampled rows under it produces the
+    IDENTICAL field count throughout (`_row_shape`, above). A genuine
+    embedded comma in a tab-delimited file splits some rows and not others
+    under a comma reading, so comma fails consistency there while tab (the
+    real delimiter) does not.
+
+    Comma is `profile_csv`'s existing default and stays the answer unless
+    some OTHER candidate (`configured.COMMON_DELIMITERS` -- reused, not
+    duplicated; see that constant's own docstring for why drift here would
+    be a correctness bug) is BOTH fully consistent AND produces MORE
+    columns than comma's own header count already does. A file that is
+    genuinely one column -- no real delimiter present at all -- never has
+    another candidate clear that bar (nothing else can be internally
+    consistent at a higher column count than 1 if it doesn't actually
+    appear as a separator), and reports nothing: there is no fallback
+    language for it, because there is nothing to fall back FROM. This is
+    what keeps a bare CVE-ID list from being treated as a detection
+    failure.
+
+    Two or more non-comma candidates each independently clearing that bar
+    is genuine ambiguity -- this function cannot tell which is really the
+    delimiter, so, matching every other refusal in this codebase's ingest
+    layer, it does not guess between them. Reported via `problems` (the
+    same `ProblemCollector`/`FileProfile.problems` channel `profile_csv`
+    already populates -- no new mechanism) and resolved to comma, the safe
+    default. No check here reads header TOKEN content at all (no "do these
+    look like names" heuristic) -- only field counts, the same structural,
+    non-semantic signal `profile_csv` already computes as `ragged_rows`.
+
+    Never touches `Source.delimiter`, the contract schema, or anything an
+    LLM's structured output declares -- see this module's own "Delimiter
+    detection" section comment for the scope boundary."""
+    shapes: dict[str, tuple[int, bool]] = {}
+    for char, _name in COMMON_DELIMITERS:
+        shape = _row_shape(
+            path, encoding=encoding, delimiter=char, quotechar=quotechar, skip_lines=skip_lines, sample_rows=sample_rows
+        )
+        if shape is not None:
+            shapes[char] = shape
+
+    comma_count = shapes.get(",", (0, False))[0]
+    detected = [
+        (char, name, shapes[char][0])
+        for char, name in COMMON_DELIMITERS
+        if char != "," and char in shapes and shapes[char][1] and shapes[char][0] > comma_count
+    ]
+
+    if not detected:
+        return ","
+
+    if len(detected) > 1:
+        if problems is not None:
+            listing = ", ".join(f"{name} ({char!r}, {count} column(s))" for char, name, count in detected)
+            problems.add(
+                f"delimiter: ambiguous -- {listing} each split the header and every one of the first "
+                f"{sample_rows} data row(s) into a consistent field count, more than comma's "
+                f"{comma_count}; neither is preferred over the other. Defaulted to comma -- sample "
+                "values may be wrong if comma is not this file's real delimiter."
+            )
+        return ","
+
+    return detected[0][0]
+
+
+def _profile_with_delimiter_detection(path: Path) -> FileProfile:
+    """`profile_csv`, but with `detect_delimiter`'s answer instead of
+    `profile_csv`'s own literal comma default -- `profile_csv` itself is
+    unchanged and unaware this happens. Any ambiguity `detect_delimiter`
+    reports is folded into the returned `FileProfile.problems` alongside
+    whatever `profile_csv`'s own pass already found, rather than kept on a
+    separate collector a caller would have to know to check."""
+    encoding = detect_encoding(path)
+    problems = NonRaisingProblemCollector(path)
+    delimiter = detect_delimiter(path, encoding=encoding, problems=problems)
+    profile = profile_csv(path, delimiter=delimiter, encoding=encoding)
+    if problems.fatal:
+        profile = replace(profile, problems=[*profile.problems, *problems.fatal])
+    return profile
+
+
 def profile_source(data_dir: Path) -> list[FileProfile]:
     """Profile every `.csv` file directly inside `data_dir` (not recursive
     -- nothing in this project's data/ layout nests CSVs), sorted by name.
-    Raises `ProbeError` if `data_dir` is not a directory or contains none."""
+    Raises `ProbeError` if `data_dir` is not a directory or contains none.
+
+    Each file's delimiter is `detect_delimiter`'s answer, not a literal
+    comma -- see that function's own docstring and the "Delimiter
+    detection" section comment above for what this does and, just as
+    deliberately, does not yet do."""
     if not data_dir.is_dir():
         raise ProbeError(f"{data_dir}: not a directory")
     try:
@@ -444,4 +647,4 @@ def profile_source(data_dir: Path) -> list[FileProfile]:
         raise ProbeError(f"{data_dir}: could not list directory contents -- {exc}") from exc
     if not csv_paths:
         raise ProbeError(f"{data_dir}: no .csv file found -- nothing to probe")
-    return [profile_csv(path) for path in csv_paths]
+    return [_profile_with_delimiter_detection(path) for path in csv_paths]

@@ -125,14 +125,13 @@ from rhinosecure.adapters.schema_registry import (
 )
 from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.parsing import AgentOutputParseError, parse_structured_output
-from rhinosecure.adapters.probe import ColumnProfile, FileProfile, profile_source
+from rhinosecure.adapters.probe import DEFAULT_SAMPLE_ROWS, ColumnProfile, FileProfile, profile_source
 from rhinosecure.llm import DEFAULT_MODEL, get_llm
 from rhinosecure.scoring import IMPACT_AXIS_TARGETS, THREAT_AXIS_TARGETS
 
 ROLE = "Schema Inference"
 
 DEFAULT_MAX_ATTEMPTS = 3
-DEFAULT_SAMPLE_ROWS = 20
 
 #: Measured against the real accepted proposal for a 20-column source
 #: (~8,200 tokens -- PROGRESS.md 2026-09-06): generous headroom for a larger
@@ -1817,10 +1816,18 @@ def _render_profile(profile: FileProfile) -> str:
 def _sample_rows(profile: FileProfile, n: int) -> str:
     """A bounded, literal read of at most `n` data rows -- for prompt
     context only, never for grounding (which stays on `probe.py`'s already
-    bounded, full-file accumulation, per CLAUDE.md Section 1)."""
+    bounded, full-file accumulation, per CLAUDE.md Section 1).
+
+    Reads with `profile.delimiter`, not a bare comma default -- `profile`
+    (from `profile_source`) was itself already built with whatever
+    `detect_delimiter` decided, and re-opening the same file with a
+    DIFFERENT delimiter here would show the model sample rows that
+    contradict its own column profile for no reason. Reading the value
+    back off `profile` rather than re-detecting is what makes the two
+    structurally unable to disagree, not merely unlikely to."""
     try:
         with profile.path.open(newline="", encoding=profile.encoding) as f:
-            reader = csv.DictReader(f)
+            reader = csv.DictReader(f, delimiter=profile.delimiter)
             rows = []
             for i, row in enumerate(reader):
                 if i >= n:

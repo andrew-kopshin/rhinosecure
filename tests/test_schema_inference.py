@@ -35,6 +35,7 @@ from rhinosecure.agents.schema_inference import (
     _check_mapped_slots_legal,
     _reconcile_redundant_structural_columns,
     _resolve_layout,
+    _sample_rows,
     _validate_format_name,
     assemble_contract,
     assemble_provisional_contract,
@@ -827,6 +828,37 @@ def test_assemble_contract_a_caveat_alone_does_not_block(tmp_path):
     assert report.failures == []
     contract = assemble_contract(proposal, profiles_map, report, generator=_generator(), generated_at=_GENERATED_AT)
     validate_contract(contract, {"data.csv": _HEADER})
+
+
+# --- _sample_rows: must read profile_source's own detected delimiter --------
+
+
+def test_sample_rows_uses_the_profile_s_own_detected_delimiter(tmp_path):
+    """profile_source (probe.py) and _sample_rows must not disagree about
+    the delimiter -- a semicolon-detected profile whose sample rows were
+    still split on a bare comma default would show the model a single,
+    garbled field per row instead of the same columns its own profile
+    already reports."""
+    path = tmp_path / "data.csv"
+    path.write_text(
+        "Asset_ID;Hostname;Role\nA01;dc01.corp.example.com;dc\nA02;sql02.corp.example.com;sql\n",
+        encoding="utf-8",
+    )
+    profile = profile_source(tmp_path)[0]
+    assert profile.delimiter == ";"  # detected, not the bare default
+    rendered = _sample_rows(profile, 20)
+    assert "Asset_ID='A01'" in rendered
+    assert "Hostname='dc01.corp.example.com'" in rendered
+    assert "Role='dc'" in rendered
+    assert ";" not in rendered.split("\n", 1)[1]  # no leftover un-split delimiter in a sample row
+
+
+def test_sample_rows_still_defaults_to_comma_for_an_ordinary_file(tmp_path):
+    _write_csv(tmp_path, _HEADER, [["A01", "HOST01", "F01", "CVE-2021-0001", "srv"]])
+    profile = profile_source(tmp_path)[0]
+    assert profile.delimiter == ","
+    rendered = _sample_rows(profile, 20)
+    assert "Asset_ID='A01'" in rendered
 
 
 # --- _resolve_layout / _validate_format_name ----------------------------------

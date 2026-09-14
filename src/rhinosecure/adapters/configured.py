@@ -314,20 +314,30 @@ def _read_header(contract: Contract, path: Path) -> list[str]:
         return list(reader.fieldnames or [])
 
 
-#: Common single-character CSV delimiters to report on when a header
-#: collapses to one column -- never a guess at which one is right (nothing
-#: reads this list to pick a delimiter; `_check_header_mode`'s own "declared"
-#: branch, its only caller, changes nothing about what the adapter reads).
+#: Common single-character CSV delimiters. `_separator_report` (below) only
+#: ever COUNTS these characters for a human to read -- never ranks or
+#: recommends one, and `_check_header_mode`'s own "declared" branch, its only
+#: caller, changes nothing about what THIS module reads (that stays
+#: `contract.source.delimiter`, always, for a confirmed contract).
+#:
+#: `adapters/probe.py`'s `detect_delimiter` is a second, separate consumer
+#: that DOES pick one from this same set -- for an unconfirmed source at
+#: propose time, never here. Public (no leading underscore) so probe.py
+#: imports rather than duplicates it: unlike probe.py's own small
+#: pattern-hint constants (that module's docstring explains why duplicating
+#: THOSE is fine), drift in this specific list would be a correctness bug,
+#: not a cosmetic one -- propose-time detection and this module's own
+#: mismatch diagnosis have to agree on what "a common delimiter" even is.
 #: Order is display order only.
-_COMMON_DELIMITERS = [(",", "comma"), (";", "semicolon"), ("\t", "tab"), ("|", "pipe")]
+COMMON_DELIMITERS = [(",", "comma"), (";", "semicolon"), ("\t", "tab"), ("|", "pipe")]
 
 
 def _separator_report(header_text: str) -> str:
-    """A factual count of each `_COMMON_DELIMITERS` character in a single,
+    """A factual count of each `COMMON_DELIMITERS` character in a single,
     undelimited header string -- e.g. "semicolon (';'): 4, comma (','): 0".
     Purely descriptive: it does not rank or recommend one, and the caller
     never acts on the counts beyond printing them for a human to read."""
-    return ", ".join(f"{name} ({char!r}): {header_text.count(char)}" for char, name in _COMMON_DELIMITERS)
+    return ", ".join(f"{name} ({char!r}): {header_text.count(char)}" for char, name in COMMON_DELIMITERS)
 
 
 def _check_header_mode(
