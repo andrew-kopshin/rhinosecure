@@ -151,7 +151,7 @@ from rhinosecure.adapters.config_model import (
     validate_contract,
 )
 from rhinosecure.adapters.configured import ConfiguredAdapter
-from rhinosecure.adapters.probe import NonRaisingProblemCollector, profile_csv
+from rhinosecure.adapters.probe import NonRaisingProblemCollector, ProbeError, profile_csv
 
 def is_provisional(contract: Contract | None) -> bool:
     """The 'never-signed' predicate: true whenever `contract` has not
@@ -229,6 +229,16 @@ class Measurement:
     #: source column -> its measured profile, for columns the contract
     #: declares it deliberately does not read. Printed, never persisted.
     unmapped_profiles: dict[str, dict[str, object]] = field(default_factory=dict)
+    #: One entry per file `_unmapped_profiles` (below) could not profile --
+    #: distinct from `halted_by` ON PURPOSE. `halted_by` answers "did the
+    #: real ingest (load_batch) run at all"; this answers "could the
+    #: SUPPLEMENTARY unmapped-columns display also be built" -- a different
+    #: question, since `_unmapped_profiles` profiles the same file a second
+    #: time, independently, after `load_batch` has already succeeded or
+    #: already failed. Deliberately excluded from `is_clean` below, for the
+    #: same reason: a failed display is not a fact about the mapping's own
+    #: correctness. Printed, never persisted.
+    unmapped_profile_problems: list[str] = field(default_factory=list)
 
     @property
     def is_clean(self) -> bool:
@@ -336,7 +346,7 @@ def _value_distribution(assets: dict) -> dict[str, dict[str, int]]:
     return distribution
 
 
-def _unmapped_profiles(contract: Contract, data_dir: Path) -> dict[str, dict[str, object]]:
+def _unmapped_profiles(contract: Contract, data_dir: Path) -> tuple[dict[str, dict[str, object]], list[str]]:
     """The measured shape of every column the contract says it deliberately
     does not read.
 
@@ -347,8 +357,26 @@ def _unmapped_profiles(contract: Contract, data_dir: Path) -> dict[str, dict[str
     column that is 0% blank with a handful of distinct values reading like a
     maintenance window, printed next to the sentence waving it away, is the
     most useful thing this command can put in front of a reviewer. Reuses
-    Slice 6's profiler rather than counting again."""
+    Slice 6's profiler rather than counting again.
+
+    Never raises. `measure()` (below) already ran the real ingest
+    (`ingest.load_batch`) over these same files before calling this function
+    at all -- if THAT hit a decode failure, it already caught it and recorded
+    it in `Measurement.halted_by`, the fact about whether the real mapping
+    ran. This function's own `profile_csv` call reads the identical file a
+    SECOND time, independently, purely to build a supplementary display --
+    and used to let `ProbeError` escape uncaught here, which crashed
+    `measure()` outright even on a file `load_batch` had already handled
+    gracefully a moment earlier (reachable with `bluepeak-gen.json`, a real
+    committed contract, whose own `unmapped_columns` names its own source
+    file). A failed display is not a fact about the mapping's correctness,
+    so a decode failure here is caught, recorded as its own problem string
+    (returned separately, never folded into `halted_by`), and that one
+    file's columns are skipped -- exactly the same "record and continue"
+    discipline this codebase's ingest layer already applies everywhere else
+    a per-record problem must not take down a whole pass."""
     profiles: dict[str, dict[str, object]] = {}
+    problems: list[str] = []
     # dict.fromkeys: single_file layout means both names are the same file
     # (ingest._require_adapter_files does the same de-dup for the same reason).
     for filename in dict.fromkeys((contract.source.assets_filename, contract.source.findings_filename)):
@@ -363,13 +391,17 @@ def _unmapped_profiles(contract: Contract, data_dir: Path) -> dict[str, dict[str
         # one giant column, every declared name misses, and this whole
         # section disappears from the review without saying so.
         source = contract.source
-        file_profile = profile_csv(
-            path,
-            delimiter=source.delimiter,
-            quotechar=source.quotechar,
-            encoding=None if source.encoding == "auto" else source.encoding,
-            skip_lines=source.first_data_row - 2,
-        )
+        try:
+            file_profile = profile_csv(
+                path,
+                delimiter=source.delimiter,
+                quotechar=source.quotechar,
+                encoding=None if source.encoding == "auto" else source.encoding,
+                skip_lines=source.first_data_row - 2,
+            )
+        except ProbeError as exc:
+            problems.append(f"{filename}: could not be profiled for the unmapped-columns display -- {exc}")
+            continue
         for column, entry in declared.items():
             column_profile = file_profile.columns.get(column)
             if column_profile is None:
@@ -383,7 +415,7 @@ def _unmapped_profiles(contract: Contract, data_dir: Path) -> dict[str, dict[str
                 "looks_like": list(column_profile.looks_like),
                 "samples": list(column_profile.sample_values[:3]),
             }
-    return profiles
+    return profiles, problems
 
 
 def measure(contract: Contract, data_dir: Path) -> Measurement:
@@ -410,6 +442,7 @@ def measure(contract: Contract, data_dir: Path) -> Measurement:
         halted_by = str(exc)
 
     report = tally.report(contract.format, assets, adapter.stats)
+    unmapped_profiles, unmapped_profile_problems = _unmapped_profiles(contract, data_dir)
     return Measurement(
         data_dir=data_dir,
         assets_loaded=report.assets_total,
@@ -425,7 +458,8 @@ def measure(contract: Contract, data_dir: Path) -> Measurement:
         fatal_problems=recording.fatal_messages(),
         halted_by=halted_by,
         value_distribution=_value_distribution(assets),
-        unmapped_profiles=_unmapped_profiles(contract, data_dir),
+        unmapped_profiles=unmapped_profiles,
+        unmapped_profile_problems=unmapped_profile_problems,
     )
 
 

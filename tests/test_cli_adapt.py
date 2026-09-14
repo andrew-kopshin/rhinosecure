@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import openpyxl
 import pytest
 
 from rhinosecure.cli import ProbeSource, _discover_probe_sources, main
@@ -292,6 +293,44 @@ def test_confirm_reports_the_measured_dialect_before_signing(tmp_path, capsys):
     main(["adapt", "confirm", str(path), "--data", BLUEPEAK_DATA, "--by", "r@example.com"])
     out = capsys.readouterr().out
     assert "dialect: encoding 'auto', delimiter ','" in out
+
+
+def test_confirm_against_an_undecodable_source_reports_cleanly_not_a_traceback(tmp_path, capsys):
+    """`_unmapped_profiles`' own crash bug, reproduced through the real CLI
+    entrypoint: bluepeak-gen's own `unmapped_columns` names its own
+    filename, synthetic_cve_inventory_50.csv -- point --data at a directory
+    where that name is really a `.xlsx` and, before this fix, `measure()`
+    raised `ProbeError` uncaught, which `cli.py` only catches as a generic
+    `IngestError` ("contract error: ...", the OLD message) rather than
+    completing the review and showing the accurate one. Now `main()` still
+    returns (no raw traceback), and the printed report carries BOTH the
+    real ingest's own halt (`_print_review_problems`) and the separate
+    unmapped-columns display failure (`_print_unmapped_profiles`) -- two
+    different facts, not one collapsed into the other."""
+    path = _scratch_contract(tmp_path)
+    data = tmp_path / "src"
+    data.mkdir()
+    wb = openpyxl.Workbook()
+    wb.active.append(["Record_ID"])
+    wb.save(data / "synthetic_cve_inventory_50.csv")
+
+    exit_code = main(["adapt", "confirm", str(path), "--data", str(data), "--by", "r@example.com"])
+    captured = capsys.readouterr()
+    assert exit_code == 1  # halted -- refused, but not a crash
+    # _print_review_problems (the real ingest's own halt) writes to stderr;
+    # _print_unmapped_profiles (the supplementary display's own problem)
+    # writes to stdout -- the same split every other "problem" vs. "notice"
+    # pair in this file already uses. Whitespace is collapsed before
+    # asserting: _wrap's own line-wrapping breaks mid-phrase at a width that
+    # shifts with tmp_path's own (variable, environment-dependent) length,
+    # so a raw multi-word substring check would be flaky by construction.
+    err = " ".join(captured.err.split())
+    out = " ".join(captured.out.split())
+    assert "is not a text file" in err
+    assert "ZIP archive" in err
+    assert "could not measure -- synthetic_cve_inventory_50.csv" in out
+    assert "could not be profiled for the" in out
+    assert "columns display" in out  # the second half of "unmapped-columns display"
 
 
 def test_confirm_refuses_an_already_confirmed_contract_and_exits_one(tmp_path, capsys):

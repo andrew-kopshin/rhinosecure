@@ -1278,10 +1278,20 @@ def _print_unmapped_profiles(m: Measurement) -> None:
     """Each column the contract declares it deliberately does not read, with
     its stated reason and its MEASURED shape side by side. `unmapped_columns`
     is a signed claim that nothing otherwise checks -- this is where a
-    dismissed column that actually carries a patch window becomes visible."""
-    if not m.unmapped_profiles:
+    dismissed column that actually carries a patch window becomes visible.
+
+    `unmapped_profile_problems` is a DIFFERENT fact from `m.halted_by`
+    (printed elsewhere, by `_print_review_problems`): this display is
+    supplementary, so a file it couldn't profile is reported here, next to
+    the feature it belongs to, not folded into the real ingest's own
+    halt/fatal reporting."""
+    if not m.unmapped_profiles and not m.unmapped_profile_problems:
         return
     print("\nColumns this contract declares it does not read:")
+    for problem in m.unmapped_profile_problems:
+        print(_wrap(f"could not measure -- {problem}", indent="  ! ", continuation_indent="    "))
+    if not m.unmapped_profiles:
+        return
     by_file: dict[str, list[tuple[str, dict]]] = {}
     for key, p in sorted(m.unmapped_profiles.items()):
         filename, column = key.split(":", 1)

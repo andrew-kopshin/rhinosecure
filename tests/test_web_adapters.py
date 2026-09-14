@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import openpyxl
 import pytest
 from crewai.types.usage_metrics import UsageMetrics
 from fastapi.testclient import TestClient
@@ -523,6 +524,44 @@ def test_confirm_refuses_without_a_required_attestation(client: TestClient, isol
     # never advance it to "confirmed".
     written = json.loads((isolated_dirs / "upload-missing-attest.json").read_text(encoding="utf-8"))
     assert written["review"]["state"] == "proposed"
+
+
+def test_confirm_against_a_source_that_became_undecodable_since_propose_does_not_500(
+    client: TestClient, isolated_dirs: Path
+):
+    """`_unmapped_profiles`' own crash bug, reproduced through the web
+    endpoint: `content_address_finding_id=True`'s proposal (reused as-is,
+    unmodified) declares `unmapped_columns` for its own source file
+    (`get_proposal`'s own code comment already names this exact scenario --
+    "a source that changed shape since it was proposed" -- as recognized,
+    not hypothetical). Overwriting the uploaded file with real `.xlsx`
+    bytes after propose reproduces it directly: `measure()`'s `load_batch`
+    call hits the decode failure and records it in `halted_by`; before this
+    fix, `_unmapped_profiles`' own separate, unguarded `profile_csv` call
+    hit the SAME failure a moment later and raised `ProbeError` uncaught --
+    not a `ReviewError`, so `post_confirm`'s own `except ReviewError` never
+    caught it, and the request failed as an unhandled 500 rather than the
+    normal "refused, here is why" JSON response every other refusal in this
+    file gets."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-goes-undecodable", content_address_finding_id=True)
+    job = _propose(client, upload_id, "upload-goes-undecodable", proposal)
+    assert job["result"]["contract_written"] is True
+
+    upload_dir = client.app.state.upload_registry.get(upload_id).dir_path
+    wb = openpyxl.Workbook()
+    wb.active.append(["Record_ID"])
+    wb.save(upload_dir / "inventory.csv")
+
+    resp = client.post(
+        "/api/adapters/upload-goes-undecodable/confirm", json={"upload_id": upload_id, "by": "andrew"}
+    )
+    assert resp.status_code == 200  # not an unhandled 500
+    body = resp.json()
+    assert body["written"] is False
+    assert body["measurement"]["halted_by"] is not None
+    assert "is not a text file" in body["measurement"]["halted_by"]
+    assert "ZIP archive" in body["measurement"]["halted_by"]
 
 
 def test_confirm_succeeds_once_the_required_attestation_is_supplied(client: TestClient, isolated_dirs: Path):

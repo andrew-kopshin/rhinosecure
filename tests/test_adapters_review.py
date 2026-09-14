@@ -226,13 +226,12 @@ def test_measure_reports_a_non_text_source_via_halted_by(tmp_path):
     here to carry the new, accurate message rather than the old,
     encoding-focused one that would have suggested a useless re-export.
 
-    unmapped_columns is cleared for this test: the REAL bluepeak-gen.json
-    declares some for its own filename, and `_unmapped_profiles`' own,
-    separate `profile_csv` call (unguarded, run right after `load_batch`
-    already handled the identical decode failure) re-triggers it and
-    crashes `measure()` outright with the OLD message instead -- a real,
-    pre-existing, unrelated gap (profile_csv has no non-text-container
-    check of its own), not something this test is about."""
+    unmapped_columns is cleared for this test so it isolates `halted_by`
+    alone -- see test_measure_reports_the_unmapped_profile_problem_
+    separately_from_halted_by, directly below, for the REAL bluepeak-gen.json
+    (unmapped_columns intact), which used to crash `measure()` outright over
+    this exact case before `_unmapped_profiles` stopped letting `ProbeError`
+    escape uncaught."""
     data = tmp_path / "src"
     data.mkdir()
     wb = openpyxl.Workbook()
@@ -247,8 +246,64 @@ def test_measure_reports_a_non_text_source_via_halted_by(tmp_path):
     m = measure(read_contract(path), data)
     assert m.halted_by is not None
     assert "is not a text file" in m.halted_by
+    assert m.unmapped_profile_problems == []  # nothing declared for this file -- nothing to fail
+
+
+def test_measure_reports_the_unmapped_profile_problem_separately_from_halted_by(tmp_path):
+    """The bug itself, reproduced with the REAL, unmodified bluepeak-gen.json
+    -- its own `unmapped_columns` names its own source file
+    (synthetic_cve_inventory_50.csv), which is exactly the "reachable with a
+    real committed contract" case. Before this fix, `_unmapped_profiles`'
+    own separate `profile_csv` call re-hit the identical decode failure
+    `load_batch` had already handled a moment earlier and raised
+    `ProbeError` uncaught -- `measure()` never returned a `Measurement` at
+    all, discarding the `halted_by` value it had already computed.
+
+    Now: both facts survive, in the two DIFFERENT fields this fix decided
+    they belong in. `halted_by` still answers "did the real ingest run" --
+    unchanged in meaning, unaffected by whether the supplementary display
+    also worked. `unmapped_profile_problems` is the new, separate answer to
+    "could that display also be built" -- and is deliberately excluded from
+    `is_clean`, which stays a fact about the mapping's own correctness, not
+    about a display that never fed scoring or ingest to begin with."""
+    data = tmp_path / "src"
+    data.mkdir()
+    wb = openpyxl.Workbook()
+    wb.active.append(["Record_ID"])
+    wb.save(data / "synthetic_cve_inventory_50.csv")
+
+    path = _bluepeak(tmp_path)  # the real, unmodified bluepeak-gen.json
+    m = measure(read_contract(path), data)
+
+    assert m.halted_by is not None
+    assert "is not a text file" in m.halted_by
     assert "ZIP archive" in m.halted_by
     assert "Re-export" not in m.halted_by
+
+    assert len(m.unmapped_profile_problems) == 1
+    problem = m.unmapped_profile_problems[0]
+    assert "synthetic_cve_inventory_50.csv" in problem
+    assert "unmapped-columns display" in problem
+    assert m.unmapped_profiles == {}  # nothing could be measured for it either
+
+
+def test_unmapped_profile_problems_alone_does_not_make_is_clean_false():
+    """The decision this fix had to make explicit: a failed SUPPLEMENTARY
+    display is not a fact about the mapping's own correctness. Constructed
+    directly against the dataclass -- in practice `_unmapped_profiles` only
+    ever fails on a file `load_batch` also had to read, so `halted_by`
+    non-None and `unmapped_profile_problems` non-empty tend to travel
+    together (test above); this isolates the PROPERTY's own definition from
+    that practical correlation, so a future change to either field can't
+    silently couple them without a test noticing."""
+    clean_but_for_the_display = Measurement(
+        data_dir=Path("."), assets_loaded=5, findings_loaded=5,
+        duplicate_assets_collapsed=0, duplicate_findings_collapsed=0,
+        excluded_assets={}, excluded_findings={}, asset_gaps={}, finding_gaps={},
+        header_notices=[], headers={}, fatal_problems=[], halted_by=None,
+        unmapped_profile_problems=["some-file.csv: could not be profiled for the unmapped-columns display -- x"],
+    )
+    assert clean_but_for_the_display.is_clean is True
 
 
 def test_measure_records_scope_exclusions_with_their_reasons(tmp_path):
