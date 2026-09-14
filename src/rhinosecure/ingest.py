@@ -242,6 +242,43 @@ def open_csv(path: Path) -> tuple[IO[str], csv.DictReader]:
     return f, reader
 
 
+#: Byte signatures for known non-text container formats, read from the
+#: file's own leading bytes -- structural facts, never inferred from its
+#: name (`Source.assets_filename`/`findings_filename`'s own validator,
+#: `config_model._FILENAME_PATTERN`, checks only that a name is bare and
+#: traversal-free; it has no extension whitelist, and this project has
+#: consistently refused name-based inference elsewhere -- a filename is not
+#: evidence of content). ZIP's local-file-header signature is the one that
+#: matters in practice: `.xlsx`/`.docx`/`.pptx`/`.ods` are all ZIP archives
+#: internally, and a hand-authored contract can legally declare any of them
+#: as `assets_filename` today (confirmed: the validator has no opinion).
+#: Checked only from inside an already-raised `UnicodeDecodeError`'s
+#: handling, below -- this never runs speculatively, and never changes
+#: which files are accepted, only how a real decode failure is explained.
+_NON_TEXT_CONTAINER_SIGNATURES: tuple[tuple[bytes, str], ...] = (
+    (b"PK\x03\x04", "a ZIP archive (the container format .xlsx/.docx/.pptx/.ods all use)"),
+)
+
+
+def _non_text_container(path: Path) -> str | None:
+    """The container format `path`'s own leading bytes declare, per
+    `_NON_TEXT_CONTAINER_SIGNATURES`, or `None` if they match none of them
+    -- a fact read from the file, never guessed from its extension. Swallows
+    its own `OSError`: this only ever runs from inside an already-raised
+    `UnicodeDecodeError`'s handling (`_decode_error_message`, below), so a
+    second, unrelated failure reading the same path here must not shadow
+    the real error with a different, less informative one."""
+    try:
+        with path.open("rb") as f:
+            prefix = f.read(4)
+    except OSError:
+        return None
+    for signature, name in _NON_TEXT_CONTAINER_SIGNATURES:
+        if prefix.startswith(signature):
+            return name
+    return None
+
+
 def _decode_error_message(path: Path, encoding: str, exc: UnicodeDecodeError, *, declared: bool = False) -> str:
     """`declared=True` when `encoding` came from an explicit, human-authored
     `Source.encoding` (a contract) rather than this module's own BOM-based
@@ -256,7 +293,27 @@ def _decode_error_message(path: Path, encoding: str, exc: UnicodeDecodeError, *,
     a human's declaration, never a guess). `open_csv`'s own callers
     (native/defender/bluepeak) have no `Source` to declare anything in --
     the remedy still names the option, pointed at the ingest-contract path
-    that does."""
+    that does.
+
+    Neither remedy is honest when `path` was never text at all -- a
+    `Source.assets_filename` pointed at a real `.xlsx` (legal today, the
+    validator has no extension check) fails here with a real
+    `UnicodeDecodeError`, and both branches above would suggest re-exporting
+    or re-declaring an encoding, which cannot fix a file that was never
+    encoded text in the first place. `_non_text_container` is checked
+    FIRST, before either branch, and short-circuits to a different message
+    entirely when it recognizes the bytes -- `declared` stops mattering,
+    since neither of ITS remedies applies either. No byte-position detail
+    here (unlike the return below): the exact byte `exc` names is incidental
+    for a binary container, not diagnostic."""
+    container = _non_text_container(path)
+    if container is not None:
+        return (
+            f"{path}: is not a text file -- its own leading bytes are {container}, not UTF-8/UTF-16/"
+            "cp1252 text of any kind. Declaring a different source.encoding, or re-exporting it, "
+            "cannot fix this: the file was never text. Point assets_filename/findings_filename at "
+            "the actual CSV export instead."
+        )
     if declared:
         cause = f"the contract declares source.encoding={encoding!r}"
         fix = (

@@ -16,6 +16,7 @@ import codecs
 import csv
 from pathlib import Path
 
+import openpyxl
 import pytest
 
 from rhinosecure import ingest
@@ -255,6 +256,64 @@ def test_undecodable_row_beyond_the_first_buffer_raises_ingest_error(tmp_path):
     with f, pytest.raises(IngestError) as excinfo:
         list(ingest.iter_csv_rows(path, reader))
     assert str(path) in str(excinfo.value)
+
+
+# --- a real, non-text container under a .csv-shaped name -----------------
+#
+# Source.assets_filename/findings_filename's own validator
+# (config_model._FILENAME_PATTERN) checks only that a name is bare and
+# traversal-free -- no extension whitelist, on purpose (a filename is not
+# evidence of content). A real .xlsx declared there is legal today, and
+# reaches open_csv exactly like any other bad byte would.
+
+
+def test_a_real_xlsx_renamed_to_csv_names_the_container_not_an_encoding_fix(tmp_path):
+    """A real .xlsx, not a hand-crafted ZIP-flavored byte string -- built
+    with openpyxl, the same library CLAUDE.md's own XLSX survey confirmed
+    is already a transitive dependency of this project's crewai pin. Its
+    PK magic bytes are read from the file itself, never guessed from the
+    ".csv" name it was saved under."""
+    path = tmp_path / "assets.csv"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["asset_id", "hostname"])
+    ws.append(["A01", "DC01"])
+    wb.save(path)
+
+    with pytest.raises(IngestError) as excinfo:
+        ingest.open_csv(path)
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert "is not a text file" in message
+    assert "ZIP archive" in message
+    assert ".xlsx" in message
+    # The old remedy -- re-exporting the file -- must not appear for this
+    # case; test_undecodable_header_raises_ingest_error_naming_the_file
+    # (above) pins that it still does for a genuine encoding mismatch. The
+    # new message DOES still say "source.encoding", but only to explicitly
+    # rule it out as a fix, not to suggest declaring one.
+    assert "Re-export" not in message
+    assert "cannot fix this" in message
+
+
+def test_a_real_docx_is_also_recognized_as_a_zip_container(tmp_path):
+    """Confirms the check is genuinely about the ZIP signature, not
+    something narrower that happens to key off openpyxl's own output --
+    python-docx isn't a dependency here, but a minimal, real ZIP archive
+    with the identical local-file-header magic bytes (any zipfile-written
+    archive carries it) proves the same signature, regardless of which
+    Office format wrote it."""
+    import zipfile
+
+    path = tmp_path / "assets.csv"
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("word/document.xml", "<xml>not a csv</xml>")
+
+    with pytest.raises(IngestError) as excinfo:
+        ingest.open_csv(path)
+    message = str(excinfo.value)
+    assert "is not a text file" in message
+    assert "ZIP archive" in message
 
 
 # --- end to end through a real adapter ----------------------------------

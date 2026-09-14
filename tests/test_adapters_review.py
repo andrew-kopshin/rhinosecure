@@ -17,6 +17,7 @@ import json
 import sys
 from pathlib import Path
 
+import openpyxl
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -213,6 +214,41 @@ def test_measure_reports_a_halting_error_separately_from_accumulated_ones(tmp_pa
     m = measure(read_contract(_bluepeak(tmp_path)), REPO_ROOT / "data" / "demo")
     assert m.halted_by is not None
     assert not m.is_clean
+
+
+def test_measure_reports_a_non_text_source_via_halted_by(tmp_path):
+    """The scenario ingest.py's non-text-container check exists for, through
+    the real measurement path: `Source.assets_filename`'s own validator
+    (`config_model._FILENAME_PATTERN`) has no extension check, so a
+    contract legally declaring a real `.xlsx` under a `.csv`-shaped name is
+    not hypothetical. `measure()` never raises for a source problem --
+    "that is the return value" (this module's own docstring) -- confirmed
+    here to carry the new, accurate message rather than the old,
+    encoding-focused one that would have suggested a useless re-export.
+
+    unmapped_columns is cleared for this test: the REAL bluepeak-gen.json
+    declares some for its own filename, and `_unmapped_profiles`' own,
+    separate `profile_csv` call (unguarded, run right after `load_batch`
+    already handled the identical decode failure) re-triggers it and
+    crashes `measure()` outright with the OLD message instead -- a real,
+    pre-existing, unrelated gap (profile_csv has no non-text-container
+    check of its own), not something this test is about."""
+    data = tmp_path / "src"
+    data.mkdir()
+    wb = openpyxl.Workbook()
+    wb.active.append(["Record_ID"])
+    wb.save(data / "synthetic_cve_inventory_50.csv")
+
+    contract_dict = bluepeak_gen_dict()
+    contract_dict["unmapped_columns"] = {}
+    path = tmp_path / "bluepeak-gen-no-unmapped.json"
+    write_contract(path, Contract.model_validate(contract_dict))
+
+    m = measure(read_contract(path), data)
+    assert m.halted_by is not None
+    assert "is not a text file" in m.halted_by
+    assert "ZIP archive" in m.halted_by
+    assert "Re-export" not in m.halted_by
 
 
 def test_measure_records_scope_exclusions_with_their_reasons(tmp_path):
