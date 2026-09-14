@@ -144,13 +144,43 @@ DEFAULT_SAMPLE_ROWS = 20
 #: other agent in this codebase sets this.
 PROPOSE_MAX_OUTPUT_TOKENS = 24_000
 
-#: A previous attempt's failure, embedded verbatim in the next attempt's
-#: retry prompt (see `build_propose_task`'s `previous_error`). Both
-#: `AgentOutputParseError.__str__` and `_check_meta_matches`' `ValueError`
-#: are already short, bounded summaries -- this is a second, defensive cap
-#: against a hypothetical future failure mode with an unbounded message,
-#: not evidence either currently produces one.
+#: A previous attempt's failure, embedded in the next attempt's retry prompt
+#: (see `build_propose_task`'s `previous_error`) after `_condense_retry_error`
+#: has already collapsed repeated per-field validation blocks down to one
+#: line per distinct problem. This cap is not evidence the message is ever
+#: unbounded on its own terms -- a real run's 7-slot repeated
+#: `union_tag_invalid` mistake produced a 2411-char message BEFORE
+#: condensing (six copies of the same two facts, six copies of the same
+#: pydantic doc URL) and a small fraction of that after -- it is a
+#: defensive backstop for whatever condensing cannot collapse (many
+#: genuinely DISTINCT problems, not repeats of one), not the primary
+#: control on message size.
 _MAX_RETRY_ERROR_CHARS = 2000
+
+#: Pydantic's own `ValidationError.__str__` repeats an identical "For
+#: further information visit ..." doc-URL line once per error and groups
+#: nothing -- a discriminated-union mistake made on N slots produces N
+#: near-identical blocks, differing only in each block's own field path and
+#: its embedded, already-abbreviated `input_value=...` repr. Never useful to
+#: a model with no web access; stripped outright before anything else runs.
+_PYDANTIC_DOC_URL_LINE = re.compile(r"[ \t]*For further information visit https://errors\.pydantic\.dev/\S+[ \t]*\n?")
+
+#: Matches pydantic's own real tag, and (as far as a syntactic pattern can)
+#: only pydantic's own real tag -- deliberately the FULLER shape
+#: `[type=<name>, input_value=`, not just `[type=`. Pydantic's format is
+#: always exactly `[type=X, input_value=Y, input_type=Z]`, so `type=` is
+#: always immediately followed by `, input_value=`; free text a validator
+#: interpolates into its own message (or that pydantic then echoes back
+#: inside `input_value=`'s own repr) can coincidentally contain the
+#: substring `[type=`, but reproducing THIS more specific, two-part
+#: sequence by coincidence is a different, much less likely thing --
+#: confirmed against both adversarial-review repro cases (a message whose
+#: own text embeds `[type=spoofed] value` before the real tag, and a real
+#: `config_model.Derivation._table_rows_match_outputs` message echoing a
+#: `derived` table key containing `[type=FAKE_ROLE_KEY] condition`):
+#: neither coincidental occurrence is followed by `, input_value=`, so
+#: only the genuine tag matches.
+_PYDANTIC_ERROR_TYPE = re.compile(r"\[type=([\w.]+), input_value=")
 
 #: Claude Sonnet 5's first-party API rate (CLAUDE.md Section 11 pins this
 #: model for every agent call). Sourced from Anthropic's published pricing,
@@ -2008,6 +2038,124 @@ def build_propose_agent(llm: BaseLLM | None = None) -> Agent:
     )
 
 
+def _condense_retry_error(text: str) -> str:
+    """Collapses repeated pydantic validation blocks in `text` (a prior
+    attempt's `AgentOutputParseError`/`_check_meta_matches` `ValueError`
+    message) so `_MAX_RETRY_ERROR_CHARS` is spent on breadth -- WHICH
+    fields are broken -- rather than repeating the same one or two facts
+    once per field. The real, live-observed shape this closes: a
+    discriminated-union mistake made identically on 7 slots produced 7
+    near-identical blocks; truncating that raw text at 2000 chars cut off
+    mid-block, losing one of the seven field names entirely, while most of
+    the budget it DID get went on six repeats of the same two facts (the
+    illegal tag, the two legal ones) and six copies of the same doc URL.
+
+    Structural, not pattern-specific -- this never hardcodes
+    "not_collected" or "union_tag_invalid": it strips every pydantic
+    doc-URL line unconditionally, then splits the remaining text into
+    (field path, message) blocks on pydantic's own convention (a
+    zero-indent line is a field path; every line under it, indented, is
+    that field's message), groups blocks whose message is identical up to
+    the `[type=...]` tag (the per-instance `input_value=`/`input_type=`
+    detail inside that bracket is exactly the noise that would otherwise
+    keep two identical mistakes from matching), and emits ONE line per
+    distinct group: every distinct field that hit it, then the message
+    once.
+
+    Locates pydantic's own tag by its FULL, specific shape --
+    `[type=<name>, input_value=` (`_PYDANTIC_ERROR_TYPE`) -- never by the
+    bare substring `[type=` alone, and takes the LAST match if more than
+    one is found. A validator elsewhere in this codebase can legitimately
+    interpolate arbitrary model/CSV-sourced free text INTO its own message
+    before pydantic's real tag is appended (e.g.
+    `config_model.Derivation._table_rows_match_outputs` echoes a `derived`
+    table's own key verbatim), and pydantic itself then echoes the same
+    offending value again inside the tag's own `input_value=` repr -- so a
+    bare `[type=` substring can legitimately appear more than once,
+    including AFTER the real tag starts. Matching on the fuller,
+    two-part sequence closes both: reproducing `[type=`X`, input_value=`
+    by coincidence, from arbitrary interpolated text, is a materially
+    different (and in practice vanishingly unlikely) thing from
+    reproducing `[type=` alone -- confirmed live during adversarial
+    review, both as a constructed case and by actually triggering
+    `Derivation._table_rows_match_outputs` through the real
+    `parse_structured_output` path with such a key: neither coincidental
+    `[type=` occurrence in either case is followed by `, input_value=`, so
+    only pydantic's genuine tag ever matches.
+
+    Field names within one group are deduplicated (two `InitErrorDetails`
+    under the identical `loc` with the identical message is a real,
+    constructible pydantic shape) so a field never appears twice in one
+    merged line.
+
+    Never raises, never invents a fact, never applies when there is
+    nothing to collapse: fewer than two recognizable blocks (a plain
+    `_check_meta_matches` `ValueError`, or a single pydantic error) means
+    there is no repetition to remove, and the URL-stripped text is
+    returned as-is. Truncation to `_MAX_RETRY_ERROR_CHARS` still happens
+    afterward, unchanged, in the caller -- this changes what the budget is
+    spent on, not how large the budget is.
+
+    Known, accepted scope limit, not fixed: a raised message containing a
+    literal embedded newline (pydantic does not re-indent a custom
+    validator's own multi-line text) would be misread as extra field-path
+    blocks, since the sole block-boundary signal is "zero-indent line
+    starts a new field." No validator in this codebase currently raises a
+    multi-line message -- confirmed by inspection of every `field_
+    validator`/`model_validator` in config_model.py -- so this is a
+    documented risk for a future one, not a live gap; handling it
+    correctly would need a materially different, more complex boundary
+    rule with its own new failure modes, for a case nothing here produces
+    today."""
+    text = _PYDANTIC_DOC_URL_LINE.sub("", text)
+    lines = text.splitlines()
+    if not lines:
+        return text
+    preamble, body = lines[0], lines[1:]
+
+    blocks: list[tuple[str, str]] = []  # (field path, message)
+    field: str | None = None
+    message_lines: list[str] = []
+    for line in body:
+        if line and not line[0].isspace():
+            if field is not None:
+                blocks.append((field, " ".join(message_lines).strip()))
+            field, message_lines = line.strip(), []
+        else:
+            message_lines.append(line.strip())
+    if field is not None:
+        blocks.append((field, " ".join(message_lines).strip()))
+
+    if len(blocks) < 2:
+        return text  # nothing repeats -- 0 or 1 block, no collapsing to do
+
+    group_fields: dict[str, list[str]] = {}
+    group_message: dict[str, str] = {}
+    for field, message in blocks:
+        # The last match, not the first: pydantic's own real tag is always
+        # the outermost/final one; taking the last of however many matches
+        # this specific, hard-to-coincidentally-reproduce pattern finds is
+        # cheap extra insurance on top of the pattern itself already being
+        # narrow (see _PYDANTIC_ERROR_TYPE's own comment).
+        type_matches = list(_PYDANTIC_ERROR_TYPE.finditer(message))
+        if type_matches:
+            last = type_matches[-1]
+            description = message[: last.start()].strip()
+            type_name = last.group(1)
+        else:
+            description, type_name = message, None
+        key = f"{description}\x00{type_name or ''}"
+        fields = group_fields.setdefault(key, [])
+        if field not in fields:
+            fields.append(field)
+        group_message.setdefault(key, f"{description} [type={type_name}]" if type_name else description)
+
+    lines_out = [preamble]
+    for key, fields in group_fields.items():
+        lines_out.append(f"{', '.join(fields)}: {group_message[key]}")
+    return "\n".join(lines_out)
+
+
 def build_propose_task(
     name: str,
     layout: str,
@@ -2028,12 +2176,15 @@ def build_propose_task(
     loop is not the cross-agent/cross-human trust boundary `agents/
     prompt_safety.py`'s fencing exists for -- it gains the model no
     instructing power over anything it did not already have by generating
-    the text once -- so this is appended plainly, just capped defensively."""
+    the text once -- so this is appended plainly, just condensed
+    (`_condense_retry_error` -- collapse repeated blocks, strip doc URLs)
+    and THEN capped defensively (`_MAX_RETRY_ERROR_CHARS`, unchanged)."""
     description = _build_task_description(name, layout, assets_filename, findings_filename, profiles, sample_rows)
     if previous_error is not None:
+        condensed = _condense_retry_error(previous_error)
         description += (
             "\n\n---\nYour previous attempt at this exact task failed, and was discarded:\n"
-            f"{previous_error[:_MAX_RETRY_ERROR_CHARS]}\n\n"
+            f"{condensed[:_MAX_RETRY_ERROR_CHARS]}\n\n"
             "Correct ONLY what caused that failure. Return the complete, corrected JSON in full -- "
             "still exactly the shape described above -- not a diff or an explanation."
         )

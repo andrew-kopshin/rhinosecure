@@ -1498,6 +1498,216 @@ def test_load_saved_proposal_wraps_a_pydantic_error_from_a_hand_edited_file(tmp_
         load_saved_proposal(path)
 
 
+# --- _condense_retry_error: collapse repeated validation blocks, strip URLs --
+#
+# Real, live-observed text: a schema-inference propose run against
+# northgate_fleet_14.csv emitted "status": "not_collected" directly (illegal --
+# not_collected is a mapping KIND, not a status) on seven slots at once. The
+# resulting pydantic ValidationError.__str__() text is reproduced VERBATIM
+# below -- reconstructed offline from that real run's own captured attempt-1
+# output, not invented -- and is exactly what str(AgentOutputParseError(...))
+# produced, 2411 characters, before this fix existed.
+
+_REAL_SEVEN_SLOT_ERROR = """agent output did not match AdapterProposal, even after tolerating a single-key wrapper: 7 validation errors for AdapterProposal
+asset.compensating_controls
+  Input tag 'not_collected' found using 'status' does not match any of the expected tags: 'mapped', 'unresolved' [type=union_tag_invalid, input_value={'status': 'not_collected...ent in the 14 columns.'}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/union_tag_invalid
+asset.os
+  Input tag 'not_collected' found using 'status' does not match any of the expected tags: 'mapped', 'unresolved' [type=union_tag_invalid, input_value={'status': 'not_collected...not a stated OS field.'}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/union_tag_invalid
+asset.os_build
+  Input tag 'not_collected' found using 'status' does not match any of the expected tags: 'mapped', 'unresolved' [type=union_tag_invalid, input_value={'status': 'not_collected...d/version information.'}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/union_tag_invalid
+asset.patch_restrictions
+  Input tag 'not_collected' found using 'status' does not match any of the expected tags: 'mapped', 'unresolved' [type=union_tag_invalid, input_value={'status': 'not_collected...intenance constraints.'}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/union_tag_invalid
+asset.patch_window
+  Input tag 'not_collected' found using 'status' does not match any of the expected tags: 'mapped', 'unresolved' [type=union_tag_invalid, input_value={'status': 'not_collected... maintenance schedule.'}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/union_tag_invalid
+finding.service
+  Input tag 'not_collected' found using 'status' does not match any of the expected tags: 'mapped', 'unresolved' [type=union_tag_invalid, input_value={'status': 'not_collected...he source data itself."}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/union_tag_invalid
+finding.version
+  Input tag 'not_collected' found using 'status' does not match any of the expected tags: 'mapped', 'unresolved' [type=union_tag_invalid, input_value={'status': 'not_collected...nywhere in the source.'}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/union_tag_invalid"""
+
+_REAL_SEVEN_SLOT_FIELDS = [
+    "asset.compensating_controls", "asset.os", "asset.os_build", "asset.patch_restrictions",
+    "asset.patch_window", "finding.service", "finding.version",
+]
+
+
+def test_condense_retry_error_matches_the_real_captured_text_exactly():
+    """Anchor: confirms the literal above is the real 2411-char text, not a
+    paraphrase -- if this ever fails, the fixture drifted from the real
+    incident it's supposed to reproduce."""
+    assert len(_REAL_SEVEN_SLOT_ERROR) == 2411
+
+
+def test_condense_retry_error_keeps_every_field_name_through_truncation():
+    """The actual regression: naive [:2000] truncation of the raw text above
+    cuts off mid-block and loses finding.version's field name entirely (it
+    never appears before character 2000 of the RAW text). After condensing,
+    all seven must survive -- not just in the condensed text, but in the
+    SAME truncated slice build_propose_task actually sends the model."""
+    from rhinosecure.agents.schema_inference import _MAX_RETRY_ERROR_CHARS, _condense_retry_error
+
+    # Confirm the regression is real against the RAW text first -- otherwise
+    # this test would prove nothing about what condensing fixes.
+    raw_truncated = _REAL_SEVEN_SLOT_ERROR[:_MAX_RETRY_ERROR_CHARS]
+    assert "finding.version" not in raw_truncated
+
+    condensed = _condense_retry_error(_REAL_SEVEN_SLOT_ERROR)
+    truncated = condensed[:_MAX_RETRY_ERROR_CHARS]
+    for field in _REAL_SEVEN_SLOT_FIELDS:
+        assert field in truncated, f"{field} did not survive collapse+truncation"
+
+
+def test_condense_retry_error_strips_the_repeated_doc_urls():
+    from rhinosecure.agents.schema_inference import _condense_retry_error
+
+    condensed = _condense_retry_error(_REAL_SEVEN_SLOT_ERROR)
+    assert "errors.pydantic.dev" not in condensed
+
+
+def test_condense_retry_error_shrinks_the_real_message_well_under_the_cap():
+    """Not just "fits after truncation" -- condensing should make truncation
+    unnecessary for this real case, since the whole point is that the
+    budget was being spent on repetition, not genuine content."""
+    from rhinosecure.agents.schema_inference import _MAX_RETRY_ERROR_CHARS, _condense_retry_error
+
+    condensed = _condense_retry_error(_REAL_SEVEN_SLOT_ERROR)
+    assert len(condensed) < len(_REAL_SEVEN_SLOT_ERROR)
+    assert len(condensed) < _MAX_RETRY_ERROR_CHARS
+
+
+def test_condense_retry_error_preserves_the_preamble_and_shared_description_once():
+    from rhinosecure.agents.schema_inference import _condense_retry_error
+
+    condensed = _condense_retry_error(_REAL_SEVEN_SLOT_ERROR)
+    lines = condensed.splitlines()
+    assert lines[0] == "agent output did not match AdapterProposal, even after tolerating a single-key wrapper: 7 validation errors for AdapterProposal"
+    # The shared problem description appears exactly once, not seven times.
+    assert condensed.count("does not match any of the expected tags: 'mapped', 'unresolved'") == 1
+
+
+def test_condense_retry_error_passes_through_a_non_pydantic_message_unchanged():
+    """_check_meta_matches raises a plain, single-sentence ValueError with no
+    per-field block structure at all -- there is nothing to collapse, and
+    condensing must not corrupt it (e.g. by misreading its own punctuation
+    as a field-path/message split)."""
+    from rhinosecure.agents.schema_inference import _condense_retry_error
+
+    plain = "meta.format 'foo' != 'bar'; meta.source_layout 'single_file' != 'two_file'"
+    assert _condense_retry_error(plain) == plain
+
+
+def test_condense_retry_error_ignores_a_coincidental_type_bracket_inside_the_message():
+    """Adversarial-review regression: a message whose own text (or pydantic's
+    own echoed `input_value=` repr of it) happens to contain the literal
+    substring "[type=" BEFORE pydantic's real tag must not be mistaken for
+    the real tag -- the real description and real type must survive
+    intact, and a second, genuinely distinct field must stay separate."""
+    from rhinosecure.agents.schema_inference import _condense_retry_error
+
+    msg = (
+        "1 validation error for M\n"
+        "role\n"
+        "  Value 'weird [type=spoofed] value' is not in the allowed vocabulary "
+        "[type=bad_val, input_value='weird [type=spoofed] value', input_type=str]\n"
+        "role2\n"
+        "  A second, real, distinct problem [type=other_err, input_value='y', input_type=str]"
+    )
+    condensed = _condense_retry_error(msg)
+    role_line = condensed.splitlines()[1]
+    # The full description survives intact, not truncated mid-word at the
+    # coincidental bracket -- "[type=spoofed]" legitimately appears IN this
+    # text (it's part of the quoted bad value), so the real bug this guards
+    # against is specifically the EXTRACTED, TRAILING tag being wrong, not
+    # that substring appearing anywhere in the line.
+    assert "is not in the allowed vocabulary" in role_line
+    assert role_line.endswith("[type=bad_val]")
+    assert "role2" in condensed and "[type=other_err]" in condensed
+
+
+def test_condense_retry_error_dedupes_a_field_repeated_within_one_group():
+    """Adversarial-review regression: two InitErrorDetails under the
+    identical field path with an identical description+type (a real,
+    constructible pydantic shape) must not list that field twice."""
+    from rhinosecure.agents.schema_inference import _condense_retry_error
+
+    msg = (
+        "2 validation errors for M\n"
+        "role\n"
+        "  Field required [type=missing, input_value={}, input_type=dict]\n"
+        "role\n"
+        "  Field required [type=missing, input_value={}, input_type=dict]"
+    )
+    condensed = _condense_retry_error(msg)
+    group_line = condensed.splitlines()[1]
+    assert group_line.count("role") == 1
+
+
+def test_condense_retry_error_passes_a_single_block_through_the_early_return():
+    """Fewer than two blocks means nothing repeats -- the early-return path,
+    exercised directly rather than only via the seven-slot case. URL
+    stripping still applies (it runs unconditionally, before the block
+    count is even checked) -- only the block-collapsing step is skipped."""
+    from rhinosecure.agents.schema_inference import _condense_retry_error
+
+    one_block = (
+        "1 validation error for AdapterProposal\n"
+        "asset.role\n"
+        "  Input tag 'bogus' found using 'kind' does not match any of the expected tags: "
+        "'column', 'vocabulary' [type=union_tag_invalid, input_value={...}, input_type=dict]\n"
+        "    For further information visit https://errors.pydantic.dev/2.12/v/union_tag_invalid"
+    )
+    condensed = _condense_retry_error(one_block)
+    assert "asset.role" in condensed
+    assert "does not match any of the expected tags" in condensed
+    assert "errors.pydantic.dev" not in condensed
+
+
+def test_condense_retry_error_keeps_two_distinct_error_types_separate():
+    """Fields hitting genuinely DIFFERENT problems must not be merged into
+    one group and must not lose either description."""
+    from rhinosecure.agents.schema_inference import _condense_retry_error
+
+    mixed = (
+        "2 validation errors for AdapterProposal\n"
+        "asset.role\n"
+        "  Input tag 'bogus' found using 'kind' does not match any of the expected tags: "
+        "'column', 'vocabulary' [type=union_tag_invalid, input_value={...}, input_type=dict]\n"
+        "    For further information visit https://errors.pydantic.dev/2.12/v/union_tag_invalid\n"
+        "asset.criticality\n"
+        "  Field required [type=missing, input_value={...}, input_type=dict]\n"
+        "    For further information visit https://errors.pydantic.dev/2.12/v/missing"
+    )
+    condensed = _condense_retry_error(mixed)
+    assert "asset.role" in condensed and "asset.criticality" in condensed
+    assert "does not match any of the expected tags" in condensed
+    assert "Field required" in condensed
+    # Two distinct groups -> two distinct output lines (plus the preamble).
+    assert len(condensed.splitlines()) == 3
+
+
+def test_build_propose_task_embeds_the_condensed_error_not_the_raw_repeated_one(profiles):
+    """Wiring check: build_propose_task must actually call
+    _condense_retry_error on `previous_error` before truncating, not just
+    have the function exist unused."""
+    from rhinosecure.agents.schema_inference import build_propose_agent, build_propose_task
+    from rhinosecure.llm import LLMConfig, get_llm
+
+    agent = build_propose_agent(llm=get_llm(LLMConfig(model="claude-sonnet-5", api_key="sk-test-key")))
+    task = build_propose_task(
+        "min-test", "single_file", "data.csv", "data.csv", profiles, 20, agent,
+        previous_error=_REAL_SEVEN_SLOT_ERROR,
+    )
+    for field in _REAL_SEVEN_SLOT_FIELDS:
+        assert field in task.description
+    assert "errors.pydantic.dev" not in task.description
+
+
 # --- build_propose_agent: the tool-call retry cap item -----------------------
 
 
