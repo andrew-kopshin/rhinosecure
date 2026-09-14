@@ -1,0 +1,3 @@
+﻿asset_id,hostname,os,os_build,role,business_function,criticality,internet_exposed,environment,data_sensitivity,patch_window,patch_restrictions,compensating_controls,owner
+A21,WKS-TOK07,Windows 10,19045,workstation,Tokyo support desk - 東京サポート,3,false,prod,internal,,,,Sato Yuki
+A22,SRV-OSAKA01,Windows Server 2019,17763,file,大阪支社 ERP backend,2,false,prod,confidential,Sun 02:00-06:00,,,Tanaka Ren

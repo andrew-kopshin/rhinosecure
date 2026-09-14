@@ -34,6 +34,34 @@ DEFENDER_SAMPLE = Path(__file__).resolve().parents[1] / "data" / "defender-sampl
 # (0x80-0x9F) a legacy Windows export puts real content in, confirmed to
 # fail strict UTF-8 decoding at that exact byte (see the tests below).
 CP1252_SAMPLE = Path(__file__).resolve().parents[1] / "data" / "cp1252-sample" / "assets.csv"
+# A REAL Excel 16.0 (Microsoft 365) "CSV UTF-8 (Comma delimited)" export, not
+# a Python .encode() simulation -- produced live via COM automation
+# (`Workbooks.Add`, `Cells.NumberFormat = "@"` to stop Excel autoconverting
+# "false"/"3" to a boolean/number before it's ever written, then
+# `Workbook.SaveAs(path, 62)` -- 62 is `xlCSVUTF8`, the same file type the
+# "CSV UTF-8" entry in Excel's own Save As dialog writes) on this project's
+# own stated environment, confirmed against the raw bytes before being
+# committed: a genuine `EF BB BF` BOM, `\r\n` line endings, and -- unlike
+# CP1252_SAMPLE's PowerShell-produced every-field quoting -- no quote
+# characters at all, since Excel only quotes a field that actually needs
+# it. Carries real multi-byte UTF-8 content (Japanese kanji/katakana in a
+# business_function field) so the round trip below proves more than "a BOM
+# was present": it proves the BOM was stripped and the real multi-byte
+# bytes after it decoded correctly.
+EXCEL_UTF8SIG_SAMPLE = Path(__file__).resolve().parents[1] / "data" / "excel-utf8sig-sample" / "assets.csv"
+# A REAL Windows PowerShell 5.1 `Export-Csv -Encoding Unicode` output, not a
+# Python .encode() simulation -- produced live the same way CP1252_SAMPLE
+# was, via `@($row1, $row2) | Export-Csv -Path assets.csv -NoTypeInformation
+# -Encoding Unicode` on this project's own stated environment. "Unicode" is
+# PowerShell's own name for UTF-16LE with a BOM -- confirmed against the raw
+# bytes before being committed: `FF FE`, then every character (ASCII
+# included) as a two-byte little-endian code unit, and every field quoted
+# (Export-Csv's default, exactly like CP1252_SAMPLE, and unlike
+# EXCEL_UTF8SIG_SAMPLE's Excel-only-quotes-when-needed behavior). Carries
+# real non-ASCII content (Cyrillic "Служба поддержки" -- "support desk" -- in
+# a business_function field) so the round trip below proves the body
+# decoded, not just that the BOM was recognized.
+POWERSHELL_UTF16_SAMPLE = Path(__file__).resolve().parents[1] / "data" / "powershell-utf16-sample" / "assets.csv"
 
 
 def _write(path: Path, rows: list[dict[str, str]], columns: list[str], encoding: str = "utf-8") -> Path:
@@ -136,6 +164,52 @@ def test_the_real_cp1252_fixture_refuses_loudly_through_open_csv_and_names_the_r
     assert "source.encoding" in message
 
 
+# --- utf-8-sig: a real Excel export, not a Python .encode() simulation --
+
+
+def test_detect_encoding_recognizes_the_real_excel_bom(tmp_path):
+    """Confirms the sniff against genuine Excel-written bytes, not a
+    Python-encoded stand-in for them."""
+    assert ingest.detect_encoding(EXCEL_UTF8SIG_SAMPLE) == "utf-8-sig"
+
+
+def test_the_real_excel_utf8_sig_fixture_round_trips_through_open_csv(tmp_path):
+    f, reader = ingest.open_csv(EXCEL_UTF8SIG_SAMPLE)
+    with f:
+        rows = [row for _n, row in ingest.iter_csv_rows(EXCEL_UTF8SIG_SAMPLE, reader)]
+    assert len(rows) == 2
+    assert rows[0]["asset_id"] == "A21"
+    assert rows[0]["business_function"] == "Tokyo support desk - 東京サポート"
+    assert rows[1]["business_function"] == "大阪支社 ERP backend"
+    # Excel's own NumberFormat="@" guard at fixture-build time is what this
+    # pins: a naive read of "false"/"3" through Excel would risk the cell
+    # having been autocorrected to a real boolean/number before it was ever
+    # saved, silently changing the value this test would see.
+    assert rows[0]["internet_exposed"] == "false"
+    assert rows[0]["criticality"] == "3"
+
+
+# --- utf-16: a real PowerShell export, not a Python .encode() simulation -
+
+
+def test_detect_encoding_recognizes_the_real_powershell_bom(tmp_path):
+    """Confirms the sniff against genuine `Export-Csv -Encoding Unicode`
+    bytes, not a Python-encoded stand-in for them."""
+    assert ingest.detect_encoding(POWERSHELL_UTF16_SAMPLE) == "utf-16"
+
+
+def test_the_real_powershell_utf16_fixture_round_trips_through_open_csv(tmp_path):
+    f, reader = ingest.open_csv(POWERSHELL_UTF16_SAMPLE)
+    with f:
+        rows = [row for _n, row in ingest.iter_csv_rows(POWERSHELL_UTF16_SAMPLE, reader)]
+    assert len(rows) == 2
+    assert rows[0]["asset_id"] == "A31"
+    assert rows[0]["business_function"] == "Moscow support desk - Служба поддержки"
+    assert rows[1]["business_function"] == "Служба поддержки ERP backend"
+    assert rows[0]["internet_exposed"] == "false"
+    assert rows[0]["criticality"] == "3"
+
+
 @pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig", "utf-16", "utf-32"])
 def test_open_csv_round_trips_every_supported_encoding(tmp_path, encoding):
     path = _write(
@@ -188,8 +262,14 @@ def test_undecodable_row_beyond_the_first_buffer_raises_ingest_error(tmp_path):
 
 @pytest.mark.parametrize("encoding", ["utf-16", "utf-8-sig"])
 def test_a_powershell_or_excel_encoded_export_loads(tmp_path, encoding):
-    """`Export-Csv` writes UTF-16LE with a BOM by default on Windows
-    PowerShell 5.1, which is how a real Defender export most often arrives."""
+    """This re-encodes the real UTF-8 Defender sample with Python's own
+    `.encode()` -- it is not a genuine PowerShell or Excel export. That claim
+    belongs to POWERSHELL_UTF16_SAMPLE / EXCEL_UTF8SIG_SAMPLE / CP1252_SAMPLE
+    above, each produced by the real tool it's named for. What this test
+    actually proves is narrower, and re-encoding is the right tool for it:
+    loading the SAME records through a real adapter's full ingest path (not
+    just open_csv/iter_csv_rows in isolation) does not depend on which
+    supported encoding the bytes happen to be in."""
     data_dir = _reencode(DEFENDER_SAMPLE, tmp_path / encoding, encoding)
     assets, findings = load_batch(data_dir, get_adapter("defender"))
     scored = list(findings)
