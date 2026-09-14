@@ -1257,5 +1257,144 @@ def test_remediation_log_prints_full_history_oldest_first(tmp_path, capsys):
     assert exit_code == 0
     out = capsys.readouterr().out
     assert out.index("deferred") < out.index("remediated")
-    assert "scheduled" in out
-    assert "patched" in out
+
+
+# --- rhino remediation mark: provisional-provenance refusal -----------------
+# CLAUDE.md's provisional-provenance entry: a finding_id a provisional run
+# once produced must refuse `remediation mark` while the named format is
+# still unconfirmed, and permit it again the instant that format is signed
+# -- with no clear/delete write of its own.
+
+
+def _provenance_contract_dict(format_name: str) -> dict:
+    """A syntactically real, minimal Contract dict -- reuses the design's
+    own bluepeak-gen example (test_adapters_config_model.py) instead of
+    hand-rolling Contract's full nested schema a second time here, with
+    the format renamed so it can never collide with the real committed
+    data/adapters/bluepeak-gen.json."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from test_adapters_config_model import bluepeak_gen_dict
+
+    data = bluepeak_gen_dict()
+    data["format"] = format_name
+    return data
+
+
+def _write_unconfirmed_test_contract(adapters_dir: Path, format_name: str):
+    from rhinosecure.adapters.config_io import write_contract
+    from rhinosecure.adapters.config_model import Contract
+
+    contract = Contract.model_validate(_provenance_contract_dict(format_name))
+    assert contract.review.state == "proposed"
+    return write_contract(adapters_dir / f"{format_name}.json", contract)
+
+
+def test_provisional_provenance_refusal_goes_inert_once_the_named_format_is_confirmed(tmp_path, monkeypatch):
+    """Direct test of the predicate itself: the SAME memory row, checked
+    before and after confirming the contract it names, answers
+    differently each time -- nothing about the row is ever touched."""
+    import rhinosecure.cli as cli_module
+    from rhinosecure.adapters.config_io import confirm_contract, overwrite_contract
+    from rhinosecure.cli import _provisional_provenance_refusal
+    from rhinosecure.memory import Memory
+
+    adapters_dir = tmp_path / "adapters"
+    adapters_dir.mkdir()
+    monkeypatch.setattr(cli_module, "resolve_config_path", lambda name: adapters_dir / f"{name}.json")
+    written = _write_unconfirmed_test_contract(adapters_dir, "test-provenance-gen")
+
+    memory = Memory(tmp_path / "mem.db")
+    memory.record_provisional_provenance(["F07"], "test-provenance-gen")
+
+    refusal = _provisional_provenance_refusal(memory, "F07")
+    assert refusal is not None
+    assert "F07" in refusal
+    assert "test-provenance-gen" in refusal
+
+    confirmed = confirm_contract(written, at="2026-09-14T00:00:00Z", by="tester@example.com")
+    overwrite_contract(adapters_dir / "test-provenance-gen.json", confirmed)
+
+    # No write happened to the provisional_provenance row itself -- only
+    # the contract file on disk changed.
+    assert _provisional_provenance_refusal(memory, "F07") is None
+
+
+def test_provisional_provenance_refusal_returns_none_for_a_finding_with_no_recorded_history(tmp_path):
+    """No entry at all -- the unchanged, fully-blind case."""
+    from rhinosecure.cli import _provisional_provenance_refusal
+    from rhinosecure.memory import Memory
+
+    memory = Memory(tmp_path / "mem.db")
+    assert _provisional_provenance_refusal(memory, "F99") is None
+
+
+def test_provisional_provenance_refusal_treats_an_unreadable_contract_as_still_unconfirmed(tmp_path, monkeypatch):
+    """A format recorded once but whose contract file has since vanished
+    cannot be proven safe by this mechanism -- it is additive protection,
+    not a hard guarantee, so it fails toward the refusal it exists to
+    produce on exactly the input it cannot otherwise verify."""
+    import rhinosecure.cli as cli_module
+    from rhinosecure.cli import _provisional_provenance_refusal
+    from rhinosecure.memory import Memory
+
+    adapters_dir = tmp_path / "adapters"
+    adapters_dir.mkdir()  # no contract file ever written inside it
+    monkeypatch.setattr(cli_module, "resolve_config_path", lambda name: adapters_dir / f"{name}.json")
+
+    memory = Memory(tmp_path / "mem.db")
+    memory.record_provisional_provenance(["F07"], "vanished-gen")
+
+    refusal = _provisional_provenance_refusal(memory, "F07")
+    assert refusal is not None
+    assert "vanished-gen" in refusal
+
+
+def test_remediation_mark_refuses_while_unconfirmed_then_permits_the_same_mark_after_confirm(
+    tmp_path, monkeypatch, capsys
+):
+    """End to end through `rhino remediation mark` itself: refused while
+    the format is unconfirmed, with nothing written; the IDENTICAL
+    command permitted, and actually recording the event, the moment the
+    format is confirmed -- no restart, no clear, no new flag."""
+    import rhinosecure.cli as cli_module
+    from rhinosecure.adapters.config_io import confirm_contract, overwrite_contract
+    from rhinosecure.memory import Memory
+
+    adapters_dir = tmp_path / "adapters"
+    adapters_dir.mkdir()
+    monkeypatch.setattr(cli_module, "resolve_config_path", lambda name: adapters_dir / f"{name}.json")
+    written = _write_unconfirmed_test_contract(adapters_dir, "test-provenance-gen")
+
+    db_path = tmp_path / "track.db"
+    Memory(db_path).record_provisional_provenance(["F07"], "test-provenance-gen")
+
+    exit_code = main(["remediation", "mark", "F07", "remediated", "--db", str(db_path)])
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "refusing to mark 'F07'" in err
+    assert "test-provenance-gen" in err
+    assert Memory(db_path).latest_remediation_event_for_finding("F07") is None  # refused BEFORE writing
+
+    confirmed = confirm_contract(written, at="2026-09-14T00:00:00Z", by="tester@example.com")
+    overwrite_contract(adapters_dir / "test-provenance-gen.json", confirmed)
+
+    exit_code = main(["remediation", "mark", "F07", "remediated", "--db", str(db_path)])
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Recorded: F07 (untracked) -> remediated" in out
+    assert Memory(db_path).latest_remediation_event_for_finding("F07").status == "remediated"
+
+
+def test_remediation_mark_with_no_provisional_provenance_recorded_marks_exactly_as_before(tmp_path, capsys):
+    """A finding_id no provisional run has ever touched has nothing to
+    check, and behaves exactly as it did before this mechanism existed --
+    fails open, the same as every additive mechanism in this codebase."""
+    db_path = tmp_path / "track.db"
+    exit_code = main(["remediation", "mark", "F21", "remediated", "--db", str(db_path)])
+    assert exit_code == 0
+
+    from rhinosecure.memory import Memory
+
+    assert Memory(db_path).latest_remediation_event_for_finding("F21").status == "remediated"

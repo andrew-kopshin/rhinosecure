@@ -2460,3 +2460,80 @@ match" and "No drift and no problems." against the real files; `rhino run --data
 --offline` still reproduces `Contested: 3/24 (12.5%)` unchanged; `rhino run --data data/bluepeak
 --adapter-config bluepeak-gen --seed 42 --offline` still reproduces `Contested: 1/50 (2.0%)`,
 0 excluded, unchanged. Full suite: 1449 passed (up from 1433), zero regressions.
+
+---
+
+## `remediation mark`'s contract-blindness closed: provisional provenance (2026-09-14)
+
+**The gap the sentinel fix above left standing.** "Nothing provisional escapes" (the trust-
+boundary principle) held for `--track-remediation` — it resolves an adapter as part of its own
+ingest and refuses via `is_provisional`. It never held for the actual write path: `rhino
+remediation mark` and the Router's `remediation_mark` job both write `remediation_events`
+(`memory.record_remediation_event`) from nothing but a bare `finding_id` string — no `--data`, no
+`--format`, no contract, by design (`remediation mark`'s own `--help`: "no ingest, no LLM, just a
+memory.py write"). A design survey (this entry's own prior turns, not restated here) established
+four things worth recording so the next reader doesn't have to re-derive them: `runs`/`decisions`
+are written ONLY inside `Coordinator.submit_constraint`/`_submit_capacity_constraint`, never by a
+bare `run()` — so `decisions_for_finding` is empty for most findings and can't be trusted as a
+provenance index; a provisional `Coordinator` (`memory=None`, refused by two independent guards
+from ever holding a real one) writes nothing durable at all, so a provisional finding_id's history
+is genuinely unrecoverable after the fact; `finding_id` stability is guaranteed only ACROSS
+reconfirms of an already-confirmed contract (the identity-freeze gate), never across the FIRST
+confirmation following a provisional period; and a bare "denylist of finding_ids" cannot be
+cleared once written, which would eventually make marking a legitimately-since-confirmed finding
+permanently impossible — worse than today's blindness, just in the opposite direction.
+
+**Built: a seventh `memory.py` table, `provisional_provenance` — `(finding_id, format)` pairs, not
+bare finding_ids.** That's the fix to the "cannot be cleared" problem: `remediation mark`'s
+refusal never trusts the ROW's age, it re-resolves the NAMED format's CURRENT contract and checks
+`is_provisional` on it fresh, every single time. An entry goes inert the instant a human confirms
+that format — no clear, no delete, nothing written to make that true, matching this table's own
+append-only convention. `Memory.record_provisional_provenance`/`.provisional_provenance_formats`
+are the write/read pair; `cli.py`'s new `_provisional_provenance_refusal(memory, finding_id)` is
+the shared check (`None` = proceed; else the refusal string), imported directly by `web/jobs.py`'s
+`_run_remediation_mark` rather than duplicated — mirrors `--track-remediation`'s own wording. A
+format whose contract file can no longer even be read (deleted, corrupted) is treated as still-
+provisional: this mechanism is additive protection, not a hard guarantee, and the one input it
+truly cannot verify is exactly where it should fail toward the refusal, not away from it.
+
+**Where the write happens, and why there, not somewhere else.** Neither `Coordinator.submit_
+constraint`'s pre-existing `memory is None` guard nor `Coordinator.__init__`'s new
+`is_provisional`-paired-with-real-`memory` guard (prior entry) fires on this write, on purpose:
+both exist to stop a SCORING VERDICT (`decisions`/`constraints`/`capacity_constraints`) from being
+persisted under an unsigned mapping. A `(finding_id, format)` fact is categorically different — a
+warning label, not a verdict — so it is written directly through a `Memory` instance the job
+handler already holds (`_run_run_deterministic`/`_run_run_agents`'s `job_memory`, the renamed
+`export_memory`), never passed into `Coordinator` at all. Placement is the crash-ordering
+requirement made concrete: the write happens immediately after scoring succeeds and strictly
+BEFORE `export.write_run_export` — the moment `export.json` and this job's own `"succeeded"`
+status make `result.scored`'s (or `coordinator.ranked()`'s) finding_ids visible to a human — and
+it is deliberately NOT wrapped in a `try`/`except`, so its own failure propagates and fails the
+whole job exactly like any other exception already does in these functions. Recording it after the
+export write would leave a window where a human could see and act on finding_ids before the safety
+record protecting them existed; swallowing a failure here would produce a run that LOOKS fully
+scored with no recorded provisional history at all — the one outcome this mechanism exists to
+prevent.
+
+**Still, honestly, fails open — stated as a property, not hedged.** A `finding_id` no provisional
+run has ever touched (predates this mechanism, or a job crashed before this exact write ran) has
+nothing to check and behaves exactly as before: fully blind. This mechanism only ever ADDS
+refusals; it narrows the gap, it does not close it. That is the correct, honestly-stated shape for
+an additive safety net layered onto a system that had zero protection on this path before today,
+not a defect to be silently promised away.
+
+**Verified.** New tests: `Memory.record_provisional_provenance`/`.provisional_provenance_formats`
+— readback, empty-iterable no-op, cross-format accumulation and dedup, cross-session survival
+(`tests/test_memory.py`). `_provisional_provenance_refusal` directly — goes inert once the named
+format is confirmed (the SAME row, checked before and after, with no write between), returns
+`None` for a finding with no recorded history, treats an unreadable contract file as still-
+provisional (`tests/test_cli.py`). End to end through `rhino remediation mark` itself — refused
+while unconfirmed with nothing written, the IDENTICAL command permitted and actually recording the
+event once confirmed, and a finding with no provisional history marking exactly as before
+(`tests/test_cli.py`). The web path's OWN wiring, not just the CLI's — a `remediation_mark` job
+refused (`status: "failed"`, the refusal message in `error.message`) then permitted after confirm
+(`tests/test_web_jobs_dispatcher.py`). The two existing provisional-run integration tests
+(`test_run_deterministic_scores_provisionally_...`, `test_run_agents_scores_provisionally_...`)
+extended to assert the real job handlers actually wrote the row, in the same db the job's own
+`JobConfig` points at — not just that the `Memory` method works in isolation. `rhino run --data
+demo --seed 42 --offline` reproduces `Contested: 3/24 (12.5%)` unchanged (this change never
+touches ingest or scoring). Full suite: 1460 passed (up from 1449), zero regressions.

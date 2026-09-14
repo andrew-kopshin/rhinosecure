@@ -756,3 +756,55 @@ def test_remediation_event_survives_a_new_session(db_path: Path):
         event = session_two.latest_remediation_event_for_finding("F14")
         assert event.status == "remediated"
         assert event.note == "patched via WSUS"
+
+
+# --- provisional provenance ----------------------------------------------
+
+
+def test_provisional_provenance_formats_returns_empty_for_an_unrecorded_finding(db_path: Path):
+    with Memory(db_path) as db:
+        assert db.provisional_provenance_formats("F07") == []
+
+
+def test_record_provisional_provenance_is_readable_back(db_path: Path):
+    with Memory(db_path) as db:
+        db.record_provisional_provenance(["F01", "F02"], "mystery-gen")
+        assert db.provisional_provenance_formats("F01") == ["mystery-gen"]
+        assert db.provisional_provenance_formats("F02") == ["mystery-gen"]
+        assert db.provisional_provenance_formats("F03") == []
+
+
+def test_record_provisional_provenance_of_an_empty_iterable_writes_nothing(db_path: Path):
+    """A provisional run that scored zero findings must not write one
+    truncated row -- `executemany` over an empty list is the mechanism,
+    this pins the observable behavior."""
+    with Memory(db_path) as db:
+        db.record_provisional_provenance([], "mystery-gen")
+        with sqlite3.connect(db_path) as conn:
+            count = conn.execute("SELECT COUNT(*) FROM provisional_provenance").fetchone()[0]
+        assert count == 0
+
+
+def test_provisional_provenance_formats_accumulates_and_dedupes_across_separate_writes(db_path: Path):
+    """The same finding_id recorded under two different formats (two
+    separate provisional runs, or -- vanishingly unlikely but not
+    structurally prevented -- two different sources whose content-address
+    recipes collided) reports both, sorted, deduplicated; recording the
+    SAME format twice for the same finding_id does not produce a
+    duplicate entry in the result."""
+    with Memory(db_path) as db:
+        db.record_provisional_provenance(["F01"], "zeta-gen")
+        db.record_provisional_provenance(["F01"], "alpha-gen")
+        db.record_provisional_provenance(["F01"], "zeta-gen")
+        assert db.provisional_provenance_formats("F01") == ["alpha-gen", "zeta-gen"]
+
+
+def test_provisional_provenance_survives_a_new_session(db_path: Path):
+    """Same cross-session guarantee every other table here has -- this
+    mechanism exists specifically so a LATER process (a fresh `rhino
+    remediation mark` invocation) can see what an EARLIER one recorded."""
+    with Memory(db_path) as session_one:
+        session_one.record_provisional_provenance(["F14"], "northgate-gen")
+
+    with Memory(db_path) as session_two:
+        assert session_two.provisional_provenance_formats("F14") == ["northgate-gen"]

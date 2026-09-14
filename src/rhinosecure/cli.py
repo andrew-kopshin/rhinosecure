@@ -883,6 +883,62 @@ def _tracked_findings_from_recommendations(coordinator: Coordinator, recommendat
     return tracked
 
 
+def _provisional_provenance_refusal(memory: "Memory", finding_id: str) -> str | None:
+    """`None` if `remediation mark` may proceed; otherwise the refusal
+    message to print/raise verbatim -- shared by the CLI command (below)
+    and web/jobs.py's `_run_remediation_mark`.
+
+    Mirrors `--track-remediation`'s own refusal wording and mechanism
+    (`is_provisional`, adapters/review.py); the only difference is what
+    triggers the check. `--track-remediation` checks a name the operator
+    types (`--adapter-config`); this checks `finding_id`'s own recorded
+    provisional history instead (`memory.provisional_provenance_formats`,
+    written by the provisional-run job handler -- see memory.py's "A
+    seventh table"). Every named format is resolved FRESH against its
+    CURRENT contract file, never trusted from whenever it was recorded --
+    an entry goes inert the instant a human confirms that format, with no
+    write needed to make that true (this module's own docstring on the
+    table explains why there is no clear operation). A format whose
+    contract file cannot even be read anymore (deleted, corrupted) is
+    treated the same as still-provisional: there is nothing here that
+    could prove it safe, and this mechanism is additive protection, not a
+    hard guarantee -- failing toward the refusal it exists to produce, on
+    exactly the input it cannot otherwise verify, is the one place it
+    should not fail open.
+
+    A `finding_id` no provisional run has ever touched has no formats to
+    check at all, and returns `None` immediately -- the unchanged, fully
+    blind behavior for every finding this mechanism has no history for
+    (memory.py's own "absence here is 'no known provisional history,'
+    never 'confirmed safe'")."""
+    formats = memory.provisional_provenance_formats(finding_id)
+    if not formats:
+        return None
+
+    from pydantic import ValidationError
+
+    from rhinosecure.adapters.config_io import read_contract
+
+    still_unconfirmed: list[str] = []
+    for fmt in formats:
+        try:
+            contract = read_contract(resolve_config_path(fmt))
+        except (IngestError, ValidationError):
+            still_unconfirmed.append(fmt)
+            continue
+        if is_provisional(contract):
+            still_unconfirmed.append(fmt)
+
+    if not still_unconfirmed:
+        return None
+    named = ", ".join(repr(f) for f in still_unconfirmed)
+    return (
+        f"refusing to mark {finding_id!r}: it was produced by a provisional (unconfirmed) "
+        f"mapping ({named}) -- confirm the contract first (rhino adapt confirm), then re-run "
+        "this mark."
+    )
+
+
 def _print_remediation_summary(summary, *, db_path: str) -> None:
     """Printed only when --track-remediation is given (see main()'s
     dispatch) -- remediation.classify_remediation already did the actual
@@ -1880,6 +1936,12 @@ def main(argv: list[str] | None = None) -> int:
         from rhinosecure.memory import Memory
 
         mark_memory = Memory(args.db) if args.db else Memory()
+
+        refusal = _provisional_provenance_refusal(mark_memory, args.finding_id)
+        if refusal is not None:
+            print(refusal, file=sys.stderr)
+            return 1
+
         previous = mark_memory.latest_remediation_event_for_finding(args.finding_id)
         previous_status = previous.status if previous is not None else None
 

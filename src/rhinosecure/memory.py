@@ -79,6 +79,27 @@ the same split `scoring.py`/this module already draw: pure computation in
 one place, pure persistence in the other, neither depending on the other's
 internals.
 
+**A seventh table:** `provisional_provenance` -- which `(finding_id, format)`
+pairs a PROVISIONAL run (CLAUDE.md's "drop a CSV, get a plan" path,
+`web/jobs.py`'s `_resolve_provisional`) has ever produced. Not a substitute
+for a `runs` row and never fed one: a provisional `Coordinator` is always
+built with `memory=None`, and both `submit_constraint`'s own guard and
+`Coordinator.__init__`'s (refusing a non-`None` `memory` paired with a
+contract `adapters.review.is_provisional()` is true for) exist specifically
+to keep a genuine scoring verdict from being persisted under a mapping
+nobody has signed. This table records something categorically different --
+not a verdict, a warning label -- so it is written directly through a
+`Memory` instance the job handler holds itself, never handed to
+`Coordinator` at all; neither guard has any reason to see it, or should.
+Append-only like every table here, with no clear/delete operation at all:
+`remediation mark`'s refusal (`remediation.py`) re-resolves the NAMED
+format's CURRENT `Contract` and checks `is_provisional` on it fresh, every
+time, rather than trusting a row's age -- so an entry goes inert the moment
+a human confirms that format, with nothing here needing to change. A
+`finding_id` with no row here is not a claim it is safe, only that no
+provisional run is known to have produced it -- the same "absence means
+no signal, never guessed" reading `Asset.not_collected` already relies on.
+
 Timestamps are UTC ISO 8601 strings (`datetime.now(timezone.utc)
 .isoformat()`), the same format `enrich/cache.py`'s `SnapshotEntry
 .retrieved_at` already uses, for the same reason: sortable as plain text,
@@ -93,6 +114,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -188,6 +210,19 @@ CREATE TABLE IF NOT EXISTS remediation_events (
     recorded_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_remediation_events_finding_id ON remediation_events (finding_id);
+
+-- One row per (finding_id, format) a PROVISIONAL run has ever produced --
+-- never one row per confirmed run, which has nothing to warn about. See
+-- record_provisional_provenance's own docstring for why this is its own
+-- table rather than a runs/decisions row, and provisional_provenance_
+-- formats' for how a row here goes inert without ever being deleted.
+CREATE TABLE IF NOT EXISTS provisional_provenance (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    finding_id TEXT NOT NULL,
+    format TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_provisional_provenance_finding_id ON provisional_provenance (finding_id);
 """
 
 
@@ -806,3 +841,44 @@ class Memory:
                 """
             ).fetchall()
         return {row["finding_id"]: _remediation_event_from_row(row) for row in rows}
+
+    # --- provisional provenance -------------------------------------------
+
+    def record_provisional_provenance(self, finding_ids: Iterable[str], format: str) -> None:
+        """Appends one row per `finding_id` in `finding_ids`, all sharing
+        `format` and one recorded timestamp -- called directly by the
+        provisional-run job handler (`web/jobs.py`), never through a
+        `Coordinator`. See this module's own docstring ("A seventh table")
+        for why: this is a warning label, not a verdict, so it deliberately
+        never touches `runs`/`decisions` and is never gated by either
+        provisional-Memory guard, both of which exist for a different
+        question (whether a SCORING result may be persisted). A no-op for
+        an empty `finding_ids` -- `executemany` over nothing issues no
+        statement and commits nothing, so a provisional run that scored
+        zero findings records zero rows rather than one truncated one."""
+        at = _now()
+        rows = [(finding_id, format, at) for finding_id in finding_ids]
+        if not rows:
+            return
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO provisional_provenance (finding_id, format, recorded_at) VALUES (?, ?, ?)",
+                rows,
+            )
+            self._conn.commit()
+
+    def provisional_provenance_formats(self, finding_id: str) -> list[str]:
+        """Every DISTINCT format name a provisional run has ever recorded
+        for `finding_id`, sorted for a deterministic result -- what
+        `remediation.py`'s refusal check resolves each of, fresh, against
+        whatever that format's CURRENT contract says. Empty when nothing
+        was ever recorded for this finding_id: the ordinary case, every
+        case predating this mechanism, and every finding a provisional run
+        never touched -- absence here is "no known provisional history,"
+        never "confirmed safe" (this module's own docstring)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT format FROM provisional_provenance WHERE finding_id = ? ORDER BY format",
+                (finding_id,),
+            ).fetchall()
+        return [row["format"] for row in rows]

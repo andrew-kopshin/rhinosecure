@@ -1054,8 +1054,25 @@ def _run_run_deterministic(job: Job, plan_state: PlanState, on_stage: Callable[[
         adapter=provisional_adapter,
     )
 
+    job_memory = plan_state.memory if plan_state.memory is not None else Memory(plan_state.config.db_path)
+
+    # Deliberately BEFORE the export write, and deliberately not wrapped in
+    # a try/except: this is the last point before result.scored's
+    # finding_ids become visible to a human (export.json, and this job's
+    # own "succeeded" status) -- CLAUDE.md's provisional-provenance entry's
+    # crash-ordering requirement. Recording this AFTER the export would
+    # leave a window where a human could already see and act on these
+    # finding_ids before the safety record protecting them existed; a
+    # failure here must fail this job exactly like any other exception in
+    # this function already does, not be swallowed and leave findings that
+    # LOOK fully scored with no recorded provisional history at all.
+    if provisional_adapter is not None:
+        on_stage("recording provenance")
+        job_memory.record_provisional_provenance(
+            (sf.finding_id for sf in result.scored), provisional_adapter.contract.format
+        )
+
     on_stage("exporting")
-    export_memory = plan_state.memory if plan_state.memory is not None else Memory(plan_state.config.db_path)
     export.write_run_export(
         plan_state.export_path,
         fmt=result.report.format,
@@ -1064,7 +1081,7 @@ def _run_run_deterministic(job: Job, plan_state: PlanState, on_stage: Callable[[
         offline=plan_state.config.offline,
         agents=False,
         result=result,
-        memory=export_memory,
+        memory=job_memory,
     )
 
     bucket_counts = Counter(sf.bucket.value for sf in result.scored)
@@ -1121,17 +1138,31 @@ def _run_run_agents(job: Job, plan_state: PlanState, on_stage: Callable[[str], N
         coordinator, _findings = plan_state._build_and_run_coordinator(
             resolved, provisional_adapter, memory=None, on_stage=on_stage
         )
-        # Mirrors _run_run_deterministic's own export_memory pattern:
+        # Mirrors _run_run_deterministic's own job_memory pattern:
         # read-only, for the constraints section's display ONLY -- this
         # coordinator's own scoring never touched memory at all
         # (memory=None above), so no constraint from this file was ever
-        # actually folded into what was just scored.
-        export_memory = plan_state.memory if plan_state.memory is not None else Memory(plan_state.config.db_path)
+        # actually folded into what was just scored. The one write this
+        # Memory instance DOES make, immediately below, is not scoring or
+        # a constraint -- see record_provisional_provenance's own
+        # docstring for why that is not the same thing this comment is
+        # about.
+        job_memory = plan_state.memory if plan_state.memory is not None else Memory(plan_state.config.db_path)
+        # Deliberately BEFORE the export write, and deliberately not
+        # wrapped in a try/except -- see _run_run_deterministic's
+        # identical comment for the full reasoning (CLAUDE.md's
+        # provisional-provenance entry's crash-ordering requirement).
+        # coordinator.ranked() here (and again below) is a pure sort over
+        # already-computed state, never a second dispatch.
+        on_stage("recording provenance")
+        job_memory.record_provisional_provenance(
+            (r.finding_id for r in coordinator.ranked()), provisional_adapter.contract.format
+        )
         provisional = True
     else:
         resolved = resolve_source_ref(source_ref)
         coordinator = plan_state.run_agents_pipeline(resolved, on_stage)
-        export_memory = plan_state.memory
+        job_memory = plan_state.memory
         provisional = False
 
     on_stage("exporting")
@@ -1143,7 +1174,7 @@ def _run_run_agents(job: Job, plan_state: PlanState, on_stage: Callable[[str], N
         offline=plan_state.config.offline,
         agents=True,
         coordinator=coordinator,
-        memory=export_memory,
+        memory=job_memory,
     )
 
     recommendations = coordinator.ranked()
@@ -1164,7 +1195,9 @@ def _run_remediation_mark(job: Job, plan_state: PlanState, on_stage: Callable[[s
     """The Router's `remediation_mark` operation -- mirrors `rhino
     remediation mark` exactly (same status vocabulary, same note-
     required-for-a-`remediated`-back-to-`open` transition, same "warn,
-    don't refuse" treatment of a finding_id no scored run has ever seen).
+    don't refuse" treatment of a finding_id no scored run has ever seen,
+    and now the identical `_provisional_provenance_refusal` gate --
+    cli.py's own module, imported directly rather than duplicated).
     Deliberately the cheapest handler here: no ingest, no LLM, no export
     write -- `rhino remediation mark` never touches `--export` either,
     since remediation status is tracking, not scoring (CLAUDE.md Section
@@ -1181,6 +1214,13 @@ def _run_remediation_mark(job: Job, plan_state: PlanState, on_stage: Callable[[s
         raise IngestError(f"remediation_mark: status must be one of {REMEDIATION_STATUSES}, got {status!r}")
 
     memory = plan_state.memory if plan_state.memory is not None else Memory(plan_state.config.db_path)
+
+    from rhinosecure.cli import _provisional_provenance_refusal
+
+    refusal = _provisional_provenance_refusal(memory, finding_id)
+    if refusal is not None:
+        raise IngestError(refusal)
+
     previous = memory.latest_remediation_event_for_finding(finding_id)
     previous_status = previous.status if previous is not None else None
 

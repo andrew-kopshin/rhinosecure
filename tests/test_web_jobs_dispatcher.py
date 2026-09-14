@@ -556,6 +556,18 @@ def test_run_deterministic_scores_provisionally_against_an_unconfirmed_upload_co
     export_data = json.loads((tmp_path / "export.json").read_text(encoding="utf-8"))
     assert export_data["provisional"] is True
 
+    # CLAUDE.md's provisional-provenance entry: both finding_ids this run
+    # actually produced are recorded against the real format name, in the
+    # SAME db the job's own JobConfig points at -- proving the write
+    # happened from inside the real job dispatch, not just that the
+    # Memory method works in isolation (tests/test_memory.py already
+    # covers that).
+    from rhinosecure.memory import Memory
+
+    provenance_memory = Memory(tmp_path / "mem.db")
+    assert provenance_memory.provisional_provenance_formats("F01") == [name]
+    assert provenance_memory.provisional_provenance_formats("F02") == [name]
+
 
 def test_run_agents_scores_provisionally_against_an_unconfirmed_upload_contract(
     client: TestClient, tmp_path: Path, monkeypatch
@@ -662,6 +674,14 @@ def test_run_agents_scores_provisionally_against_an_unconfirmed_upload_contract(
     assert plan_state.memory is None
     assert plan_state.active_source is None
     assert plan_state.findings is None
+
+    # Recorded even though this Coordinator's own memory=None -- the write
+    # goes through a SEPARATE Memory instance the job handler holds
+    # itself, never through the provisional Coordinator (CLAUDE.md's
+    # provisional-provenance entry).
+    from rhinosecure.memory import Memory
+
+    assert Memory(tmp_path / "mem.db").provisional_provenance_formats("F01") == [name]
 
 
 def test_run_agents_provisional_branch_never_clobbers_an_existing_confirmed_plan(
@@ -997,3 +1017,53 @@ def test_remediation_mark_requires_a_note_to_reopen_from_remediated(client: Test
     body = _wait_for_terminal(client, third.json()["job_id"])
     assert body["status"] == "succeeded"
     assert body["result"]["transition"] == "remediated -> open"
+
+
+def test_remediation_mark_job_refuses_a_finding_with_provisional_provenance_then_permits_after_confirm(
+    client: TestClient, tmp_path: Path, monkeypatch
+):
+    """The web path's OWN wiring of _provisional_provenance_refusal
+    (cli.py, imported directly by _run_remediation_mark) -- not just the
+    CLI command's. The provisional_provenance row is written directly via
+    Memory rather than by re-running a full provisional job (the two
+    tests above already cover that the real job handlers write it); this
+    test is specifically about the refusal reading it back correctly."""
+    import sys
+
+    import rhinosecure.cli as cli_module
+    from rhinosecure.adapters.config_io import confirm_contract, overwrite_contract, write_contract
+    from rhinosecure.adapters.config_model import Contract
+    from rhinosecure.memory import Memory
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from test_adapters_config_model import bluepeak_gen_dict
+
+    adapters_dir = tmp_path / "adapters"
+    adapters_dir.mkdir()
+    monkeypatch.setattr(cli_module, "resolve_config_path", lambda name: adapters_dir / f"{name}.json")
+
+    contract_path = adapters_dir / "test-provenance-gen.json"
+    data = bluepeak_gen_dict()
+    data["format"] = "test-provenance-gen"
+    unconfirmed = Contract.model_validate(data)
+    assert unconfirmed.review.state == "proposed"
+    written = write_contract(contract_path, unconfirmed)
+
+    Memory(tmp_path / "mem.db").record_provisional_provenance(["F07"], "test-provenance-gen")
+
+    resp = client.post(
+        "/api/jobs", json={"kind": "remediation_mark", "input": {"finding_id": "F07", "status": "remediated"}}
+    )
+    body = _wait_for_terminal(client, resp.json()["job_id"])
+    assert body["status"] == "failed"
+    assert "test-provenance-gen" in body["error"]["message"]
+
+    confirmed = confirm_contract(written, at="2026-09-14T00:00:00Z", by="tester@example.com")
+    overwrite_contract(contract_path, confirmed)
+
+    resp2 = client.post(
+        "/api/jobs", json={"kind": "remediation_mark", "input": {"finding_id": "F07", "status": "remediated"}}
+    )
+    body2 = _wait_for_terminal(client, resp2.json()["job_id"])
+    assert body2["status"] == "succeeded"
+    assert body2["result"]["transition"] == "(untracked) -> remediated"
