@@ -314,7 +314,25 @@ def _read_header(contract: Contract, path: Path) -> list[str]:
         return list(reader.fieldnames or [])
 
 
-def _check_header_mode(mode: str, filename: str, declared_columns: list[str], real_columns: list[str]) -> list[str]:
+#: Common single-character CSV delimiters to report on when a header
+#: collapses to one column -- never a guess at which one is right (nothing
+#: reads this list to pick a delimiter; `_check_header_mode`'s own "declared"
+#: branch, its only caller, changes nothing about what the adapter reads).
+#: Order is display order only.
+_COMMON_DELIMITERS = [(",", "comma"), (";", "semicolon"), ("\t", "tab"), ("|", "pipe")]
+
+
+def _separator_report(header_text: str) -> str:
+    """A factual count of each `_COMMON_DELIMITERS` character in a single,
+    undelimited header string -- e.g. "semicolon (';'): 4, comma (','): 0".
+    Purely descriptive: it does not rank or recommend one, and the caller
+    never acts on the counts beyond printing them for a human to read."""
+    return ", ".join(f"{name} ({char!r}): {header_text.count(char)}" for char, name in _COMMON_DELIMITERS)
+
+
+def _check_header_mode(
+    mode: str, filename: str, declared_columns: list[str], real_columns: list[str], declared_delimiter: str
+) -> list[str]:
     """Compares `declared_columns` (what the contract recorded when it was
     confirmed, `contract.header.assets`/`.findings`) against `real_columns`
     (what the file has right now), under `mode`. Returns a list of NOTICE
@@ -336,6 +354,20 @@ def _check_header_mode(mode: str, filename: str, declared_columns: list[str], re
     "frozen": the ordered column list must match exactly. Reorder,
     addition, and removal all refuse -- the strictest mode, for a source
     whose shape must never move without a human looking at it again.
+
+    One refinement to "declared"'s missing-column refusal: when EVERY
+    declared column is missing and the real header parsed as exactly one
+    column, "renamed or removed since this contract was confirmed" is very
+    likely false -- reproduced live against a real semicolon-delimited file
+    read with a declared comma: all 34 declared columns come back "missing"
+    from a header that is actually one column wide, and nothing was renamed
+    or removed at all. That shape (all-missing + one real column) means the
+    declared delimiter almost certainly does not match the file, so that
+    branch names the likely cause and reports the declared delimiter plus
+    what separators the one real header string actually contains -- never a
+    guess at which one is correct, and `declared_delimiter` is used only for
+    this message; the delimiter the adapter actually reads with stays
+    `contract.source.delimiter`, unchanged.
     """
     real_set = set(real_columns)
     declared_set = set(declared_columns)
@@ -360,6 +392,14 @@ def _check_header_mode(mode: str, filename: str, declared_columns: list[str], re
 
     # declared
     if missing:
+        if len(missing) == len(declared_columns) and len(real_columns) == 1:
+            raise ContractValidationError(
+                f"{filename}: every declared column is missing, and the real header parsed as "
+                f"exactly one column -- likely cause: the declared delimiter {declared_delimiter!r} "
+                "does not match this file, not a renamed or removed column. Separators found in "
+                f"that one header string ({real_columns[0]!r}): {_separator_report(real_columns[0])}. "
+                f"Declared: {declared_columns}."
+            )
         raise ContractValidationError(
             f"{filename}: declared column(s) {missing} are missing from the real header {real_columns} "
             "-- renamed or removed since this contract was confirmed"
@@ -688,9 +728,14 @@ class ConfiguredAdapter(IngestAdapter):
 
         header = self.contract.header
         notices: list[str] = []
-        notices += _check_header_mode(header.mode, self.assets_filename, header.assets.columns, assets_header)
+        declared_delimiter = self.contract.source.delimiter
+        notices += _check_header_mode(
+            header.mode, self.assets_filename, header.assets.columns, assets_header, declared_delimiter
+        )
         if self.contract.source.layout == "two_file":
-            notices += _check_header_mode(header.mode, self.findings_filename, header.findings.columns, findings_header)
+            notices += _check_header_mode(
+                header.mode, self.findings_filename, header.findings.columns, findings_header, declared_delimiter
+            )
         self.header_notices = notices
 
         self.headers = {

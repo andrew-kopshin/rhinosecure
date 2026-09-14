@@ -9,6 +9,7 @@ caching, and instance-attribute shadowing."""
 
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 
 import pytest
@@ -141,6 +142,32 @@ def test_load_assets_refuses_a_renamed_column(tmp_path):
     (data_dir / BP_FILENAME).write_text(text.replace("Asset_ID", "AssetId"), encoding="utf-8")
     with pytest.raises(ContractValidationError):
         load_batch(data_dir, ConfiguredAdapter(_bluepeak_gen()))
+
+
+def test_a_semicolon_delimited_file_names_the_delimiter_not_a_rename(tmp_path):
+    """The bug this guards, reproduced with real bluepeak row data (not a
+    contrived one-off): a semicolon-delimited file read with the contract's
+    declared comma collapses to one column, so EVERY declared column comes
+    back "missing" -- and before this fix that raised the identical message
+    a genuinely renamed/removed column gets ("renamed or removed since this
+    contract was confirmed"), which is false here: nothing was renamed."""
+    rows = [bp_row(record_id="VULN-0001", asset_id="A1")]
+    data_dir = tmp_path
+    with (data_dir / BP_FILENAME).open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=BP_COLUMNS, extrasaction="ignore", delimiter=";")
+        writer.writeheader()
+        writer.writerows({c: row.get(c, "") for c in BP_COLUMNS} for row in rows)
+
+    with pytest.raises(ContractValidationError) as excinfo:
+        load_batch(data_dir, ConfiguredAdapter(_bluepeak_gen()))
+    message = str(excinfo.value)
+    assert "renamed or removed since this contract was confirmed" not in message
+    assert "every declared column is missing" in message
+    assert "one column" in message
+    assert "','" in message  # the declared delimiter, reported as-is
+    assert "semicolon (';'): " in message  # a real count, not a guess at which one is right
+    # Not claimed as the answer -- just reported, per the same factual listing.
+    assert "comma (','): 0" in message
 
 
 # --- Source.encoding="cp1252": declared, never sniffed --------------------
