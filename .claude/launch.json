@@ -4,24 +4,42 @@
     {
       "name": "rhino-web-chat",
       "runtimeExecutable": ".venv312/Scripts/rhino.exe",
-      "runtimeArgs": ["web", "--export", "out/export_demo.json", "--enable-chat", "--port", "8420"],
+      "runtimeArgs": [
+        "web",
+        "--export",
+        "out/export_demo.json",
+        "--enable-chat",
+        "--port",
+        "8420"
+      ],
       "port": 8420
     },
     {
       "name": "rhino-web-scenarios",
       "runtimeExecutable": ".venv312/Scripts/rhino.exe",
-      "runtimeArgs": ["web", "--export", "out/export_fleet_scale.json", "--port", "8421"],
+      "runtimeArgs": [
+        "web",
+        "--export",
+        "out/export_fleet_scale.json",
+        "--port",
+        "8421"
+      ],
       "port": 8421
     },
     {
       "name": "rhino-web-empty",
       "runtimeExecutable": ".venv312/Scripts/rhino.exe",
       "runtimeArgs": [
-        "web", "--enable-jobs", "--enable-chat",
-        "--export", "out/export_empty_smoke.json",
-        "--db", "out/empty_smoke.db",
+        "web",
+        "--enable-jobs",
+        "--enable-chat",
+        "--export",
+        "out/export_empty_smoke.json",
+        "--db",
+        "out/empty_smoke.db",
         "--offline",
-        "--port", "8422"
+        "--port",
+        "8422"
       ],
       "port": 8422
     },
@@ -29,13 +47,36 @@
       "name": "rhino-web-verify",
       "runtimeExecutable": ".venv312/Scripts/python.exe",
       "runtimeArgs": [
-        "-m", "rhinosecure.cli",
-        "web", "--enable-jobs",
-        "--export", "out/export_verify_registry.json",
-        "--db", "out/verify_registry.db",
-        "--port", "8423"
+        "-m",
+        "rhinosecure.cli",
+        "web",
+        "--enable-jobs",
+        "--export",
+        "out/export_verify_registry.json",
+        "--db",
+        "out/verify_registry.db",
+        "--port",
+        "8423"
       ],
       "port": 8423
+    },
+    {
+      "name": "rhino-web-deadrow",
+      "runtimeExecutable": ".venv312/Scripts/python.exe",
+      "runtimeArgs": [
+        "-m",
+        "rhinosecure.cli",
+        "web",
+        "--enable-jobs",
+        "--export",
+        "out/export_deadrow.json",
+        "--db",
+        "out/deadrow.db",
+        "--offline",
+        "--port",
+        "8424"
+      ],
+      "port": 8424
     }
   ]
 }

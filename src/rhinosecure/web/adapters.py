@@ -511,6 +511,18 @@ def mount_adapter_routes(app: FastAPI) -> None:
 
         return {
             "name": name,
+            # Where the file the browser is editing actually lives. The
+            # form needs it for exactly one thing: naming the recourse on a
+            # slot it cannot correct itself ("edit THIS file by hand and
+            # re-run --from-proposal"). Supplied here rather than rebuilt
+            # in JS because `out/propose_<name>.json` is a server-side
+            # convention three writers already share -- a fourth copy of it
+            # in the browser is precisely the kind of re-derived rule that
+            # drifts. Note what this deliberately is NOT: a flag saying
+            # whether a row is correctable. That depends on which controls
+            # `buildSlotMapping` can emit, which only app.js knows -- see
+            # `resolveSlotControls`' own comment for the argument.
+            "saved_proposal_path": str(path),
             "saved_proposal": dump_saved_proposal(saved),
             "unresolved": unresolved_detail,
             "illegal": _illegal_mapped_detail(saved.proposal, profiles),

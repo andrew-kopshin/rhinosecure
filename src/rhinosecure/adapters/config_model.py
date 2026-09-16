@@ -1347,17 +1347,17 @@ def validate_contract(contract: Contract, headers: "dict[str, list[str]]") -> No
             problems.append(f"{where}: content_address is legal only for finding.finding_id")
         if isinstance(mapping, ComposedMapping):
             problems.append(f"{where}: composed is legal only for finding.evidence")
-        if isinstance(mapping, NotCollectedMapping) and target not in GAP_LEGAL_TARGETS:
-            problems.append(f"{where}: not_collected has no NOT_COLLECTED_DEFAULTS entry for {target!r}")
         if isinstance(mapping, DefaultByMapping):
             _check_default_by(problems, where, mapping, target, contract)
         column = _column_of(mapping)
         if column is not None:
             check_column(where, column, assets_header_set, accounted_assets, "assets", optional=mapping.optional)
+        # The not_collected/GAP_LEGAL_TARGETS and vocabulary-value rules
+        # that used to sit inline here are inside this call now -- both
+        # depend only on (target, mapping), so duplicating them per section
+        # only created two more places to keep in sync. See that function's
+        # own docstring for the relocation and why it matters downstream.
         problems.extend(check_slot_mapping_legality(where, target, mapping))
-        if isinstance(mapping, VocabularyMapping):
-            for value in mapping.table.values():
-                _check_vocabulary_value(problems, where, target, value)
 
     for target, mapping in contract.finding.items():
         where = f"finding.{target}"
@@ -1365,8 +1365,6 @@ def validate_contract(contract: Contract, headers: "dict[str, list[str]]") -> No
             problems.append(f"{where}: content_address is legal only for finding.finding_id")
         if isinstance(mapping, ComposedMapping) and target != "evidence":
             problems.append(f"{where}: composed is legal only for finding.evidence")
-        if isinstance(mapping, NotCollectedMapping) and target not in GAP_LEGAL_TARGETS:
-            problems.append(f"{where}: not_collected has no NOT_COLLECTED_DEFAULTS entry for {target!r}")
         if isinstance(mapping, ContentAddressMapping):
             for column in mapping.columns:
                 check_column(where, column, findings_header_set, accounted_findings, "findings")
@@ -1394,10 +1392,9 @@ def validate_contract(contract: Contract, headers: "dict[str, list[str]]") -> No
                         f"{where}: column {placeholder!r} is in the assets header, not findings -- "
                         "composed has no cross-file join; a finding cannot read a column from the other file"
                     )
+        # Carries the relocated not_collected/vocabulary-value rules too --
+        # see the asset loop's own note above.
         problems.extend(check_slot_mapping_legality(where, target, mapping))
-        if isinstance(mapping, VocabularyMapping):
-            for value in mapping.table.values():
-                _check_vocabulary_value(problems, where, target, value)
 
     check_column("asset_grouping.key", contract.asset_grouping.key, assets_header_set, accounted_assets, "assets")
     if contract.asset_grouping.order_by is not None:
@@ -1667,12 +1664,34 @@ def check_slot_mapping_legality(where: str, target: str, mapping: Any) -> list[s
     parser outside `asset_grouping.order_by`, is rejected immediately and
     retried with the specific violation fed back to the model, rather than
     accepted as "resolved" and only failing later when the assembled
-    contract reaches this exact same check."""
+    contract reaches this exact same check.
+
+    The last two rules were RELOCATED here from `validate_contract`'s own
+    per-slot loops, where each sat inline and duplicated between the asset
+    and finding halves. Both depend only on `(target, mapping)` -- a
+    `not_collected` mapping's legality is `GAP_LEGAL_TARGETS` membership
+    and nothing else; a vocabulary table's target-side values are checked
+    against `_target_vocabulary(target)` and nothing else -- so by this
+    function's own stated scope above they always belonged here, and
+    `validate_contract` no longer carries a copy of either. The
+    consequence that motivated the move: every consumer of this function
+    now sees them, `schema_inference.illegal_mapped_slots` included, which
+    is what lets the browser's slot-resolution form render a row for a
+    mapping the validator refuses for either reason instead of only for
+    the three rules above. Everything ELSE in those loops
+    (content_address/composed placement, default_by, the header-dependent
+    column checks) genuinely needs section or full-contract context and
+    stays where it is."""
     problems: list[str] = []
     if isinstance(mapping, _BLANK_BEARING_KINDS):
         _check_blank_policy(problems, where, mapping.blank, target)
     _check_parser_placement(problems, where, mapping)
     _check_column_mapping_type(problems, where, target, mapping)
+    if isinstance(mapping, NotCollectedMapping) and target not in GAP_LEGAL_TARGETS:
+        problems.append(f"{where}: not_collected has no NOT_COLLECTED_DEFAULTS entry for {target!r}")
+    if isinstance(mapping, VocabularyMapping):
+        for value in mapping.table.values():
+            _check_vocabulary_value(problems, where, target, value)
     return problems
 
 

@@ -2022,7 +2022,14 @@ async function openResolvePanel(name, uploadId) {
   // one combined row set -- each entry already carries its own `kind`, so
   // `resolveSlotRowHtml` can word the two differently without this panel
   // needing to know which list an entry came from.
-  renderResolvePanel(card, [...data.unresolved, ...(data.illegal || [])]);
+  // Two response-level facts stamped onto each row, rather than repeated
+  // per entry server-side: an uncorrectable row needs to name the real
+  // file and format to edit by hand, and both are properties of the
+  // proposal, not of any one slot.
+  const rows = [...data.unresolved, ...(data.illegal || [])].map((slot) =>
+    Object.assign({ saved_proposal_path: data.saved_proposal_path, format_name: data.name }, slot)
+  );
+  renderResolvePanel(card, rows);
 }
 
 /* Shared by the unresolved-slot resolver and the low-confidence-mapping
@@ -2039,11 +2046,37 @@ async function openResolvePanel(name, uploadId) {
  * `data-initial-value`, so a caller (the low-confidence corrector's dirty
  * check, `isLowConfidenceItemDirty`) can tell "still exactly what was
  * proposed" apart from "edited, not yet applied" without re-deriving it. */
-function resolveSlotRowHtml(slot) {
+/* THE single decision about what this form can actually build for a row --
+ * consulted by the renderer (which control to draw), by `buildSlotMapping`
+ * (which mapping to build from it) and by `buildResolvedProposal` (whether
+ * to rebuild the row at all). Deliberately one function rather than three
+ * places that each re-derive it: the dead-row bug this closes existed
+ * precisely because the render conditions and the build conditions were
+ * written separately and disagreed -- the renderer drew nothing while the
+ * builder still fell through to its vocabulary branch and emitted a
+ * mapping with `column: undefined`, which JSON.stringify drops and the
+ * server then refuses, taking every correctly-filled row in the same
+ * submission down with it.
+ *
+ * Client-side on purpose, and NOT marked by the endpoint. "Is this row
+ * correctable" is not a fact about the contract grammar -- the server
+ * already reports that, as `reason`. It is a fact about what THIS FORM can
+ * emit, and `buildSlotMapping` can emit exactly three mapping kinds. Only
+ * this file knows that. A server-side `correctable` flag would have to
+ * restate these conditions in Python and would silently go stale the day a
+ * fourth control is added here -- the same "one component asserting a rule
+ * another component actually owns" shape that produced the original bug.
+ * Single-sourcing it HERE, where the capability lives, is what makes drift
+ * structurally impossible rather than merely unlikely: adding a control
+ * means adding a branch to this function, and the renderer and builder
+ * both follow automatically.
+ *
+ * Returns `{columnPicker, valuePicker, notCollected}`; every field falsy
+ * means the form cannot correct this slot at all. */
+function resolveSlotControls(slot) {
   const vocab = slot.target_vocabulary;
   const column = slot.candidate_columns[0];
   const profile = column ? slot.column_profiles[column] : null;
-  const currentValues = slot.current_values || null;
   // Both false only for a target this backend endpoint hasn't been taught
   // about yet (every real target is in at least one of these two sets --
   // config_model.ABSENT_FACT_LEGAL_TARGETS covers essentially every
@@ -2052,32 +2085,48 @@ function resolveSlotRowHtml(slot) {
   const gapLegal = slot.gap_legal !== undefined ? slot.gap_legal : true;
   const absentFactLegal = !!slot.absent_fact_legal;
 
+  // A free-text target (finding.product, .evidence, ...) has no closed set
+  // of legal values to pick per source value -- the correction is WHICH
+  // column feeds it, not what each value maps to. Building this as a
+  // `column` mapping (never a value lookup) keeps Rule 2's "no free-text
+  // pattern at runtime" intact: the human picks a column from a closed
+  // list the model already profiled, nothing else.
+  const blankPolicy = absentFactLegal ? "absent_fact" : gapLegal ? "gap" : null;
+  const columnPicker = !vocab && slot.candidate_columns.length && blankPolicy ? blankPolicy : null;
+  const valuePicker =
+    column && profile && vocab && (vocab.kind === "enum" || vocab.kind === "range" || vocab.kind === "bool")
+      ? { column, profile, vocab }
+      : null;
+  return { columnPicker, valuePicker, notCollected: gapLegal };
+}
+
+function slotIsCorrectable(slot) {
+  const c = resolveSlotControls(slot);
+  return !!(c.columnPicker || c.valuePicker || c.notCollected);
+}
+
+function resolveSlotRowHtml(slot) {
+  const controls = resolveSlotControls(slot);
+  const vocab = slot.target_vocabulary;
+  const currentValues = slot.current_values || null;
+  const gapLegal = controls.notCollected;
+
   let valuePickerHtml = "";
   let columnPickerHtml = "";
-  if (!vocab && slot.candidate_columns.length) {
-    // A free-text target (finding.product, .evidence, ...) has no closed
-    // set of legal values to pick per source value -- the correction is
-    // WHICH column feeds it, not what each value maps to. Building this as
-    // a `column` mapping (never a value lookup) keeps Rule 2's "no
-    // free-text pattern at runtime" intact: the human picks a column from
-    // a closed list the model already profiled, nothing else.
-    const blankPolicy = absentFactLegal ? "absent_fact" : gapLegal ? "gap" : null;
-    if (blankPolicy) {
-      const options = slot.candidate_columns
-        .map((c) => `<option value="${esc(c)}">${esc(c)}</option>`)
-        .join("");
-      columnPickerHtml = `
-        <p class="hint">No fixed set of legal values for this field -- map it directly to the column it should read from:</p>
-        <select class="resolve-column-select" data-blank-policy="${blankPolicy}">${options}</select>
-      `;
-    }
+  if (controls.columnPicker) {
+    const options = slot.candidate_columns
+      .map((c) => `<option value="${esc(c)}">${esc(c)}</option>`)
+      .join("");
+    columnPickerHtml = `
+      <p class="hint">No fixed set of legal values for this field -- map it directly to the column it should read from:</p>
+      <select class="resolve-column-select" data-blank-policy="${controls.columnPicker}">${options}</select>
+    `;
   }
-  if (!vocab && !columnPickerHtml) {
-    valuePickerHtml = gapLegal
-      ? `<p class="hint">No candidate column with a known profile -- only "mark not collected" is offered.</p>`
-      : `<p class="chat-msg-error">This slot has no legal automatic resolution through this form: no candidate column to map to, and "not collected" is not a legal value for this target. Edit the saved proposal file by hand and re-run "rhino adapt propose --from-proposal".</p>`;
+  if (!vocab && !columnPickerHtml && gapLegal) {
+    valuePickerHtml = `<p class="hint">No candidate column with a known profile -- only "mark not collected" is offered.</p>`;
   }
-  if (column && profile && vocab && (vocab.kind === "enum" || vocab.kind === "range" || vocab.kind === "bool")) {
+  const { column, profile } = controls.valuePicker || {};
+  if (controls.valuePicker) {
     const selectOptions = (current) => {
       if (vocab.kind === "bool") {
         return [
@@ -2141,6 +2190,32 @@ function resolveSlotRowHtml(slot) {
     `
     : "";
 
+  // Nothing this form can build for this slot -- `asset.role` mapped
+  // `not_collected` is the live case: not_collected cites no column, so
+  // there is nothing to pick from, and "mark not collected" is the very
+  // thing the validator is refusing. Say so, name the recourse with the
+  // real file path (`saved_proposal_path`, supplied by the endpoint --
+  // the one fact this form genuinely cannot derive), and, critically,
+  // mark the row `data-uncorrectable` so `buildResolvedProposal` leaves
+  // it alone. Before this, such a row rendered empty and still went
+  // through buildSlotMapping's vocabulary fallthrough with no column,
+  // failing the WHOLE submission and discarding every other row the human
+  // had filled in correctly.
+  if (!slotIsCorrectable(slot)) {
+    const recourse = slot.saved_proposal_path
+      ? `Edit <code>${esc(slot.saved_proposal_path)}</code> by hand, then re-run <code>rhino adapt propose ${esc(slot.format_name || "&lt;name&gt;")} --from-proposal ${esc(slot.saved_proposal_path)}</code>.`
+      : `Edit the saved proposal file by hand and re-run "rhino adapt propose --from-proposal".`;
+    return `
+      <div class="resolve-slot resolve-slot-uncorrectable" data-slot="${esc(slot.slot)}" data-uncorrectable="true">
+        <h4>${esc(slot.slot)}</h4>
+        ${confidenceHtml}
+        ${reasonHtml}
+        <p class="chat-msg-error">This slot cannot be corrected from this form: there is no candidate column to map it to, and "not collected" is not a legal value for this target. ${recourse}</p>
+        <p class="hint">Other slots below can still be resolved and resubmitted -- this one is left exactly as it is.</p>
+      </div>
+    `;
+  }
+
   return `
     <div class="resolve-slot" data-slot="${esc(slot.slot)}">
       <h4>${esc(slot.slot)}</h4>
@@ -2170,6 +2245,16 @@ function renderResolvePanel(card, slots) {
  * never anything the closed grammar's own `check_grounding`/
  * `assemble_contract` gate wouldn't already accept from a model. */
 function buildSlotMapping(slot, row) {
+  // Stands on the SAME `resolveSlotControls` the renderer drew this row
+  // from, so "what was drawn" and "what can be built" cannot disagree.
+  // Two cases return null -- no mapping, leave the slot as it is:
+  // an uncorrectable slot (nothing was drawn at all), and a slot whose
+  // only control is the not-collected checkbox left unchecked (the human
+  // declined the one correction on offer; the old code fell through to
+  // the vocabulary branch here and emitted `column: undefined`).
+  const controls = resolveSlotControls(slot);
+  if (!(controls.columnPicker || controls.valuePicker || controls.notCollected)) return null;
+
   // A free-text target (no target_vocabulary) has no per-value picker at
   // all -- its only controls are this column-select and (when legal) the
   // not-collected checkbox below, so it's checked first.
@@ -2190,7 +2275,15 @@ function buildSlotMapping(slot, row) {
       evidence: { columns_cited: [], sample_values_cited: [], note: "Marked not collected via the browser slot-resolution form." },
     };
   }
-  const column = slot.candidate_columns[0];
+  // The value-picker branch, and the ONLY one that can legally get here --
+  // reached via controls.valuePicker's own column, never
+  // `slot.candidate_columns[0]` unconditionally. That unconditional read is
+  // what produced `column: undefined` for a row with no picker drawn; the
+  // guard above now makes that unreachable, and taking the column from the
+  // same object the renderer drew from makes it unreachable for the right
+  // reason rather than by luck.
+  if (!controls.valuePicker) return null;
+  const column = controls.valuePicker.column;
   const table = {};
   row.querySelectorAll(".resolve-value-select").forEach((input) => {
     const value = input.value.trim();
@@ -2267,6 +2360,13 @@ function _isColumnUsedElsewhere(proposal, column, excludeSlotKey) {
 function applySlotEditToProposal(proposal, slot, row) {
   const [section, target] = slot.slot.split(".");
   const built = buildSlotMapping(slot, row);
+  // Nothing was built -- the slot is uncorrectable through this form, or
+  // its only control was declined. Leave the proposal's own entry exactly
+  // as it arrived, and skip the unmapped_columns bookkeeping below too:
+  // that settles a slot's CANDIDATE columns on the strength of what the
+  // new mapping reads, and there is no new mapping here to settle them
+  // against.
+  if (!built) return proposal;
   proposal[section][target] = built;
 
   // Every real header column must end up either mapped or explicitly
@@ -2307,8 +2407,14 @@ function applySlotEditToProposal(proposal, slot, row) {
 
 function buildResolvedProposal(card, slots) {
   const proposal = JSON.parse(JSON.stringify(card.savedProposal.proposal));
-  for (const slot of slots) {
+  // Uncorrectable rows are excluded from the rebuild entirely -- they have
+  // no controls to read and nothing this form could put in their place, so
+  // they pass through untouched and the rows a human DID fill in still
+  // submit. `slotIsCorrectable` is the same `resolveSlotControls` the rows
+  // were rendered from, not a second reading of the DOM.
+  for (const slot of slots.filter(slotIsCorrectable)) {
     const row = card.querySelector(`.resolve-slot[data-slot="${CSS.escape(slot.slot)}"]`);
+    if (!row) continue;
     applySlotEditToProposal(proposal, slot, row);
   }
   return proposal;

@@ -309,6 +309,82 @@ def test_get_proposal_surfaces_an_illegal_mapped_slot_distinctly_from_unresolved
     assert "asset.role" not in {u["slot"] for u in body["unresolved"]}
 
 
+def test_get_proposal_surfaces_an_illegal_vocabulary_value_with_a_usable_picker(client: TestClient):
+    """One of the two classes that used to be enforced only by
+    validate_contract and gated only in the browser. 'srv' is a real
+    observed token, so check_grounding passes it cleanly -- it says nothing
+    about whether 'supervisor' is a legal AssetRole. The row must carry the
+    validator's own text AND the column profile, since correcting this one
+    means repicking each value against the real column."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-badvalue")
+    proposal["asset"]["role"] = {
+        "status": "mapped", "confidence": 0.9,
+        "mapping": {
+            "kind": "vocabulary", "column": "Col", "case": "lower", "blank": "fatal",
+            "table": {"srv": "supervisor", "wks": "workstation"},
+        },
+        "evidence": {"columns_cited": ["Col"], "sample_values_cited": [], "note": "test reasoning"},
+    }
+    job = _propose_edited(client, upload_id, "upload-badvalue", proposal)
+    assert job["status"] == "succeeded"
+    assert job["result"]["grounding"]["failures"] == []  # grounding really is clean; only the value rule catches this
+
+    resp = client.get("/api/adapters/upload-badvalue/proposal", params={"upload_id": upload_id})
+    assert resp.status_code == 200
+    entry = {e["slot"]: e for e in resp.json()["illegal"]}["asset.role"]
+    assert entry["kind"] == "illegal"
+    assert "'supervisor' is not one of" in entry["reason"]  # the validator's own text
+    # The row has what the value-picker needs to actually be correctable.
+    assert entry["candidate_columns"] == ["Col"]
+    assert set(entry["column_profiles"]["Col"]["distinct_values"]) == {"srv", "wks"}
+    assert entry["target_vocabulary"]["kind"] == "enum"
+
+
+def test_get_proposal_surfaces_not_collected_on_a_target_with_no_defaults_entry(client: TestClient):
+    """The other class. `role` falls back through default_by/
+    ROLE_DEFAULT_BY_OS_CLASS, never a bare not_collected mapping, so it has
+    no NOT_COLLECTED_DEFAULTS entry. The browser hides its not-collected
+    checkbox for exactly this target, but that gate is client-side and
+    /api/jobs is not bound to the browser.
+
+    Pins the row's SHAPE as well as its presence, because the shape is the
+    known limitation: a not_collected mapping cites no column, so
+    candidate_columns is empty and gap_legal is false -- which between them
+    leave resolveSlotRowHtml with no control to render. The row states the
+    reason; it is not yet correctable in the form. Asserted so that stays a
+    recorded fact rather than a surprise."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-badgap")
+    proposal["asset"]["role"] = {
+        "status": "mapped", "confidence": 0.9,
+        "mapping": {"kind": "not_collected"},
+        "evidence": {"columns_cited": [], "sample_values_cited": [], "note": "test reasoning"},
+    }
+    job = _propose_edited(client, upload_id, "upload-badgap", proposal)
+    assert job["status"] == "succeeded"
+
+    resp = client.get("/api/adapters/upload-badgap/proposal", params={"upload_id": upload_id})
+    assert resp.status_code == 200
+    body = resp.json()
+    entry = {e["slot"]: e for e in body["illegal"]}["asset.role"]
+    assert entry["kind"] == "illegal"
+    assert "not_collected has no NOT_COLLECTED_DEFAULTS entry for 'role'" in entry["reason"]
+    assert entry["current_mapping"] == {"kind": "not_collected"}
+    assert entry["candidate_columns"] == []  # no column is cited, so none can be offered
+    assert entry["gap_legal"] is False  # and "mark not collected" is the very thing being refused
+    # Mapped-but-illegal is not unresolved -- never both lists.
+    assert "asset.role" not in {u["slot"] for u in body["unresolved"]}
+    # The form names this file as the recourse for a row it cannot correct.
+    # Response-level, not per-row: it is a property of the proposal.
+    assert body["saved_proposal_path"].endswith("propose_upload-badgap.json")
+    assert Path(body["saved_proposal_path"]).is_file()
+    # And deliberately NOT a server-side "correctable" flag -- which
+    # controls this form can emit is app.js's fact, not the endpoint's
+    # (resolveSlotControls' own comment argues it).
+    assert "correctable" not in entry
+
+
 def test_get_proposal_illegal_is_empty_for_a_clean_proposal(client: TestClient):
     upload_id = _upload(client)
     job = _propose(client, upload_id, "upload-clean", _proposal_dict(name="upload-clean"))

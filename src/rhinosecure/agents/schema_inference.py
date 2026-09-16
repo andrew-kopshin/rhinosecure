@@ -960,7 +960,31 @@ def illegal_mapped_slots(proposal: AdapterProposal, profiles: dict[str, FileProf
     FRESH model candidate during generation -- so this can never drift
     from what a real `validate_contract` call, or the provisional-degrade
     path's own `_degrade_invalid_slots`, would independently decide is
-    illegal about the same mapping."""
+    illegal about the same mapping.
+
+    Coverage, stated because it is narrower than "everything
+    validate_contract can refuse per slot" and should not be mistaken for
+    it: this reports the rules that depend only on `(target, mapping)`
+    plus the one data-dependent `ColumnMapping` value check. Two of those
+    -- a `not_collected` mapping on a target with no
+    `NOT_COLLECTED_DEFAULTS` entry, and a vocabulary table value illegal
+    for its target -- were relocated into `check_slot_mapping_legality`
+    for exactly this reason: both are things the browser's resolve-slots
+    form can author (its `not_collected` checkbox and its per-value
+    pickers are gated client-side off the same `GAP_LEGAL_TARGETS` and
+    `describe_target_vocabulary` the validator reads, and a client-side
+    gate is not a guarantee -- `POST /api/jobs` is not bound to the
+    browser), so a human who produces one needs the row back rather than
+    a refusal with nothing to act on.
+
+    Still NOT covered, deliberately: `content_address`/`composed`
+    misplacement, `default_by` problems, and the header-dependent column
+    checks. Those need section or full-contract context this function
+    does not have, and -- the reason it is a scope decision rather than a
+    gap -- the form cannot build any of those mapping kinds in the first
+    place (`buildSlotMapping`, app.js, emits only `column`,
+    `not_collected` and `vocabulary`), so there is no row to render for a
+    slot a human could not have authored this way."""
     return _mapped_slot_legality_problems(proposal, profiles)
 
 

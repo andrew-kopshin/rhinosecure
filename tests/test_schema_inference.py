@@ -993,6 +993,76 @@ def test_illegal_mapped_slots_reports_every_violating_slot_together(profiles):
     assert set(result) == {"asset.role", "finding.detected_date"}
 
 
+# --- illegal_mapped_slots: the two classes the resolve-slots form can
+# AUTHOR, previously enforced only by validate_contract (and gated only
+# client-side, which POST /api/jobs is not bound by) ------------------------
+
+
+def test_illegal_mapped_slots_reports_not_collected_on_a_target_with_no_defaults(profiles):
+    """The form's not-collected checkbox is hidden for a target outside
+    GAP_LEGAL_TARGETS, but that gate lives in the browser -- a direct POST,
+    a hand-edited --from-proposal file, or a model proposal reaches here
+    anyway. Before this class was surfaced the mapping was refused with no
+    row to correct it."""
+    data = _full_proposal_dict(overrides_asset={"role": _mapped({"kind": "not_collected"})})
+    proposal = AdapterProposal.model_validate(data)
+
+    result = illegal_mapped_slots(proposal, profiles)
+
+    assert list(result) == ["asset.role"]
+    (reason,) = result["asset.role"]
+    assert "not_collected has no NOT_COLLECTED_DEFAULTS entry for 'role'" in reason  # the validator's own text
+    # The same mapping on a gap-legal target is perfectly fine -- this is a
+    # per-target rule, not a blanket ban on not_collected.
+    assert illegal_mapped_slots(
+        AdapterProposal.model_validate(
+            _full_proposal_dict(overrides_asset={"environment": _mapped({"kind": "not_collected"})})
+        ),
+        profiles,
+    ) == {}
+
+
+def test_illegal_mapped_slots_reports_a_vocabulary_value_illegal_for_its_target(profiles):
+    """check_grounding verifies a vocabulary table's KEYS are real observed
+    tokens and says nothing about its VALUES, so 'srv' being genuinely in
+    the file does not make 'supervisor' a legal AssetRole. Grounding is
+    asserted clean here so the row can only be coming from this check."""
+    data = _full_proposal_dict(overrides_asset={
+        "role": _mapped(
+            {"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "fatal", "table": {"srv": "supervisor"}},
+            columns_cited=["Col"],
+        ),
+    })
+    proposal = AdapterProposal.model_validate(data)
+    assert check_grounding(proposal, profiles).failures == []  # the key really is a real observed token
+
+    result = illegal_mapped_slots(proposal, profiles)
+
+    assert list(result) == ["asset.role"]
+    (reason,) = result["asset.role"]
+    assert "'supervisor' is not one of" in reason  # the validator's own text, naming the legal set
+    assert reason.startswith("asset.role: ")
+
+
+def test_illegal_mapped_slots_reports_an_out_of_range_vocabulary_value(profiles):
+    """The numeric branch of the same rule: criticality is a 1-5 range, and
+    a table value outside it is exactly the "the model guessed a scale"
+    failure LOW_CONFIDENCE_THRESHOLD exists to flag -- except this one is
+    mechanically checkable, so it is a row rather than an attestation."""
+    data = _full_proposal_dict(overrides_asset={
+        "criticality": _mapped(
+            {"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "gap", "table": {"srv": 9}},
+            columns_cited=["Col"],
+        ),
+    })
+    proposal = AdapterProposal.model_validate(data)
+
+    result = illegal_mapped_slots(proposal, profiles)
+
+    assert list(result) == ["asset.criticality"]
+    assert "is not an int in [1, 5]" in result["asset.criticality"][0]
+
+
 def test_assemble_contract_a_caveat_alone_does_not_block(tmp_path):
     from rhinosecure.adapters.probe import MAX_DISTINCT_TRACKED
 

@@ -969,10 +969,91 @@ def test_check_slot_mapping_legality_passes_a_legal_mapping():
 
 
 def test_check_slot_mapping_legality_ignores_kinds_with_no_blank_or_parser():
-    # not_collected has neither a `blank` field nor a `parser` -- must be a
-    # silent no-op here (its own legality -- whether `role` may be
-    # not_collected at all -- is a DIFFERENT check, not this function's job).
-    assert check_slot_mapping_legality("asset.role", "role", NotCollectedMapping(kind="not_collected")) == []
+    # not_collected has neither a `blank` field nor a `parser`, so the
+    # blank-policy and parser-placement rules must both be silent no-ops
+    # for it. Asserted against a GAP-LEGAL target so the separate
+    # not_collected rule below has nothing to say either -- this test is
+    # about the two field-shaped rules not firing spuriously, and using
+    # `role` here would now conflate that with the relocated rule.
+    assert "environment" in GAP_LEGAL_TARGETS  # the premise this case rests on
+    assert check_slot_mapping_legality("asset.environment", "environment", NotCollectedMapping(kind="not_collected")) == []
+
+
+# --- check_slot_mapping_legality: the two rules RELOCATED here out of
+# validate_contract's own per-slot loops. Both depend only on
+# (target, mapping), so they belonged in this function by its own stated
+# scope -- and moving them is what lets schema_inference.illegal_mapped_slots
+# surface them, since it stands on this function rather than on
+# validate_contract. -----------------------------------------------------
+
+
+def test_not_collected_on_a_target_with_no_defaults_entry_is_illegal():
+    """`role` is the sharpest case: it falls back through default_by/
+    ROLE_DEFAULT_BY_OS_CLASS, never a bare not_collected mapping, so it has
+    no NOT_COLLECTED_DEFAULTS entry and a not_collected mapping on it is
+    what validate_contract refuses. Previously this function said nothing
+    about it and only the full validator did."""
+    assert "role" not in GAP_LEGAL_TARGETS  # the premise: no defaults entry
+    problems = check_slot_mapping_legality("asset.role", "role", NotCollectedMapping(kind="not_collected"))
+    assert len(problems) == 1
+    assert "not_collected has no NOT_COLLECTED_DEFAULTS entry for 'role'" in problems[0]
+    assert problems[0].startswith("asset.role: ")  # the caller's own `where`, so a row can be keyed off it
+
+
+def test_a_vocabulary_value_illegal_for_its_target_is_reported():
+    """A vocabulary table's KEYS are what check_grounding verifies are real
+    observed tokens; its target-side VALUES are a different claim entirely,
+    and 'supervisor' is not an AssetRole. Reported per offending value, with
+    the legal set named, exactly as validate_contract worded it."""
+    mapping = VocabularyMapping(
+        kind="vocabulary", column="Asset_Type", blank="fatal",
+        table={"Workstation": "workstation", "Boss": "supervisor"},
+    )
+    problems = check_slot_mapping_legality("asset.role", "role", mapping)
+    assert len(problems) == 1  # only the illegal value, not the legal one beside it
+    assert "'supervisor' is not one of" in problems[0]
+    assert "workstation" in problems[0]  # the legal set really is spelled out
+
+
+def test_a_vocabulary_value_out_of_a_numeric_targets_range_is_reported():
+    """The range branch of the same rule -- criticality is 1-5, so 9 is
+    illegal even though the mapping's shape is perfectly valid."""
+    mapping = VocabularyMapping(
+        kind="vocabulary", column="Sev", blank="fatal", table={"Critical": 5, "Apocalyptic": 9},
+    )
+    problems = check_slot_mapping_legality("asset.criticality", "criticality", mapping)
+    assert len(problems) == 1
+    assert "9" in problems[0] and "is not an int in [1, 5]" in problems[0]
+
+
+def test_relocated_rules_are_not_reported_twice_by_validate_contract():
+    """The relocation removed validate_contract's own inline copies. Had
+    either been left behind, the validator would now name the same problem
+    TWICE for one slot -- that specific regression is what this asserts
+    against, not merely that the contract still fails. Both rules are
+    exercised on the same contract, one per section, so a leftover copy in
+    either loop is caught."""
+    from rhinosecure.adapters.config_model import _compute_not_collected
+
+    contract_dict = _minimal_contract_mapping_one_target("owner", "gap")
+    contract_dict["asset"]["role"] = {"kind": "not_collected"}
+    contract_dict["finding"]["scanner_severity"] = {
+        "kind": "vocabulary", "column": "Col", "case": "lower", "blank": "fatal", "table": {"x": "catastrophic"},
+    }
+    # Recomputed the way the helper itself does, so V09 doesn't pile an
+    # unrelated mismatch on top of the two problems under test.
+    header_set = set(_MINIMAL_HEADER)
+    contract_dict["not_collected"] = {}
+    contract_dict["not_collected"] = _compute_not_collected(
+        Contract.model_validate(contract_dict), header_set, header_set
+    ).model_dump()
+
+    with pytest.raises(ContractValidationError) as exc:
+        validate_contract(Contract.model_validate(contract_dict), {"data.csv": _MINIMAL_HEADER})
+
+    message = str(exc.value)
+    assert message.count("not_collected has no NOT_COLLECTED_DEFAULTS entry for 'role'") == 1
+    assert message.count("'catastrophic' is not one of") == 1
 
 
 # --- check_slot_mapping_legality: a "column" mapping can never legally feed
