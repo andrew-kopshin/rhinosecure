@@ -72,10 +72,12 @@ flow (Slices 7-8), not something this mechanical pass decides on its own.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from pathlib import Path
+from typing import IO
+import codecs
 import csv
 import re
 
@@ -339,6 +341,188 @@ class FileProfile:
     problems: list[str]
 
 
+class _NeedsPreciseRescan(Exception):
+    """Internal-only, never seen outside `profile_csv`: signals that the fast
+    reader (below) hit a `UnicodeDecodeError` whose attribution -- header vs.
+    mid-file -- cannot be trusted, and a byte-exact rescan is needed. See
+    `profile_csv`'s own docstring for why this exists."""
+
+
+def _iter_decoded_lines_precise(path: Path, encoding: str) -> Iterator[str]:
+    """Decode `path` one RAW BYTE at a time and yield each complete physical
+    line (through its own `\\n`, `\\r` preserved -- the `newline=""` contract
+    `csv.reader` needs for correct embedded-newline-in-quoted-field handling,
+    matched here by never translating line endings, only splitting on `\\n`).
+
+    This exists for exactly one reason: `codecs.IncrementalDecoder.decode()`
+    given a single byte either returns the one character that byte completes
+    (buffering silently across a multi-byte sequence, correctly, for every
+    encoding this project legally declares -- cp1252, utf-8[-sig], utf-16[-le
+    -be] all have real IncrementalDecoder implementations with exactly this
+    contract) or raises `UnicodeDecodeError` for THAT byte specifically, with
+    zero ambiguity about which byte it was or what came before it. A caller
+    iterating this generator with `csv.reader` therefore gets every row that
+    genuinely decodes, in order, and the exception genuinely surfaces at the
+    first physical line that could not be completed -- never earlier, never
+    later, regardless of how large or small the file is. See
+    `_scan_csv`'s docstring for why the header-vs-mid-file question needs
+    this guarantee and a bulk chunked reader cannot honestly give it.
+
+    Deliberately slow -- this is the FALLBACK path, used only after a fast
+    chunked read has already hit a decode problem somewhere in the file, not
+    the default. A multi-megabyte file with no decode problem never reaches
+    this function at all; one that does have a problem pays a real, bounded
+    (by how far into the file the first bad byte is, not by the whole file)
+    per-byte cost to find out exactly where -- the honest price of an exact
+    answer, not a guess dressed up as one."""
+    decoder = codecs.getincrementaldecoder(encoding)()
+    buffer: list[str] = []
+    with path.open("rb") as raw:
+        while True:
+            byte = raw.read(1)
+            if not byte:
+                break
+            piece = decoder.decode(byte)  # "" while a multi-byte char is incomplete
+            if not piece:
+                continue
+            buffer.append(piece)
+            if piece == "\n":
+                yield "".join(buffer)
+                buffer = []
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            buffer.append(tail)
+    if buffer:
+        yield "".join(buffer)
+
+
+def _scan_csv(
+    path: Path,
+    encoding: str,
+    delimiter: str,
+    quotechar: str,
+    skip_lines: int,
+    declared: bool,
+    *,
+    precise: bool,
+) -> FileProfile:
+    """The actual profiling pass, run against either reader `profile_csv`
+    (below) can supply: the fast, chunked `TextIOWrapper`+`csv.reader` pair
+    (`precise=False`) or `_iter_decoded_lines_precise` (`precise=True`). The
+    header-vs-mid-file classification logic is identical either way -- what
+    changes is whether a caught `UnicodeDecodeError` is trusted as final
+    (`precise=True`: classify and report/raise for real) or treated as
+    provisional (`precise=False`: bail out via `_NeedsPreciseRescan` without
+    deciding anything, since the fast reader's own internal chunk size can
+    span both the header and a later row for a small file, making WHICH
+    `except` block catches it an accident of file size and chunk boundaries,
+    not a fact about where the bad byte is)."""
+    problems = NonRaisingProblemCollector(path)
+
+    if precise:
+        line_source: Iterator[str] | IO[str] = _iter_decoded_lines_precise(path, encoding)
+        opened_file: IO[str] | None = None
+    else:
+        try:
+            opened_file = path.open(newline="", encoding=encoding)
+        except OSError as exc:
+            raise ProbeError(f"{path}: could not be opened -- {exc}") from exc
+        line_source = opened_file
+
+    try:
+        if opened_file is not None:
+            for _ in range(skip_lines):
+                opened_file.readline()  # a banner above the real header, if one is declared
+        else:
+            for _ in range(skip_lines):
+                next(line_source, None)
+        reader = csv.reader(line_source, delimiter=delimiter, quotechar=quotechar)
+        try:
+            header = next(reader)
+        except StopIteration:
+            raise ProbeError(f"{path}: empty file -- no header row") from None
+        except UnicodeDecodeError as exc:
+            if not precise:
+                raise _NeedsPreciseRescan() from None
+            raise ProbeError(_decode_error_message(path, encoding, exc, declared=declared)) from None
+        if not header:
+            raise ProbeError(f"{path}: header row is empty")
+
+        duplicate_header_names = sorted({name for name in header if header.count(name) > 1})
+        if duplicate_header_names:
+            problems.add(
+                f"header: column name(s) {duplicate_header_names} appear more than once -- a row "
+                "reader keeps only the LAST occurrence's value for a repeated name, and this profile "
+                "does the same"
+            )
+
+        # dict comprehension collapses a repeated name to one accumulator,
+        # matching the last-occurrence-wins semantics `duplicate_header_names`
+        # already warns about.
+        accumulators = {name: _ColumnAccumulator() for name in header}
+
+        row_count = 0
+        ragged_rows = 0
+        truncated = False
+        try:
+            for row in reader:
+                row_count += 1
+                row_no = reader.line_num
+                if len(row) != len(header):
+                    ragged_rows += 1
+                    if ragged_rows <= MAX_PROBLEMS_SHOWN:
+                        problems.add(f"row {row_no}: expected {len(header)} field(s), found {len(row)}")
+                # dict(zip(...)) gives last-occurrence-wins for a repeated
+                # header name, and a SHORT row simply never reaches the
+                # trailing column names -- they are not observed for this
+                # row at all, not counted as blank (a truncated field is
+                # not a field with an empty value; see ingest.iter_csv_rows,
+                # whose docstring draws the identical distinction for the
+                # real engine).
+                for name, value in dict(zip(header, row)).items():
+                    accumulators[name].observe(value)
+        except UnicodeDecodeError as exc:
+            if not precise:
+                raise _NeedsPreciseRescan() from None
+            truncated = True
+            # `_decode_error_message` always leads with "{path}: " -- stripped here since
+            # `_print_probe_report` already prints the filename as this file's own heading,
+            # directly above the `problems` list this message joins (cli.py's own
+            # `_column_row`-adjacent rendering); every other entry in that list already omits
+            # the path for the same reason (see e.g. the duplicate-header-name message above).
+            detail = _decode_error_message(path, encoding, exc, declared=declared).removeprefix(f"{path}: ")
+            problems.add(
+                f"row {row_count + 1}: profiling stopped here, counts above reflect only the rows read "
+                f"before this point -- {detail}"
+            )
+        if ragged_rows > MAX_PROBLEMS_SHOWN:
+            problems.add(f"... and {ragged_rows - MAX_PROBLEMS_SHOWN} more ragged row(s)")
+    finally:
+        if opened_file is not None:
+            opened_file.close()
+
+    columns = {name: acc.finalize(name) for name, acc in accumulators.items()}
+    for name, profile in columns.items():
+        if profile.distinct_overflow:
+            problems.add(
+                f"column {name!r}: reached the tracked-distinct-values cap ({MAX_DISTINCT_TRACKED}); "
+                "it has at least that many distinct values, the true count is not known"
+            )
+
+    return FileProfile(
+        path=path,
+        encoding=encoding,
+        delimiter=delimiter,
+        header=header,
+        duplicate_header_names=duplicate_header_names,
+        row_count=row_count,
+        ragged_rows=ragged_rows,
+        truncated=truncated,
+        columns=columns,
+        problems=list(problems.fatal),
+    )
+
+
 def profile_csv(
     path: Path,
     *,
@@ -378,99 +562,48 @@ def profile_csv(
     identical reason: it has no `Source` to have declared anything in
     either. Decode-error wording is otherwise identical either way --
     `_decode_error_message` is the single place that text is written, not
-    re-derived per call site."""
+    re-derived per call site.
+
+    Two readers, one fast and one exact, not one. `_scan_csv` (above) does
+    the real work; this function tries it FAST first --
+    `path.open(newline="", encoding=encoding)` wrapped by `csv.reader`,
+    exactly as before -- and only reaches for `precise=True` when that fast
+    attempt cannot be trusted to have classified its own failure correctly.
+
+    The reason it can't always be trusted: `io.TextIOWrapper` decodes in
+    large internal chunks (its own read-ahead, sized independent of line
+    boundaries), so for a file small enough that the header AND the first
+    bad byte both land in the SAME chunk -- true of any file under roughly
+    8KB, which covers every fixture and most hand-authored test files in
+    this repo -- the very first `next(reader)` call (nominally "read the
+    header") can raise `UnicodeDecodeError` even though the header itself
+    decodes fine and the actual bad byte is in a later row. Confirmed live:
+    the real `data/cp1252-sample/assets.csv` fixture (a clean ASCII header,
+    cp1252-only bytes in row 1) read under a wrong declared encoding raised
+    from the HEADER try/except, not the row one, before this existed --
+    which read caught the exception was an accident of file size and
+    `TextIOWrapper`'s own chunk size, not a fact about where the bad byte
+    actually is. For a file LARGER than one internal chunk, the fast
+    reader's classification usually happens to already be correct (an
+    earlier chunk that decoded cleanly already returned its rows before a
+    later chunk's failure is ever reached) -- but "usually" is not a
+    guarantee this function is willing to rely on, so `precise=True` is the
+    unconditional fallback for ANY `UnicodeDecodeError` from the fast
+    reader, not a special case reserved for small files.
+
+    `_iter_decoded_lines_precise` (its own docstring has the mechanism)
+    guarantees the fast reader cannot: exact, byte-level attribution. It
+    only ever runs after the fast attempt has already found a real decode
+    problem somewhere in the file -- never on the clean, no-error path,
+    which stays exactly as fast as before this existed."""
     if not path.is_file():
         raise ProbeError(f"{path}: not a file")
 
     encoding = encoding or detect_encoding(path)
-    problems = NonRaisingProblemCollector(path)
-
     try:
-        f = path.open(newline="", encoding=encoding)
-    except OSError as exc:
-        raise ProbeError(f"{path}: could not be opened -- {exc}") from exc
-
-    with f:
-        for _ in range(skip_lines):
-            f.readline()  # a banner above the real header, if one is declared
-        reader = csv.reader(f, delimiter=delimiter, quotechar=quotechar)
-        try:
-            header = next(reader)
-        except StopIteration:
-            raise ProbeError(f"{path}: empty file -- no header row") from None
-        except UnicodeDecodeError as exc:
-            raise ProbeError(_decode_error_message(path, encoding, exc, declared=declared)) from None
-        if not header:
-            raise ProbeError(f"{path}: header row is empty")
-
-        duplicate_header_names = sorted({name for name in header if header.count(name) > 1})
-        if duplicate_header_names:
-            problems.add(
-                f"header: column name(s) {duplicate_header_names} appear more than once -- a row "
-                "reader keeps only the LAST occurrence's value for a repeated name, and this profile "
-                "does the same"
-            )
-
-        # dict comprehension collapses a repeated name to one accumulator,
-        # matching the last-occurrence-wins semantics `duplicate_header_names`
-        # already warns about.
-        accumulators = {name: _ColumnAccumulator() for name in header}
-
-        row_count = 0
-        ragged_rows = 0
-        truncated = False
-        try:
-            for row in reader:
-                row_count += 1
-                row_no = reader.line_num
-                if len(row) != len(header):
-                    ragged_rows += 1
-                    if ragged_rows <= MAX_PROBLEMS_SHOWN:
-                        problems.add(f"row {row_no}: expected {len(header)} field(s), found {len(row)}")
-                # dict(zip(...)) gives last-occurrence-wins for a repeated
-                # header name, and a SHORT row simply never reaches the
-                # trailing column names -- they are not observed for this
-                # row at all, not counted as blank (a truncated field is
-                # not a field with an empty value; see ingest.iter_csv_rows,
-                # whose docstring draws the identical distinction for the
-                # real engine).
-                for name, value in dict(zip(header, row)).items():
-                    accumulators[name].observe(value)
-        except UnicodeDecodeError as exc:
-            truncated = True
-            # `_decode_error_message` always leads with "{path}: " -- stripped here since
-            # `_print_probe_report` already prints the filename as this file's own heading,
-            # directly above the `problems` list this message joins (cli.py's own
-            # `_column_row`-adjacent rendering); every other entry in that list already omits
-            # the path for the same reason (see e.g. the duplicate-header-name message above).
-            detail = _decode_error_message(path, encoding, exc, declared=declared).removeprefix(f"{path}: ")
-            problems.add(
-                f"row {row_count + 1}: profiling stopped here, counts above reflect only the rows read "
-                f"before this point -- {detail}"
-            )
-        if ragged_rows > MAX_PROBLEMS_SHOWN:
-            problems.add(f"... and {ragged_rows - MAX_PROBLEMS_SHOWN} more ragged row(s)")
-
-    columns = {name: acc.finalize(name) for name, acc in accumulators.items()}
-    for name, profile in columns.items():
-        if profile.distinct_overflow:
-            problems.add(
-                f"column {name!r}: reached the tracked-distinct-values cap ({MAX_DISTINCT_TRACKED}); "
-                "it has at least that many distinct values, the true count is not known"
-            )
-
-    return FileProfile(
-        path=path,
-        encoding=encoding,
-        delimiter=delimiter,
-        header=header,
-        duplicate_header_names=duplicate_header_names,
-        row_count=row_count,
-        ragged_rows=ragged_rows,
-        truncated=truncated,
-        columns=columns,
-        problems=list(problems.fatal),
-    )
+        return _scan_csv(path, encoding, delimiter, quotechar, skip_lines, declared, precise=False)
+    except _NeedsPreciseRescan:
+        return _scan_csv(path, encoding, delimiter, quotechar, skip_lines, declared, precise=True)
 
 
 # ---------------------------------------------------------------------------

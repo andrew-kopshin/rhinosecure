@@ -24,6 +24,7 @@ web = [
 ]
 dev = [
     "pytest",
+    "openpyxl~=3.1.5",
 ]
 
 [project.scripts]
