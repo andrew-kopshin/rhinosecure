@@ -131,6 +131,7 @@ from rhinosecure.adapters.config_model import (
     ABSENT_FACT_LEGAL_TARGETS,
     GAP_LEGAL_TARGETS,
     LOW_CONFIDENCE_THRESHOLD,
+    PARSER_POSITIONS,
     REGISTERED_DEFAULT_TABLES,
     SCORING_ENUM_TARGETS,
     describe_target_vocabulary,
@@ -242,6 +243,21 @@ def _predict_current_values(mapping: Any, derived: dict[str, Any], distinct_valu
             if value is not None:
                 predicted[raw] = value
         elif kind == "parsed":
+            # `_parse_scalar` asserts for a parser with no scalar resolver
+            # (today: "timestamp", legal only inside `asset_grouping.
+            # order_by` -- `PARSER_POSITIONS`, the same registry `config_
+            # model._check_parser_placement` reads). The real engine never
+            # reaches it with one, because `validate_contract` refuses that
+            # placement first -- but THIS function runs against a proposal
+            # that has not been validated yet, which is exactly how a
+            # misplaced parser is supposed to surface here: as one more row
+            # in `illegal`, not a 500 out of the route handler. Skipping it
+            # is the same "omit what this mapping doesn't resolve" rule
+            # already applied to every other missed lookup below, not a
+            # special case -- a mapping the validator will refuse outright
+            # has no meaningful "currently resolves to" value to predict.
+            if "row" not in PARSER_POSITIONS.get(mapping.parser, frozenset()):
+                continue
             value = _parse_scalar(mapping.parser, cased, mapping.params)
             if value is not None:
                 predicted[raw] = value

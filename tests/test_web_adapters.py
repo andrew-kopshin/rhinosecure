@@ -390,6 +390,41 @@ def test_get_proposal_surfaces_not_collected_on_a_target_with_no_defaults_entry(
     assert "correctable" not in entry
 
 
+def test_get_proposal_does_not_crash_on_a_misplaced_timestamp_parser(client: TestClient):
+    """Regression test for docs/handoff.md 4.2.1's crash defect. `parser:
+    "timestamp"` is legal only inside `asset_grouping.order_by`
+    (`PARSER_POSITIONS`), never on a plain per-row mapping -- exactly the
+    illegality `illegal_mapped_slots` exists to turn into a row (this
+    function's own docstring names `finding.detected_date` with a
+    misplaced `timestamp` parser as its worked example).
+
+    Before the fix, `_predict_current_values` called `_parse_scalar`
+    unconditionally for every `"parsed"` mapping, which raises a bare
+    `AssertionError` for `"timestamp"` ("timestamp is order_by-only")
+    with nothing catching it between there and the route handler --
+    a 500 out of `GET /api/adapters/{name}/proposal`, not a row."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-badparser")
+    proposal["finding"]["detected_date"] = {
+        "status": "mapped", "confidence": 0.9,
+        "mapping": {"kind": "parsed", "column": "Col", "case": "exact", "blank": "fatal", "parser": "timestamp"},
+        "evidence": {"columns_cited": ["Col"], "sample_values_cited": [], "note": "test reasoning"},
+    }
+    job = _propose_edited(client, upload_id, "upload-badparser", proposal)
+    assert job["status"] == "succeeded"  # a refused mapping is an incomplete proposal, not a job failure
+    assert job["result"]["contract_written"] is False
+
+    resp = client.get("/api/adapters/upload-badparser/proposal", params={"upload_id": upload_id})
+    assert resp.status_code == 200  # not a 500
+    entry = {e["slot"]: e for e in resp.json()["illegal"]}["finding.detected_date"]
+    assert entry["kind"] == "illegal"
+    assert "order_by" in entry["reason"]  # the validator's own text
+    # No scalar resolver exists for "timestamp" outside order_by, so
+    # nothing is predicted for it -- the same honest-blank behavior as any
+    # other value a mapping doesn't resolve, never a guess.
+    assert entry["current_values"] == {}
+
+
 def test_get_proposal_illegal_is_empty_for_a_clean_proposal(client: TestClient):
     upload_id = _upload(client)
     job = _propose(client, upload_id, "upload-clean", _proposal_dict(name="upload-clean"))
