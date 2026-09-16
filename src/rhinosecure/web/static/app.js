@@ -1953,25 +1953,57 @@ function appendFollowUpCard(html) {
 
 /* ---------------- slot resolution (GET .../proposal, then POST /api/jobs) ---------------- */
 
-/* `ingest_propose`'s result carries `contract_written: false` in exactly
- * two, structurally different cases (schema_inference.ProposeResult /
- * propose_contract's own module docstring): (1) slots are still
- * unresolved or a value failed grounding -- `unresolved_slots` names them;
- * (2) every slot IS mapped and grounded, but the assembled contract fails
- * the real contract validator (an illegal mapping for its target, a
- * column left neither mapped nor unmapped, ...) -- `unresolved_slots` is
- * EMPTY in this case, and the real reason lives only in
- * `incomplete_reason`. `incomplete_reason` is set in BOTH cases (it is
- * the exact str(ProposalIncompleteError) either way) -- so it alone is
- * always the right thing to show, and showing `unresolved_slots` instead
- * whenever it happens to be empty is what silently reported "0 slot(s)
- * remain unresolved: ." for case (2), hiding the one thing making the
- * state make sense. Confirmed live: a standalone repro resolving a
- * free-text unresolved slot (finding.product) the only way the old UI
- * offered reproduced exactly this -- 0 unresolved, not written, real
- * reason (`not_collected has no NOT_COLLECTED_DEFAULTS entry for
- * 'product'`) present in the job result the whole time, never rendered. */
+/* `ingest_propose`'s result carries `contract_written: false` in three,
+ * structurally different cases (schema_inference.ProposeResult /
+ * propose_contract's own module docstring): (1) a mapped slot's table/
+ * reference fails GROUNDING (a cited column or table key that isn't
+ * real, or -- the alias-contradiction check -- a value that disagrees
+ * with published schema knowledge) -- `result.grounding.failures[]`
+ * names each one with the validator's own per-slot text; (2) a slot is
+ * still genuinely unresolved -- `unresolved_slots` names them; (3) every
+ * slot IS mapped and grounded, but the assembled contract fails the real
+ * contract validator for some other reason (an illegal mapping for its
+ * target, a column left neither mapped nor unmapped, ...) --
+ * `unresolved_slots` is EMPTY and `result.grounding.failures` is EMPTY
+ * too, and the real reason lives only in `incomplete_reason`.
+ *
+ * `incomplete_reason` is ALSO set for case (1) -- it is
+ * `assemble_provisional_contract`'s own generic hard-stop text
+ * ("N slot(s)/reference(s) failed grounding (a real data-quality
+ * problem, not a coverage gap): [...]"), which used to be the only thing
+ * shown. That text is actively misleading for the alias-contradiction
+ * case specifically: the data is clean (real observed values, legal
+ * types), the disagreement is with a registry anchor, not a data-quality
+ * defect, and it never names WHY a given slot failed at all -- that
+ * detail sat unread in `result.grounding.failures[]` the whole time,
+ * present in the job result and never rendered (confirmed live against
+ * the reported incident: `{Critical: 4, Low: 2}` refused with this exact
+ * generic text while the real reason -- "Critical" anchored to 5, not 4
+ * -- sat in `grounding.failures[0].message`). Checking `grounding.
+ * failures` FIRST, before `incomplete_reason`, is what fixes that: case
+ * (1) is the only one where it is ever non-empty (grounding failing is a
+ * hard stop in both `assemble_contract` and `assemble_provisional_
+ * contract`, so `contract_written` is always false whenever it fires),
+ * so this never shadows the real reason for cases (2)/(3).
+ *
+ * For case (3), `incomplete_reason` alone is still the right thing to
+ * show, and showing `unresolved_slots` instead whenever it happens to be
+ * empty is what silently reported "0 slot(s) remain unresolved: ." for
+ * that case, hiding the one thing making the state make sense. Confirmed
+ * live: a standalone repro resolving a free-text unresolved slot
+ * (finding.product) the only way the old UI offered reproduced exactly
+ * this -- 0 unresolved, not written, real reason (`not_collected has no
+ * NOT_COLLECTED_DEFAULTS entry for 'product'`) present in the job result
+ * the whole time, never rendered. */
 function describeIngestProposeIncomplete(result) {
+  const groundingFailures = (result.grounding && result.grounding.failures) || [];
+  if (groundingFailures.length) {
+    const detail = groundingFailures.map((f) => `${f.slot} -- ${f.message}`).join("; ");
+    return (
+      `${groundingFailures.length} slot(s)/reference(s) failed grounding: ${detail}. ` +
+      "Resolve them by hand in the saved proposal file, then re-run with --from-proposal."
+    );
+  }
   if (result.incomplete_reason) return result.incomplete_reason;
   if (result.unresolved_slots && result.unresolved_slots.length) {
     return `${result.unresolved_slots.length} slot(s) remain unresolved: ${result.unresolved_slots.join(", ")}.`;
