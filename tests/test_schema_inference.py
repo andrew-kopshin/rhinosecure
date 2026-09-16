@@ -655,7 +655,18 @@ def test_provisional_assembly_drops_authorship_alongside_a_degraded_slot(tmp_pat
     authored by whoever the ORIGINAL, now-discarded mapping was attributed
     to -- so the degraded slot has no entry at all. A DIFFERENT, surviving
     slot's own authorship must still be there, unaffected -- this is
-    per-slot bookkeeping, not a blanket wipe."""
+    per-slot bookkeeping, not a blanket wipe.
+
+    Deliberately pins the CURRENT degrade behaviour, including the part
+    that is known to be wrong: a mapping attributed to a human is dropped
+    and replaced with a placeholder exactly like a model's guess. Once
+    per-slot attribution landed (`_stamp_authorship_per_slot`), the
+    authored_by='human' below stopped meaning "arrived via the form" and
+    started meaning "a human actually typed this mapping" -- which is what
+    makes silently discarding it wrong, and what a later change to
+    _degrade_invalid_slots will act on. Nothing here is asserted because
+    it is desirable; it is asserted so that change shows up as a diff
+    against a stated position rather than a gap in coverage."""
     header = _HEADER + ["RoleColUnique"]
     _write_csv(tmp_path, header, [
         ["A01", "HOST01", "F01", "CVE-2021-0001", "srv", "Workstation"],
@@ -1292,10 +1303,18 @@ def test_propose_contract_stamps_every_slot_model_on_the_fresh_llm_path(data_dir
             assert sp.authored_by == "model", target
 
 
-def test_propose_contract_stamps_every_slot_human_via_from_proposal(data_dir):
+def test_propose_contract_stamps_every_slot_human_via_from_proposal_without_a_baseline(data_dir):
     """The from_proposal branch never calls the LLM -- nothing arriving
-    through it can honestly be 'model', so every slot is stamped 'human',
-    unconditionally, the same way the fresh path stamps 'model'."""
+    through it can honestly be 'model'. With NO baseline to diff against
+    (the CLI's `rhino adapt propose --from-proposal`, where a human had
+    the whole file open, and the web fallback when the saved proposal
+    cannot be read) every slot is stamped 'human', unconditionally, the
+    same way the fresh path stamps 'model'.
+
+    Narrowed when per-slot attribution landed: this is now specifically
+    the NO-baseline case. `test_propose_contract_with_a_baseline_*` below
+    covers the browser path, where blanket 'human' would attribute a
+    mapping the model wrote and the human never saw to the human."""
     proposal = AdapterProposal.model_validate(_full_proposal_dict())
     saved = SavedProposal(proposal=proposal, generator=_generator())
     result = propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, from_proposal=saved)
@@ -1304,15 +1323,21 @@ def test_propose_contract_stamps_every_slot_human_via_from_proposal(data_dir):
             assert sp.authored_by == "human", target
 
 
-def test_propose_contract_from_proposal_never_trusts_a_client_claimed_authorship(data_dir):
-    """The spoofing case: a POSTed edited_saved_proposal (or a hand-edited
-    --from-proposal file) can claim ANYTHING for authored_by -- /api/jobs is
-    not bound to the browser, and a raw file is not bound to rhino adapt
-    propose's own UI at all. Every slot here explicitly claims 'model' or
-    'registry', a lie either way (nothing here came from an LLM call this
-    invocation made, and none of it came from a registry lookup) -- the
-    server must overwrite every one of them to 'human', never repeat the
-    claim back."""
+def test_propose_contract_from_proposal_without_a_baseline_never_trusts_a_client_claim(data_dir):
+    """The spoofing case, no-baseline half: a POSTed edited_saved_proposal
+    (or a hand-edited --from-proposal file) can claim ANYTHING for
+    authored_by -- /api/jobs is not bound to the browser, and a raw file is
+    not bound to rhino adapt propose's own UI at all. Every slot here
+    explicitly claims 'model' or 'registry', a lie either way (nothing here
+    came from an LLM call this invocation made, and none of it came from a
+    registry lookup) -- the server must overwrite every one of them to
+    'human', never repeat the claim back.
+
+    The baseline half is
+    `test_propose_contract_with_a_baseline_still_never_trusts_a_client_claim`
+    below: per-slot attribution introduced a second value a spoofer might
+    hope to keep (the inherited one), so the property has to be proven on
+    both paths, not just this one."""
     data = _full_proposal_dict(
         overrides_asset={
             "asset_id": _mapped(
@@ -1360,6 +1385,137 @@ def test_propose_contract_illegal_candidate_fallback_is_also_stamped_model(data_
     assert result.contract is None  # still illegal -- not what this test is about
     assert result.proposal.finding["detected_date"].authored_by == "model"
     assert result.proposal.asset["role"].authored_by == "model"
+
+
+# --- authorship: per-slot attribution against a baseline (the browser path) ---
+# The resolve-slots form POSTs a deep copy of the WHOLE saved proposal with
+# edits applied only to the rows it rendered, so "arrived via the form" is
+# not "a human authored this slot". Everything below pins the diff that
+# separates the two -- and that a client still cannot assert a value, only
+# cause a diff.
+
+_ROLE_BASELINE = {"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "fatal", "table": {"srv": "dc"}}
+_ROLE_EDITED = {"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "fatal",
+                "table": {"srv": "file", "wks": "workstation"}}
+
+
+def _saved(proposal_dict: dict) -> SavedProposal:
+    return SavedProposal(proposal=AdapterProposal.model_validate(proposal_dict), generator=_generator())
+
+
+def test_propose_contract_with_a_baseline_stamps_human_only_where_the_mapping_changed(data_dir):
+    """The whole point: one slot edited, every other slot carried along
+    verbatim by the form's deep copy. Only the edited one is the human's;
+    the rest keep whatever the server's own baseline already recorded."""
+    baseline = AdapterProposal.model_validate(_full_proposal_dict(overrides_asset={
+        "role": _mapped(_ROLE_BASELINE, columns_cited=["Col"], authored_by="model"),
+        "asset_id": _mapped(
+            {"kind": "column", "column": "Asset_ID", "case": "exact", "blank": "fatal"},
+            columns_cited=["Asset_ID"], authored_by="registry",
+        ),
+    }))
+    edited = _saved(_full_proposal_dict(overrides_asset={
+        "role": _mapped(_ROLE_EDITED, columns_cited=["Col"], authored_by="model"),
+        "asset_id": _mapped(
+            {"kind": "column", "column": "Asset_ID", "case": "exact", "blank": "fatal"},
+            columns_cited=["Asset_ID"], authored_by="registry",
+        ),
+    }))
+
+    result = propose_contract(
+        data_dir, "min-test", generated_at=_GENERATED_AT, from_proposal=edited, baseline_proposal=baseline,
+    )
+
+    assert result.proposal.asset["role"].authored_by == "human"  # the one mapping that actually changed
+    assert result.proposal.asset["asset_id"].authored_by == "registry"  # carried along, not authored
+    assert result.proposal.asset["hostname"].authored_by is None  # baseline held no record; none is invented
+    # And the distinction survives into the assembled contract, which is
+    # what any later consumer actually reads.
+    assert result.contract is not None
+    assert result.contract.mapping_authorship["asset.role"] == "human"
+    assert result.contract.mapping_authorship["asset.asset_id"] == "registry"
+    assert "asset.hostname" not in result.contract.mapping_authorship
+
+
+def test_propose_contract_with_a_baseline_still_never_trusts_a_client_claim(data_dir):
+    """Per-slot attribution must not become a way to KEEP a spoofed claim.
+    Both slots here lie on the wire; neither lie survives. The edited one
+    is forced to 'human' (true -- this submitter did supply a different
+    mapping); the unchanged one inherits the SERVER's record, not the
+    request's."""
+    baseline = AdapterProposal.model_validate(_full_proposal_dict(overrides_asset={
+        "role": _mapped(_ROLE_BASELINE, columns_cited=["Col"], authored_by="model"),
+        "asset_id": _mapped(
+            {"kind": "column", "column": "Asset_ID", "case": "exact", "blank": "fatal"},
+            columns_cited=["Asset_ID"], authored_by="model",
+        ),
+    }))
+    spoofed_dict = _full_proposal_dict(overrides_asset={
+        # Edited, but claiming the model's name for a mapping the model never wrote.
+        "role": _mapped(_ROLE_EDITED, columns_cited=["Col"], authored_by="model"),
+        # Untouched, but claiming a registry lookup that never happened.
+        "asset_id": _mapped(
+            {"kind": "column", "column": "Asset_ID", "case": "exact", "blank": "fatal"},
+            columns_cited=["Asset_ID"], authored_by="registry",
+        ),
+    })
+    assert spoofed_dict["asset"]["role"]["authored_by"] == "model"  # the claims really are on the wire
+    assert spoofed_dict["asset"]["asset_id"]["authored_by"] == "registry"
+
+    result = propose_contract(
+        data_dir, "min-test", generated_at=_GENERATED_AT,
+        from_proposal=_saved(spoofed_dict), baseline_proposal=baseline,
+    )
+
+    assert result.proposal.asset["role"].authored_by == "human"
+    assert result.proposal.asset["asset_id"].authored_by == "model"  # the server's record, not 'registry'
+
+
+def test_propose_contract_with_a_baseline_treats_a_resolved_unresolved_slot_as_human(data_dir):
+    """Resolving a slot IS authoring it -- the single most common thing the
+    form is actually for. A baseline that left the slot `unresolved` has no
+    mapping to inherit from, so this can never be anything but 'human'."""
+    baseline = AdapterProposal.model_validate(
+        _full_proposal_dict(overrides_finding={"cve_id": _unresolved()})
+    )
+    edited = _saved(_full_proposal_dict())  # cve_id now mapped normally
+
+    result = propose_contract(
+        data_dir, "min-test", generated_at=_GENERATED_AT, from_proposal=edited, baseline_proposal=baseline,
+    )
+
+    assert result.proposal.finding["cve_id"].authored_by == "human"
+
+
+def test_propose_contract_with_a_baseline_ignores_confidence_and_evidence_changes(data_dir):
+    """Attribution reads the MAPPING, never confidence/evidence -- the form
+    rebuilds both on every row it renders (`buildSlotMapping` hardcodes
+    confidence 1.0 and its own note), so folding them in would re-attribute
+    a row a human looked at and left semantically unchanged. Seen-but-
+    unchanged is a real fact, but it is the low_confidence_mappings
+    attestation's, not authorship's."""
+    baseline = AdapterProposal.model_validate(_full_proposal_dict(overrides_asset={
+        "role": _mapped(_ROLE_BASELINE, confidence=0.5, columns_cited=["Col"], authored_by="model"),
+    }))
+    edited = _saved(_full_proposal_dict(overrides_asset={
+        "role": _mapped(_ROLE_BASELINE, confidence=1.0, columns_cited=["Col", "Hostname"], authored_by="model"),
+    }))
+
+    result = propose_contract(
+        data_dir, "min-test", generated_at=_GENERATED_AT, from_proposal=edited, baseline_proposal=baseline,
+    )
+
+    assert result.proposal.asset["role"].authored_by == "model"  # identical mapping -- nothing was authored
+    assert result.proposal.asset["role"].confidence == 1.0  # the submitted values themselves are untouched
+
+
+def test_propose_contract_refuses_a_baseline_without_a_from_proposal(data_dir):
+    """A baseline names what an edit was made on top of. Without an edit it
+    describes nothing, and silently ignoring it would hide a caller's
+    mistake behind output that looks right -- refuse instead."""
+    baseline = AdapterProposal.model_validate(_full_proposal_dict())
+    with pytest.raises(SchemaInferenceError, match="only meaningful alongside from_proposal"):
+        propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, baseline_proposal=baseline)
 
 
 # --- fixes from the post-implementation adversarial review --------------------

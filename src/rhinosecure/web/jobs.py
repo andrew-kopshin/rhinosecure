@@ -144,6 +144,7 @@ from rhinosecure.agents.schema_inference import (
     SavedProposal,
     assemble_provisional_contract,
     dump_saved_proposal,
+    load_saved_proposal,
     placeholder_axes,
     propose_contract,
     saved_proposal_from_dict,
@@ -863,7 +864,22 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
     such key and is unaffected. `agents/router.py`'s `IngestProposeParams`
     has no field for this, so chat can dispatch a fresh propose but can
     never smuggle in a slot edit -- only a direct `POST /api/jobs` call
-    from the dedicated resolution form can."""
+    from the dedicated resolution form can.
+
+    That same edit path is also the only one that can supply
+    `propose_contract`'s `baseline_proposal`: the form POSTs the WHOLE
+    saved proposal back with edits applied to just the rows it rendered,
+    so attributing every mapped slot to the human -- what this path did
+    before -- marks mappings the model wrote and the human never saw as
+    the human's own. The baseline is `out/propose_<name>.json` as it
+    stands BEFORE this run overwrites it, read off this process's own
+    disk and never from the request, which is what keeps a client able to
+    cause a diff but not to assert an authorship value
+    (`_stamp_authorship_per_slot`'s own docstring argues the full
+    property). An unreadable or absent baseline falls back to the blanket
+    `"human"`, reported in `result.authorship_baseline` rather than
+    silently -- see the call site's own comment for why over-attributing
+    is the safe direction of the two."""
     upload_id = str(job.input.get("upload_id") or "").strip()
     if not upload_id:
         raise SchemaInferenceError("ingest_propose requires a non-empty input.upload_id")
@@ -888,11 +904,61 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
                 "Pass input.overwrite_confirmed=true if you really mean to replace it."
             )
 
+    # Hoisted above the branch: this is both where the proposal is SAVED
+    # (below) and, on the edit path, where the baseline the browser form
+    # was rendered from is READ -- the read has to happen before this run
+    # overwrites it. One expression, so the two can never point at
+    # different files.
+    saved_path = REPO_ROOT / "out" / f"propose_{name}.json"
+
     edited_saved_proposal_data = job.input.get("edited_saved_proposal")
+    authorship_baseline = "not applicable -- fresh proposal, every slot authored by the model"
     if edited_saved_proposal_data is not None:
         on_stage("re-grounding the edited proposal")
         from_proposal = saved_proposal_from_dict(edited_saved_proposal_data)
-        result = propose_contract(data_dir, name, generated_at=_now(), from_proposal=from_proposal)
+        # The browser POSTs a deep copy of the WHOLE saved proposal with
+        # edits applied only to the rows it rendered, so "arrived via the
+        # form" is not "a human authored this slot" -- diffing against the
+        # baseline it was rendered from is what separates the two
+        # (`_stamp_authorship_per_slot`). No baseline, no diff: fall back
+        # to the blanket "human" this path has always used, which
+        # over-attributes rather than under-attributes and so can never
+        # cause a human's own mapping to read as the model's. Recorded in
+        # the result either way -- a plan whose authorship record is
+        # coarser than it looks must say so, not decide it quietly.
+        #
+        # `UnicodeDecodeError` alongside `SchemaInferenceError`, and not
+        # by preference: `load_saved_proposal` wraps a missing file, bad
+        # JSON and a wrong shape into `SchemaInferenceError`, but its own
+        # `read_text(encoding="utf-8")` sits inside an `except OSError`,
+        # and `UnicodeDecodeError` is a `ValueError` -- so a baseline that
+        # exists but is not valid UTF-8 escapes that wrapper entirely
+        # (confirmed against a real file, not inferred from the source).
+        # A file that cannot be decoded is exactly as absent a baseline as
+        # one that is missing, so it takes the same fallback here rather
+        # than failing the job. Widening `load_saved_proposal`'s own catch
+        # would fix this for its other two callers too and is deliberately
+        # NOT done here -- that is a change to a shared function's stated
+        # contract, not to this path.
+        baseline_proposal = None
+        try:
+            baseline_proposal = load_saved_proposal(saved_path).proposal
+        except (SchemaInferenceError, UnicodeDecodeError) as exc:
+            # load_saved_proposal already prefixes its own messages with the
+            # path; a raw UnicodeDecodeError does not, and an operator
+            # reading this needs to know WHICH file to go look at. Mirrors
+            # that function's own "<path>: could not be read -- ..." wording
+            # rather than inventing a second phrasing for the same thing.
+            reason = str(exc) if isinstance(exc, SchemaInferenceError) else f"{saved_path}: could not be decoded -- {exc}"
+            authorship_baseline = (
+                f"unavailable -- {reason}; every mapped slot stamped 'human' (coarse: a slot the model "
+                "authored and the human never saw is attributed to the human)"
+            )
+        else:
+            authorship_baseline = f"diffed against {saved_path}"
+        result = propose_contract(
+            data_dir, name, generated_at=_now(), from_proposal=from_proposal, baseline_proposal=baseline_proposal,
+        )
     else:
         on_stage("proposing")
         result = propose_contract(
@@ -906,7 +972,6 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
         )
 
     on_stage("saving proposal")
-    saved_path = REPO_ROOT / "out" / f"propose_{name}.json"
     saved_path.parent.mkdir(parents=True, exist_ok=True)
     saved_path.write_text(
         json.dumps(
@@ -938,6 +1003,12 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
             # why this sits beside, not inside, the summed totals above.
             "per_attempt": list(result.attempt_usage),
         },
+        # How `mapping_authorship` on this run's proposal was arrived at --
+        # "diffed against <path>" means per-slot, "unavailable" means the
+        # coarse blanket fallback. Reporting, never an input to anything:
+        # the same "audit trail, not a decision" role Contract.generator
+        # already has.
+        "authorship_baseline": authorship_baseline,
         "contract_written": False,
         "contract_path": None,
         "incomplete_reason": result.incomplete_reason,

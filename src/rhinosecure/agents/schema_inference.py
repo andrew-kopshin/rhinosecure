@@ -1117,6 +1117,74 @@ def _stamp_authorship(proposal: AdapterProposal, source: SlotAuthor) -> AdapterP
     return proposal.model_copy(update={"asset": new_asset, "finding": new_finding})
 
 
+def _stamp_authorship_per_slot(proposal: AdapterProposal, baseline: AdapterProposal) -> AdapterProposal:
+    """`_stamp_authorship`'s per-slot sibling, for the one caller that has
+    a real baseline to diff against: the browser resolve-slots form, which
+    POSTs a deep copy of the WHOLE saved proposal with edits applied only
+    to the rows it actually rendered (`buildResolvedProposal`,
+    web/static/app.js). Blanket-stamping `"human"` there labels a mapping
+    the model wrote and the human never saw as the human's own -- true of
+    how the proposal ARRIVED, false of who authored the slot, and the two
+    are not interchangeable for anything that has to decide whether a
+    mapping may be silently discarded.
+
+    Deliberately NOT applied to `rhino adapt propose --from-proposal`,
+    which keeps `_stamp_authorship`'s blanket `"human"`: a hand-edited
+    file is a human artifact in its entirety -- the human had the whole
+    thing open -- whereas the form exposes only the rows it rendered. The
+    two paths differ in what a human actually saw, so they differ here.
+
+    `"human"` is written for a slot whose MAPPING differs from the
+    baseline's -- including one the baseline left `SlotUnresolved`, or
+    never carried at all, since resolving a slot IS authoring it. Every
+    other mapped slot inherits `baseline`'s own recorded author verbatim,
+    `None` included: a baseline written before `authored_by` existed
+    yields `None` for every slot the edit did not touch, the honest "this
+    server holds no record of who authored this" rather than a
+    manufactured one. A stale baseline (a different source shape, a
+    renamed column) simply disagrees with more mappings and so attributes
+    more slots to the human -- the safe direction, and no reason for a
+    separate staleness check here.
+
+    Comparison is on `mapping` alone, never `confidence`/`evidence`: the
+    form rebuilds both on every row it renders, so folding them in would
+    re-attribute a row a human merely looked at and left semantically
+    unchanged -- the same over-attribution this function exists to
+    remove. Seen-but-unchanged is already a distinct, separately
+    represented fact (the `low_confidence_mappings` attestation, which
+    exists precisely so a human can leave a mapping alone and still
+    record having reviewed it); it is not authorship.
+
+    A client cannot assert authorship through this, only cause a diff.
+    Every `SlotMapped` is rewritten unconditionally, so no `authored_by`
+    arriving in `proposal` (the request body) is ever kept; the only
+    other value written comes from `baseline`, which this process read
+    off its own disk. Submitting a mapping that differs from the baseline
+    can force `"human"` -- which is simply true, the submitter did supply
+    a different mapping, and it is the protective direction besides --
+    but nothing a client sends can make a slot read `"model"` or
+    `"registry"` unless the server's own baseline already records it that
+    way for the identical mapping."""
+
+    def stamped(slots: dict[str, Any], baseline_slots: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for target, sp in slots.items():
+            if not isinstance(sp, SlotMapped):
+                out[target] = sp  # nothing to stamp -- _stamp_authorship leaves these alone too
+                continue
+            prior = baseline_slots.get(target)
+            unchanged = isinstance(prior, SlotMapped) and prior.mapping == sp.mapping
+            out[target] = sp.model_copy(update={"authored_by": prior.authored_by if unchanged else "human"})
+        return out
+
+    return proposal.model_copy(
+        update={
+            "asset": stamped(proposal.asset, baseline.asset),
+            "finding": stamped(proposal.finding, baseline.finding),
+        }
+    )
+
+
 def _apply_registry_aliases(proposal: AdapterProposal, profiles: dict[str, FileProfile]) -> AdapterProposal:
     """Deterministic, LLM-free pass over the four `REGISTRY_BACKED_TARGETS`
     slots in `proposal.asset` -- table augmentation for an already-mapped
@@ -2608,6 +2676,7 @@ def propose_contract(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     sample_rows: int = DEFAULT_SAMPLE_ROWS,
     from_proposal: SavedProposal | None = None,
+    baseline_proposal: AdapterProposal | None = None,
     llm: BaseLLM | None = None,
     model_name: str = DEFAULT_MODEL,
     verbose: bool = False,
@@ -2624,8 +2693,23 @@ def propose_contract(
     `ProposalIncompleteError` itself -- an incomplete proposal is a normal,
     reportable outcome (`ProposeResult.contract is None`), not a failure of
     this function.
+
+    `baseline_proposal` is the previously-saved proposal `from_proposal`'s
+    edit was made ON TOP OF -- supplied only by the browser resolve-slots
+    path (`web/jobs.py`'s `_run_ingest_propose`, which reads it off this
+    process's own disk), and used for one purpose: per-slot authorship
+    attribution (`_stamp_authorship_per_slot`). Meaningless without
+    `from_proposal`, so passing it alone is refused rather than ignored.
+    Omitting it is legal and keeps the blanket-`"human"` stamping this
+    function has always done -- the CLI's `--from-proposal` behaviour, and
+    the fallback when the web path has no readable baseline to diff.
     """
     _validate_format_name(name)
+    if baseline_proposal is not None and from_proposal is None:
+        raise SchemaInferenceError(
+            "baseline_proposal is only meaningful alongside from_proposal -- it names what an edit was "
+            "made on top of, and a fresh LLM proposal was not edited from anything"
+        )
     profiles = {p.path.name: p for p in profile_source(data_dir)}
     layout, resolved_assets, resolved_findings = _resolve_layout(profiles, assets_filename, findings_filename)
 
@@ -2766,11 +2850,23 @@ def propose_contract(
             call_log_digest="sha256:" + hashlib.sha256("\n===\n".join(call_log_parts).encode("utf-8")).hexdigest(),
         )
 
-    # Server-authoritative, not the input's: `source` is decided from which
-    # branch of this function just ran, never read off `proposal` itself --
-    # see `_stamp_authorship`'s own docstring for why that's the one place
-    # this project trusts an authorship claim at all.
-    proposal = _stamp_authorship(proposal, "human" if from_proposal is not None else "model")
+    # Server-authoritative, not the input's: never read off `proposal`
+    # itself -- see `_stamp_authorship`'s own docstring for why that's the
+    # one place this project trusts an authorship claim at all. Three
+    # cases, not two: a fresh LLM candidate is wholly `"model"`; an edit
+    # WITH the baseline it was made on top of is attributed per slot,
+    # `"human"` only where the mapping actually changed
+    # (`_stamp_authorship_per_slot`); an edit without one -- the CLI's
+    # `--from-proposal`, or a web edit whose baseline could not be read --
+    # keeps the blanket `"human"`, since nothing here can tell which slots
+    # a human touched and claiming fewer than all of them would be the
+    # guess, not the safe default.
+    if from_proposal is None:
+        proposal = _stamp_authorship(proposal, "model")
+    elif baseline_proposal is None:
+        proposal = _stamp_authorship(proposal, "human")
+    else:
+        proposal = _stamp_authorship_per_slot(proposal, baseline_proposal)
     proposal = _apply_registry_aliases(proposal, profiles)
     report = check_grounding(proposal, profiles)
     incomplete_reason: str | None = None

@@ -295,6 +295,10 @@ def test_single_file_upload_proposes_and_writes_a_confirmable_contract(client: T
     assert result["unresolved_slots"] == []
     assert result["grounding"]["failures"] == []
     assert f"uploads/{upload_id}" in result["next_step"]
+    # A fresh propose has no edit to attribute, so there is nothing to diff
+    # against -- the field says so rather than reporting a baseline it
+    # never consulted.
+    assert result["authorship_baseline"].startswith("not applicable")
     assert "rhino adapt confirm upload-abc" in result["next_step"]
 
     written = json.loads((isolated_dirs / "upload-abc.json").read_text(encoding="utf-8"))
@@ -616,7 +620,13 @@ def test_edited_saved_proposal_never_trusts_a_client_claimed_authorship(client: 
     edited_saved_proposal claiming authored_by='model' (or 'registry') for
     a slot it typed itself. This never even reaches an LLM call (no queue
     entry needed), so the claim can only have come from the request body.
-    The written contract must show 'human' regardless of what was claimed."""
+    The written contract must show 'human' regardless of what was claimed.
+
+    Submitted under a name no propose run ever used, so there is no saved
+    proposal on disk to diff against -- this is deliberately the
+    NO-baseline path, where the blanket 'human' stamping still applies.
+    `test_edited_saved_proposal_attributes_only_the_edited_slot_to_the_human`
+    below covers the same spoofing property on the baseline path."""
     upload_id = _upload(client, "inventory.csv", _csv_bytes(_ROWS))["upload_id"]
     spoofed = _full_proposal_dict(
         name="upload-spoof",
@@ -647,6 +657,107 @@ def test_edited_saved_proposal_never_trusts_a_client_claimed_authorship(client: 
     contract_path = Path(body["result"]["contract_path"])
     on_disk = json.loads(contract_path.read_text(encoding="utf-8"))
     assert on_disk["mapping_authorship"]["asset.asset_id"] == "human"
+    assert body["result"]["authorship_baseline"].startswith("unavailable --")
+
+
+def test_edited_saved_proposal_attributes_only_the_edited_slot_to_the_human(
+    client: TestClient, isolated_dirs: Path
+):
+    """End to end over the real job path, with a real baseline on disk: the
+    browser POSTs the WHOLE saved proposal back with one row edited, so
+    every OTHER mapped slot is a mapping the model wrote and the human
+    never saw. Those must keep reading 'model'; only the edited one is the
+    human's.
+
+    Also the baseline half of the spoofing property: `asset.os` is carried
+    along untouched while claiming 'registry' on the wire. Inheriting is
+    inheriting from the SERVER's saved proposal, never from the request, so
+    that claim must not survive either."""
+    upload_id = _upload(client, "inventory.csv", _csv_bytes(_ROWS))["upload_id"]
+    first = _full_proposal_dict(name="upload-attrib", overrides_finding={"cve_id": _unresolved()})
+    _QueuedFakeCrew.queue = [json.dumps(first)]
+
+    job1 = _submit(client, upload_id=upload_id, name="upload-attrib")
+    body1 = _wait_for_terminal(client, job1["job_id"])
+    assert body1["status"] == "succeeded"
+    assert body1["result"]["contract_written"] is False  # cve_id unresolved -- the reason a human opens the form
+    # The baseline really is on disk, stamped by the fresh-LLM run.
+    saved_on_disk = json.loads(Path(body1["result"]["proposal_saved_path"]).read_text(encoding="utf-8"))
+    assert saved_on_disk["proposal"]["asset"]["os"]["authored_by"] == "model"
+
+    edited = _full_proposal_dict(  # cve_id resolved; os untouched but lying about who wrote it
+        name="upload-attrib",
+        overrides_asset={
+            "os": _mapped({"kind": "not_collected"}, authored_by="registry"),
+        },
+    )
+    assert edited["asset"]["os"]["authored_by"] == "registry"  # the claim really is on the wire
+    edited_saved_proposal = {
+        "proposal": edited,
+        "generator": {
+            "tool": "rhino-adapt-propose", "model": "claude-sonnet-5", "prompt_tokens": 100,
+            "completion_tokens": 50, "estimated_cost_usd": 0.001, "attempts": 1,
+            "call_log_digest": "sha256:" + "a" * 64,
+        },
+    }
+    assert _QueuedFakeCrew.queue == []  # no LLM call backs the resubmission
+
+    job2 = _submit(
+        client, upload_id=upload_id, name="upload-attrib", edited_saved_proposal=edited_saved_proposal
+    )
+    body2 = _wait_for_terminal(client, job2["job_id"])
+    assert body2["status"] == "succeeded"
+    assert body2["result"]["contract_written"] is True
+    assert "diffed against" in body2["result"]["authorship_baseline"]
+
+    on_disk = json.loads(Path(body2["result"]["contract_path"]).read_text(encoding="utf-8"))
+    authorship = on_disk["mapping_authorship"]
+    assert authorship["finding.cve_id"] == "human"  # the slot the human actually resolved
+    assert authorship["asset.os"] == "model"  # carried along, claim discarded, server's record kept
+    assert authorship["asset.asset_id"] == "model"  # every other carried-along slot, likewise
+    assert authorship["asset.hostname"] == "model"
+    # Before per-slot attribution this whole map read 'human'. Guard the
+    # regression directly rather than inferring it from the three above.
+    assert [slot for slot, who in authorship.items() if who == "human"] == ["finding.cve_id"]
+
+
+def test_edited_saved_proposal_falls_back_when_the_baseline_cannot_be_decoded(
+    client: TestClient, isolated_dirs: Path
+):
+    """"Unreadable" covers more than "missing". `load_saved_proposal` wraps
+    a missing file, bad JSON and a wrong shape into SchemaInferenceError,
+    but its read sits inside `except OSError` and UnicodeDecodeError is a
+    ValueError -- so a baseline that exists and cannot be DECODED escapes
+    that wrapper. It must still take the no-baseline fallback rather than
+    failing the job, and must still say so."""
+    upload_id = _upload(client, "inventory.csv", _csv_bytes(_ROWS))["upload_id"]
+    _QueuedFakeCrew.queue = [json.dumps(_full_proposal_dict(name="upload-undecodable"))]
+    job1 = _submit(client, upload_id=upload_id, name="upload-undecodable")
+    body1 = _wait_for_terminal(client, job1["job_id"])
+    assert body1["status"] == "succeeded"
+
+    # Corrupt the real baseline the next submission will reach for.
+    saved_path = Path(body1["result"]["proposal_saved_path"])
+    saved_path.write_bytes(b'{"proposal": "\xff\xfe\x00 not utf-8"}')
+
+    edited_saved_proposal = {
+        "proposal": _full_proposal_dict(name="upload-undecodable"),
+        "generator": {
+            "tool": "rhino-adapt-propose", "model": "claude-sonnet-5", "prompt_tokens": 100,
+            "completion_tokens": 50, "estimated_cost_usd": 0.001, "attempts": 1,
+            "call_log_digest": "sha256:" + "a" * 64,
+        },
+    }
+    job2 = _submit(
+        client, upload_id=upload_id, name="upload-undecodable", edited_saved_proposal=edited_saved_proposal
+    )
+    body2 = _wait_for_terminal(client, job2["job_id"])
+
+    assert body2["status"] == "succeeded"  # fell back, did not crash
+    assert body2["result"]["authorship_baseline"].startswith("unavailable --")
+    on_disk = json.loads(Path(body2["result"]["contract_path"]).read_text(encoding="utf-8"))
+    # The coarse fallback, stated plainly: everything reads 'human'.
+    assert set(on_disk["mapping_authorship"].values()) == {"human"}
 
 
 def test_edited_saved_proposal_still_refuses_an_illegal_edit(client: TestClient, isolated_dirs: Path):
