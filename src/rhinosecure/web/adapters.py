@@ -20,13 +20,28 @@ entry) and confirming a contract (a dedicated, non-conversational
 signature):
 
 - `GET /api/adapters/{name}/proposal?upload_id=...` -- read-only. Returns
-  the saved proposal (`out/propose_<name>.json`) plus TWO lists needing a
+  the saved proposal (`out/propose_<name>.json`) plus THREE lists needing a
   human's eyes before this can be confirmed:
   - `unresolved` -- every `SlotUnresolved` slot, with the real measured
     profile of its candidate column(s) (`ColumnProfile.distinct_values` --
     already computed by `check_grounding` today, just not previously
     surfaced to a human) and the target field's own closed vocabulary/range
     (`config_model.describe_target_vocabulary`).
+  - `illegal` -- every slot that IS `SlotMapped` but individually fails
+    `validate_contract` (`schema_inference.illegal_mapped_slots`,
+    `_illegal_mapped_detail` below). A DIFFERENT fact from `unresolved`,
+    on purpose (see `illegal_mapped_slots`'s own docstring for the argued
+    reason it is a separate function, not folded into `unresolved_slots`):
+    a mapping exists here and the validator rejects it, never "no mapping
+    could be found." This is exactly the slot `assemble_provisional_
+    contract`'s degrade path (or, on the strict path, `assemble_contract`'s
+    own refusal) would otherwise silently drop and paper over with a
+    placeholder or a bare, unreachable error -- before this existed, the
+    only documented recourse was hand-editing the saved proposal JSON and
+    re-running `rhino adapt propose --from-proposal` on the CLI. Renders
+    through the identical `resolveSlotRowHtml` widget `unresolved`/
+    `low_confidence` already use, worded distinctly (app.js reads each
+    entry's `"kind"`).
   - `low_confidence` -- every `SCORING_ENUM_TARGETS` slot the model DID map,
     but at a self-reported confidence below `config_model
     .LOW_CONFIDENCE_THRESHOLD` (`_low_confidence_detail`, below). This is
@@ -39,20 +54,20 @@ signature):
     the file. Scoped to `SCORING_ENUM_TARGETS` specifically because that's
     where a wrong value silently corrupts a real risk score, not just a
     free-text display field.
-  Both lists share one shape for a reason: a slot is RESOLVED (an
-  unresolved one) or CHANGED (a low-confidence one) the identical way --
-  editing the returned `proposal` JSON client-side and resubmitting the
-  WHOLE thing through the EXISTING generic `POST /api/jobs` with
-  `kind="ingest_propose"` and a new, additive job input,
+  All three lists share one shape for a reason: a slot is RESOLVED (an
+  unresolved one), CORRECTED (an illegal one), or CHANGED (a low-confidence
+  one) the identical way -- editing the returned `proposal` JSON client-side
+  and resubmitting the WHOLE thing through the EXISTING generic `POST
+  /api/jobs` with `kind="ingest_propose"` and a new, additive job input,
   `edited_saved_proposal` (`_run_ingest_propose`, web/jobs.py) -- this
   module mounts no dispatch route of its own for that step. A human may
   also leave a low-confidence slot exactly as the model proposed it and
-  simply attest to having reviewed it (below) -- unlike `unresolved`, a
-  low-confidence mapping is not REQUIRED to change, only required to be
-  seen. Either way, an illegal edit is refused by the identical
-  `check_grounding`/`assemble_contract` gate a bad model output already
-  goes through, never a second validator built for this surface that
-  could disagree with it.
+  simply attest to having reviewed it (below) -- unlike `unresolved`/
+  `illegal`, a low-confidence mapping is not REQUIRED to change, only
+  required to be seen. Either way, an illegal edit is refused by the
+  identical `check_grounding`/`assemble_contract` gate a bad model output
+  already goes through, never a second validator built for this surface
+  that could disagree with it.
 - `GET /api/adapters/{name}/review?upload_id=...` and `POST /api/adapters
   /{name}/confirm` -- the dedicated confirmation form, calling `adapters
   .review.review_contract` with `sign=False`/`sign=True` exactly as `rhino
@@ -130,6 +145,7 @@ from rhinosecure.agents.schema_inference import (
     SchemaInferenceError,
     SlotMapped,
     dump_saved_proposal,
+    illegal_mapped_slots,
     load_saved_proposal,
     unresolved_slots,
 )
@@ -313,6 +329,64 @@ def _low_confidence_detail(
     return detail
 
 
+def _illegal_mapped_detail(proposal: AdapterProposal, profiles: dict) -> list[dict[str, Any]]:
+    """One entry per slot `illegal_mapped_slots` reports -- a mapping DOES
+    exist here, but `validate_contract` itself would refuse it. Shaped
+    like `_low_confidence_detail`'s own entries on purpose (`current_
+    mapping`/`current_values`/`candidate_columns`/`column_profiles`/
+    `gap_legal`/`target_vocabulary`): the browser widget that renders a
+    row from this dict (`resolveSlotRowHtml`, app.js) is the SAME one
+    `_low_confidence_detail` already feeds, since both describe "a
+    mapping exists, here's what it currently resolves to, correct it
+    through the identical controls." `"kind": "illegal"` is the one new
+    field, read by that widget to word the row differently from a
+    genuinely unresolved one -- see `illegal_mapped_slots`'s own
+    docstring for why that distinction has to survive all the way to the
+    row, not just to this function's return shape.
+
+    Not scoped to `SCORING_ENUM_TARGETS` the way `_low_confidence_detail`
+    is: a mapping validate_contract refuses can be any target, not only a
+    scoring axis -- `finding.detected_date` with a misplaced `timestamp`
+    parser is exactly as illegal, and exactly as invisible before this
+    function existed, as a bad `asset.role` mapping.
+
+    `reason` is the validator's own text for this slot, verbatim -- never
+    a generic "this mapping is invalid" placeholder. Multiple problems for
+    one slot (rare, but `_mapped_slot_legality_problems` allows it) are
+    joined, not truncated, so nothing the validator said is silently
+    dropped from what the human reads before correcting it."""
+    detail = []
+    for slot, problems in illegal_mapped_slots(proposal, profiles).items():
+        section, _, target = slot.partition(".")
+        sp = (proposal.asset if section == "asset" else proposal.finding)[target]
+        candidate_columns = _mapping_source_columns(sp.mapping, proposal.derived)
+        column_profiles = {
+            column: profile
+            for column in candidate_columns
+            if (profile := _column_profile_dict(profiles, column)) is not None
+        }
+        current_values: dict[str, Any] = {}
+        if candidate_columns:
+            profile = column_profiles.get(candidate_columns[0])
+            if profile is not None:
+                current_values = _predict_current_values(sp.mapping, proposal.derived, profile["distinct_values"])
+        detail.append(
+            {
+                "slot": slot,
+                "kind": "illegal",
+                "reason": "; ".join(problems),
+                "current_mapping": sp.mapping.model_dump(mode="json"),
+                "current_values": current_values,
+                "candidate_columns": candidate_columns,
+                "column_profiles": column_profiles,
+                "gap_legal": target in GAP_LEGAL_TARGETS,
+                "absent_fact_legal": target in ABSENT_FACT_LEGAL_TARGETS,
+                "target_vocabulary": describe_target_vocabulary(target),
+            }
+        )
+    return detail
+
+
 def _column_profile_dict(profiles: dict, column: str) -> dict[str, Any] | None:
     for profile in profiles.values():
         column_profile = profile.columns.get(column)
@@ -409,6 +483,7 @@ def mount_adapter_routes(app: FastAPI) -> None:
             unresolved_detail.append(
                 {
                     "slot": slot,
+                    "kind": "unresolved",
                     "reason": entry.reason,
                     "candidate_columns": list(entry.candidate_columns),
                     "column_profiles": column_profiles,
@@ -438,6 +513,7 @@ def mount_adapter_routes(app: FastAPI) -> None:
             "name": name,
             "saved_proposal": dump_saved_proposal(saved),
             "unresolved": unresolved_detail,
+            "illegal": _illegal_mapped_detail(saved.proposal, profiles),
             "low_confidence": _low_confidence_detail(saved.proposal, profiles),
         }
 

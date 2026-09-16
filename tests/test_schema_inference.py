@@ -42,6 +42,7 @@ from rhinosecure.agents.schema_inference import (
     check_column_mapping_legal_values,
     check_grounding,
     dump_saved_proposal,
+    illegal_mapped_slots,
     load_saved_proposal,
     placeholder_axes,
     propose_contract,
@@ -809,6 +810,66 @@ def test_check_mapped_slots_legal_flags_an_illegal_mapping(profiles):
 def test_check_mapped_slots_legal_passes_the_valid_fixture(profiles):
     proposal = AdapterProposal.model_validate(_full_proposal_dict())
     _check_mapped_slots_legal(proposal, profiles)  # must not raise
+
+
+# --- illegal_mapped_slots: the resolve-slots form's OTHER row source,
+# distinct from unresolved_slots (module docstring on why) ------------------
+
+
+def test_illegal_mapped_slots_reports_the_validators_own_reason(profiles):
+    """The identical illegal mapping test_check_mapped_slots_legal_flags_an_
+    illegal_mapping raises on above -- here read back as data instead of an
+    exception, keyed to the exact validate_contract text, never a generic
+    message."""
+    data = _full_proposal_dict(overrides_asset={
+        "role": _mapped({"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "gap", "table": {"srv": "dc"}}, columns_cited=["Col"]),
+    })
+    proposal = AdapterProposal.model_validate(data)
+
+    result = illegal_mapped_slots(proposal, profiles)
+
+    assert list(result) == ["asset.role"]
+    (reason,) = result["asset.role"]
+    assert "blank='gap'" in reason
+    assert "'role'" in reason
+
+
+def test_illegal_mapped_slots_is_empty_for_the_valid_fixture(profiles):
+    proposal = AdapterProposal.model_validate(_full_proposal_dict())
+    assert illegal_mapped_slots(proposal, profiles) == {}
+
+
+def test_illegal_mapped_slots_never_reports_a_genuinely_unresolved_slot(profiles):
+    """Case A (no mapping proposed) and Case B (a mapping proposed, and
+    illegal) are different facts -- a SlotUnresolved slot must never show
+    up here, only in unresolved_slots. Pinned explicitly since the whole
+    point of keeping these two functions separate is that neither's
+    output can be mistaken for the other's."""
+    data = _full_proposal_dict(overrides_asset={"patch_window": _unresolved()})
+    proposal = AdapterProposal.model_validate(data)
+
+    assert illegal_mapped_slots(proposal, profiles) == {}
+    assert unresolved_slots(proposal) == ["asset.patch_window"]
+
+
+def test_illegal_mapped_slots_reports_every_violating_slot_together(profiles):
+    """validate_contract accumulates every problem before refusing --
+    illegal_mapped_slots must not stop at the first illegal slot either,
+    since the resolve-slots form needs every offending row in one pass,
+    not a fix-one-resubmit-find-the-next loop."""
+    data = _full_proposal_dict(
+        overrides_asset={
+            "role": _mapped({"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "gap", "table": {"srv": "dc"}}, columns_cited=["Col"]),
+        },
+        overrides_finding={
+            "detected_date": _mapped({"kind": "parsed", "column": "Cve", "case": "exact", "blank": "gap", "parser": "timestamp"}, columns_cited=["Cve"]),
+        },
+    )
+    proposal = AdapterProposal.model_validate(data)
+
+    result = illegal_mapped_slots(proposal, profiles)
+
+    assert set(result) == {"asset.role", "finding.detected_date"}
 
 
 def test_assemble_contract_a_caveat_alone_does_not_block(tmp_path):

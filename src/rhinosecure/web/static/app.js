@@ -2000,7 +2000,7 @@ function describeProvisionalCoverage(r) {
 }
 
 async function openResolvePanel(name, uploadId) {
-  const card = appendFollowUpCard(`<span class="spinner"></span> Loading unresolved slot(s)…`);
+  const card = appendFollowUpCard(`<span class="spinner"></span> Loading slot(s) needing attention…`);
   let data;
   try {
     const res = await fetch(`/api/adapters/${encodeURIComponent(name)}/proposal?upload_id=${encodeURIComponent(uploadId)}`);
@@ -2014,7 +2014,15 @@ async function openResolvePanel(name, uploadId) {
   card.dataset.uploadId = uploadId;
   card.savedProposal = data.saved_proposal;
   card.resolutions = {}; // slot -> {column, table: {sourceValue: targetValue}} | {notCollected: true}
-  renderResolvePanel(card, data.unresolved);
+  // Two structurally different reasons a slot needs a human here
+  // (data.unresolved: no mapping was ever proposed; data.illegal: one WAS
+  // proposed and the validator rejects it -- web/adapters.py's own
+  // `illegal_mapped_slots` docstring argues why these stay two separate
+  // server-side lists rather than one overloaded signal) are rendered as
+  // one combined row set -- each entry already carries its own `kind`, so
+  // `resolveSlotRowHtml` can word the two differently without this panel
+  // needing to know which list an entry came from.
+  renderResolvePanel(card, [...data.unresolved, ...(data.illegal || [])]);
 }
 
 /* Shared by the unresolved-slot resolver and the low-confidence-mapping
@@ -2106,6 +2114,19 @@ function resolveSlotRowHtml(slot) {
   const confidenceHtml =
     slot.confidence !== undefined ? `<p class="hint">Model confidence: ${(slot.confidence * 100).toFixed(0)}%</p>` : "";
 
+  // Worded distinctly from a genuinely unresolved slot on purpose: an
+  // unresolved slot has no mapping at all ("could not be identified"); an
+  // illegal one HAS a mapping and the validator rejects it specifically
+  // (`slot.reason` is validate_contract's own text for this slot, not a
+  // generic message -- web/adapters.py's `_illegal_mapped_detail`). Same
+  // `chat-msg-error` styling the "no legal automatic resolution" and
+  // "mapping hit fatal problems" messages elsewhere in this file already
+  // use for a real rejection, not a plain fill-this-in hint.
+  const reasonHtml =
+    slot.kind === "illegal"
+      ? `<p class="chat-msg-error">A mapping exists for this slot, but the validator rejects it: ${esc(slot.reason)}</p>`
+      : `<p class="hint">${esc(slot.reason)}</p>`;
+
   // "Mark not collected" is only ever a legal correction for a target with
   // its own NOT_COLLECTED_DEFAULTS entry (config_model.GAP_LEGAL_TARGETS) --
   // asset.role is the sharpest example: it falls back through `default_by`/
@@ -2124,7 +2145,7 @@ function resolveSlotRowHtml(slot) {
     <div class="resolve-slot" data-slot="${esc(slot.slot)}">
       <h4>${esc(slot.slot)}</h4>
       ${confidenceHtml}
-      <p class="hint">${esc(slot.reason)}</p>
+      ${reasonHtml}
       ${valuePickerHtml}
       ${columnPickerHtml}
       ${notCollectedHtml}
@@ -2132,15 +2153,15 @@ function resolveSlotRowHtml(slot) {
   `;
 }
 
-function renderResolvePanel(card, unresolved) {
+function renderResolvePanel(card, slots) {
   card.innerHTML = `
-    <h3>Resolve unresolved slot(s)</h3>
+    <h3>Resolve slot(s) needing attention</h3>
     <p class="hint">Only values the real file actually contains, and only target values this schema actually accepts -- the same closed grammar the model itself is held to. An illegal or incomplete resolution is refused, not silently accepted.</p>
-    ${unresolved.map((slot) => resolveSlotRowHtml(slot)).join("")}
+    ${slots.map((slot) => resolveSlotRowHtml(slot)).join("")}
     <div class="route-step-result resolve-status" hidden></div>
     <button type="button" class="secondary-btn resolve-submit-btn">Resubmit</button>
   `;
-  card.querySelector(".resolve-submit-btn").addEventListener("click", () => submitResolvedProposal(card, unresolved));
+  card.querySelector(".resolve-submit-btn").addEventListener("click", () => submitResolvedProposal(card, slots));
 }
 
 /* Shared by the unresolved-slot resolver and the low-confidence-mapping
@@ -2284,23 +2305,23 @@ function applySlotEditToProposal(proposal, slot, row) {
   return proposal;
 }
 
-function buildResolvedProposal(card, unresolved) {
+function buildResolvedProposal(card, slots) {
   const proposal = JSON.parse(JSON.stringify(card.savedProposal.proposal));
-  for (const slot of unresolved) {
+  for (const slot of slots) {
     const row = card.querySelector(`.resolve-slot[data-slot="${CSS.escape(slot.slot)}"]`);
     applySlotEditToProposal(proposal, slot, row);
   }
   return proposal;
 }
 
-async function submitResolvedProposal(card, unresolved) {
+async function submitResolvedProposal(card, slots) {
   const statusEl = card.querySelector(".resolve-status");
   const submitBtn = card.querySelector(".resolve-submit-btn");
   submitBtn.disabled = true;
   statusEl.hidden = false;
   statusEl.innerHTML = `<span class="spinner"></span> Re-checking against the real file…`;
 
-  const editedProposal = buildResolvedProposal(card, unresolved);
+  const editedProposal = buildResolvedProposal(card, slots);
   const editedSavedProposal = {
     proposal: editedProposal,
     generator: card.savedProposal.generator,

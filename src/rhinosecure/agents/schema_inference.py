@@ -894,6 +894,56 @@ def unresolved_slots(proposal: AdapterProposal) -> list[str]:
     return sorted(out)
 
 
+def illegal_mapped_slots(proposal: AdapterProposal, profiles: dict[str, FileProfile]) -> dict[str, list[str]]:
+    """Every `asset.<target>`/`finding.<target>` slot that IS `SlotMapped` --
+    a real mapping exists -- but that mapping individually violates a rule
+    `validate_contract` itself enforces, keyed to the validator's own
+    problem text for it (never a generic message: the row this feeds in
+    the resolve-slots form must say exactly why, the same reason a human
+    reading `rhino adapt propose`'s own refusal output would see).
+
+    A deliberately separate function from `unresolved_slots`, not a second
+    case folded into it, argued rather than assumed:
+
+    `unresolved_slots` answers one question -- "does ANY mapping exist for
+    this target at all" -- fully determined by `proposal` alone
+    (`isinstance(sp, SlotUnresolved)`), and its result already has two
+    live consumers that depend on it meaning exactly that: `_run_ingest_
+    propose`'s `result_dict["unresolved_slots"]`, and the resolve-slots
+    panel's own row set. This function answers a different question --
+    "is the mapping that DOES exist here one the validator will actually
+    accept" -- which needs context `unresolved_slots` doesn't (`profiles`,
+    to run the same checks `validate_contract` runs), and produces a
+    different SHAPE of answer (a mapped-but-illegal slot needs its
+    rejection reason carried along, not just its name). Widening
+    `unresolved_slots`'s signature and return shape to cover both would
+    force every existing caller to either ignore the new half of the
+    return value or start handling a case it was never asked about.
+
+    More than a signature mismatch: conflating the two meanings is a
+    mistake this codebase has already made and already paid for, in the
+    very UI this function now feeds. `app.js`'s `describeIngestProposeIncomplete`
+    carries its own scar tissue from this exact confusion -- a proposal
+    that is fully mapped and grounded but fails whole-contract validation
+    used to report "0 slot(s) remain unresolved: ." (`unresolved_slots`
+    correctly empty, since nothing is genuinely unmapped) while the real,
+    actionable reason sat unread in `incomplete_reason`. That bug was fixed
+    by keeping the two signals separate and always preferring the specific
+    one, not by merging them. A slot that is mapped-but-illegal is not
+    unresolved -- it is a different fact, needs a different sentence in
+    the form ("a mapping exists and the validator rejects it," not "no
+    mapping could be found"), and demonstrably drifts out of sync with its
+    own meaning the moment it is asked to also stand in for this one.
+
+    Reuses `_mapped_slot_legality_problems` -- the identical per-slot
+    check `_check_mapped_slots_legal` (below) already runs against a
+    FRESH model candidate during generation -- so this can never drift
+    from what a real `validate_contract` call, or the provisional-degrade
+    path's own `_degrade_invalid_slots`, would independently decide is
+    illegal about the same mapping."""
+    return _mapped_slot_legality_problems(proposal, profiles)
+
+
 # ---------------------------------------------------------------------------
 # Registry-backed alias resolution (deterministic, no LLM): closes exactly
 # the gap that produced an incomplete `role` table and an unresolved
@@ -2399,27 +2449,57 @@ def _check_mapped_slots_legal(proposal: AdapterProposal, profiles: dict[str, Fil
     failure path (or `assemble_contract`'s ordinary, clearly-worded
     refusal). Gating construction itself would make that review loop
     impossible: the very file a human needs to open and fix would refuse to
-    load at all."""
-    problems: list[str] = []
+    load at all.
+
+    Thin wrapper, not the check itself: `_mapped_slot_legality_problems`
+    (below) does the real per-slot work and returns it keyed by slot, so
+    `illegal_mapped_slots` (the resolve-slots form's own read of the
+    identical check, see its own docstring for why that's a separate
+    function rather than a case folded into `unresolved_slots`) can reuse
+    it without also inheriting this function's raise-one-bundled-exception
+    shape, which suits a generation-time retry loop but not a read-only
+    per-slot report."""
+    by_slot = _mapped_slot_legality_problems(proposal, profiles)
+    if by_slot:
+        problems = [p for probs in by_slot.values() for p in probs]
+        raise MappingLegalityError(
+            f"{len(problems)} mapped slot(s) violate the closed contract grammar (the identical "
+            f"checks validate_contract itself runs): {problems}"
+        )
+
+
+def _mapped_slot_legality_problems(
+    proposal: AdapterProposal, profiles: dict[str, FileProfile]
+) -> dict[str, list[str]]:
+    """The actual per-slot legality check `_check_mapped_slots_legal` and
+    `illegal_mapped_slots` both stand on -- runs `check_slot_mapping_legality`
+    (static) and, for a `ColumnMapping` against a closed vocabulary,
+    `check_column_mapping_legal_values` (data-dependent) over every
+    `SlotMapped` entry, keyed by its own `"asset.<target>"`/
+    `"finding.<target>"` name to whatever problem strings resulted. Empty
+    for a slot with no problems, and never an entry at all for a
+    `SlotUnresolved` one -- this function has nothing to say about a slot
+    with no mapping to check."""
+    by_slot: dict[str, list[str]] = {}
     assets_profile = profiles.get(proposal.meta.assets_filename)
     findings_profile = profiles.get(proposal.meta.findings_filename)
     for target, sp in proposal.asset.items():
         if isinstance(sp, SlotMapped):
             where = f"asset.{target}"
-            problems.extend(check_slot_mapping_legality(where, target, sp.mapping))
+            problems = list(check_slot_mapping_legality(where, target, sp.mapping))
             if isinstance(sp.mapping, ColumnMapping) and assets_profile is not None:
                 problems.extend(check_column_mapping_legal_values(where, target, sp.mapping, assets_profile))
+            if problems:
+                by_slot[where] = problems
     for target, sp in proposal.finding.items():
         if isinstance(sp, SlotMapped):
             where = f"finding.{target}"
-            problems.extend(check_slot_mapping_legality(where, target, sp.mapping))
+            problems = list(check_slot_mapping_legality(where, target, sp.mapping))
             if isinstance(sp.mapping, ColumnMapping) and findings_profile is not None:
                 problems.extend(check_column_mapping_legal_values(where, target, sp.mapping, findings_profile))
-    if problems:
-        raise MappingLegalityError(
-            f"{len(problems)} mapped slot(s) violate the closed contract grammar (the identical "
-            f"checks validate_contract itself runs): {problems}"
-        )
+            if problems:
+                by_slot[where] = problems
+    return by_slot
 
 
 def _estimate_cost_usd(usage: UsageMetrics | None) -> float:

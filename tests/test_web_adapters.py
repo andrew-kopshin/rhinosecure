@@ -191,6 +191,41 @@ def _propose(client: TestClient, upload_id: str, name: str, proposal: dict) -> d
     raise AssertionError("job did not finish")
 
 
+def _propose_edited(client: TestClient, upload_id: str, name: str, proposal: dict) -> dict:
+    """Mirrors `_propose`, but submits `proposal` as a human's resubmitted
+    edit (`edited_saved_proposal`) rather than a fresh LLM candidate --
+    the resolve-slots form's own request shape. Never touches the fake-crew
+    queue: `_run_ingest_propose`'s `from_proposal` branch never calls the
+    LLM at all, exactly like the real `rhino adapt propose --from-proposal`
+    it shares code with."""
+    edited_saved_proposal = {
+        "proposal": proposal,
+        "generator": {
+            "tool": "rhino-adapt-propose", "model": "claude-sonnet-5",
+            "prompt_tokens": 10, "completion_tokens": 5, "estimated_cost_usd": 0.0,
+            "attempts": 1, "call_log_digest": "sha256:" + "a" * 64,
+        },
+        "attempt_usage": [],
+    }
+    resp = client.post(
+        "/api/jobs",
+        json={
+            "kind": "ingest_propose",
+            "input": {"upload_id": upload_id, "name": name, "edited_saved_proposal": edited_saved_proposal},
+        },
+    )
+    job_id = resp.json()["job_id"]
+    import time
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        body = client.get(f"/api/jobs/{job_id}").json()
+        if body["status"] in ("succeeded", "failed"):
+            return body
+        time.sleep(0.02)
+    raise AssertionError("job did not finish")
+
+
 # ---------------- routes are absent without jobs_enabled ----------------
 
 
@@ -228,6 +263,60 @@ def test_get_proposal_surfaces_unresolved_slot_detail(client: TestClient):
     assert detail["candidate_columns"] == ["Env"]
     assert detail["target_vocabulary"] == {"kind": "enum", "values": ["dev", "prod", "staging"]}
     assert set(detail["column_profiles"]["Env"]["distinct_values"]) == {"Production", "Corporate"}
+
+
+def test_get_proposal_surfaces_an_illegal_mapped_slot_distinctly_from_unresolved(client: TestClient):
+    """The gap this endpoint addition closes: `role` HAS a mapping here --
+    it is not unresolved -- but `blank='gap'` is illegal for it
+    (`role` has no `NOT_COLLECTED_DEFAULTS` entry). Before `illegal`
+    existed, the only documented recourse was hand-editing the saved
+    proposal JSON and re-running `rhino adapt propose --from-proposal` on
+    the CLI -- this proves the same slot now round-trips through the web
+    endpoint instead, worded as a rejection, not a generic message, and
+    never double-counted as unresolved."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-illegal")
+    proposal["asset"]["role"] = {
+        "status": "mapped", "confidence": 0.9,
+        "mapping": {
+            "kind": "vocabulary", "column": "Col", "case": "lower", "blank": "gap",
+            "table": {"srv": "dc", "wks": "workstation"},
+        },
+        "evidence": {"columns_cited": ["Col"], "sample_values_cited": [], "note": "test reasoning"},
+    }
+    job = _propose_edited(client, upload_id, "upload-illegal", proposal)
+    assert job["status"] == "succeeded"
+    # assemble_contract refuses role outright (blank='gap' is illegal for
+    # it); the provisional fallback then degrades it -- confirms the
+    # scenario this test is actually about really occurred, not just that
+    # the endpoint under test handles an arbitrary saved proposal.
+    assert job["result"]["contract_written"] is True
+    assert job["result"]["provisional"] is True
+    assert "asset.role" in job["result"]["invalid_mappings_dropped"]
+
+    resp = client.get("/api/adapters/upload-illegal/proposal", params={"upload_id": upload_id})
+    assert resp.status_code == 200
+    body = resp.json()
+    illegal = {entry["slot"]: entry for entry in body["illegal"]}
+    assert "asset.role" in illegal
+    entry = illegal["asset.role"]
+    assert entry["kind"] == "illegal"
+    assert "blank='gap'" in entry["reason"]  # the validator's own text, not a generic message
+    assert entry["candidate_columns"] == ["Col"]
+    assert entry["current_mapping"]["table"] == {"srv": "dc", "wks": "workstation"}
+    assert set(entry["column_profiles"]["Col"]["distinct_values"]) == {"srv", "wks"}
+    # mapped-but-illegal is not unresolved -- must never appear in both lists.
+    assert "asset.role" not in {u["slot"] for u in body["unresolved"]}
+
+
+def test_get_proposal_illegal_is_empty_for_a_clean_proposal(client: TestClient):
+    upload_id = _upload(client)
+    job = _propose(client, upload_id, "upload-clean", _proposal_dict(name="upload-clean"))
+    assert job["result"]["contract_written"] is True
+    assert job["result"].get("provisional") is False
+
+    resp = client.get("/api/adapters/upload-clean/proposal", params={"upload_id": upload_id})
+    assert resp.json()["illegal"] == []
 
 
 def test_get_proposal_404s_for_an_unknown_name(client: TestClient):
