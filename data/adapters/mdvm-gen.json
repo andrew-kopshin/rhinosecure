@@ -105,7 +105,7 @@
   },
   "attestations": [
     {
-      "at": "2026-09-04T19:09:44Z",
+      "at": "2026-09-16T05:21:31Z",
       "item": "finding_id.synthesized",
       "text": "Defender exports no stable per-finding id; the id is a sha256 over DeviceId/SoftwareVendor/SoftwareName/SoftwareVersion/CveId, frozen on confirmation. SoftwareVendor is an OPTIONAL column inside that tuple."
     }
@@ -358,6 +358,7 @@
     },
     "mode": "declared"
   },
+  "mapping_authorship": null,
   "mapping_confidence": null,
   "not_collected": {
     "always_asset": [
@@ -394,7 +395,7 @@
     "excluded_findings": 0,
     "findings_loaded": 9,
     "header_notices": [],
-    "measured_at": "2026-09-06T23:31:21Z",
+    "measured_at": "2026-09-16T05:21:31Z",
     "measured_by": "andy.kopshin@gmail.com",
     "measured_by_command": "confirm",
     "not_collected_assets": {
@@ -415,10 +416,10 @@
     }
   },
   "review": {
-    "confirmed_at": "2026-09-06T23:31:21Z",
+    "confirmed_at": "2026-09-16T05:21:31Z",
     "confirmed_by": "andy.kopshin@gmail.com",
     "confirmed_version": 1,
-    "content_digest": "sha256:4254d4a27e2cf3eb99523193f176f195d26a7d34314010e3642710747f26f4b8",
+    "content_digest": "sha256:c8c9420074abcb305a9439d1c5f571f2ecec5c56cc31e67ca2e7570efef8d034",
     "decision_digest": "sha256:d7a803d22f93c97c2f0fde07d3a706eee38e9ec02f2087a04ede19a22c3c1ffd",
     "slot_digests": {
       "asset.asset_id": "sha256:58b04e0cb4524791ffa2cbe6d830bbfcf4dae493818c014bc532903118cf147d",

@@ -33,10 +33,13 @@ from rhinosecure.web.server import create_app
 _HEADER = ["Asset_ID", "Hostname", "Finding_ID", "Cve", "Col"]
 
 
-def _mapped(mapping: dict, *, confidence: float = 0.9, columns_cited: list[str] | None = None) -> dict:
+def _mapped(
+    mapping: dict, *, confidence: float = 0.9, columns_cited: list[str] | None = None, authored_by: str | None = None
+) -> dict:
     return {
         "status": "mapped", "mapping": mapping, "confidence": confidence,
         "evidence": {"columns_cited": columns_cited or [], "sample_values_cited": [], "note": "test"},
+        "authored_by": authored_by,
     }
 
 
@@ -605,6 +608,45 @@ def test_edited_saved_proposal_resolves_without_a_new_llm_call(client: TestClien
     on_disk = json.loads(contract_path.read_text(encoding="utf-8"))
     assert on_disk["review"]["state"] == "proposed"
     assert on_disk["format"] == "upload-resolve"
+
+
+def test_edited_saved_proposal_never_trusts_a_client_claimed_authorship(client: TestClient, isolated_dirs: Path):
+    """The actual spoofing surface CLAUDE.md's authorship design names:
+    POST /api/jobs is not bound to the browser -- anything can submit an
+    edited_saved_proposal claiming authored_by='model' (or 'registry') for
+    a slot it typed itself. This never even reaches an LLM call (no queue
+    entry needed), so the claim can only have come from the request body.
+    The written contract must show 'human' regardless of what was claimed."""
+    upload_id = _upload(client, "inventory.csv", _csv_bytes(_ROWS))["upload_id"]
+    spoofed = _full_proposal_dict(
+        name="upload-spoof",
+        overrides_asset={
+            "asset_id": _mapped(
+                {"kind": "column", "column": "Asset_ID", "case": "exact", "blank": "fatal"},
+                columns_cited=["Asset_ID"], authored_by="model",
+            ),
+        },
+    )
+    assert spoofed["asset"]["asset_id"]["authored_by"] == "model"  # the claim really is on the wire
+    edited_saved_proposal = {
+        "proposal": spoofed,
+        "generator": {
+            "tool": "rhino-adapt-propose", "model": "claude-sonnet-5", "prompt_tokens": 100,
+            "completion_tokens": 50, "estimated_cost_usd": 0.001, "attempts": 1,
+            "call_log_digest": "sha256:" + "a" * 64,
+        },
+    }
+    assert _QueuedFakeCrew.queue == []  # no LLM call backs this submission at all
+
+    job = _submit(client, upload_id=upload_id, name="upload-spoof", edited_saved_proposal=edited_saved_proposal)
+    body = _wait_for_terminal(client, job["job_id"])
+    assert body["status"] == "succeeded"
+    assert body["result"]["contract_written"] is True
+    assert _QueuedFakeCrew.instantiations == 0  # confirms nothing here ever called the model
+
+    contract_path = Path(body["result"]["contract_path"])
+    on_disk = json.loads(contract_path.read_text(encoding="utf-8"))
+    assert on_disk["mapping_authorship"]["asset.asset_id"] == "human"
 
 
 def test_edited_saved_proposal_still_refuses_an_illegal_edit(client: TestClient, isolated_dirs: Path):

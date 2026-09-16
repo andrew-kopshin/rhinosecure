@@ -278,6 +278,16 @@ class SlotEvidence(BaseModel):
     note: str
 
 
+#: Model structured output ("model"), a human's edit via the resolve-slots
+#: form or a hand-edited `--from-proposal` file ("human"), or a
+#: deterministic schema-registry lookup that needed neither
+#: ("registry" -- `_promote_unresolved_slot`'s own doing). See
+#: `propose_contract`'s own docstring for exactly where and how each is
+#: set -- never trusted from whatever `SlotMapped.authored_by` happens to
+#: arrive holding; see that field's own comment.
+SlotAuthor = Literal["model", "human", "registry"]
+
+
 class SlotMapped(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -285,6 +295,16 @@ class SlotMapped(BaseModel):
     mapping: Mapping
     confidence: float = PydanticField(ge=0, le=1)
     evidence: SlotEvidence
+    #: Who authored this mapping -- `SlotAuthor`'s own docstring names the
+    #: three values. `None` by default ONLY so this field can be absent
+    #: from untrusted input and still parse: the model is never asked to
+    #: report it, and a `--from-proposal` file or a POSTed
+    #: `edited_saved_proposal` is never trusted to report it correctly
+    #: either. `propose_contract`'s own `_stamp_authorship` pass always
+    #: overwrites this, unconditionally, before the proposal is used for
+    #: anything else -- a `None` surviving past that point means the
+    #: stamping pass was skipped, never that no one authored the slot.
+    authored_by: SlotAuthor | None = None
 
 
 class SlotUnresolved(BaseModel):
@@ -1061,7 +1081,40 @@ def _promote_unresolved_slot(target: str, slot: SlotUnresolved, assets_profile: 
             sample_values_cited=sorted(table)[:6],
             note="resolved via schema registry alias table, no model judgment",
         ),
+        authored_by="registry",
     )
+
+
+def _stamp_authorship(proposal: AdapterProposal, source: SlotAuthor) -> AdapterProposal:
+    """Overwrites `authored_by` to `source` on every currently-`SlotMapped`
+    slot in `proposal`, unconditionally -- the one place this project
+    trusts a claim about who authored a mapping, because it never reads
+    the claim FROM `proposal` at all. `source` is chosen by the caller
+    (`propose_contract`, immediately below `_apply_registry_aliases`)
+    from which CODE PATH is executing -- a fresh LLM candidate is always
+    `"model"`, anything arriving via `from_proposal` is always `"human"`
+    -- never from anything the proposal itself claims. Whatever
+    `authored_by` a slot already carried, including a value a careless or
+    malicious caller set directly in a POSTed `edited_saved_proposal`
+    (`web/jobs.py`'s `_run_ingest_propose`; `/api/jobs` is not bound to
+    the browser), is discarded here every time, no exceptions.
+
+    `SlotUnresolved` slots are left untouched -- nothing to stamp.
+    `_apply_registry_aliases`, called immediately after this in
+    `propose_contract`, can still promote a freshly-stamped slot's
+    authorship on to `"registry"` where that actually applies (a genuine
+    slot PROMOTION -- table AUGMENTATION of an already-`SlotMapped` slot
+    changes only the table, never who decided the slot's own structure,
+    so it leaves whatever this function just stamped alone)."""
+    new_asset = {
+        target: (sp.model_copy(update={"authored_by": source}) if isinstance(sp, SlotMapped) else sp)
+        for target, sp in proposal.asset.items()
+    }
+    new_finding = {
+        target: (sp.model_copy(update={"authored_by": source}) if isinstance(sp, SlotMapped) else sp)
+        for target, sp in proposal.finding.items()
+    }
+    return proposal.model_copy(update={"asset": new_asset, "finding": new_finding})
 
 
 def _apply_registry_aliases(proposal: AdapterProposal, profiles: dict[str, FileProfile]) -> AdapterProposal:
@@ -1131,6 +1184,7 @@ def _assemble_and_validate(
     asset_mappings: dict[str, Mapping],
     finding_mappings: dict[str, Mapping],
     mapping_confidence: dict[str, float],
+    mapping_authorship: dict[str, str],
     *,
     generator: Generator,
     generated_at: str,
@@ -1139,7 +1193,8 @@ def _assemble_and_validate(
     -- builds `Header`/`Source`, recomputes `not_collected` (V09), and runs
     the real `validate_contract` as the final safety net, exactly as this
     function's own body always has. The two callers differ ONLY in how
-    `asset_mappings`/`finding_mappings`/`mapping_confidence` were built
+    `asset_mappings`/`finding_mappings`/`mapping_confidence`/
+    `mapping_authorship` were built
     (every slot resolved by the model, vs. some auto-filled with a legal
     placeholder) -- everything after that point is identical, and drifting
     the two would silently reopen exactly the gaps an adversarial review of
@@ -1245,6 +1300,7 @@ def _assemble_and_validate(
         generated_at=generated_at,
         generator=generator,
         mapping_confidence=mapping_confidence,
+        mapping_authorship=mapping_authorship,
         source=source,
         header=header,
         derived=proposal.derived,
@@ -1347,8 +1403,24 @@ def assemble_contract(
         for section, slots in (("asset", proposal.asset), ("finding", proposal.finding))
         for t, sp in slots.items()
     }
+    # `.authored_by`'s own counterpart to the comment above: carried into
+    # the Contract the identical way, for the identical reason (audit
+    # trail, never read by configured.py's engine). Skips a slot whose
+    # `authored_by` is still `None` rather than asserting one can't exist --
+    # every slot `propose_contract` itself produces always has a real
+    # value (`_stamp_authorship`'s own guarantee), but this function is
+    # also called directly in tests against a hand-built `AdapterProposal`
+    # that never went through that stamping pass, and a partial or empty
+    # `mapping_authorship` there is the honest reflection of what's
+    # actually known, not a bug to guard against.
+    mapping_authorship = {
+        f"{section}.{t}": sp.authored_by
+        for section, slots in (("asset", proposal.asset), ("finding", proposal.finding))
+        for t, sp in slots.items()
+        if sp.authored_by is not None
+    }
     return _assemble_and_validate(
-        proposal, profiles, asset_mappings, finding_mappings, mapping_confidence,
+        proposal, profiles, asset_mappings, finding_mappings, mapping_confidence, mapping_authorship,
         generator=generator, generated_at=generated_at,
     )
 
@@ -1484,6 +1556,7 @@ def _degrade_invalid_slots(
     asset_mappings: "dict[str, Mapping]",
     finding_mappings: "dict[str, Mapping]",
     mapping_confidence: dict[str, float],
+    mapping_authorship: dict[str, str],
     neutralized_axes: set[str],
     dropped: set[str],
     dropped_columns: dict[str, set[str]],
@@ -1493,11 +1566,22 @@ def _degrade_invalid_slots(
     """The sibling of the main per-slot loop below, for a `SlotMapped`
     mapping that turns out to be individually illegal rather than genuinely
     unresolved. Mutates `asset_mappings`/`finding_mappings`/
-    `mapping_confidence`/`neutralized_axes`/`dropped`/`dropped_columns` in
-    place; returns `None` on success, or a human-readable hard-stop reason
-    when a violation cannot be attributed to a single slot (a whole-contract
-    problem no per-mapping change can fix) or a named slot has no legal
-    placeholder at all (`_provisional_placeholder_for` returns `None`).
+    `mapping_confidence`/`mapping_authorship`/`neutralized_axes`/`dropped`/
+    `dropped_columns` in place; returns `None` on success, or a
+    human-readable hard-stop reason when a violation cannot be attributed
+    to a single slot (a whole-contract problem no per-mapping change can
+    fix) or a named slot has no legal placeholder at all
+    (`_provisional_placeholder_for` returns `None`).
+
+    `mapping_authorship` is popped exactly like `mapping_confidence` is,
+    for the identical reason: the placeholder that replaces a dropped
+    mapping was chosen by `_provisional_placeholder_for`'s own ordered
+    fallback, not authored by whoever the ORIGINAL (now-discarded) mapping
+    was attributed to -- a degraded slot has no human, model, or registry
+    author to report, so it correctly has no entry at all rather than a
+    stale one. This is bookkeeping only -- this function still decides
+    nothing DIFFERENTLY based on who authored the mapping it's dropping;
+    that's deliberately not built yet.
 
     Validates every named slot has a legal placeholder BEFORE mutating
     anything, so a hard stop never leaves `asset_mappings`/`finding_mappings`
@@ -1527,6 +1611,7 @@ def _degrade_invalid_slots(
             dropped_columns.setdefault(filenames[section], set()).add(column)
         mapping_dicts[section][target] = new_mapping
         mapping_confidence.pop(slot, None)
+        mapping_authorship.pop(slot, None)
         dropped.add(slot)
         if neutralize:
             neutralized_axes.add(target)
@@ -1743,6 +1828,7 @@ def assemble_provisional_contract(
     asset_mappings: dict[str, Mapping] = {}
     finding_mappings: dict[str, Mapping] = {}
     mapping_confidence: dict[str, float] = {}
+    mapping_authorship: dict[str, str] = {}
     neutralized_axes: set[str] = set()
     hard_stop_targets: list[str] = []
 
@@ -1754,6 +1840,8 @@ def assemble_provisional_contract(
             if isinstance(sp, SlotMapped):
                 mapping_dict[target] = sp.mapping
                 mapping_confidence[f"{section}.{target}"] = sp.confidence
+                if sp.authored_by is not None:
+                    mapping_authorship[f"{section}.{target}"] = sp.authored_by
                 continue
             # SlotUnresolved from here on.
             placeholder = _provisional_placeholder_for(target)
@@ -1787,7 +1875,7 @@ def assemble_provisional_contract(
     dropped_columns: dict[str, set[str]] = {}
     try:
         contract = _assemble_and_validate(
-            proposal, profiles, asset_mappings, finding_mappings, mapping_confidence,
+            proposal, profiles, asset_mappings, finding_mappings, mapping_confidence, mapping_authorship,
             generator=generator, generated_at=generated_at,
         )
     except ProposalIncompleteError as exc:
@@ -1818,7 +1906,7 @@ def assemble_provisional_contract(
             proposal = proposal.model_copy(update={"unmapped_columns": pruned_unmapped})
             try:
                 contract = _assemble_and_validate(
-                    proposal, profiles, asset_mappings, finding_mappings, mapping_confidence,
+                    proposal, profiles, asset_mappings, finding_mappings, mapping_confidence, mapping_authorship,
                     generator=generator, generated_at=generated_at,
                 )
             except ProposalIncompleteError as exc_after_reconcile:
@@ -1833,7 +1921,7 @@ def assemble_provisional_contract(
         # named and retry once with the identical proposal otherwise
         # unchanged.
         hard_stop = _degrade_invalid_slots(
-            exc, asset_mappings, finding_mappings, mapping_confidence, neutralized_axes,
+            exc, asset_mappings, finding_mappings, mapping_confidence, mapping_authorship, neutralized_axes,
             dropped_slots, dropped_columns, proposal.meta.assets_filename, proposal.meta.findings_filename,
         )
         if hard_stop is not None:
@@ -1842,7 +1930,7 @@ def assemble_provisional_contract(
         retry_proposal = proposal
         try:
             contract = _assemble_and_validate(
-                retry_proposal, profiles, asset_mappings, finding_mappings, mapping_confidence,
+                retry_proposal, profiles, asset_mappings, finding_mappings, mapping_confidence, mapping_authorship,
                 generator=generator, generated_at=generated_at,
             )
         except ProposalIncompleteError as exc2:
@@ -1860,7 +1948,7 @@ def assemble_provisional_contract(
             retry_proposal = retry_proposal.model_copy(update={"unmapped_columns": merged_unmapped})
             try:
                 contract = _assemble_and_validate(
-                    retry_proposal, profiles, asset_mappings, finding_mappings, mapping_confidence,
+                    retry_proposal, profiles, asset_mappings, finding_mappings, mapping_confidence, mapping_authorship,
                     generator=generator, generated_at=generated_at,
                 )
             except ProposalIncompleteError as exc3:
@@ -2678,6 +2766,11 @@ def propose_contract(
             call_log_digest="sha256:" + hashlib.sha256("\n===\n".join(call_log_parts).encode("utf-8")).hexdigest(),
         )
 
+    # Server-authoritative, not the input's: `source` is decided from which
+    # branch of this function just ran, never read off `proposal` itself --
+    # see `_stamp_authorship`'s own docstring for why that's the one place
+    # this project trusts an authorship claim at all.
+    proposal = _stamp_authorship(proposal, "human" if from_proposal is not None else "model")
     proposal = _apply_registry_aliases(proposal, profiles)
     report = check_grounding(proposal, profiles)
     incomplete_reason: str | None = None

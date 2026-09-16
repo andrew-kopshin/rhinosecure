@@ -17,7 +17,14 @@ import pytest
 from crewai.types.usage_metrics import UsageMetrics
 
 import rhinosecure.agents.schema_inference as schema_inference_module
-from rhinosecure.adapters.config_model import ASSET_SLOTS, FINDING_SLOTS, ColumnMapping, Contract, validate_contract
+from rhinosecure.adapters.config_model import (
+    ASSET_SLOTS,
+    FINDING_SLOTS,
+    ColumnMapping,
+    Contract,
+    compute_decision_digest,
+    validate_contract,
+)
 from rhinosecure.adapters.probe import profile_source
 from rhinosecure.agents.schema_inference import (
     PROVISIONAL_ROLE_PLACEHOLDER,
@@ -60,10 +67,13 @@ def _generator() -> Generator:
     )
 
 
-def _mapped(mapping: dict, *, confidence: float = 0.9, columns_cited: list[str] | None = None) -> dict:
+def _mapped(
+    mapping: dict, *, confidence: float = 0.9, columns_cited: list[str] | None = None, authored_by: str | None = None
+) -> dict:
     return {
         "status": "mapped", "mapping": mapping, "confidence": confidence,
         "evidence": {"columns_cited": columns_cited or [], "sample_values_cited": [], "note": "test"},
+        "authored_by": authored_by,
     }
 
 
@@ -362,6 +372,70 @@ def test_assemble_contract_carries_every_slots_confidence_into_the_contract(prof
     assert len(contract.mapping_confidence) == len(ASSET_SLOTS) + len(FINDING_SLOTS)
 
 
+def test_assemble_contract_carries_authorship_into_the_contract_skipping_unstamped_slots(profiles):
+    """`mapping_authorship`'s counterpart to the test above -- carried
+    forward the identical way, for the identical reason. Deliberately built
+    from a proposal where most slots were never stamped (`_mapped`'s own
+    `authored_by=None` default, exactly what a hand-built AdapterProposal
+    that never went through propose_contract's stamping pass looks like):
+    the Contract this produces has a PARTIAL mapping_authorship, only for
+    the slots that actually carry a value -- the honest reflection of what's
+    known, not an assertion that every slot must have one."""
+    data = _full_proposal_dict(overrides_asset={
+        "role": _mapped(
+            {"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "fatal", "table": {"srv": "dc"}},
+            columns_cited=["Col"], authored_by="human",
+        ),
+        "asset_id": _mapped(
+            {"kind": "column", "column": "Asset_ID", "case": "exact", "blank": "fatal"},
+            columns_cited=["Asset_ID"], authored_by="model",
+        ),
+    })
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles)
+    contract = assemble_contract(proposal, profiles, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract.mapping_authorship["asset.role"] == "human"
+    assert contract.mapping_authorship["asset.asset_id"] == "model"
+    # Every OTHER slot in this fixture was never stamped -- absent, not a
+    # fabricated value and not a `None` sitting in the dict either.
+    assert "asset.hostname" not in contract.mapping_authorship
+    assert "finding.cve_id" not in contract.mapping_authorship
+    assert len(contract.mapping_authorship) == 2
+
+
+def test_mapping_authorship_never_affects_decision_digest(profiles):
+    """The decision this task explicitly had to make and state, not pick
+    silently: mapping_authorship is carried forward onto the assembled
+    Contract, exactly like mapping_confidence, but -- also exactly like
+    mapping_confidence -- it is audit trail, never a mapping DECISION.
+    Two contracts differing ONLY in who authored every slot must produce
+    the IDENTICAL decision_digest, so a human or model correcting who gets
+    credited for a value can never retroactively invalidate an existing
+    signature the way an actual mapping change would."""
+    human_data = _full_proposal_dict(overrides_asset={
+        "role": _mapped(
+            {"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "fatal", "table": {"srv": "dc"}},
+            columns_cited=["Col"], authored_by="human",
+        ),
+    })
+    model_data = _full_proposal_dict(overrides_asset={
+        "role": _mapped(
+            {"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "fatal", "table": {"srv": "dc"}},
+            columns_cited=["Col"], authored_by="model",
+        ),
+    })
+    human_proposal = AdapterProposal.model_validate(human_data)
+    model_proposal = AdapterProposal.model_validate(model_data)
+    human_contract = assemble_contract(
+        human_proposal, profiles, check_grounding(human_proposal, profiles), generator=_generator(), generated_at=_GENERATED_AT
+    )
+    model_contract = assemble_contract(
+        model_proposal, profiles, check_grounding(model_proposal, profiles), generator=_generator(), generated_at=_GENERATED_AT
+    )
+    assert human_contract.mapping_authorship["asset.role"] != model_contract.mapping_authorship["asset.role"]
+    assert compute_decision_digest(human_contract) == compute_decision_digest(model_contract)
+
+
 def test_a_low_confidence_scoring_slot_requires_attestation_before_it_can_confirm(profiles):
     from rhinosecure.adapters.config_model import missing_attestations
 
@@ -571,6 +645,42 @@ def test_provisional_assembly_drops_a_mapped_but_illegal_blank_policy_and_report
     assert "RoleColUnique" in contract.unmapped_columns["data.csv"]
     assert contract.unmapped_columns["data.csv"]["RoleColUnique"].disposition == "deliberately_dropped"
     validate_contract(contract, {"data.csv": header})
+
+
+def test_provisional_assembly_drops_authorship_alongside_a_degraded_slot(tmp_path):
+    """mapping_authorship's counterpart to invalid_mappings_dropped, popped
+    the identical way mapping_confidence already is (_degrade_invalid_slots'
+    own docstring on why): the placeholder that replaces a dropped mapping
+    was chosen by _provisional_placeholder_for's ordered fallback, not
+    authored by whoever the ORIGINAL, now-discarded mapping was attributed
+    to -- so the degraded slot has no entry at all. A DIFFERENT, surviving
+    slot's own authorship must still be there, unaffected -- this is
+    per-slot bookkeeping, not a blanket wipe."""
+    header = _HEADER + ["RoleColUnique"]
+    _write_csv(tmp_path, header, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "srv", "Workstation"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "wks", "Workstation"],
+    ])
+    profiles_map = {p.path.name: p for p in profile_source(tmp_path)}
+
+    data = _full_proposal_dict(overrides_asset={
+        "role": _mapped(
+            {"kind": "vocabulary", "column": "RoleColUnique", "case": "exact", "blank": "gap", "optional": True,
+             "table": {"Workstation": "workstation"}},
+            columns_cited=["RoleColUnique"], authored_by="human",
+        ),
+        "asset_id": _mapped(
+            {"kind": "column", "column": "Asset_ID", "case": "exact", "blank": "fatal"},
+            columns_cited=["Asset_ID"], authored_by="model",
+        ),
+    })
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, profiles_map)
+    contract, notes = assemble_provisional_contract(proposal, profiles_map, report, generator=_generator(), generated_at=_GENERATED_AT)
+    assert contract is not None
+    assert notes.invalid_mappings_dropped == frozenset({"asset.role"})
+    assert "asset.role" not in contract.mapping_authorship  # degraded -- the human's own value was replaced
+    assert contract.mapping_authorship["asset.asset_id"] == "model"  # untouched sibling slot survives
 
 
 def test_provisional_assembly_drops_a_mapped_but_illegal_parser_and_reports_it(tmp_path):
@@ -1166,6 +1276,90 @@ def test_propose_contract_rejects_a_bad_format_name_before_touching_the_llm(data
     with pytest.raises(SchemaInferenceError):
         propose_contract(data_dir, "native", generated_at=_GENERATED_AT)  # collides with a built-in format
     assert _QueuedFakeCrew.instantiations == 0
+
+
+# --- authorship: _stamp_authorship, and that nothing else is ever trusted ----
+
+
+def test_propose_contract_stamps_every_slot_model_on_the_fresh_llm_path(data_dir):
+    """A fresh candidate never declares its own authorship (the model is
+    never asked to report it) -- propose_contract stamps it, unconditionally,
+    for every slot, right after the retry loop and before registry aliasing."""
+    _QueuedFakeCrew.queue = [json.dumps(_full_proposal_dict())]
+    result = propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT)
+    for section in (result.proposal.asset, result.proposal.finding):
+        for target, sp in section.items():
+            assert sp.authored_by == "model", target
+
+
+def test_propose_contract_stamps_every_slot_human_via_from_proposal(data_dir):
+    """The from_proposal branch never calls the LLM -- nothing arriving
+    through it can honestly be 'model', so every slot is stamped 'human',
+    unconditionally, the same way the fresh path stamps 'model'."""
+    proposal = AdapterProposal.model_validate(_full_proposal_dict())
+    saved = SavedProposal(proposal=proposal, generator=_generator())
+    result = propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, from_proposal=saved)
+    for section in (result.proposal.asset, result.proposal.finding):
+        for target, sp in section.items():
+            assert sp.authored_by == "human", target
+
+
+def test_propose_contract_from_proposal_never_trusts_a_client_claimed_authorship(data_dir):
+    """The spoofing case: a POSTed edited_saved_proposal (or a hand-edited
+    --from-proposal file) can claim ANYTHING for authored_by -- /api/jobs is
+    not bound to the browser, and a raw file is not bound to rhino adapt
+    propose's own UI at all. Every slot here explicitly claims 'model' or
+    'registry', a lie either way (nothing here came from an LLM call this
+    invocation made, and none of it came from a registry lookup) -- the
+    server must overwrite every one of them to 'human', never repeat the
+    claim back."""
+    data = _full_proposal_dict(
+        overrides_asset={
+            "asset_id": _mapped(
+                {"kind": "column", "column": "Asset_ID", "case": "exact", "blank": "fatal"},
+                columns_cited=["Asset_ID"], authored_by="model",
+            ),
+            "role": _mapped(
+                {"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "fatal", "table": {"srv": "dc"}},
+                columns_cited=["Col"], authored_by="registry",
+            ),
+        },
+    )
+    proposal = AdapterProposal.model_validate(data)
+    # The claims really are present on the INPUT -- confirms this test would
+    # actually catch a regression, not merely pass because nothing was set.
+    assert proposal.asset["asset_id"].authored_by == "model"
+    assert proposal.asset["role"].authored_by == "registry"
+
+    saved = SavedProposal(proposal=proposal, generator=_generator())
+    result = propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, from_proposal=saved)
+
+    assert result.proposal.asset["asset_id"].authored_by == "human"
+    assert result.proposal.asset["role"].authored_by == "human"
+    # And it survives all the way into the assembled, signed Contract too --
+    # not just the in-memory proposal this function also returns.
+    assert result.contract is not None
+    assert result.contract.mapping_authorship["asset.asset_id"] == "human"
+    assert result.contract.mapping_authorship["asset.role"] == "human"
+
+
+def test_propose_contract_illegal_candidate_fallback_is_also_stamped_model(data_dir):
+    """The OTHER way a fresh proposal reaches _stamp_authorship:
+    last_illegal_candidate (every attempt matched meta but kept re-proposing
+    an individually illegal mapping) is STILL 100% model output -- it must
+    be stamped 'model' exactly like the ordinary success path, not skipped
+    because it took the degrade-eligible route."""
+    illegal = json.dumps(_full_proposal_dict(overrides_finding={
+        "detected_date": _mapped(
+            {"kind": "parsed", "column": "Col", "case": "exact", "blank": "gap", "parser": "timestamp"},
+            columns_cited=["Col"],
+        ),
+    }))
+    _QueuedFakeCrew.queue = [illegal, illegal, illegal]
+    result = propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, max_attempts=3)
+    assert result.contract is None  # still illegal -- not what this test is about
+    assert result.proposal.finding["detected_date"].authored_by == "model"
+    assert result.proposal.asset["role"].authored_by == "model"
 
 
 # --- fixes from the post-implementation adversarial review --------------------
@@ -2196,6 +2390,29 @@ def test_apply_registry_aliases_leaves_an_already_complete_table_unchanged(profi
     assert new_proposal.asset["role"].mapping.table == proposal.asset["role"].mapping.table
 
 
+def test_apply_registry_aliases_augmentation_preserves_existing_authorship(tmp_path):
+    """Table AUGMENTATION of an already-`SlotMapped` slot changes only the
+    table, never who decided the slot's own structure -- a human's own
+    correction, augmented with a few registry-known aliases the human
+    didn't type, is still the human's mapping, not the registry's."""
+    _write_csv(tmp_path, _HEADER, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "Workstation"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "Domain Controller"],
+    ])
+    profiles = {p.path.name: p for p in profile_source(tmp_path)}
+    data = _full_proposal_dict(overrides_asset={
+        "role": _mapped(
+            {"kind": "vocabulary", "column": "Col", "case": "exact", "blank": "fatal", "table": {"Workstation": "workstation"}},
+            columns_cited=["Col"], authored_by="human",
+        ),
+    })
+    proposal = AdapterProposal.model_validate(data)
+    new_proposal = _apply_registry_aliases(proposal, profiles)
+    slot = new_proposal.asset["role"]
+    assert slot.mapping.table == {"Workstation": "workstation", "Domain Controller": "dc"}  # augmentation did happen
+    assert slot.authored_by == "human"  # but authorship is untouched by it
+
+
 # --- _apply_registry_aliases: slot promotion --------------------------------
 
 
@@ -2216,6 +2433,7 @@ def test_apply_registry_aliases_promotes_a_fully_resolvable_unresolved_criticali
     assert slot.mapping.blank == "gap"  # criticality IS gap-legal (a NOT_COLLECTED_DEFAULTS key)
     assert slot.confidence == 1.0
     assert "no model judgment" in slot.evidence.note
+    assert slot.authored_by == "registry"  # promoted from unresolved -- the model contributed nothing
 
 
 def test_apply_registry_aliases_promotes_role_with_blank_fatal_not_gap(tmp_path):

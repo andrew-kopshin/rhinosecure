@@ -164,12 +164,12 @@
   },
   "attestations": [
     {
-      "at": "2026-09-04T18:31:02Z",
+      "at": "2026-09-16T05:21:23Z",
       "item": "enrichment",
       "text": "Every CVE_ID in this export matches CVE-2099-NNNNN; trusting the export's own CVSS/exploitation/technique fields instead of a live lookup."
     },
     {
-      "at": "2026-09-04T18:31:02Z",
+      "at": "2026-09-16T05:21:23Z",
       "item": "union",
       "text": "Compensating_Control is declared per finding; FILE-SRV-01 declares two different real controls on two rows with the same Last_Observed. No control string in this file contains a comma or semicolon."
     }
@@ -406,6 +406,7 @@
     "findings": null,
     "mode": "declared"
   },
+  "mapping_authorship": null,
   "mapping_confidence": null,
   "not_collected": {
     "always_asset": [
@@ -432,7 +433,7 @@
     "excluded_findings": 0,
     "findings_loaded": 50,
     "header_notices": [],
-    "measured_at": "2026-09-06T23:31:12Z",
+    "measured_at": "2026-09-16T05:21:23Z",
     "measured_by": "andy.kopshin@gmail.com",
     "measured_by_command": "confirm",
     "not_collected_assets": {
@@ -448,10 +449,10 @@
     }
   },
   "review": {
-    "confirmed_at": "2026-09-06T23:31:12Z",
+    "confirmed_at": "2026-09-16T05:21:23Z",
     "confirmed_by": "andy.kopshin@gmail.com",
     "confirmed_version": 2,
-    "content_digest": "sha256:c88cd7446bec910a883cf52764322bb98064ad407f9b974e94d767a55ccf7326",
+    "content_digest": "sha256:de810eaff108c639e100683803177ae897136a9d14043ff40212ee336fb23d57",
     "decision_digest": "sha256:525f02a99a11229aebe14e6aa3c426e3de18e3a08ad68c9af75eff2a43739e90",
     "slot_digests": {
       "asset.asset_id": "sha256:5ee570092987ada4f5804ace98cc88fc9bcefb376528a88f9b15bd2200e5053a",

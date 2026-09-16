@@ -251,10 +251,10 @@ def bluepeak_gen_dict() -> dict:
         "attestations": [
             {"item": "enrichment",
              "text": "Every CVE_ID in this export matches CVE-2099-NNNNN; trusting the export's own CVSS/exploitation/technique fields instead of a live lookup.",
-             "at": "2026-09-04T18:31:02Z"},
+             "at": "2026-09-16T05:21:23Z"},
             {"item": "union",
              "text": "Compensating_Control is declared per finding; FILE-SRV-01 declares two different real controls on two rows with the same Last_Observed. No control string in this file contains a comma or semicolon.",
-             "at": "2026-09-04T18:31:02Z"},
+             "at": "2026-09-16T05:21:23Z"},
         ],
         "review": {"state": "proposed"},
     }
@@ -408,7 +408,7 @@ def mdvm_gen_dict() -> dict:
         "attestations": [
             {"item": "finding_id.synthesized",
              "text": "Defender exports no stable per-finding id; the id is a sha256 over DeviceId/SoftwareVendor/SoftwareName/SoftwareVersion/CveId, frozen on confirmation. SoftwareVendor is an OPTIONAL column inside that tuple.",
-             "at": "2026-09-04T19:09:44Z"},
+             "at": "2026-09-16T05:21:31Z"},
         ],
         "review": {"state": "proposed"},
     }

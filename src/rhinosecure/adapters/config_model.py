@@ -910,6 +910,29 @@ class Contract(BaseModel):
     #: confidence to report for those, so absence is the honest value, not
     #: a fabricated 1.0.
     mapping_confidence: dict[str, float] | None = None
+    #: `"asset.<target>"` / `"finding.<target>"` -> who authored that slot's
+    #: mapping at proposal time -- `"model"`, `"human"`, or `"registry"`
+    #: (`agents/schema_inference.py`'s `SlotAuthor`/`SlotMapped.authored_by`,
+    #: and `propose_contract`'s own docstring for exactly where each is
+    #: set). Carried forward the identical way `mapping_confidence` is, for
+    #: the identical reason and with the identical status: audit trail,
+    #: never read by `configured.py`'s engine, never part of
+    #: `DECISION_SUBTREES` -- a signed `decision_digest` is unaffected by
+    #: this field, so this alone can never invalidate a confirmation. This
+    #: is a deliberate choice, not an accident of mirroring: it's what lets
+    #: a reader who already holds a `decision_digest` (e.g. from a scored
+    #: finding's own provenance, a separate and not-yet-built mechanism)
+    #: later ask "who chose this slot's value" without needing the original
+    #: proposal file, which a hand-authored contract
+    #: (bluepeak-gen.json/mdvm-gen.json) never had to begin with. `None`
+    #: for exactly the cases `mapping_confidence` is `None` for -- a
+    #: contract that never went through a proposal at all, or (unlike
+    #: `mapping_confidence`, which pydantic makes REQUIRED-per-slot via
+    #: `SlotMapped.confidence`) a slot whose authorship was never stamped;
+    #: `agents/schema_inference.py`'s own comments name where that would be
+    #: a bug in this project's own code, not something this field asserts
+    #: can't happen.
+    mapping_authorship: dict[str, str] | None = None
     source: Source
     header: Header
     derived: dict[str, Derivation] = Field(default_factory=dict)
