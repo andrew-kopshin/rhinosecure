@@ -657,16 +657,16 @@ def test_provisional_assembly_drops_authorship_alongside_a_degraded_slot(tmp_pat
     slot's own authorship must still be there, unaffected -- this is
     per-slot bookkeeping, not a blanket wipe.
 
-    Deliberately pins the CURRENT degrade behaviour, including the part
-    that is known to be wrong: a mapping attributed to a human is dropped
-    and replaced with a placeholder exactly like a model's guess. Once
-    per-slot attribution landed (`_stamp_authorship_per_slot`), the
-    authored_by='human' below stopped meaning "arrived via the form" and
-    started meaning "a human actually typed this mapping" -- which is what
-    makes silently discarding it wrong, and what a later change to
-    _degrade_invalid_slots will act on. Nothing here is asserted because
-    it is desirable; it is asserted so that change shows up as a diff
-    against a stated position rather than a gap in coverage."""
+    UPDATED. This used to assert the degraded slot was authored_by='human'
+    -- pinning, deliberately, behaviour that was known to be wrong: a
+    human's explicit choice dropped and replaced with a placeholder exactly
+    like a model's guess. That is now refused outright
+    (`test_provisional_assembly_refuses_a_human_authored_invalid_mapping`
+    below), so a human-authored slot never reaches the popping code at all.
+    What it asserts now is the same bookkeeping property on the authors
+    that DO still degrade: 'model' here, with a surviving 'registry'
+    sibling to show the popping is per-slot rather than a blanket wipe, and
+    that a non-model author is not itself what triggers a refusal."""
     header = _HEADER + ["RoleColUnique"]
     _write_csv(tmp_path, header, [
         ["A01", "HOST01", "F01", "CVE-2021-0001", "srv", "Workstation"],
@@ -678,11 +678,11 @@ def test_provisional_assembly_drops_authorship_alongside_a_degraded_slot(tmp_pat
         "role": _mapped(
             {"kind": "vocabulary", "column": "RoleColUnique", "case": "exact", "blank": "gap", "optional": True,
              "table": {"Workstation": "workstation"}},
-            columns_cited=["RoleColUnique"], authored_by="human",
+            columns_cited=["RoleColUnique"], authored_by="model",
         ),
         "asset_id": _mapped(
             {"kind": "column", "column": "Asset_ID", "case": "exact", "blank": "fatal"},
-            columns_cited=["Asset_ID"], authored_by="model",
+            columns_cited=["Asset_ID"], authored_by="registry",
         ),
     })
     proposal = AdapterProposal.model_validate(data)
@@ -690,8 +690,127 @@ def test_provisional_assembly_drops_authorship_alongside_a_degraded_slot(tmp_pat
     contract, notes = assemble_provisional_contract(proposal, profiles_map, report, generator=_generator(), generated_at=_GENERATED_AT)
     assert contract is not None
     assert notes.invalid_mappings_dropped == frozenset({"asset.role"})
-    assert "asset.role" not in contract.mapping_authorship  # degraded -- the human's own value was replaced
-    assert contract.mapping_authorship["asset.asset_id"] == "model"  # untouched sibling slot survives
+    assert "asset.role" not in contract.mapping_authorship  # degraded -- no author to report for a placeholder
+    assert contract.mapping_authorship["asset.asset_id"] == "registry"  # untouched sibling slot survives
+
+
+# --- a human-authored invalid mapping is refused, never degraded around ------
+
+
+def _illegal_role_proposal(author: str | None) -> dict:
+    """The identical illegal mapping (blank='gap' on role, which has no
+    NOT_COLLECTED_DEFAULTS entry) under a given author -- so every test
+    below differs in exactly one thing: who is said to have written it."""
+    return _full_proposal_dict(overrides_asset={
+        "role": _mapped(
+            {"kind": "vocabulary", "column": "RoleColUnique", "case": "exact", "blank": "gap", "optional": True,
+             "table": {"Workstation": "workstation"}},
+            columns_cited=["RoleColUnique"], authored_by=author,
+        ),
+    })
+
+
+@pytest.fixture
+def role_profiles(tmp_path):
+    header = _HEADER + ["RoleColUnique"]
+    _write_csv(tmp_path, header, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "srv", "Workstation"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "wks", "Workstation"],
+    ])
+    return {p.path.name: p for p in profile_source(tmp_path)}
+
+
+def test_provisional_assembly_refuses_a_human_authored_invalid_mapping(role_profiles):
+    """The position this change takes: a human said what this slot should
+    be, the validator disagreed, and returning a plan scored on a
+    placeholder instead would answer a question nobody asked while looking
+    exactly like success. No contract, and the reason names the slot and
+    the validator's own text so the form can put the row back."""
+    proposal = AdapterProposal.model_validate(_illegal_role_proposal("human"))
+    report = check_grounding(proposal, role_profiles)
+
+    contract, notes = assemble_provisional_contract(
+        proposal, role_profiles, report, generator=_generator(), generated_at=_GENERATED_AT
+    )
+
+    assert contract is None
+    assert notes.invalid_mappings_dropped == frozenset()  # nothing was dropped -- nothing was degraded
+    assert notes.neutralized_axes == frozenset()
+    assert "asset.role" in notes.hard_stop_reason  # the slot
+    assert "blank='gap'" in notes.hard_stop_reason  # the validator's own text, not a paraphrase
+    assert "attributed to a human author" in notes.hard_stop_reason
+    # Worded for the coarse-attribution case too: never "you typed this",
+    # which would be a lie when the baseline was unreadable and every slot
+    # was blanket-stamped.
+    assert "you typed" not in notes.hard_stop_reason
+
+
+@pytest.mark.parametrize("author", ["model", "registry", None])
+def test_provisional_assembly_still_degrades_a_non_human_authored_invalid_mapping(author, role_profiles):
+    """The other half of the same decision, asserted against the SAME
+    illegal mapping so authorship is provably the only variable: a model's
+    guess (or a registry lookup, or an unattributed slot) still degrades
+    exactly as before, and the run still produces a plan."""
+    proposal = AdapterProposal.model_validate(_illegal_role_proposal(author))
+    report = check_grounding(proposal, role_profiles)
+
+    contract, notes = assemble_provisional_contract(
+        proposal, role_profiles, report, generator=_generator(), generated_at=_GENERATED_AT
+    )
+
+    assert contract is not None
+    assert notes.hard_stop_reason is None
+    assert notes.invalid_mappings_dropped == frozenset({"asset.role"})
+    assert contract.asset["role"].kind == "literal"
+
+
+def test_provisional_assembly_refuses_outright_when_authorship_is_mixed(role_profiles):
+    """Mixed authorship refuses rather than degrading the model-authored
+    half and returning a partial plan. There is no partial contract to
+    return, and a plan silently missing a human's own correction is the
+    thing being prevented whether or not other slots could have been
+    patched around it."""
+    data = _illegal_role_proposal("human")
+    data["finding"]["detected_date"] = _mapped(
+        {"kind": "parsed", "column": "Cve", "case": "exact", "blank": "gap", "parser": "timestamp"},
+        columns_cited=["Cve"], authored_by="model",
+    )
+    proposal = AdapterProposal.model_validate(data)
+    report = check_grounding(proposal, role_profiles)
+
+    contract, notes = assemble_provisional_contract(
+        proposal, role_profiles, report, generator=_generator(), generated_at=_GENERATED_AT
+    )
+
+    assert contract is None
+    assert "asset.role" in notes.hard_stop_reason
+    # The model-authored slot is NOT reported as dropped -- nothing was
+    # degraded, because nothing was degraded partially either.
+    assert notes.invalid_mappings_dropped == frozenset()
+
+
+def test_provisional_assembly_over_refuses_under_coarse_blanket_authorship(role_profiles):
+    """The documented cost of the safe direction, asserted rather than left
+    to be discovered. When the browser edit path has no readable baseline,
+    `_stamp_authorship` blanket-stamps every mapped slot 'human', so an
+    illegal mapping the MODEL wrote and the human never saw is refused too.
+    That is over-refusal. It is the direction to err in -- refusing costs a
+    round trip through a form that can still correct the slot, degrading
+    costs a human's own decision, silently -- and `web/jobs.py`'s
+    `authorship_baseline` in the job result is what tells an operator which
+    regime produced the attribution."""
+    from rhinosecure.agents.schema_inference import _stamp_authorship
+
+    proposal = _stamp_authorship(AdapterProposal.model_validate(_illegal_role_proposal(None)), "human")
+    assert proposal.asset["role"].authored_by == "human"  # blanket-stamped, not individually authored
+    report = check_grounding(proposal, role_profiles)
+
+    contract, notes = assemble_provisional_contract(
+        proposal, role_profiles, report, generator=_generator(), generated_at=_GENERATED_AT
+    )
+
+    assert contract is None  # refused, though no human actually typed this mapping
+    assert "attributed to a human author" in notes.hard_stop_reason
 
 
 def test_provisional_assembly_drops_a_mapped_but_illegal_parser_and_reports_it(tmp_path):

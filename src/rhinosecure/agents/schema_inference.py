@@ -1662,18 +1662,50 @@ def _degrade_invalid_slots(
     `dropped_columns` in place; returns `None` on success, or a
     human-readable hard-stop reason when a violation cannot be attributed
     to a single slot (a whole-contract problem no per-mapping change can
-    fix) or a named slot has no legal placeholder at all
+    fix), when a named slot's mapping is attributed to a HUMAN author (see
+    below), or when a named slot has no legal placeholder at all
     (`_provisional_placeholder_for` returns `None`).
+
+    **A mapping attributed to a human is refused, never degraded.**
+    Degrading means dropping the mapping, substituting a placeholder, and
+    returning a plan scored on that placeholder. For a model's guess that
+    is defensible -- a guess that turned out illegal is worth less than the
+    rest of the run. For a human's explicit choice it is not: the person
+    said what this slot should be, the validator disagreed, and silently
+    scoring absence in its place answers a question nobody asked while
+    looking exactly like success. So this returns a hard stop naming every
+    such slot and the validator's own text for it, and
+    `assemble_provisional_contract` produces no contract at all. A
+    model-authored or registry-authored slot degrades exactly as before.
+
+    Mixed authorship refuses outright rather than degrading the
+    model-authored half: there is no partial contract to return, and a plan
+    silently missing a human's own correction is the thing being prevented
+    whether or not other slots could have been patched around.
+
+    Where "human" comes from matters, and is not uniformly precise.
+    `_stamp_authorship_per_slot` makes it exact on the browser edit path --
+    only a slot whose mapping actually differs from the baseline the form
+    was rendered from. But when that baseline is missing or unreadable, and
+    on `rhino adapt propose --from-proposal`, `_stamp_authorship` blanket-
+    stamps every mapped slot `"human"`, so this refuses for an illegal
+    model-authored mapping that merely rode along. That is
+    over-refusal, and it is the direction to err in: refusing costs a
+    round trip through a form that can still correct the slot, while
+    degrading costs a human's own decision, silently. `web/jobs.py`'s
+    `authorship_baseline` in the job result says which of the two regimes
+    produced a given run's attribution -- hence "attributed to a human
+    author" in the message below rather than "you typed this", which would
+    be a lie in the coarse case.
 
     `mapping_authorship` is popped exactly like `mapping_confidence` is,
     for the identical reason: the placeholder that replaces a dropped
     mapping was chosen by `_provisional_placeholder_for`'s own ordered
     fallback, not authored by whoever the ORIGINAL (now-discarded) mapping
-    was attributed to -- a degraded slot has no human, model, or registry
-    author to report, so it correctly has no entry at all rather than a
-    stale one. This is bookkeeping only -- this function still decides
-    nothing DIFFERENTLY based on who authored the mapping it's dropping;
-    that's deliberately not built yet.
+    was attributed to -- a degraded slot has no model or registry author to
+    report, so it correctly has no entry at all rather than a stale one.
+    (A human-authored slot never reaches that code now, having refused
+    above.)
 
     Validates every named slot has a legal placeholder BEFORE mutating
     anything, so a hard stop never leaves `asset_mappings`/`finding_mappings`
@@ -1681,6 +1713,16 @@ def _degrade_invalid_slots(
     by_slot, unattributed = _slot_scoped_problems(exc.problems)
     if not by_slot or unattributed:
         return str(exc)
+
+    human_authored = [slot for slot in sorted(by_slot) if mapping_authorship.get(slot) == "human"]
+    if human_authored:
+        problems = "; ".join(problem for slot in human_authored for problem in by_slot[slot])
+        return (
+            f"{len(human_authored)} slot(s) whose mapping is attributed to a human author still fail contract "
+            f"validation: {problems}. Refusing rather than dropping a hand-authored mapping and scoring a "
+            "placeholder nobody chose in its place -- correct the slot(s) in the resolve-slots form and "
+            "resubmit, or edit the saved proposal by hand and re-run with --from-proposal."
+        )
 
     resolved: dict[str, "tuple[Mapping, bool]"] = {}
     for slot in sorted(by_slot):
@@ -1840,9 +1882,12 @@ class ProvisionalAssemblyNotes:
     #: was never something the model actually mapped in the first place.
     invalid_mappings_dropped: frozenset[str] = frozenset()
     #: Set only when assembly could not proceed at all -- a target in
-    #: `_PROVISIONAL_HARD_STOP_TARGETS` was unresolved, or the real
-    #: `validate_contract` safety net refused for an unrelated reason. When
-    #: set, the contract this call returns is `None`; when `None`, it isn't.
+    #: `_PROVISIONAL_HARD_STOP_TARGETS` was unresolved, an individually
+    #: invalid mapping was attributed to a HUMAN author (never degraded
+    #: around -- `_degrade_invalid_slots`' own docstring argues why), or the
+    #: real `validate_contract` safety net refused for an unrelated reason.
+    #: When set, the contract this call returns is `None`; when `None`, it
+    #: isn't.
     hard_stop_reason: str | None = None
 
 
@@ -1886,7 +1931,15 @@ def assemble_provisional_contract(
         own docstring). `_degrade_invalid_slots` handles this, reusing the
         SAME `_provisional_placeholder_for` fallback as case (A) -- for
         this purpose a mapped-but-illegal slot is exactly as unusable as
-        one the model never proposed. Dropping a column-reading mapping can
+        one the model never proposed -- EXCEPT when the mapping is
+        attributed to a human author, which is refused outright instead
+        (no contract, `hard_stop_reason` naming the slot and the
+        validator's own text): substituting absence for someone's explicit
+        choice and returning a plan anyway is not a degrade, it is
+        answering a different question while looking like success. See
+        that function's own docstring, including what "human" means on
+        each path and where the attribution is coarse. Dropping a
+        column-reading mapping can
         orphan the column it used to read (`validate_contract`'s own V08
         column-accounting rule); `_reconcile_orphaned_columns` recovers
         ONLY that exact, predictable side effect of our own drop, never any

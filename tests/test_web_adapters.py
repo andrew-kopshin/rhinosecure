@@ -287,12 +287,17 @@ def test_get_proposal_surfaces_an_illegal_mapped_slot_distinctly_from_unresolved
     job = _propose_edited(client, upload_id, "upload-illegal", proposal)
     assert job["status"] == "succeeded"
     # assemble_contract refuses role outright (blank='gap' is illegal for
-    # it); the provisional fallback then degrades it -- confirms the
-    # scenario this test is actually about really occurred, not just that
-    # the endpoint under test handles an arbitrary saved proposal.
-    assert job["result"]["contract_written"] is True
-    assert job["result"]["provisional"] is True
-    assert "asset.role" in job["result"]["invalid_mappings_dropped"]
+    # it). UPDATED: the provisional fallback used to degrade it and write a
+    # contract; arriving via edited_saved_proposal it is attributed to a
+    # human author, and a human-authored invalid mapping is now refused
+    # instead. Either way the scenario this test is actually about really
+    # occurred -- role IS mapped and IS rejected -- which is what makes the
+    # endpoint assertions below meaningful rather than incidental.
+    assert job["result"]["contract_written"] is False
+    assert "asset.role" in job["result"]["incomplete_reason"]
+    assert job["result"]["invalid_mappings_dropped"] == []  # refused, not degraded
+    # And the refusal is exactly the case that most needs a row back in the
+    # form, which is what the rest of this test checks.
 
     resp = client.get("/api/adapters/upload-illegal/proposal", params={"upload_id": upload_id})
     assert resp.status_code == 200

@@ -477,16 +477,68 @@ def test_a_fully_mapped_but_individually_illegal_slot_still_writes_a_provisional
     unresolved slots). It must now write a provisional contract, reporting
     exactly which slot was dropped.
 
-    Submitted via `edited_saved_proposal`, not a fresh LLM attempt: a FRESH
-    generation now gets this exact illegal shape rejected and retried at
-    the source (`_check_mapped_slots_legal`, schema_inference.py's own
-    generation-time closure) -- `edited_saved_proposal` is the one path
-    that must still tolerate it, since it is also how a human resubmits a
-    hand-reviewed proposal (the same reason `--from-proposal` must stay
-    loadable), and it is what makes this degrade path reachable at all."""
+    REPATHED. This used to submit via `edited_saved_proposal`, on the
+    premise that it was "the one path that must still tolerate" an illegal
+    mapping. That premise is now wrong in one specific way: everything
+    arriving that way is attributed to a human author, and a human-authored
+    invalid mapping is refused rather than degraded
+    (`test_edited_saved_proposal_refuses_a_human_authored_illegal_mapping`
+    below). The degrade itself is still real and still needs this coverage
+    -- it is reached on the FRESH generation path instead, via
+    propose_contract's `last_illegal_candidate` fallback: every attempt
+    parses and matches meta but keeps re-proposing the same illegal
+    mapping, the retry loop exhausts, and the candidate proceeds stamped
+    'model'. That is a genuine model guess, which is exactly what the
+    degrade is for."""
+    upload_id = _upload(client, "inventory.csv", _csv_bytes(_ROWS))["upload_id"]
+    illegal = json.dumps(_full_proposal_dict(
+        name="upload-illegal-mapping",
+        overrides_asset={
+            "role": _mapped(
+                {"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "gap", "table": {"srv": "dc"}},
+                columns_cited=["Col"],
+            ),
+        },
+    ))
+    # Every attempt re-proposes the identical illegal mapping, so the
+    # generation-time check rejects each one and the loop exhausts.
+    _QueuedFakeCrew.queue = [illegal, illegal]
+
+    job = _submit(client, upload_id=upload_id, name="upload-illegal-mapping", max_attempts=2)
+    body = _wait_for_terminal(client, job["job_id"])
+
+    assert body["status"] == "succeeded"
+    result = body["result"]
+    assert result["unresolved_slots"] == []  # the model mapped every slot -- this is NOT an unresolved-slot case
+    assert result["contract_written"] is True
+    assert result["provisional"] is True
+    assert result["neutralized_axes"] == ["role"]
+    assert result["invalid_mappings_dropped"] == ["asset.role"]
+    assert result["next_step"] is not None
+
+    contract_path = Path(result["contract_path"])
+    assert contract_path.exists()
+    on_disk = json.loads(contract_path.read_text(encoding="utf-8"))
+    assert on_disk["asset"]["role"] == {"kind": "literal", "value": "workstation"}
+    assert on_disk["review"]["state"] == "proposed"
+    assert on_disk["mapping_authorship"].get("asset.role") is None  # degraded, so no author to report
+
+
+def test_edited_saved_proposal_refuses_a_human_authored_illegal_mapping(
+    client: TestClient, isolated_dirs: Path
+):
+    """The same illegal mapping as above, arriving the way a human's own
+    correction does. No contract is written, and the reason names the slot
+    and the validator's own text -- rather than a plan quietly scored on
+    literal 'workstation' in place of the mapping the human chose.
+
+    The job itself still SUCCEEDS: an incomplete proposal is a reportable
+    outcome, not a job failure, exactly as it already is for an unresolved
+    slot. What changed is that `contract_written` is false instead of a
+    provisional true."""
     upload_id = _upload(client, "inventory.csv", _csv_bytes(_ROWS))["upload_id"]
     data = _full_proposal_dict(
-        name="upload-illegal-mapping",
+        name="upload-human-illegal",
         overrides_asset={
             "role": _mapped(
                 {"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "gap", "table": {"srv": "dc"}},
@@ -504,23 +556,24 @@ def test_a_fully_mapped_but_individually_illegal_slot_still_writes_a_provisional
     }
     assert _QueuedFakeCrew.queue == []  # nothing queued -- proves no LLM call happens below
 
-    job = _submit(client, upload_id=upload_id, name="upload-illegal-mapping", edited_saved_proposal=edited_saved_proposal)
+    job = _submit(client, upload_id=upload_id, name="upload-human-illegal", edited_saved_proposal=edited_saved_proposal)
     body = _wait_for_terminal(client, job["job_id"])
 
     assert body["status"] == "succeeded"
     result = body["result"]
-    assert result["unresolved_slots"] == []  # the model mapped every slot -- this is NOT an unresolved-slot case
-    assert result["contract_written"] is True
-    assert result["provisional"] is True
-    assert result["neutralized_axes"] == ["role"]
-    assert result["invalid_mappings_dropped"] == ["asset.role"]
-    assert result["next_step"] is not None
-
-    contract_path = Path(result["contract_path"])
-    assert contract_path.exists()
-    on_disk = json.loads(contract_path.read_text(encoding="utf-8"))
-    assert on_disk["asset"]["role"] == {"kind": "literal", "value": "workstation"}
-    assert on_disk["review"]["state"] == "proposed"
+    assert result["contract_written"] is False
+    assert result["provisional"] is False
+    assert result["invalid_mappings_dropped"] == []  # nothing degraded, so nothing to report as dropped
+    assert "asset.role" in result["incomplete_reason"]
+    assert "blank='gap'" in result["incomplete_reason"]  # the validator's own text
+    assert "attributed to a human author" in result["incomplete_reason"]
+    # No baseline existed for this name, so attribution was the coarse
+    # blanket stamp -- the result says so, which is how an operator tells
+    # this apart from a slot they genuinely typed.
+    assert result["authorship_baseline"].startswith("unavailable --")
+    # The saved proposal is still written, so the resolve-slots form can
+    # re-read it and put the offending row back.
+    assert Path(result["proposal_saved_path"]).is_file()
 
 
 # ---------------- ingest_propose: not silently overwriting a signature ----------------
