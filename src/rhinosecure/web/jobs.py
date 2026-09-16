@@ -829,6 +829,37 @@ def _default_propose_name(upload_id: str) -> str:
     return f"upload-{upload_id[:24]}"
 
 
+def _write_saved_proposal_atomic(path: Path, saved: SavedProposal) -> None:
+    """Persists `saved` to `path` -- the resolve-slots browser form's own
+    edit baseline (`GET /api/adapters/{name}/proposal` reads it back;
+    `_stamp_authorship_per_slot` diffs the NEXT resubmit against it) --
+    as a `.tmp` sibling then `Path.replace`, the same pattern `adapters/
+    config_io.py`'s own `_atomic_write_json` uses for a contract. A bare
+    `write_text` (what this used to be) can leave a half-written file
+    behind a crash mid-write; nothing else in this module reads `path`
+    concurrently with this job (`JobRegistry` allows at most one job in
+    flight), so a `.tmp`-sibling-then-replace is enough -- no PID/uuid
+    suffix needed the way `export.py`'s own atomic writer uses for a path
+    genuinely shared across processes.
+
+    Call this ONLY when the caller is about to report a usable outcome
+    (a real or provisional contract actually written). `_run_ingest_
+    propose`'s resubmit path diffs every future edit against whatever
+    this function last wrote -- overwriting it with a run that hard-
+    refused would make that refusal the new baseline forever: nothing a
+    later resubmit can legally change would ever touch the disputed
+    slot's mapping, so `_stamp_authorship_per_slot` would keep reporting
+    it "unchanged" and grounding would refuse identically on every
+    subsequent resubmit, with no sequence of edits able to recover."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(
+        json.dumps(dump_saved_proposal(saved), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
+
+
 def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str], None]) -> JobOutcome:
     """Phase 1 of LLM-assisted adapter generation (docs/adapter-
     generation.md), dispatched against an uploaded source instead of a
@@ -904,10 +935,11 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
                 "Pass input.overwrite_confirmed=true if you really mean to replace it."
             )
 
-    # Hoisted above the branch: this is both where the proposal is SAVED
-    # (below) and, on the edit path, where the baseline the browser form
-    # was rendered from is READ -- the read has to happen before this run
-    # overwrites it. One expression, so the two can never point at
+    # Hoisted above the branch: this is both where a USABLE proposal gets
+    # saved (below -- conditionally, see _write_saved_proposal_atomic) and,
+    # on the edit path, where the baseline the browser form was rendered
+    # from is READ -- the read has to happen before this run could
+    # overwrite it. One expression, so the two can never point at
     # different files.
     saved_path = REPO_ROOT / "out" / f"propose_{name}.json"
 
@@ -971,16 +1003,7 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
             sample_rows=int(job.input.get("sample_rows") or DEFAULT_SAMPLE_ROWS),
         )
 
-    on_stage("saving proposal")
-    saved_path.parent.mkdir(parents=True, exist_ok=True)
-    saved_path.write_text(
-        json.dumps(
-            dump_saved_proposal(SavedProposal(result.proposal, result.generator, result.attempt_usage)),
-            indent=2, sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    saved_proposal = SavedProposal(result.proposal, result.generator, result.attempt_usage)
 
     result_dict: dict[str, Any] = {
         "upload_id": upload_id,
@@ -1033,9 +1056,49 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
             result.proposal, result.profiles, result.grounding, generator=result.generator, generated_at=_now()
         )
         if provisional_contract is None:
+            # `result.grounding.failures` is exactly the condition
+            # `assemble_provisional_contract`'s OWN first check (`if report.
+            # failures:`) tests, on the identical `result.grounding` object
+            # -- so it is non-empty here if and only if THAT branch, not a
+            # later legality/structural one, is what produced this refusal.
+            # That distinction matters because the resolve-slots panel has
+            # a real row source for a legality refusal (`illegal_mapped_
+            # slots`) but none at all for a grounding one -- a slot that's
+            # mapped, individually legal, and fails only grounding (the
+            # reported incident) matches neither `unresolved_slots` nor
+            # `illegal_mapped_slots`, so the browser can never touch it.
+            # Persisting THAT proposal as the new edit baseline would make
+            # this exact refusal permanent, because no resubmit the browser
+            # can construct would ever change the disputed slot's mapping
+            # -- see _write_saved_proposal_atomic's own docstring.
+            #
+            # A legality-only or structural refusal has no such trap (the
+            # panel can redisplay and correct it, or -- for the rare
+            # structural cases -- the slot was unresolved to begin with,
+            # which the panel already renders), so those keep the prior,
+            # always-save behavior, matching the hard-stop text's own
+            # promised "resolve them by hand in the saved proposal file"
+            # recourse for a fresh propose that refuses on its first try.
+            #
+            # MAINTENANCE NOTE: `not result.grounding.failures` is doing
+            # real work in this condition, and it is only correct because
+            # grounding has NO row source in the resolve-slots panel today
+            # (`GET /api/adapters/{name}/proposal` builds rows from
+            # `unresolved`/`illegal` only -- web/adapters.py). If grounding
+            # ever gains one -- the same way `illegal_mapped_slots`
+            # (schema_inference.py) is the existing precedent for a gate
+            # the panel CAN redisplay and let a human correct -- this
+            # branch must be revisited: skipping the write would then be
+            # protecting against a trap that no longer exists, at the cost
+            # of losing a resubmit's legitimate progress for no reason.
+            if edited_saved_proposal_data is None or not result.grounding.failures:
+                on_stage("saving proposal")
+                _write_saved_proposal_atomic(saved_path, saved_proposal)
             result_dict["incomplete_reason"] = notes.hard_stop_reason or result.incomplete_reason
             return JobOutcome(result=result_dict)
 
+        on_stage("saving proposal")
+        _write_saved_proposal_atomic(saved_path, saved_proposal)
         on_stage("writing provisional contract")
         written = write_contract(output_path, provisional_contract)
         _record_upload_contract_name(data_dir, name)
@@ -1049,6 +1112,8 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
         result_dict["next_step"] = f'rhino adapt confirm {name} --data uploads/{upload_id} --by "<you>"'
         return JobOutcome(result=result_dict)
 
+    on_stage("saving proposal")
+    _write_saved_proposal_atomic(saved_path, saved_proposal)
     on_stage("writing contract")
     written = write_contract(output_path, result.contract)
     # So resolve_source_ref can find this contract later regardless of

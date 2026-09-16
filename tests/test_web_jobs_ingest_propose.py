@@ -845,6 +845,102 @@ def test_edited_saved_proposal_still_refuses_an_illegal_edit(client: TestClient,
     assert _QueuedFakeCrew.instantiations == 0
 
 
+def test_a_refused_grounding_resubmit_does_not_poison_the_baseline(client: TestClient, isolated_dirs: Path):
+    """Regression test for docs/handoff.md 4.2.1: a resubmit that fails
+    only grounding (the alias-contradiction incident, or -- as here --
+    an invented table entry) must never become the new edit baseline.
+
+    Before this fix, `saved_path` was overwritten unconditionally: a
+    refused resubmit's disputed mapping got persisted, `authored_by`
+    'human' and all, and every later resubmit diffed against THAT
+    baseline. Since the resolve-slots panel has no row source for a
+    grounding failure (only `unresolved_slots`/`illegal_mapped_slots`,
+    neither of which a mapped-and-individually-legal-but-ungrounded slot
+    matches), nothing could ever change the disputed slot's mapping
+    again -- `_stamp_authorship_per_slot` would keep reporting it
+    "unchanged", and grounding would refuse identically forever, even
+    for a resubmit that only touches an unrelated row.
+    """
+    upload_id = _upload(client, "inventory.csv", _csv_bytes(_ROWS))["upload_id"]
+    first = _full_proposal_dict(name="upload-trap")
+    _QueuedFakeCrew.queue = [json.dumps(first)]
+
+    job1 = _submit(client, upload_id=upload_id, name="upload-trap")
+    body1 = _wait_for_terminal(client, job1["job_id"])
+    assert body1["status"] == "succeeded"
+    assert body1["result"]["contract_written"] is True  # a clean baseline now exists on disk
+    saved_path = Path(body1["result"]["proposal_saved_path"])
+    baseline_on_disk = saved_path.read_text(encoding="utf-8")
+
+    # Resubmit #1: invents a table entry for "owner" that was never
+    # observed in the real file ("never-seen") -- fails grounding, not
+    # legality, exactly the shape the resolve-slots panel has no row for.
+    bad = _full_proposal_dict(
+        name="upload-trap",
+        overrides_asset={
+            "owner": _mapped(
+                {"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "fatal", "table": {"never-seen": "x"}},
+                columns_cited=["Col"],
+            )
+        },
+    )
+    edited_saved_proposal_bad = {
+        "proposal": bad,
+        "generator": {
+            "tool": "rhino-adapt-propose", "model": "claude-sonnet-5", "prompt_tokens": 100,
+            "completion_tokens": 50, "estimated_cost_usd": 0.001, "attempts": 1,
+            "call_log_digest": "sha256:" + "a" * 64,
+        },
+    }
+    job2 = _submit(client, upload_id=upload_id, name="upload-trap", edited_saved_proposal=edited_saved_proposal_bad)
+    body2 = _wait_for_terminal(client, job2["job_id"])
+    assert body2["status"] == "succeeded"  # a refused proposal is a reportable outcome, not a job failure
+    assert body2["result"]["contract_written"] is False
+    # Confirms this really is the grounding-failure shape, not a legality
+    # one -- the distinction the fix's own guard condition relies on.
+    assert "asset.owner" in [f["slot"] for f in body2["result"]["grounding"]["failures"]]
+
+    # The load-bearing assertion: the on-disk baseline is byte-identical
+    # to what the first, successful run wrote. The refused resubmit never
+    # touched it.
+    assert saved_path.read_text(encoding="utf-8") == baseline_on_disk
+
+    # Resubmit #2: an unrelated, legal edit to evidence's own case policy
+    # -- nothing to do with "owner" at all. Diffs against the UNPOISONED
+    # baseline, so it must succeed exactly as it would have if resubmit
+    # #1 had never happened.
+    fixed = _full_proposal_dict(
+        name="upload-trap",
+        overrides_finding={
+            "evidence": _mapped(
+                {"kind": "column", "column": "Col", "case": "upper", "blank": "absent_fact"}, columns_cited=["Col"]
+            ),
+        },
+    )
+    edited_saved_proposal_fixed = {
+        "proposal": fixed,
+        "generator": {
+            "tool": "rhino-adapt-propose", "model": "claude-sonnet-5", "prompt_tokens": 100,
+            "completion_tokens": 50, "estimated_cost_usd": 0.001, "attempts": 1,
+            "call_log_digest": "sha256:" + "a" * 64,
+        },
+    }
+    job3 = _submit(
+        client, upload_id=upload_id, name="upload-trap", edited_saved_proposal=edited_saved_proposal_fixed
+    )
+    body3 = _wait_for_terminal(client, job3["job_id"])
+    # This is the proof the trap did not spring: without the fix, "owner"
+    # would already be stamped 'human' with the disputed table by resubmit
+    # #1's persisted write, grounding would refuse identically here too,
+    # and contract_written would be False.
+    assert body3["result"]["contract_written"] is True
+
+    on_disk = json.loads(Path(body3["result"]["contract_path"]).read_text(encoding="utf-8"))
+    authorship = on_disk["mapping_authorship"]
+    assert authorship["finding.evidence"] == "human"
+    assert authorship.get("asset.owner") == "model"  # never poisoned to 'human' by the refused attempt
+
+
 def test_resolving_a_free_text_unresolved_slot_via_a_column_mapping_writes_a_confirmable_contract(
     client: TestClient, isolated_dirs: Path
 ):
