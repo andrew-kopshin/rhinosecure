@@ -75,16 +75,128 @@ The slot-resolution widget offered a correction that `validate_contract` always 
 
 **The right first move is not a bug list, it is making legality and provenance single-sourced.** One grammar object that the generator, the widget and the validator all consult. One representation of "not known" that cannot be mistaken for a value. Then the six symptoms become one fix each, or disappear.
 
+**2026-09-16: a concrete, worse instance of the same shape, fully diagnosed — see 4.2.1.** The widget-vs-grammar gap above turns out to be one of *three* independent gates (grounding, legality, authorship) that can block a write, and the resolve-slots panel's row sources are keyed only to legality. A gate with no row source is not "offers a correction that gets refused" — it is a dead end by construction, and because a refused resubmit is persisted as the new edit baseline unconditionally, it is a *permanent* dead end once reached, not a one-time refusal. Same root cause this section already names; a sharper, code-verified case of it.
+
 ### 4.2 The concrete parked items
 
 | Item | What's wrong | Priority |
 |---|---|---|
-| Resolve-slots form | Unestablished, needs re-surveying. "The form never completes" is not blanket true — on-disk evidence (`upload-6f1bbcfe`) shows it assembling cleanly with two human checkbox edits. Whether it's reliably broken, reliably works, or fails only in specific cases isn't known yet. | **High** |
+| Resolve-slots form | **Established, 2026-09-16 — see 4.2.1.** Not "never completes": it completes for `unresolved`/`illegal` slots. It is a structural dead end specifically for a `SlotMapped`, individually-legal slot that GROUNDING refuses — the alias-contradiction check is the concrete trigger, but the gap is the missing row source, not that one check. | **High** |
 | `remediation mark` has no per-finding provenance | The provisional-run gap is closed (principle 6: `provisional_provenance`, checked live at mark time). What remains: a `Finding`/`ScoredFinding` carries no reference to the contract that produced it, confirmed or not — so even a mark against a finding from a fully signed contract can't be verified against that specific contract/revision, only trusted because the format name currently resolves to something confirmed. | Medium |
 | Enrichment on the upload path | Only partially attaches — `epss: null` even when the CVE *is* in the snapshot cache. Fifth instance of the fetched-then-discarded pattern. | Medium |
 | Grounding vs paraphrase | `check_grounding` catches a placeholder restated literally, not one that is paraphrased. Known limit, not a quick fix. | Medium |
 | Compound `Asset Tags` parser | Pipe-delimited key-value tags in scanner exports were never parsed. | Low |
 | Chat box intercepts operations | Once a plan is loaded, the chat box swallows operation requests, so there is no UI path to dispatch `run_agents`. | Low |
+
+### 4.2.1 Resolve-slots form: diagnosed 2026-09-16, not yet fixed
+
+Diagnosis only — nothing below is built. Whether a human may override a registry
+anchor at all is a separate, open design question and is deliberately **not**
+decided by anything here; every defect below holds regardless of how that
+question is eventually answered.
+
+**The incident.** A human used the browser resolve-slots form to map
+`asset.criticality` over a source column (`Asset Criticality`) whose observed
+values are exactly `Critical` and `Low`. They entered `{Critical: 4, Low: 2}` —
+legal ints in `[1,5]`, both real observed keys, clean data. Resubmit was
+refused. On disk: `out/propose_upload-9b56e08b42ff415bb2718beb.json`,
+`data/uploads/9b56e08b42ff415bb2718beb2b6e5224/northgate_flat_3.csv`.
+
+Reproduced offline against those exact files (no LLM, no repo writes):
+`_check_alias_contradiction` (`schema_inference.py`) fails the slot because
+`schema_registry` anchors `"Critical"` to `5` and the table says `4`
+(`resolve_criticality_anchor` — `"Low"` has no anchor, so `{Critical: 5, Low: 4}`
+would pass). `unresolved_slots` → `[]`. `illegal_mapped_slots` → `{}`.
+`check_grounding` → one failure, `asset.criticality`, the alias-contradiction
+text above. `assemble_contract` and `assemble_provisional_contract` both
+refuse, citing only the slot name, never the reason.
+
+**Root cause: the panel has exactly two row sources — `unresolved` and
+`illegal` (`GET /api/adapters/{name}/proposal`, `web/adapters.py:512-530`) —
+and neither is keyed to GROUNDING.** Three independent gates can block a
+write (grounding, legality, authorship); the form only has controls for
+legality (`illegal_mapped_slots`) and absence (`unresolved_slots`). A slot
+that IS mapped, IS individually legal, and fails only grounding — exactly
+this case — matches neither list. `openResolvePanel` (`app.js:2029`) builds
+zero rows for it. This is the load-bearing gap; everything below either
+follows from it or compounds it.
+
+**Confirmed, code-level (each independently verified against the real files
+above, not simulated):**
+
+1. **No row source for a grounding failure.** As above. `resolveSlotControls`/
+   `buildSlotMapping` never run for this slot — there is no `slot` object to
+   build controls from.
+2. **A refused resubmit is still persisted as the new edit baseline, and this
+   makes the dead end permanent.** `web/jobs.py`: `saved_path` is both where
+   the browser's diff baseline is *read* (`load_saved_proposal(saved_path)`,
+   ~line 942, before this run's `propose_contract` call) and where this run's
+   result is unconditionally *written* (`saved_path.write_text(...)`, line
+   976) — regardless of whether grounding/assembly succeeded, and non-atomic
+   (plain `write_text`, no temp-file+rename, unlike `export.py`'s own
+   `_write_json_atomic`). Consequence, traced through the code: resubmit #2,
+   even editing an unrelated row, reads a baseline where `criticality` is
+   already `authored_by="human"` with the disputed table — nothing in
+   resubmit #2 touches it (no row exists to touch), so
+   `_stamp_authorship_per_slot` preserves that attribution unchanged.
+   Grounding refuses again, identically, forever. **No sequence of legal
+   edits through this form can recover once this state is reached** — not a
+   one-time refusal, a structural trap.
+3. **The actual reason never reaches the human.** `result.grounding.failures[]`
+   carries the real alias-contradiction message (`web/jobs.py`'s
+   `result_dict["grounding"]`, populated unconditionally) but `app.js` never
+   reads `result.grounding` anywhere (grepped — zero references outside two
+   comments). What IS shown (`incomplete_reason`, via
+   `describeIngestProposeIncomplete`) is `assemble_provisional_contract`'s
+   hard-stop text for this case: *"1 slot(s)/reference(s) failed grounding (a
+   real data-quality problem, not a coverage gap): ['asset.criticality']"* —
+   which is not just uninformative, it's wrong on its face (the data is
+   clean; the disagreement is with a registry anchor, not a data-quality
+   defect) and never names the actual reason, in the UI or in the CLI
+   fallback instructions it points to.
+4. **The panel still renders a live, no-op Resubmit button with zero rows.**
+   `renderResolvePanel` (`app.js:2231-2239`) renders unconditionally. Clicking
+   Resubmit with nothing correctable reposts a byte-identical proposal and
+   reproduces the identical refusal, with no signal that this slot is
+   unreachable from the form at all.
+5. **The widget has no way to reflect the registry's own anchor/alias
+   knowledge.** `describe_target_vocabulary('criticality')` →
+   `{"kind":"range","min":1,"max":5}` (`config_model.py:1145`) — the only
+   schema knowledge shipped to the browser. Nothing says `"Critical"` is
+   pinned to exactly `5`. The rendered control is a bare
+   `<input type=number min=1 max=5>` that invites any legal integer for a
+   value the server will refuse for all but one choice. Same shape (narrower
+   blast radius) for the three enum-valued `REGISTRY_BACKED_TARGETS`.
+
+**Adjacent defects, found tracing the same path, narrower in scope:**
+
+6. `_apply_registry_aliases` can silently rewrite a human-authored table.
+   Verified directly: a human table that deliberately *excludes* `"Critical"`
+   (left it on "exclude this value") gets `"Critical": 5` added back by
+   registry augmentation, unasked — and the slot stays stamped
+   `authored_by="human"` for a value the human never chose.
+7. `GET /api/adapters/{name}/proposal` 500s outright for an illegal
+   `parsed`/`timestamp` mapping — `_predict_current_values` calls
+   `_parse_scalar("timestamp", ...)`, which raises `AssertionError`
+   ("timestamp is order_by-only") with nothing catching it between there and
+   the route handler. Confirmed live. A misplaced parser is exactly the kind
+   of illegality `illegal_mapped_slots` is supposed to turn into a row, not a
+   crash.
+8. `buildSlotMapping` stamps `confidence: 1.0` unconditionally on every
+   human-built mapping, which exempts it from `_low_confidence_detail`'s
+   review gate and the `low_confidence_mappings` attestation — even though
+   the correction was made blind to the registry knowledge in (5).
+9. The value-picker's own hint text ("leave blank to exclude this value... per
+   the same rule the engine itself follows") is false for every target except
+   `role` — `EXCLUDING_TARGETS` (`config_model.py:135`) is `{"role"}` only;
+   for `criticality` and everything else, a missing table key is a
+   whole-batch FATAL refusal at real ingest, not a per-row exclusion.
+
+**Explicitly not addressed by any of this, on purpose:** whether a human
+should be able to override a registry anchor at all. That decision changes
+what a *fixed* grounding gate should do; it changes nothing about (1)-(4)
+above, which are true regardless of how `_check_alias_contradiction`'s rule
+itself eventually reads.
 
 ### 4.3 Known cost mechanics
 
