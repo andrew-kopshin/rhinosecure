@@ -391,6 +391,13 @@ def _unmapped_profiles(contract: Contract, data_dir: Path) -> tuple[dict[str, di
         # one giant column, every declared name misses, and this whole
         # section disappears from the review without saying so.
         source = contract.source
+        # Named separately from this loop's own `declared` (the unmapped-column
+        # dict below) -- passed through as `profile_csv`'s `declared=` keyword,
+        # which means something unrelated: whether `source.encoding` itself was a
+        # human's declaration rather than this profiler's own BOM-sniffing
+        # fallback. Mirrors `configured._open_csv`'s identical expression, so a
+        # decode failure here is worded exactly as one on the real ingest path.
+        encoding_declared = source.encoding != "auto"
         try:
             file_profile = profile_csv(
                 path,
@@ -398,6 +405,7 @@ def _unmapped_profiles(contract: Contract, data_dir: Path) -> tuple[dict[str, di
                 quotechar=source.quotechar,
                 encoding=None if source.encoding == "auto" else source.encoding,
                 skip_lines=source.first_data_row - 2,
+                declared=encoding_declared,
             )
         except ProbeError as exc:
             problems.append(f"{filename}: could not be profiled for the unmapped-columns display -- {exc}")

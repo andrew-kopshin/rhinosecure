@@ -368,6 +368,80 @@ def test_utf16_bom_is_detected_via_ingest_detect_encoding(tmp_path):
     assert profile.row_count == 1
 
 
+# --- decode-error wording routes through ingest._decode_error_message,
+# the same shared text configured.py's _open_csv and ingest.open_csv use ---
+
+CP1252_ASSETS = REPO_ROOT / "data" / "cp1252-sample" / "assets.csv"
+
+
+def test_header_decode_failure_raises_the_shared_decode_error_message(tmp_path):
+    """A bad byte in the HEADER itself (not a data row) hits profile_csv's
+    other decode-error site -- the one that raises ProbeError outright,
+    since there is nothing to profile at all without a readable header.
+    declared=True simulates a caller with a real contract (review.py),
+    which should get the "the contract declares source.encoding=..."
+    wording, not the auto-detection wording."""
+    path = tmp_path / "data.csv"
+    path.write_bytes("asset_id,“business”\r\n".encode("cp1252"))
+    with pytest.raises(ProbeError) as excinfo:
+        profile_csv(path, encoding="utf-8", declared=True)
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert "source.encoding='utf-8'" in message
+    assert "cp1252" in message  # the remedy the shared message names
+
+
+def test_mid_file_decode_failure_against_the_real_cp1252_fixture_is_recorded_not_raised(tmp_path):
+    """The real PowerShell-produced fixture (its own header is plain ASCII;
+    only the data rows carry cp1252-only bytes like curly quotes and an en
+    dash), read under a wrong DECLARED encoding -- the mid-file branch:
+    profile_csv keeps what it already read, sets truncated=True, and
+    records one problem via the shared message instead of raising."""
+    profile = profile_csv(CP1252_ASSETS, encoding="utf-8", declared=True)
+    assert profile.truncated is True
+    assert len(profile.problems) == 1
+    problem = profile.problems[0]
+    assert problem.startswith("row ")
+    assert "profiling stopped here" in problem
+    assert "source.encoding='utf-8'" in problem  # declared=True wording
+    assert "cp1252" in problem
+    # the file heading already names the path (cli.py's _print_probe_report)
+    # -- this message must not repeat it a second time.
+    assert str(CP1252_ASSETS) not in problem
+
+
+def test_mid_file_decode_failure_defaults_to_undeclared_wording(tmp_path):
+    """declared defaults to False -- the propose path's own case, where
+    profile_csv resolved `encoding` itself via detect_encoding and has no
+    contract to have declared anything in. Same real fixture, same wrong
+    encoding, only the wording differs from the test above."""
+    profile = profile_csv(CP1252_ASSETS, encoding="utf-8")
+    assert profile.truncated is True
+    problem = profile.problems[0]
+    assert "byte-order mark" in problem
+    # the declared=True cause clause ("the contract declares source.encoding=...")
+    # must not appear -- both wordings' FIX text legitimately mentions
+    # source.encoding as a remedy, so that substring alone can't distinguish them.
+    assert "the contract declares" not in problem
+    assert "cp1252" in problem
+
+
+def test_profile_source_on_the_real_cp1252_fixture_end_to_end():
+    """The actual propose-path entry point (profile_source ->
+    _profile_with_delimiter_detection), which always resolves `encoding`
+    itself via detect_encoding and never passes declared= -- confirming the
+    default reaches the real end-to-end call, not just a direct profile_csv
+    call. detect_encoding finds no BOM on this cp1252 file, falls back to
+    utf-8, and the mid-file decode failure is reported with the same
+    undeclared wording as the direct-call test above."""
+    profiles = profile_source(CP1252_ASSETS.parent)
+    (profile,) = [p for p in profiles if p.path.name == "assets.csv"]
+    assert profile.truncated is True
+    problem = profile.problems[0]
+    assert "byte-order mark" in problem
+    assert "cp1252" in problem
+
+
 def test_profile_csv_records_the_delimiter_it_was_actually_called_with(tmp_path):
     path = tmp_path / "data.csv"
     path.write_text("a;b\n1;2\n", encoding="utf-8")

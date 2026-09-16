@@ -81,7 +81,7 @@ import re
 
 from rhinosecure.adapters.base import MAX_PROBLEMS_SHOWN, AdapterError, ProblemCollector
 from rhinosecure.adapters.configured import COMMON_DELIMITERS
-from rhinosecure.ingest import detect_encoding
+from rhinosecure.ingest import _decode_error_message, detect_encoding
 
 MAX_DISTINCT_TRACKED = 500
 MAX_SAMPLE_VALUES = 8
@@ -346,6 +346,7 @@ def profile_csv(
     quotechar: str = '"',
     encoding: str | None = None,
     skip_lines: int = 0,
+    declared: bool = False,
 ) -> FileProfile:
     """Profile one CSV file, streaming, in a single pass. Never raises for
     a messy file -- a duplicate header name, a ragged row, or a mid-file
@@ -364,7 +365,20 @@ def profile_csv(
     semicolon-delimited or banner-prefixed source parses as one giant
     column, every declared name is missed, and the section vanishes from
     the review in silence -- the worst failure mode for a report whose job
-    is to show what a mapping does not read."""
+    is to show what a mapping does not read.
+
+    `declared` is the identical flag `configured._open_csv` passes to
+    `ingest._decode_error_message` -- true only when `encoding` came from a
+    human's own `Source.encoding` (a confirmed contract), never from this
+    function's own `encoding or detect_encoding(path)` BOM-sniffing
+    fallback. A caller with no contract to consult (the propose path, via
+    `_profile_with_delimiter_detection`, which always resolves `encoding`
+    itself through `detect_encoding` before calling this) leaves it at the
+    default `False`, matching `ingest.open_csv`'s own default for the
+    identical reason: it has no `Source` to have declared anything in
+    either. Decode-error wording is otherwise identical either way --
+    `_decode_error_message` is the single place that text is written, not
+    re-derived per call site."""
     if not path.is_file():
         raise ProbeError(f"{path}: not a file")
 
@@ -385,7 +399,7 @@ def profile_csv(
         except StopIteration:
             raise ProbeError(f"{path}: empty file -- no header row") from None
         except UnicodeDecodeError as exc:
-            raise ProbeError(f"{path}: could not decode the header as {encoding} -- {exc}") from None
+            raise ProbeError(_decode_error_message(path, encoding, exc, declared=declared)) from None
         if not header:
             raise ProbeError(f"{path}: header row is empty")
 
@@ -424,9 +438,15 @@ def profile_csv(
                     accumulators[name].observe(value)
         except UnicodeDecodeError as exc:
             truncated = True
+            # `_decode_error_message` always leads with "{path}: " -- stripped here since
+            # `_print_probe_report` already prints the filename as this file's own heading,
+            # directly above the `problems` list this message joins (cli.py's own
+            # `_column_row`-adjacent rendering); every other entry in that list already omits
+            # the path for the same reason (see e.g. the duplicate-header-name message above).
+            detail = _decode_error_message(path, encoding, exc, declared=declared).removeprefix(f"{path}: ")
             problems.add(
-                f"row {row_count + 1}: could not decode as {encoding} -- {exc}; profiling stopped here, "
-                "counts above reflect only the rows read before this point"
+                f"row {row_count + 1}: profiling stopped here, counts above reflect only the rows read "
+                f"before this point -- {detail}"
             )
         if ragged_rows > MAX_PROBLEMS_SHOWN:
             problems.add(f"... and {ragged_rows - MAX_PROBLEMS_SHOWN} more ragged row(s)")
