@@ -1807,7 +1807,7 @@ specified. `.venv` (3.14) is kept alongside `.venv312` for the rest of the toolc
 doesn't touch CrewAI; `.venv312` is the working environment from Slice 3 onward.
 
 **Packages:** `crewai`, `langchain`, `langchain-anthropic`, `requests`, `pydantic`,
-`pandas`, `python-dotenv`, `pytest`. `chromadb` and `faiss-cpu` are no longer installed for
+`python-dotenv`, `pytest`. `chromadb` and `faiss-cpu` are no longer installed for
 this project's own use — Slice 2's retrieval layer (`retrieval/vector.py`/`mmr.py`) replaced
 chromadb with a from-scratch TF-IDF + MMR implementation after chromadb failed outright on
 Python 3.14 (see PROGRESS.md 2026-09-01), so **no RhinoSecure code needed to change** for the

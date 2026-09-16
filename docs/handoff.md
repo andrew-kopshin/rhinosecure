@@ -98,6 +98,32 @@ The end state: **drop a CSV, get a defensible remediation plan back** — one st
 
 Five phases, in this order and for these reasons.
 
+### Phase 0 prerequisite — source intake
+
+Phase 0 asks whether an unfamiliar CSV produces a signable contract or an honest, specific refusal. That question presupposes the file can be read at all — decoded, split into rows and columns — before there's a mapping to accept or refuse in the first place. This sits underneath Phase 0 rather than inside it.
+
+**CSV half: closed, 2026-09-14.** Six fixes landed this week, verified against real producer output, not synthetic re-encodes:
+
+- `cp1252` is now declarable in `Source.encoding` (cp1252 only — not `latin-1`; the two aren't the same encoding and conflating them would misdecode real bytes). Reasoning is in the field's own docstring.
+- `configured.py`'s `_open_csv` now forces and wraps the header read, so a mis-declared encoding is caught and reported by the one function that knows the path and the codec — the discipline `ingest.open_csv` already held, now held on the confirmed-contract read path too.
+- Three real-producer fixtures — PowerShell writing cp1252, Excel's COM `xlCSVUTF8` export (UTF-8 with BOM), PowerShell writing UTF-16 — each with non-ASCII verified at the codepoint level, not just "the file opens."
+- Delimiter detection (`probe.detect_delimiter`) switched from character-frequency counting to row-shape consistency: a candidate delimiter is accepted only if it splits the header and every sampled row into the identical field count throughout. Wired into `Source` and rendered at confirm time so a human signer can actually see what was detected.
+- A cross-file encoding or delimiter mismatch between the assets and findings files now refuses assembly outright, instead of silently preferring the assets file's profile.
+- Non-text input (a `.xlsx`/`.docx`/`.pptx` dropped where a CSV was expected) is now named by its real container format via ZIP magic bytes, instead of suggesting a "re-export as UTF-8" fix that can't help a binary file.
+- A failed unmapped-columns profile — the confirm-review's supplementary display, which re-reads the same file a second time after `load_batch` has already succeeded or failed — now degrades into its own `Measurement.unmapped_profile_problems` field instead of raising `ProbeError` uncaught. This was a real, unhandled 500 on the web confirm path, reachable with the committed `bluepeak-gen.json`.
+
+**Still open:** all six fixes above landed on the confirmed/configured read path (`configured.py`, `probe.detect_delimiter`, `review.py`). `probe.profile_csv` — the propose-path profiler, the one an unfamiliar CSV actually hits first — still carries its own inline decode-error strings and never calls `ingest._decode_error_message`, so the message-quality fixes exist but aren't reachable from the path a new user meets first.
+
+### XLSX intake — a separate phase, not started
+
+Not a remaining item of the CSV work above — a phase of its own, filed here so it isn't assumed folded into source intake by omission. Constraints established in discussion; nothing built or decided yet:
+
+- **Typed cells break every parser that assumes `str`.** openpyxl returns real Python types for numeric, date, and boolean cells, not strings — every parser downstream of a row (`ParsedMapping`, `_apply_case`, the delimiter/row-shape logic) assumes string input throughout the ingest layer today.
+- **Sheet selection has no home in the current schema.** `Source.layout` is a two-member `Literal["single_file", "two_file"]` — it has no dimension for "which sheet," a question a CSV never has to answer.
+- **Ragged-row protection can't transfer as-is.** The CSV-side protections (row-shape consistency, ragged-row reporting) depend on line-oriented reading; XLSX has no equivalent concept to detect the same failure mode against, so this needs a different mechanism, not a port of the existing one.
+- **Merge detection and memory-bounded streaming are in direct tension in openpyxl's own API.** `read_only=True` streaming mode gives up the ability to detect merged cells; detecting merges means loading the full worksheet into memory — which conflicts with the "must not assume input fits in memory" rule (CLAUDE.md Section 1).
+- **openpyxl's dependency boundary is unresolved, and currently inconsistent with `pyproject.toml`.** It isn't declared anywhere there — not core, not `agents`, not `dev` — yet it's installed in `.venv312` and imported unconditionally (no guard) by `tests/test_adapters_probe.py`, today only to construct a real `.xlsx` binary for the non-text-refusal test, never to parse XLSX content. The real design question — whether XLSX support is core, gated behind `agents`, or its own extra, given the deterministic path must keep working without it — is still open; the current ambient install isn't an answer to it, just an untracked gap.
+
 ### Phase 0 — Single-source the rules *(do this first)*
 
 Make grammar legality and "not known" single-sourced, per 4.1. Then clear the High-priority items in 4.2. Nothing else is worth building on the current foundation, because every new surface will re-derive the same rules and drift from them again.
