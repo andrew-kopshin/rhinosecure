@@ -1927,7 +1927,7 @@ function ingestProposeActionsHtml(step) {
     return `
       <div class="route-step-body">
         <button type="button" class="secondary-btn ingest-resolve-btn" data-name="${esc(name)}" data-upload-id="${esc(uploadId)}">
-          Resolve unresolved slots →
+          Resolve slots needing attention →
         </button>
       </div>
     `;
@@ -2001,7 +2001,7 @@ function describeIngestProposeIncomplete(result) {
     const detail = groundingFailures.map((f) => `${f.slot} -- ${f.message}`).join("; ");
     return (
       `${groundingFailures.length} slot(s)/reference(s) failed grounding: ${detail}. ` +
-      "Resolve them by hand in the saved proposal file, then re-run with --from-proposal."
+      "Correct the ones the resolve form can, or edit the saved proposal file by hand and re-run with --from-proposal."
     );
   }
   if (result.incomplete_reason) return result.incomplete_reason;
@@ -2046,19 +2046,24 @@ async function openResolvePanel(name, uploadId) {
   card.dataset.uploadId = uploadId;
   card.savedProposal = data.saved_proposal;
   card.resolutions = {}; // slot -> {column, table: {sourceValue: targetValue}} | {notCollected: true}
-  // Two structurally different reasons a slot needs a human here
+  // Three structurally different reasons a slot needs a human here
   // (data.unresolved: no mapping was ever proposed; data.illegal: one WAS
-  // proposed and the validator rejects it -- web/adapters.py's own
-  // `illegal_mapped_slots` docstring argues why these stay two separate
+  // proposed and the validator rejects it; data.grounding_failed: one was
+  // proposed, is individually legal, and the real file or the schema
+  // registry does not support it -- web/adapters.py's own
+  // `illegal_mapped_slots` docstring argues why these stay separate
   // server-side lists rather than one overloaded signal) are rendered as
   // one combined row set -- each entry already carries its own `kind`, so
-  // `resolveSlotRowHtml` can word the two differently without this panel
-  // needing to know which list an entry came from.
+  // `resolveSlotRowHtml` can word them differently without this panel
+  // needing to know which list an entry came from. The server never puts
+  // one slot in two lists (a slot both illegal and ungrounded is one
+  // `illegal` row with the grounding text merged in), which matters
+  // because rows are looked up by `data-slot`.
   // Two response-level facts stamped onto each row, rather than repeated
   // per entry server-side: an uncorrectable row needs to name the real
   // file and format to edit by hand, and both are properties of the
   // proposal, not of any one slot.
-  const rows = [...data.unresolved, ...(data.illegal || [])].map((slot) =>
+  const rows = [...data.unresolved, ...(data.illegal || []), ...(data.grounding_failed || [])].map((slot) =>
     Object.assign({ saved_proposal_path: data.saved_proposal_path, format_name: data.name }, slot)
   );
   renderResolvePanel(card, rows);
@@ -2116,6 +2121,15 @@ function resolveSlotControls(slot) {
   // not-collected checkbox for a caller that predates these fields.
   const gapLegal = slot.gap_legal !== undefined ? slot.gap_legal : true;
   const absentFactLegal = !!slot.absent_fact_legal;
+  // `fatal` (a blank refuses the whole batch) is the ONLY blank policy an
+  // identity-like target has -- hostname, cve_id, asset_id, finding_id. The
+  // endpoint sends `fatal_legal` off the same registry validate_contract
+  // enforces (web/adapters.py's `_fatal_legal`). Without this fallback the
+  // picker below was drawn only for a target with `gap` or `absent_fact`,
+  // so a hostname or CVE column that was obviously right could not be
+  // chosen from this form at all. Absent for a caller that predates the
+  // field, which keeps the old behavior exactly.
+  const fatalLegal = !!slot.fatal_legal;
 
   // A free-text target (finding.product, .evidence, ...) has no closed set
   // of legal values to pick per source value -- the correction is WHICH
@@ -2123,7 +2137,7 @@ function resolveSlotControls(slot) {
   // `column` mapping (never a value lookup) keeps Rule 2's "no free-text
   // pattern at runtime" intact: the human picks a column from a closed
   // list the model already profiled, nothing else.
-  const blankPolicy = absentFactLegal ? "absent_fact" : gapLegal ? "gap" : null;
+  const blankPolicy = absentFactLegal ? "absent_fact" : gapLegal ? "gap" : fatalLegal ? "fatal" : null;
   const columnPicker = !vocab && slot.candidate_columns.length && blankPolicy ? blankPolicy : null;
   const valuePicker =
     column && profile && vocab && (vocab.kind === "enum" || vocab.kind === "range" || vocab.kind === "bool")
@@ -2209,10 +2223,25 @@ function resolveSlotRowHtml(slot) {
   // `chat-msg-error` styling the "no legal automatic resolution" and
   // "mapping hit fatal problems" messages elsewhere in this file already
   // use for a real rejection, not a plain fill-this-in hint.
-  const reasonHtml =
-    slot.kind === "illegal"
-      ? `<p class="chat-msg-error">A mapping exists for this slot, but the validator rejects it: ${esc(slot.reason)}</p>`
-      : `<p class="hint">${esc(slot.reason)}</p>`;
+  // A `grounding` row is a third thing: the mapping is legal, and what it
+  // cites is not supported -- by the real file (a column that is not there,
+  // a table key never observed, a parser that rejects the real values) or
+  // by the schema registry. Naming which matters, because a registry
+  // disagreement is not a data-quality problem and must not read like one
+  // (the reported incident: `{Critical: 4}` refused as if the data were
+  // bad, when the registry anchors "Critical" to 5).
+  const groundingKinds = slot.grounding_kinds || [];
+  const anchorHintHtml = groundingKinds.includes("registry_anchor")
+    ? `<p class="hint">This disagrees with the schema's published alias knowledge; it is not a problem with your data. Set the value the registry expects -- a table that still contradicts it is refused, and this form has no override.</p>`
+    : "";
+  let reasonHtml;
+  if (slot.kind === "illegal") {
+    reasonHtml = `<p class="chat-msg-error">A mapping exists for this slot, but the validator rejects it: ${esc(slot.reason)}</p>${anchorHintHtml}`;
+  } else if (slot.kind === "grounding") {
+    reasonHtml = `<p class="chat-msg-error">A mapping exists for this slot, but it does not hold up against the real file and the schema: ${esc(slot.reason)}</p>${anchorHintHtml}`;
+  } else {
+    reasonHtml = `<p class="hint">${esc(slot.reason)}</p>`;
+  }
 
   // "Mark not collected" is only ever a legal correction for a target with
   // its own NOT_COLLECTED_DEFAULTS entry (config_model.GAP_LEGAL_TARGETS) --
@@ -2243,12 +2272,18 @@ function resolveSlotRowHtml(slot) {
     const recourse = slot.saved_proposal_path
       ? `Edit <code>${esc(slot.saved_proposal_path)}</code> by hand, then re-run <code>rhino adapt propose ${esc(slot.format_name || "&lt;name&gt;")} --from-proposal ${esc(slot.saved_proposal_path)}</code>.`
       : `Edit the saved proposal file by hand and re-run "rhino adapt propose --from-proposal".`;
+    // A structural reference (asset_grouping, enrichment, unmapped_columns)
+    // is not a slot at all, so "no candidate column for this target" would
+    // be the wrong sentence for it.
+    const whyUncorrectable = slot.structural
+      ? `This is a structural reference in the proposal, not a slot with a target field, so there is no mapping for this form to build.`
+      : `This slot cannot be corrected from this form: there is no candidate column to map it to, and "not collected" is not a legal value for this target.`;
     return `
       <div class="resolve-slot resolve-slot-uncorrectable" data-slot="${esc(slot.slot)}" data-uncorrectable="true">
         <h4>${esc(slot.slot)}</h4>
         ${confidenceHtml}
         ${reasonHtml}
-        <p class="chat-msg-error">This slot cannot be corrected from this form: there is no candidate column to map it to, and "not collected" is not a legal value for this target. ${recourse}</p>
+        <p class="chat-msg-error">${whyUncorrectable} ${recourse}</p>
         <p class="hint">Other slots below can still be resolved and resubmitted -- this one is left exactly as it is.</p>
       </div>
     `;

@@ -847,15 +847,17 @@ def _write_saved_proposal_atomic(path: Path, saved: SavedProposal) -> None:
     suffix needed the way `export.py`'s own atomic writer uses for a path
     genuinely shared across processes.
 
-    Call this ONLY when the caller is about to report a usable outcome
-    (a real or provisional contract actually written). `_run_ingest_
-    propose`'s resubmit path diffs every future edit against whatever
-    this function last wrote -- overwriting it with a run that hard-
-    refused would make that refusal the new baseline forever: nothing a
-    later resubmit can legally change would ever touch the disputed
-    slot's mapping, so `_stamp_authorship_per_slot` would keep reporting
-    it "unchanged" and grounding would refuse identically on every
-    subsequent resubmit, with no sequence of edits able to recover."""
+    Every outcome of `_run_ingest_propose` is saved through this, refused
+    ones included. That was once NOT true for a refused resubmit that
+    failed grounding: with no row in the panel for a slot that is mapped,
+    individually legal, and fails only grounding, persisting the refusal
+    made it the baseline every later resubmit diffed against, and nothing
+    the form could build would ever change the disputed slot again. The
+    panel now has that row (`grounding_failed`, web/adapters.py), so a
+    refused edit stays correctable and the write only preserves progress.
+    The invariant worth keeping is the one tests/test_web_jobs_ingest_
+    propose.py pins: after a refused grounding resubmit, `GET .../proposal`
+    still returns a row for the failing slot."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(path.name + ".tmp")
     tmp_path.write_text(
@@ -940,12 +942,11 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
                 "Pass input.overwrite_confirmed=true if you really mean to replace it."
             )
 
-    # Hoisted above the branch: this is both where a USABLE proposal gets
-    # saved (below -- conditionally, see _write_saved_proposal_atomic) and,
-    # on the edit path, where the baseline the browser form was rendered
-    # from is READ -- the read has to happen before this run could
-    # overwrite it. One expression, so the two can never point at
-    # different files.
+    # Hoisted above the branch: this is both where every outcome's proposal
+    # gets saved (below -- see _write_saved_proposal_atomic) and, on the
+    # edit path, where the baseline the browser form was rendered from is
+    # READ -- the read has to happen before this run could overwrite it.
+    # One expression, so the two can never point at different files.
     saved_path = REPO_ROOT / "out" / f"propose_{name}.json"
 
     edited_saved_proposal_data = job.input.get("edited_saved_proposal")
@@ -1017,8 +1018,8 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
         "proposal_saved_path": str(saved_path),
         "unresolved_slots": unresolved_slots(result.proposal),
         "grounding": {
-            "failures": [{"slot": i.slot, "message": i.message} for i in result.grounding.failures],
-            "caveats": [{"slot": i.slot, "message": i.message} for i in result.grounding.caveats],
+            "failures": [{"slot": i.slot, "kind": i.kind, "message": i.message} for i in result.grounding.failures],
+            "caveats": [{"slot": i.slot, "kind": i.kind, "message": i.message} for i in result.grounding.caveats],
         },
         "generator": {
             "model": result.generator.model,
@@ -1061,44 +1062,27 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
             result.proposal, result.profiles, result.grounding, generator=result.generator, generated_at=_now()
         )
         if provisional_contract is None:
-            # `result.grounding.failures` is exactly the condition
-            # `assemble_provisional_contract`'s OWN first check (`if report.
-            # failures:`) tests, on the identical `result.grounding` object
-            # -- so it is non-empty here if and only if THAT branch, not a
-            # later legality/structural one, is what produced this refusal.
-            # That distinction matters because the resolve-slots panel has
-            # a real row source for a legality refusal (`illegal_mapped_
-            # slots`) but none at all for a grounding one -- a slot that's
-            # mapped, individually legal, and fails only grounding (the
-            # reported incident) matches neither `unresolved_slots` nor
-            # `illegal_mapped_slots`, so the browser can never touch it.
-            # Persisting THAT proposal as the new edit baseline would make
-            # this exact refusal permanent, because no resubmit the browser
-            # can construct would ever change the disputed slot's mapping
-            # -- see _write_saved_proposal_atomic's own docstring.
+            # A refused proposal is ALWAYS saved, including a refused
+            # RESUBMIT that failed only grounding. This used to skip the
+            # write for exactly that case (docs/handoff.md 4.2.1, item 2):
+            # the resolve-slots panel had no row for a slot that is mapped,
+            # individually legal, and fails only grounding, so persisting a
+            # human's refused edit as the new baseline left the disputed
+            # slot with no control that could ever change it -- the refusal
+            # repeated identically forever.
             #
-            # A legality-only or structural refusal has no such trap (the
-            # panel can redisplay and correct it, or -- for the rare
-            # structural cases -- the slot was unresolved to begin with,
-            # which the panel already renders), so those keep the prior,
-            # always-save behavior, matching the hard-stop text's own
-            # promised "resolve them by hand in the saved proposal file"
-            # recourse for a fresh propose that refuses on its first try.
-            #
-            # MAINTENANCE NOTE: `not result.grounding.failures` is doing
-            # real work in this condition, and it is only correct because
-            # grounding has NO row source in the resolve-slots panel today
-            # (`GET /api/adapters/{name}/proposal` builds rows from
-            # `unresolved`/`illegal` only -- web/adapters.py). If grounding
-            # ever gains one -- the same way `illegal_mapped_slots`
-            # (schema_inference.py) is the existing precedent for a gate
-            # the panel CAN redisplay and let a human correct -- this
-            # branch must be revisited: skipping the write would then be
-            # protecting against a trap that no longer exists, at the cost
-            # of losing a resubmit's legitimate progress for no reason.
-            if edited_saved_proposal_data is None or not result.grounding.failures:
-                on_stage("saving proposal")
-                _write_saved_proposal_atomic(saved_path, saved_proposal)
+            # That trap needed the missing row source, and
+            # `GET /api/adapters/{name}/proposal` now has one
+            # (`grounding_failed`, web/adapters.py) covering EVERY failing
+            # grounding issue -- correctable rows carry controls, the rest
+            # name the recourse. Skipping the write would now only discard
+            # progress: a human who fixed three rows and got one wrong
+            # would lose all four on reload. tests/test_web_jobs_ingest_
+            # propose.py's recoverability test pins the property that made
+            # the old guard necessary: a refused grounding resubmit is
+            # visible as a row and a corrective resubmit through it works.
+            on_stage("saving proposal")
+            _write_saved_proposal_atomic(saved_path, saved_proposal)
             result_dict["incomplete_reason"] = notes.hard_stop_reason or result.incomplete_reason
             return JobOutcome(result=result_dict)
 

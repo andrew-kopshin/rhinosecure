@@ -20,7 +20,7 @@ entry) and confirming a contract (a dedicated, non-conversational
 signature):
 
 - `GET /api/adapters/{name}/proposal?upload_id=...` -- read-only. Returns
-  the saved proposal (`out/propose_<name>.json`) plus THREE lists needing a
+  the saved proposal (`out/propose_<name>.json`) plus FOUR lists needing a
   human's eyes before this can be confirmed:
   - `unresolved` -- every `SlotUnresolved` slot, with the real measured
     profile of its candidate column(s) (`ColumnProfile.distinct_values` --
@@ -42,6 +42,16 @@ signature):
     through the identical `resolveSlotRowHtml` widget `unresolved`/
     `low_confidence` already use, worded distinctly (app.js reads each
     entry's `"kind"`).
+  - `grounding_failed` -- every slot (or structural reference) that fails
+    `check_grounding`: `_grounding_failed_detail` below. A mapping that IS
+    present, IS individually legal, and fails only grounding matched
+    neither list above, so the panel drew no row for it and its Resubmit
+    was a no-op (docs/handoff.md 4.2.1). Each entry carries
+    `grounding_kinds` (`schema_inference.GroundingKind`), so the row can
+    say whether the file does not support the mapping or the schema
+    registry disagrees with it. Deliberately NOT an override: a
+    `registry_anchor` row lets the human change the value to match; a table
+    that still contradicts the anchor is refused by the same gate.
   - `low_confidence` -- every `SCORING_ENUM_TARGETS` slot the model DID map,
     but at a self-reported confidence below `config_model
     .LOW_CONFIDENCE_THRESHOLD` (`_low_confidence_detail`, below). This is
@@ -54,9 +64,9 @@ signature):
     the file. Scoped to `SCORING_ENUM_TARGETS` specifically because that's
     where a wrong value silently corrupts a real risk score, not just a
     free-text display field.
-  All three lists share one shape for a reason: a slot is RESOLVED (an
-  unresolved one), CORRECTED (an illegal one), or CHANGED (a low-confidence
-  one) the identical way -- editing the returned `proposal` JSON client-side
+  All four lists share one shape for a reason: a slot is RESOLVED (an
+  unresolved one), CORRECTED (an illegal or grounding-failed one), or
+  CHANGED (a low-confidence one) the identical way -- editing the returned `proposal` JSON client-side
   and resubmitting the WHOLE thing through the EXISTING generic `POST
   /api/jobs` with `kind="ingest_propose"` and a new, additive job input,
   `edited_saved_proposal` (`_run_ingest_propose`, web/jobs.py) -- this
@@ -141,10 +151,13 @@ from rhinosecure.adapters.config_model import (
 from rhinosecure.adapters.configured import _apply_case, _parse_scalar
 from rhinosecure.adapters.probe import profile_source
 from rhinosecure.adapters.review import Measurement, ReviewError, ReviewOutcome, review_contract
+from rhinosecure.adapters.schema_registry import TARGET_REGISTRY
 from rhinosecure.agents.schema_inference import (
     AdapterProposal,
+    GroundingIssue,
     SchemaInferenceError,
     SlotMapped,
+    check_grounding,
     dump_saved_proposal,
     illegal_mapped_slots,
     load_saved_proposal,
@@ -397,7 +410,144 @@ def _illegal_mapped_detail(proposal: AdapterProposal, profiles: dict) -> list[di
                 "column_profiles": column_profiles,
                 "gap_legal": target in GAP_LEGAL_TARGETS,
                 "absent_fact_legal": target in ABSENT_FACT_LEGAL_TARGETS,
+                "fatal_legal": _fatal_legal(target),
                 "target_vocabulary": describe_target_vocabulary(target),
+            }
+        )
+    return detail
+
+
+def _fatal_legal(target: str) -> bool:
+    """Whether `blank: "fatal"` (refuse the batch on a blank) is a legal
+    policy for `target`, read off the same registry `validate_contract`
+    enforces. Sent per row because the browser cannot otherwise build a
+    column mapping for an identity-like target (`hostname`, `cve_id`,
+    `asset_id`, `finding_id`): each has `fatal` as its ONLY legal blank
+    policy, and the picker offered a column only when `gap` or
+    `absent_fact` was legal -- so a slot no source column could be
+    mapped to from the form, however obvious the column was."""
+    spec = TARGET_REGISTRY.get(target)
+    return spec is not None and "fatal" in spec.legal_blank_policies
+
+
+def _grounding_failed_detail(
+    proposal: AdapterProposal,
+    profiles: dict,
+    failures: list[GroundingIssue],
+    *,
+    unresolved: set[str],
+    illegal_by_slot: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """One row per slot (or structural reference) that fails grounding --
+    the row source docs/handoff.md 4.2.1 found missing. A slot that IS
+    mapped, IS individually legal, and fails only grounding matched
+    neither `unresolved` nor `illegal`, so the panel drew nothing for it
+    and its Resubmit button was a no-op that reproduced the identical
+    refusal.
+
+    Every failing issue gets a row, correctable or not: a correctable one
+    carries the controls the form already has (`resolveSlotControls`,
+    app.js -- which alone decides what THIS FORM can build), and one it
+    cannot correct still names the real reason and the recourse. Nothing
+    here decides whether a human may overrule a registry anchor: a
+    `registry_anchor` row shows the disagreement and the same per-value
+    pickers, and a table that still contradicts the anchor is refused by
+    the identical `check_grounding` gate as before -- this only makes the
+    refusal visible and fixable in place.
+
+    Three de-duplications, so the panel never shows one slot twice:
+    - a slot already in `unresolved` is skipped (its own row exists; a
+      hallucinated CANDIDATE column on it is grounding's `missing_column`
+      but changes nothing about what the human has to do);
+    - a slot already in `illegal_by_slot` gets the grounding text MERGED
+      into that row's `reason` rather than a second row, since one
+      `.resolve-slot` per `data-slot` is what the JS looks rows up by;
+    - issues are grouped by slot, so two failures on one slot are one row.
+
+    `candidate_columns` is filtered to columns the file really has: a
+    column picker must never offer the very column that failed. The one
+    exception is deliberate and narrow -- a `missing_column` failure on a
+    FREE-TEXT target (no closed vocabulary), where the whole real header
+    of that slot's file is offered instead, because picking a real column
+    IS the correction. For a closed-vocabulary target the form's per-value
+    picker needs one specific column and its profile, which a missing
+    column cannot supply, so the row stays uncorrectable and says so."""
+    by_slot: dict[str, list[GroundingIssue]] = {}
+    for issue in failures:
+        by_slot.setdefault(issue.slot, []).append(issue)
+
+    detail: list[dict[str, Any]] = []
+    for slot, issues in by_slot.items():
+        if slot in unresolved:
+            continue
+        reason = "; ".join(i.message for i in issues)
+        kinds = sorted({i.kind for i in issues})
+
+        merged = illegal_by_slot.get(slot)
+        if merged is not None:
+            merged["reason"] = f"{merged['reason']}; also fails grounding: {reason}"
+            merged["grounding_kinds"] = kinds
+            continue
+
+        section, _, target = slot.partition(".")
+        slot_map = proposal.asset if section == "asset" else proposal.finding if section == "finding" else None
+        sp = slot_map.get(target) if slot_map is not None else None
+        if not isinstance(sp, SlotMapped):
+            # Structural: no target field exists to correct. `structural`
+            # tells the row to name the reference instead of claiming a
+            # target has "no candidate column".
+            detail.append(
+                {
+                    "slot": slot,
+                    "kind": "grounding",
+                    "structural": True,
+                    "grounding_kinds": kinds,
+                    "reason": reason,
+                    "current_mapping": None,
+                    "current_values": {},
+                    "candidate_columns": [],
+                    "column_profiles": {},
+                    "gap_legal": False,
+                    "absent_fact_legal": False,
+                    "fatal_legal": False,
+                    "target_vocabulary": None,
+                }
+            )
+            continue
+
+        vocabulary = describe_target_vocabulary(target)
+        own_columns = [
+            c for c in _mapping_source_columns(sp.mapping, proposal.derived)
+            if _column_profile_dict(profiles, c) is not None
+        ]
+        candidate_columns = list(own_columns)
+        if vocabulary is None and "missing_column" in kinds:
+            filename = proposal.meta.assets_filename if section == "asset" else proposal.meta.findings_filename
+            candidate_columns = list(profiles[filename].columns)
+        column_profiles = {
+            column: profile
+            for column in candidate_columns
+            if (profile := _column_profile_dict(profiles, column)) is not None
+        }
+        current_values: dict[str, Any] = {}
+        if own_columns:
+            current_values = _predict_current_values(
+                sp.mapping, proposal.derived, _column_profile_dict(profiles, own_columns[0])["distinct_values"]
+            )
+        detail.append(
+            {
+                "slot": slot,
+                "kind": "grounding",
+                "grounding_kinds": kinds,
+                "reason": reason,
+                "current_mapping": sp.mapping.model_dump(mode="json"),
+                "current_values": current_values,
+                "candidate_columns": candidate_columns,
+                "column_profiles": column_profiles,
+                "gap_legal": target in GAP_LEGAL_TARGETS,
+                "absent_fact_legal": target in ABSENT_FACT_LEGAL_TARGETS,
+                "fatal_legal": _fatal_legal(target),
+                "target_vocabulary": vocabulary,
             }
         )
     return detail
@@ -522,8 +672,26 @@ def mount_adapter_routes(app: FastAPI) -> None:
                     # in JS.
                     "gap_legal": target in GAP_LEGAL_TARGETS,
                     "absent_fact_legal": target in ABSENT_FACT_LEGAL_TARGETS,
+                    "fatal_legal": _fatal_legal(target),
                 }
             )
+
+        illegal = _illegal_mapped_detail(saved.proposal, profiles)
+        try:
+            report = check_grounding(saved.proposal, profiles)
+        except SchemaInferenceError as exc:
+            # The saved proposal names files this upload does not contain:
+            # it was generated for a different source. Refused loudly --
+            # the alternative, an empty grounding list, would present a
+            # proposal nobody has actually checked as though it were clean.
+            raise HTTPException(409, f"the saved proposal does not match this upload: {exc}")
+        grounding_failed = _grounding_failed_detail(
+            saved.proposal,
+            profiles,
+            report.failures,
+            unresolved={e["slot"] for e in unresolved_detail},
+            illegal_by_slot={e["slot"]: e for e in illegal},
+        )
 
         return {
             "name": name,
@@ -541,7 +709,8 @@ def mount_adapter_routes(app: FastAPI) -> None:
             "saved_proposal_path": str(path),
             "saved_proposal": dump_saved_proposal(saved),
             "unresolved": unresolved_detail,
-            "illegal": _illegal_mapped_detail(saved.proposal, profiles),
+            "illegal": illegal,
+            "grounding_failed": grounding_failed,
             "low_confidence": _low_confidence_detail(saved.proposal, profiles),
         }
 

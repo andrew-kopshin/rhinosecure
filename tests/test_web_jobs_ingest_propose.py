@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient
 
 import rhinosecure.agents.schema_inference as schema_inference_module
 from rhinosecure.adapters.config_model import ASSET_SLOTS, FINDING_SLOTS
+from rhinosecure.web import adapters as adapters_module
 from rhinosecure.web import jobs as jobs_module
 from rhinosecure.web import uploads as uploads_module
 from rhinosecure.web.jobs import JobConfig, _default_propose_name, known_format_match
@@ -845,22 +846,26 @@ def test_edited_saved_proposal_still_refuses_an_illegal_edit(client: TestClient,
     assert _QueuedFakeCrew.instantiations == 0
 
 
-def test_a_refused_grounding_resubmit_does_not_poison_the_baseline(client: TestClient, isolated_dirs: Path):
-    """Regression test for docs/handoff.md 4.2.1: a resubmit that fails
-    only grounding (the alias-contradiction incident, or -- as here --
-    an invented table entry) must never become the new edit baseline.
+def test_a_refused_grounding_resubmit_stays_visible_and_correctable(
+    client: TestClient, isolated_dirs: Path, tmp_path: Path, monkeypatch
+):
+    """Regression test for docs/handoff.md 4.2.1, item 2 -- the property
+    that made the old "don't persist a refused grounding resubmit" guard
+    necessary, now held by a row source instead of by discarding progress.
 
-    Before this fix, `saved_path` was overwritten unconditionally: a
-    refused resubmit's disputed mapping got persisted, `authored_by`
-    'human' and all, and every later resubmit diffed against THAT
-    baseline. Since the resolve-slots panel has no row source for a
-    grounding failure (only `unresolved_slots`/`illegal_mapped_slots`,
-    neither of which a mapped-and-individually-legal-but-ungrounded slot
-    matches), nothing could ever change the disputed slot's mapping
-    again -- `_stamp_authorship_per_slot` would keep reporting it
-    "unchanged", and grounding would refuse identically forever, even
-    for a resubmit that only touches an unrelated row.
+    A resubmit that fails only grounding (the alias-contradiction incident,
+    or -- as here -- an invented table entry) IS persisted as the edit
+    baseline, `authored_by` 'human' and all. What used to make that
+    permanent was that the resolve-slots panel had no row for a slot that
+    is mapped, individually legal, and fails only grounding: nothing the
+    form could build would ever change it again. The recoverability chain
+    below is the proof that is no longer true: the refused edit is on
+    disk, `GET .../proposal` returns a `grounding_failed` row for it, and
+    a corrective resubmit built the way the form builds it succeeds.
     """
+    # `web/adapters.py` resolves the saved-proposal path from its own
+    # `_REPO_ROOT`, separate from `jobs.py`'s (which `isolated_dirs` patches).
+    monkeypatch.setattr(adapters_module, "_REPO_ROOT", tmp_path)
     upload_id = _upload(client, "inventory.csv", _csv_bytes(_ROWS))["upload_id"]
     first = _full_proposal_dict(name="upload-trap")
     _QueuedFakeCrew.queue = [json.dumps(first)]
@@ -870,11 +875,16 @@ def test_a_refused_grounding_resubmit_does_not_poison_the_baseline(client: TestC
     assert body1["status"] == "succeeded"
     assert body1["result"]["contract_written"] is True  # a clean baseline now exists on disk
     saved_path = Path(body1["result"]["proposal_saved_path"])
-    baseline_on_disk = saved_path.read_text(encoding="utf-8")
+
+    generator = {
+        "tool": "rhino-adapt-propose", "model": "claude-sonnet-5", "prompt_tokens": 100,
+        "completion_tokens": 50, "estimated_cost_usd": 0.001, "attempts": 1,
+        "call_log_digest": "sha256:" + "a" * 64,
+    }
 
     # Resubmit #1: invents a table entry for "owner" that was never
     # observed in the real file ("never-seen") -- fails grounding, not
-    # legality, exactly the shape the resolve-slots panel has no row for.
+    # legality.
     bad = _full_proposal_dict(
         name="upload-trap",
         overrides_asset={
@@ -884,61 +894,50 @@ def test_a_refused_grounding_resubmit_does_not_poison_the_baseline(client: TestC
             )
         },
     )
-    edited_saved_proposal_bad = {
-        "proposal": bad,
-        "generator": {
-            "tool": "rhino-adapt-propose", "model": "claude-sonnet-5", "prompt_tokens": 100,
-            "completion_tokens": 50, "estimated_cost_usd": 0.001, "attempts": 1,
-            "call_log_digest": "sha256:" + "a" * 64,
-        },
-    }
-    job2 = _submit(client, upload_id=upload_id, name="upload-trap", edited_saved_proposal=edited_saved_proposal_bad)
+    job2 = _submit(
+        client, upload_id=upload_id, name="upload-trap",
+        edited_saved_proposal={"proposal": bad, "generator": generator},
+    )
     body2 = _wait_for_terminal(client, job2["job_id"])
     assert body2["status"] == "succeeded"  # a refused proposal is a reportable outcome, not a job failure
     assert body2["result"]["contract_written"] is False
-    # Confirms this really is the grounding-failure shape, not a legality
-    # one -- the distinction the fix's own guard condition relies on.
-    assert "asset.owner" in [f["slot"] for f in body2["result"]["grounding"]["failures"]]
+    failures = {f["slot"]: f for f in body2["result"]["grounding"]["failures"]}
+    assert failures["asset.owner"]["kind"] == "invented_table_key"
 
-    # The load-bearing assertion: the on-disk baseline is byte-identical
-    # to what the first, successful run wrote. The refused resubmit never
-    # touched it.
-    assert saved_path.read_text(encoding="utf-8") == baseline_on_disk
+    # The refused edit IS the baseline now -- deliberately (web/jobs.py).
+    on_disk = json.loads(saved_path.read_text(encoding="utf-8"))
+    assert on_disk["proposal"]["asset"]["owner"]["mapping"]["table"] == {"never-seen": "x"}
 
-    # Resubmit #2: an unrelated, legal edit to evidence's own case policy
-    # -- nothing to do with "owner" at all. Diffs against the UNPOISONED
-    # baseline, so it must succeed exactly as it would have if resubmit
-    # #1 had never happened.
+    # ...and it is not a dead end: the panel's endpoint returns a row for it.
+    resp = client.get("/api/adapters/upload-trap/proposal", params={"upload_id": upload_id})
+    assert resp.status_code == 200
+    rows = {r["slot"]: r for r in resp.json()["grounding_failed"]}
+    assert set(rows) == {"asset.owner"}
+    row = rows["asset.owner"]
+    assert row["kind"] == "grounding"
+    assert row["grounding_kinds"] == ["invented_table_key"]
+    assert row["candidate_columns"] == ["Col"]  # a real column, so the form can offer it
+    assert row["absent_fact_legal"] is True  # so `resolveSlotControls` can draw a column picker
+
+    # Resubmit #2: the correction the form itself would build for that row --
+    # a plain `column` mapping over the real column.
     fixed = _full_proposal_dict(
         name="upload-trap",
-        overrides_finding={
-            "evidence": _mapped(
-                {"kind": "column", "column": "Col", "case": "upper", "blank": "absent_fact"}, columns_cited=["Col"]
-            ),
+        overrides_asset={
+            "owner": _mapped(
+                {"kind": "column", "column": "Col", "case": "exact", "blank": "absent_fact"}, columns_cited=["Col"]
+            )
         },
     )
-    edited_saved_proposal_fixed = {
-        "proposal": fixed,
-        "generator": {
-            "tool": "rhino-adapt-propose", "model": "claude-sonnet-5", "prompt_tokens": 100,
-            "completion_tokens": 50, "estimated_cost_usd": 0.001, "attempts": 1,
-            "call_log_digest": "sha256:" + "a" * 64,
-        },
-    }
     job3 = _submit(
-        client, upload_id=upload_id, name="upload-trap", edited_saved_proposal=edited_saved_proposal_fixed
+        client, upload_id=upload_id, name="upload-trap",
+        edited_saved_proposal={"proposal": fixed, "generator": generator},
     )
     body3 = _wait_for_terminal(client, job3["job_id"])
-    # This is the proof the trap did not spring: without the fix, "owner"
-    # would already be stamped 'human' with the disputed table by resubmit
-    # #1's persisted write, grounding would refuse identically here too,
-    # and contract_written would be False.
     assert body3["result"]["contract_written"] is True
 
-    on_disk = json.loads(Path(body3["result"]["contract_path"]).read_text(encoding="utf-8"))
-    authorship = on_disk["mapping_authorship"]
-    assert authorship["finding.evidence"] == "human"
-    assert authorship.get("asset.owner") == "model"  # never poisoned to 'human' by the refused attempt
+    contract = json.loads(Path(body3["result"]["contract_path"]).read_text(encoding="utf-8"))
+    assert contract["mapping_authorship"]["asset.owner"] == "human"
 
 
 def test_resolving_a_free_text_unresolved_slot_via_a_column_mapping_writes_a_confirmable_contract(

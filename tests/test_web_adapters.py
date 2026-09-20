@@ -435,6 +435,230 @@ def test_get_proposal_illegal_is_empty_for_a_clean_proposal(client: TestClient):
     assert resp.json()["illegal"] == []
 
 
+# ---------------- grounding_failed: the row source docs/handoff.md 4.2.1 found missing ----------------
+
+
+def _grounding_rows(client: TestClient, name: str, upload_id: str) -> tuple[dict, dict]:
+    resp = client.get(f"/api/adapters/{name}/proposal", params={"upload_id": upload_id})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    return body, {row["slot"]: row for row in body["grounding_failed"]}
+
+
+def test_get_proposal_grounding_failed_is_empty_for_a_clean_proposal(client: TestClient):
+    upload_id = _upload(client)
+    _propose(client, upload_id, "upload-gf-clean", _proposal_dict(name="upload-gf-clean"))
+    body, rows = _grounding_rows(client, "upload-gf-clean", upload_id)
+    assert body["grounding_failed"] == []
+
+
+def test_grounding_failed_row_for_a_parser_that_rejects_the_source_ids(client: TestClient):
+    """The itco case (docs/handoff.md section 4 item 1): a source whose IDs
+    are `CVE-SYN-2026-1001`, mapped with the `cve_id` parser, which insists
+    on `CVE-YYYY-NNNN+`. `Finding.cve_id` itself accepts these (its own
+    pattern is the safe-identifier one), so the correction is a plain
+    `column` mapping -- and the row must make that reachable: the real
+    column as the only candidate, and `fatal_legal` true, because `fatal` is
+    the ONLY blank policy `cve_id` has, which is what used to leave the form
+    with no column picker to draw."""
+    rows = [
+        ["A01", "HOST01", "F01", "CVE-SYN-2026-1001", "srv", "Production"],
+        ["A02", "HOST02", "F02", "CVE-SYN-2026-1002", "wks", "Corporate"],
+    ]
+    upload_id = _upload(client, content=_csv_bytes(rows))
+    job = _propose_edited(client, upload_id, "upload-gf-syn", _proposal_dict(name="upload-gf-syn"))
+    assert job["result"]["contract_written"] is False
+
+    _, found = _grounding_rows(client, "upload-gf-syn", upload_id)
+    assert set(found) == {"finding.cve_id"}
+    row = found["finding.cve_id"]
+    assert row["kind"] == "grounding"
+    assert row["grounding_kinds"] == ["parser_no_resolve"]
+    assert "does not resolve 2 of 2" in row["reason"]
+    assert row["candidate_columns"] == ["Cve"]
+    assert set(row["column_profiles"]["Cve"]["distinct_values"]) == {"CVE-SYN-2026-1001", "CVE-SYN-2026-1002"}
+    assert row["current_values"] == {}  # the parser resolves nothing, so nothing is predicted
+    assert row["target_vocabulary"] is None
+    assert (row["gap_legal"], row["absent_fact_legal"], row["fatal_legal"]) == (False, False, True)
+    assert "structural" not in row
+
+
+def test_grounding_failed_row_for_a_registry_anchor_disagreement_offers_no_override(client: TestClient):
+    """The reported incident: `{Critical: 4}` against a registry that
+    anchors "Critical" to 5. The row shows the real reason and the value
+    picker's ingredients; it does NOT change what is accepted -- the
+    disputed table is still refused (contract_written False) by the same
+    gate, so nothing here decides whether a human may overrule an anchor."""
+    rows = [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "Critical", "Production"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "Low", "Corporate"],
+    ]
+    upload_id = _upload(client, content=_csv_bytes(rows))
+    proposal = _proposal_dict(name="upload-gf-anchor")
+    # Re-key every other Col-reading table onto the real values so that
+    # criticality is the ONLY slot failing grounding.
+    proposal["asset"]["role"]["mapping"]["table"] = {"Critical": "dc", "Low": "workstation"}
+    proposal["asset"]["role"]["mapping"]["case"] = "exact"
+    proposal["finding"]["scanner_severity"]["mapping"]["table"] = {"Critical": "critical", "Low": "low"}
+    proposal["finding"]["scanner_severity"]["mapping"]["case"] = "exact"
+    proposal["asset"]["criticality"] = _mapped(
+        {"kind": "vocabulary", "column": "Col", "case": "exact", "blank": "fatal", "table": {"Critical": 4, "Low": 2}},
+        columns_cited=["Col"],
+    )
+    job = _propose_edited(client, upload_id, "upload-gf-anchor", proposal)
+    assert job["result"]["contract_written"] is False
+
+    _, found = _grounding_rows(client, "upload-gf-anchor", upload_id)
+    assert set(found) == {"asset.criticality"}
+    row = found["asset.criticality"]
+    assert row["grounding_kinds"] == ["registry_anchor"]
+    assert "'Critical'" in row["reason"] and "5" in row["reason"] and "4" in row["reason"]
+    assert row["candidate_columns"] == ["Col"]
+    assert row["current_values"] == {"Critical": 4, "Low": 2}  # what the mapping says today, to correct in place
+    assert row["target_vocabulary"] == {"kind": "range", "min": 1, "max": 5}
+
+    # A resubmit that MATCHES the anchor is accepted -- the row is a way
+    # to fix the table, not a way around the registry.
+    proposal["asset"]["criticality"]["mapping"]["table"] = {"Critical": 5, "Low": 2}
+    fixed = _propose_edited(client, upload_id, "upload-gf-anchor", proposal)
+    assert fixed["result"]["grounding"]["failures"] == []
+
+
+def test_grounding_failed_row_for_an_invented_table_key_on_a_closed_vocabulary(client: TestClient):
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-gf-key")
+    proposal["asset"]["role"]["mapping"]["table"] = {"srv": "dc", "never-seen": "file"}
+    _propose_edited(client, upload_id, "upload-gf-key", proposal)
+
+    _, found = _grounding_rows(client, "upload-gf-key", upload_id)
+    assert set(found) == {"asset.role"}
+    row = found["asset.role"]
+    assert row["grounding_kinds"] == ["invented_table_key"]
+    assert "never-seen" in row["reason"]
+    assert row["candidate_columns"] == ["Col"]  # the real column the value picker reads
+    assert set(row["column_profiles"]["Col"]["distinct_values"]) == {"srv", "wks"}
+    assert row["current_values"] == {"srv": "dc"}  # only what the mapping actually resolves
+    assert row["target_vocabulary"]["kind"] == "enum"
+
+
+def test_grounding_failed_row_for_a_missing_column_on_a_free_text_target_offers_the_real_header(client: TestClient):
+    """Picking a real column IS the correction for a hallucinated one, so a
+    free-text target is offered the whole header of its file -- never the
+    column that failed."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-gf-col")
+    proposal["finding"]["product"] = _mapped(
+        {"kind": "column", "column": "Nope", "case": "exact", "blank": "absent_fact"}, columns_cited=["Nope"]
+    )
+    _propose_edited(client, upload_id, "upload-gf-col", proposal)
+
+    _, found = _grounding_rows(client, "upload-gf-col", upload_id)
+    assert set(found) == {"finding.product"}
+    row = found["finding.product"]
+    assert row["grounding_kinds"] == ["missing_column"]
+    assert row["candidate_columns"] == _HEADER
+    assert "Nope" not in row["candidate_columns"]
+    assert set(row["column_profiles"]) == set(_HEADER)
+    assert row["current_values"] == {}
+    assert row["absent_fact_legal"] is True
+
+
+def test_grounding_failed_row_for_a_missing_column_on_a_closed_vocabulary_is_left_uncorrectable(client: TestClient):
+    """The per-value picker needs ONE specific column and its profile, and
+    a missing column supplies neither -- so the row carries the reason and
+    no candidates, and the form names the recourse instead of drawing a
+    picker over an arbitrary column."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-gf-vocab")
+    proposal["asset"]["role"]["mapping"]["column"] = "Nope"
+    _propose_edited(client, upload_id, "upload-gf-vocab", proposal)
+
+    _, found = _grounding_rows(client, "upload-gf-vocab", upload_id)
+    row = found["asset.role"]
+    assert row["grounding_kinds"] == ["missing_column"]
+    assert row["candidate_columns"] == []
+    assert row["column_profiles"] == {}
+    assert row["target_vocabulary"]["kind"] == "enum"
+
+
+def test_grounding_failed_reports_a_structural_reference_as_a_row_with_no_target(client: TestClient):
+    """`asset_grouping.key` is not a slot, so no mapping can be built for
+    it -- but a failure must not be invisible, or the panel is back to zero
+    rows and a Resubmit that reproduces the refusal."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-gf-struct")
+    proposal["asset_grouping"]["key"] = "Nope"
+    _propose_edited(client, upload_id, "upload-gf-struct", proposal)
+
+    _, found = _grounding_rows(client, "upload-gf-struct", upload_id)
+    row = found["asset_grouping.key"]
+    assert row["structural"] is True
+    assert row["grounding_kinds"] == ["missing_column"]
+    assert row["candidate_columns"] == [] and row["current_mapping"] is None
+    assert (row["gap_legal"], row["absent_fact_legal"], row["fatal_legal"]) == (False, False, False)
+
+
+def test_a_slot_that_is_both_illegal_and_ungrounded_is_one_row_not_two(client: TestClient):
+    """The JS looks a row up by `data-slot`, so a slot listed twice would
+    render two forms and edit only the first. The grounding text is merged
+    into the `illegal` row instead of hidden."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-gf-both")
+    # blank='gap' is illegal for cve_id (fatal is its only policy), and the
+    # cited column does not exist.
+    proposal["finding"]["cve_id"] = _mapped(
+        {"kind": "parsed", "column": "Nope", "case": "upper", "blank": "gap", "parser": "cve_id"}, columns_cited=["Nope"]
+    )
+    _propose_edited(client, upload_id, "upload-gf-both", proposal)
+
+    body, found = _grounding_rows(client, "upload-gf-both", upload_id)
+    assert "finding.cve_id" not in found
+    entry = {e["slot"]: e for e in body["illegal"]}["finding.cve_id"]
+    assert "blank='gap'" in entry["reason"]
+    assert "also fails grounding" in entry["reason"] and "Nope" in entry["reason"]
+    assert entry["grounding_kinds"] == ["missing_column"]
+
+
+def test_an_unresolved_slot_with_a_hallucinated_candidate_is_not_also_a_grounding_row(client: TestClient):
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-gf-unres", environment_status="unresolved")
+    proposal["asset"]["environment"]["candidate_columns"] = ["Nope"]
+    _propose_edited(client, upload_id, "upload-gf-unres", proposal)
+
+    body, found = _grounding_rows(client, "upload-gf-unres", upload_id)
+    assert "asset.environment" in {u["slot"] for u in body["unresolved"]}
+    assert "asset.environment" not in found
+
+
+def test_an_unresolved_identity_slot_carries_fatal_legal_so_the_form_can_offer_its_column(client: TestClient):
+    """`hostname` has `fatal` as its only blank policy. Before `fatal_legal`
+    the form's column picker required `gap` or `absent_fact`, so an
+    unresolved `hostname` with an obvious candidate column rendered as
+    "cannot be corrected from this form"."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-gf-host")
+    proposal["asset"]["hostname"] = _unresolved("the source has no machine name", ["Hostname"])
+    proposal["unmapped_columns"] = {}
+    _propose_edited(client, upload_id, "upload-gf-host", proposal)
+
+    resp = client.get("/api/adapters/upload-gf-host/proposal", params={"upload_id": upload_id})
+    row = {u["slot"]: u for u in resp.json()["unresolved"]}["asset.hostname"]
+    assert row["candidate_columns"] == ["Hostname"]
+    assert (row["gap_legal"], row["absent_fact_legal"], row["fatal_legal"]) == (False, False, True)
+
+
+def test_get_proposal_409s_when_the_saved_proposal_names_files_the_upload_does_not_have(client: TestClient):
+    """A proposal generated for one source, read against another. Refusing
+    is right: an empty grounding list would present a proposal nobody has
+    checked against THIS upload as though it were clean."""
+    first = _upload(client)
+    _propose(client, first, "upload-gf-mismatch", _proposal_dict(name="upload-gf-mismatch"))
+    other = _upload(client, filename="other.csv")
+    resp = client.get("/api/adapters/upload-gf-mismatch/proposal", params={"upload_id": other})
+    assert resp.status_code == 409
+    assert "does not match this upload" in resp.json()["detail"]
+
+
 def test_get_proposal_404s_for_an_unknown_name(client: TestClient):
     upload_id = _upload(client)
     resp = client.get("/api/adapters/no-such-name/proposal", params={"upload_id": upload_id})
