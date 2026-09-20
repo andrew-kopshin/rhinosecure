@@ -125,3 +125,13 @@ def test_jobs_enabled_false_explicitly_also_has_no_job_routes(export_file):
     client = TestClient(create_app(export_file, jobs_enabled=False))
     resp = client.post("/api/jobs", json={"kind": "constraint_submit", "text": "anything"})
     assert resp.status_code == 404
+
+
+def test_the_page_and_its_static_assets_are_revalidated_not_heuristically_cached(export_file):
+    """No Cache-Control meant browsers kept serving a stale app.js after the
+    file changed. `no-cache` still allows a cheap 304 via the ETag."""
+    client = TestClient(create_app(export_file))
+    for path in ("/", "/static/app.js", "/static/index.html"):
+        response = client.get(path)
+        assert response.status_code == 200, path
+        assert response.headers["cache-control"] == "no-cache", path

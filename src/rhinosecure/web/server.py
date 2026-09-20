@@ -126,6 +126,21 @@ def load_export(path: Path) -> Any:
         raise HTTPException(status_code=500, detail=f"export file {path} is not valid JSON: {exc}")
 
 
+
+class _RevalidatingStaticFiles(StaticFiles):
+    """Static files carry an `ETag` and a `Last-Modified` but no
+    `Cache-Control`, so a browser applies heuristic freshness to them and keeps
+    serving a stale `app.js` against a newer backend after an upgrade -- seen
+    live: a freshly edited script was ignored until the cache was forced.
+    `no-cache` makes the browser revalidate on every load (a cheap 304 via the
+    existing `ETag`), never skip the check."""
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 def create_app(
     export_path: Path | str | None = None,
     *,
@@ -206,11 +221,11 @@ def create_app(
 
         mount_chat_routes(app)
 
-    app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+    app.mount("/static", _RevalidatingStaticFiles(directory=_STATIC_DIR), name="static")
 
     @app.get("/")
     def index() -> FileResponse:
-        return FileResponse(_STATIC_DIR / "index.html")
+        return FileResponse(_STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
     return app
 
