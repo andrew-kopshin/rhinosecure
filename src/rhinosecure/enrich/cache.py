@@ -25,13 +25,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from rhinosecure.schema import SAFE_IDENTIFIER_PATTERN
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_SNAPSHOT_DIR = REPO_ROOT / "data" / "snapshots"
 
 # CVE IDs, ATT&CK bundle/technique names, and similar keys are all plain
 # identifiers. Restricting to this set keeps a key from ever escaping its
 # source's directory (no "/", no "..").
-_SAFE_KEY = re.compile(r"^[A-Za-z0-9._-]+$")
+_SAFE_KEY = re.compile(SAFE_IDENTIFIER_PATTERN)
 
 
 class OfflineCacheMissError(RuntimeError):

@@ -414,6 +414,68 @@ def load_findings(path: Path) -> Iterator[Finding]:
             raise IngestError(f"{path}: invalid finding row {row!r}: {exc}") from exc
 
 
+def index_assets(
+    assets: Iterable[Asset], *, source: str, stats: "IngestStats | None" = None
+) -> dict[str, Asset]:
+    """asset_id -> Asset, refusing to guess. Two rows for one asset_id that
+    are identical collapse into one (counted on `stats` when given); two that
+    disagree are a data-quality problem, not a tie to break by row order --
+    the plain `{a.asset_id: a for a in assets}` this replaces silently kept
+    whichever came last, so a conflicting owner, window or criticality
+    vanished without a word. Every conflicting id is named at once, the same
+    "refuse loudly, name every offender" shape `ProblemCollector` gives the
+    adapters that already handled this themselves (they never reach here with
+    a duplicate; native did)."""
+    index: dict[str, Asset] = {}
+    conflicts: dict[str, list[str]] = {}
+    for asset in assets:
+        prior = index.get(asset.asset_id)
+        if prior is None:
+            index[asset.asset_id] = asset
+        elif prior == asset:
+            if stats is not None:
+                stats.duplicate_assets_collapsed += 1
+        else:
+            conflicts.setdefault(
+                asset.asset_id, sorted(f for f in Asset.model_fields if getattr(prior, f) != getattr(asset, f))
+            )
+    if conflicts:
+        detail = "; ".join(f"{aid!r} (differs in {fields})" for aid, fields in sorted(conflicts.items())[:20])
+        more = f" (+{len(conflicts) - 20} more)" if len(conflicts) > 20 else ""
+        raise IngestError(
+            f"{source}: {len(conflicts)} asset_id(s) appear on more than one row with different values -- "
+            f"refusing to guess which row is right: {detail}{more}"
+        )
+    return index
+
+
+def unique_findings(
+    findings: Iterable[Finding], *, source: str, stats: "IngestStats | None" = None
+) -> Iterator[Finding]:
+    """The finding-side twin of `index_assets`, kept streaming: findings are
+    the side expected to scale, so only an id -> digest map is held, never the
+    findings themselves. A finding_id is the key decisions, remediation
+    history and the export are all keyed on -- two rows sharing one made the
+    ranked plan list it twice with different scores and every keyed lookup
+    quietly pick one. An identical repeat collapses (counted); a repeat that
+    differs is refused."""
+    seen: dict[str, int] = {}
+    for finding in findings:
+        digest = hash(finding.model_dump_json())
+        prior = seen.get(finding.finding_id)
+        if prior is None:
+            seen[finding.finding_id] = digest
+            yield finding
+        elif prior == digest:
+            if stats is not None:
+                stats.duplicate_findings_collapsed += 1
+        else:
+            raise IngestError(
+                f"{source}: finding_id {finding.finding_id!r} appears on more than one row with different "
+                "values -- refusing to guess which row is right"
+            )
+
+
 def load_asset_index(path: Path) -> dict[str, Asset]:
     """Build an asset_id -> Asset lookup.
 
@@ -421,10 +483,7 @@ def load_asset_index(path: Path) -> dict[str, Asset]:
     only they are kept as a lazy stream; the asset inventory is the natural
     side to index for O(1) lookup during that stream's consumption.
     """
-    index: dict[str, Asset] = {}
-    for asset in load_assets(path):
-        index[asset.asset_id] = asset
-    return index
+    return index_assets(load_assets(path), source=str(path))
 
 
 def join(
@@ -447,7 +506,11 @@ def join(
 def join_findings(
     findings_path: Path, assets_path: Path
 ) -> Iterator[EnrichedFinding]:
-    yield from join(load_asset_index(assets_path), load_findings(findings_path), source=str(findings_path))
+    yield from join(
+        load_asset_index(assets_path),
+        unique_findings(load_findings(findings_path), source=str(findings_path)),
+        source=str(findings_path),
+    )
 
 
 def _describe_directory_contents(data_dir: Path) -> str:
@@ -547,9 +610,18 @@ def load_batch(data_dir: Path, adapter: IngestAdapter) -> tuple[dict[str, Asset]
     either file is opened if `data_dir` doesn't have what `adapter`
     expects -- see that function's docstring."""
     _require_adapter_files(data_dir, adapter)
-    assets = {a.asset_id: a for a in adapter.load_assets(data_dir / adapter.assets_filename)}
+    assets_path = data_dir / adapter.assets_filename
+    assets = index_assets(adapter.load_assets(assets_path), source=str(assets_path), stats=adapter.stats)
+    if not assets and not adapter.stats.excluded_assets:
+        # Without this an empty or header-only inventory surfaces as "finding
+        # X references unknown asset_id Y" -- blaming the findings for a
+        # problem that is in the file with nothing in it.
+        raise IngestError(
+            f"{assets_path}: contains no asset rows (empty, or a header with nothing under it) -- "
+            "there is nothing to score findings against"
+        )
     findings_path = data_dir / adapter.findings_filename
-    findings = adapter.load_findings(findings_path, assets)
+    findings = unique_findings(adapter.load_findings(findings_path, assets), source=str(findings_path), stats=adapter.stats)
     return assets, join(assets, findings, source=str(findings_path))
 
 

@@ -30,6 +30,15 @@ Environment = Literal["prod", "staging", "dev"]
 DataSensitivity = Literal["none", "internal", "confidential", "regulated"]
 ScannerSeverity = Literal["critical", "high", "medium", "low", "informational"]
 
+#: What a CVE-shaped identifier may contain. Also the rule `enrich/cache.py`
+#: applies to every snapshot key (so a key can never escape its source's
+#: directory) -- one definition, so the ingest gate below and the cache can
+#: never disagree about what is a usable key. A `cve_id` that fails it (blank,
+#: or a free-text cell holding an ID plus a note) used to reach the cache and
+#: abort the whole run with an unhandled ValueError; it is now refused at the
+#: row that carries it.
+SAFE_IDENTIFIER_PATTERN = r"^[A-Za-z0-9._-]+$"
+
 
 def _validate_not_collected(model: type[BaseModel], value: frozenset[str]) -> frozenset[str]:
     """`not_collected` may only name fields the model actually has, and
@@ -57,7 +66,7 @@ class Asset(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, frozen=True)
     _never_not_collected: ClassVar[frozenset[str]] = frozenset({"asset_id"})
 
-    asset_id: str
+    asset_id: str = Field(min_length=1)
     hostname: str
     os: str
     os_build: str
@@ -123,9 +132,9 @@ class Finding(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, frozen=True)
     _never_not_collected: ClassVar[frozenset[str]] = frozenset({"finding_id", "asset_id", "cve_id"})
 
-    finding_id: str
-    asset_id: str
-    cve_id: str
+    finding_id: str = Field(min_length=1)
+    asset_id: str = Field(min_length=1)
+    cve_id: str = Field(pattern=SAFE_IDENTIFIER_PATTERN)
     detected_date: str = ""
     scanner_severity: ScannerSeverity
     product: str = ""
