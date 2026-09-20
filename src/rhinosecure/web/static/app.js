@@ -2146,12 +2146,18 @@ function resolveSlotRowHtml(slot) {
   let valuePickerHtml = "";
   let columnPickerHtml = "";
   if (controls.columnPicker) {
+    // The first option is "leave unresolved" and it is the DEFAULT. A picker
+    // that pre-selected its first candidate turned an untouched row into a
+    // mapping: clicking Resubmit for some other slot silently mapped
+    // itco's `os` to `Affected_Product` -- a column the model had itself
+    // said is not an OS field -- and stamped it `authored_by: human`. Only
+    // a column the human actually chose may be a human's mapping.
     const options = slot.candidate_columns
       .map((c) => `<option value="${esc(c)}">${esc(c)}</option>`)
       .join("");
     columnPickerHtml = `
-      <p class="hint">No fixed set of legal values for this field -- map it directly to the column it should read from:</p>
-      <select class="resolve-column-select" data-blank-policy="${controls.columnPicker}">${options}</select>
+      <p class="hint">No fixed set of legal values for this field -- map it directly to the column it should read from, or leave it unresolved:</p>
+      <select class="resolve-column-select" data-blank-policy="${controls.columnPicker}"><option value="">(leave unresolved)</option>${options}</select>
     `;
   }
   if (!vocab && !columnPickerHtml && gapLegal) {
@@ -2290,8 +2296,11 @@ function buildSlotMapping(slot, row) {
   // A free-text target (no target_vocabulary) has no per-value picker at
   // all -- its only controls are this column-select and (when legal) the
   // not-collected checkbox below, so it's checked first.
+  // An empty value is the "leave unresolved" default: nothing was chosen, so
+  // this falls through to the not-collected checkbox and, failing that, to
+  // "declined" (null) -- never to a mapping over some column by default.
   const columnSelect = row.querySelector(".resolve-column-select");
-  if (columnSelect) {
+  if (columnSelect && columnSelect.value) {
     const column = columnSelect.value;
     return {
       status: "mapped", confidence: 1.0,
@@ -2324,6 +2333,18 @@ function buildSlotMapping(slot, row) {
     else if (slot.target_vocabulary.kind === "bool") table[input.dataset.sourceValue] = value === "true";
     else table[input.dataset.sourceValue] = value;
   });
+  // Every value still on "(exclude this value)": the human chose nothing
+  // for this row, which is declining, exactly like the unchecked
+  // not-collected box above -- not a mapping. Building one anyway produced
+  // an EMPTY table, which the server refuses outright ("table must not be
+  // empty") and which would exclude every asset or finding if it were ever
+  // accepted. The refusal took the whole submission down with it, so a
+  // human who wanted to resolve one slot (itco's hostname and cve_id,
+  // confirmed live) was forced to fill in every other row's values too --
+  // 18 role values they had made no decision about. Returning null leaves
+  // this slot exactly as it arrived (unresolved, and so degraded by the
+  // provisional path as designed), and lets the rows they DID fill in go.
+  if (Object.keys(table).length === 0) return null;
   return {
     status: "mapped", confidence: 1.0,
     mapping: { kind: "vocabulary", column, case: "exact", blank: "fatal", table },
