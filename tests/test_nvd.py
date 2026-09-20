@@ -308,3 +308,27 @@ def test_no_api_key_omits_header(tmp_path: Path, monkeypatch):
     cache = SnapshotCache(tmp_path)
     lookup("CVE-2021-26855", cache)
     assert captured["headers"] == {}
+
+
+def test_404_is_a_record_not_found_not_a_crash(tmp_path: Path, monkeypatch):
+    """NVD answers an unknown cveId (private/vendor ID, typo, not yet
+    published) with HTTP 404. `lookup` documents "record not found" as None,
+    but a 404 used to raise HTTPError and abort the whole online run over one
+    finding. The miss is cached like any other answer, so a second lookup does
+    not touch the network again."""
+    call_count = {"n": 0}
+
+    def fake_get(url, params, headers, timeout):
+        call_count["n"] += 1
+        return _FakeResponse(404)
+
+    monkeypatch.setattr("rhinosecure.enrich.nvd.requests.get", fake_get)
+    monkeypatch.setattr(
+        "rhinosecure.enrich.nvd.time.sleep",
+        lambda seconds: (_ for _ in ()).throw(AssertionError("a 404 is not retryable")),
+    )
+
+    cache = SnapshotCache(tmp_path)
+    assert lookup("CVE-SYN-2026-1001", cache) is None
+    assert lookup("CVE-SYN-2026-1001", cache) is None
+    assert call_count["n"] == 1

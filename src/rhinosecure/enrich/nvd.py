@@ -78,6 +78,14 @@ def _fetch_one(cve_id: str) -> dict[str, Any]:
         )
         if response.status_code == 200:
             return response.json()
+        if response.status_code == 404:
+            # NVD answers an unknown `cveId` (a private/vendor identifier, a
+            # typo, an ID not published yet) with 404, not an empty 200. That
+            # is "record not found", which `lookup` documents as `None` --
+            # raising here instead aborted the entire online run over one
+            # finding. Returned in the shape a found-but-empty query has, so
+            # `_best_metric` yields None and the snapshot records the miss.
+            return {"resultsPerPage": 0, "startIndex": 0, "totalResults": 0, "vulnerabilities": []}
         if response.status_code in (403, 429) and attempt < MAX_ATTEMPTS - 1:
             time.sleep(RETRY_BACKOFF_BASE_SECONDS * (2**attempt))
             continue
