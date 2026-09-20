@@ -780,11 +780,16 @@ def _run_constraint_submit(job: Job, plan_state: PlanState, on_stage: Callable[[
         return JobOutcome(result=result_dict)  # refused -- interpreted, but nothing to apply
 
     on_stage("exporting")
+    # The plan's own source, not the server's startup flag: in the empty-
+    # workspace mode `config.data_dir` is None (the plan came from an upload
+    # or a Router-named source), and the refreshed export used to record the
+    # string "None" as its data_dir -- the page title then read "None (agents)".
+    active = plan_state.active_source
     try:
         export.write_run_export(
             plan_state.export_path,
             fmt=coordinator.contract.format if coordinator.contract else coordinator.ingest_format,
-            data_dir=plan_state.config.data_dir,
+            data_dir=active.data_dir if active is not None else plan_state.config.data_dir,
             seed=plan_state.config.seed,
             offline=plan_state.config.offline,
             agents=True,

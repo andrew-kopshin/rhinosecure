@@ -806,6 +806,12 @@ def test_run_agents_provisional_branch_never_clobbers_an_existing_confirmed_plan
     assert constraint_body["result"]["persisted"] is True
     assert constraint_body["result"]["interpretation"]["asset_id"] == "A01"
 
+    # The refreshed export names the plan's real source. It used to write the
+    # server's startup `config.data_dir` -- None in this empty-workspace mode --
+    # so the export said data_dir "None" and the page title read "None (agents)".
+    exported = json.loads((tmp_path / "export.json").read_text(encoding="utf-8"))
+    assert exported["run"]["data_dir"] == str(data_dir_a)
+
 
 def test_constraint_submit_still_raises_plan_not_seeded_after_only_a_provisional_run_agents_job(
     tmp_path: Path, monkeypatch
