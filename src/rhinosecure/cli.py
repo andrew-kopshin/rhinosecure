@@ -1553,6 +1553,24 @@ def main(argv: list[str] | None = None) -> int:
         help="use a declarative ingest contract instead of a built-in --format, same as `rhino run --adapter-config`",
     )
 
+    constraint_list_parser = constraint_subparsers.add_parser(
+        "list", help="print every active asset-scoped constraint on file, with the id `retract` takes"
+    )
+    constraint_list_parser.add_argument(
+        "--db", default=None, help="path to the memory.py SQLite file (default: memory.DEFAULT_DB_PATH)"
+    )
+    constraint_retract_parser = constraint_subparsers.add_parser(
+        "retract",
+        help=(
+            "retract one asset-scoped constraint by id (from `constraint list`) -- soft-delete: the row "
+            "stays on file, inactive; no LLM, no ingest. Takes effect on the next run."
+        ),
+    )
+    constraint_retract_parser.add_argument("constraint_id", type=int)
+    constraint_retract_parser.add_argument(
+        "--db", default=None, help="path to the memory.py SQLite file (default: memory.DEFAULT_DB_PATH)"
+    )
+
     remediation_parser = subparsers.add_parser(
         "remediation", help="record and inspect what actually happened to a finding (memory.py's remediation_events)"
     )
@@ -1903,6 +1921,46 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"export error: {exc}", file=sys.stderr)
                 return 1
 
+        return 0
+
+    if args.command == "constraint" and args.constraint_command == "list":
+        from rhinosecure.memory import Memory
+
+        active = (Memory(args.db) if args.db else Memory()).all_active_constraints()
+        if not active:
+            print("no active asset-scoped constraints on file")
+            return 0
+        _print_rows(
+            ("id", "asset_id", "effect", "constraint"),
+            [
+                (
+                    str(c.id),
+                    c.asset_id,
+                    f"{c.effect_kind}={c.effect_value!r}" if c.effect_kind else "(not interpreted)",
+                    c.constraint_text,
+                )
+                for c in active
+            ],
+        )
+        return 0
+
+    if args.command == "constraint" and args.constraint_command == "retract":
+        from rhinosecure.memory import Memory
+
+        retract_memory = Memory(args.db) if args.db else Memory()
+        active_ids = {c.id for c in retract_memory.all_active_constraints()}
+        if args.constraint_id not in active_ids:
+            print(
+                f"constraint retract: no active constraint with id {args.constraint_id} "
+                "(see `rhino constraint list`; an already-retracted one cannot be retracted again)",
+                file=sys.stderr,
+            )
+            return 1
+        retract_memory.deactivate_constraint(args.constraint_id)
+        print(
+            f"Retracted constraint #{args.constraint_id} (kept on file, inactive). It stops applying "
+            "on the next run; plans already exported are unchanged until re-run."
+        )
         return 0
 
     if args.command == "constraint" and args.constraint_command == "add":

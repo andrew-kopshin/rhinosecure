@@ -1398,3 +1398,50 @@ def test_remediation_mark_with_no_provisional_provenance_recorded_marks_exactly_
     from rhinosecure.memory import Memory
 
     assert Memory(db_path).latest_remediation_event_for_finding("F21").status == "remediated"
+
+
+# --- constraint list / retract ------------------------------------------------
+
+
+def test_constraint_list_says_so_when_nothing_is_on_file(tmp_path, capsys):
+    assert main(["constraint", "list", "--db", str(tmp_path / "c.db")]) == 0
+    assert "no active asset-scoped constraints on file" in capsys.readouterr().out
+
+
+def test_constraint_retract_soft_deletes_by_the_id_list_prints(tmp_path, capsys):
+    """A constraint typed wrong (or since overtaken) had no way out: memory.py
+    could deactivate one, but neither the CLI nor the web UI exposed it, so a
+    bad constraint applied to every later run until someone edited the SQLite
+    file by hand."""
+    from rhinosecure.memory import Memory
+
+    db = tmp_path / "c.db"
+    memory = Memory(db)
+    keep = memory.add_constraint("A09", "WKS-FIN12 only Sundays")
+    drop = memory.add_constraint("A01", "DC01 no reboot")
+    keep_id, drop_id = getattr(keep, "id", keep), getattr(drop, "id", drop)
+
+    assert main(["constraint", "list", "--db", str(db)]) == 0
+    listed = capsys.readouterr().out
+    assert "WKS-FIN12 only Sundays" in listed and "DC01 no reboot" in listed
+
+    assert main(["constraint", "retract", str(drop_id), "--db", str(db)]) == 0
+    assert f"Retracted constraint #{drop_id}" in capsys.readouterr().out
+    assert [c.id for c in Memory(db).all_active_constraints()] == [keep_id]
+    # soft delete: still on file for the historical record
+    assert any(c.id == drop_id and not c.active for c in Memory(db).constraints_for_asset("A01", active_only=False))
+
+    assert main(["constraint", "list", "--db", str(db)]) == 0
+    assert "DC01 no reboot" not in capsys.readouterr().out
+
+
+def test_constraint_retract_refuses_an_unknown_or_already_retracted_id(tmp_path, capsys):
+    from rhinosecure.memory import Memory
+
+    db = tmp_path / "c.db"
+    made = Memory(db).add_constraint("A09", "x")
+    cid = getattr(made, "id", made)
+    assert main(["constraint", "retract", "9999", "--db", str(db)]) == 1
+    assert main(["constraint", "retract", str(cid), "--db", str(db)]) == 0
+    assert main(["constraint", "retract", str(cid), "--db", str(db)]) == 1
+    assert "no active constraint" in capsys.readouterr().err
