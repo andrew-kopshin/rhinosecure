@@ -145,6 +145,26 @@ DEFAULT_MAX_PARSE_ATTEMPTS = 3
 # fifth of the full range -- enough that a couple tenths of scoring
 # noise between rounds can't spuriously trigger it, small enough to
 # resolve a genuinely one-sided case in fewer than 3 rounds.
+#
+# MEASURED 2026-09-20, and deliberately left at 2.0 (a decision, not an
+# oversight): across the 27 distinct resolved searches on disk (out/*.json
+# exports from 2026-09-03..09-20, three datasets), 24 ended near_tie and 3
+# picked a winner (gaps 2.05, 2.10, 5.00). The final-round gap was 0.00-0.90
+# for 17 of them, 1.00-2.00 for 7, and >= 2.0 for 3. Two facts argue against
+# lowering it: (1) the SAME finding lands on both sides of any threshold
+# across runs (F11: 0.05 in one run, 2.05 in another; F14: 0.00 vs 1.60), so
+# the gap is noisier than any margin one could pick and a lower margin
+# would mint winners a re-run overturns; (2) every result with gap >= 1.0
+# (10 of 10) named emergency_change on top, i.e. a lower margin would only
+# ever "decide" for the default answer to a KEV finding while adding no
+# information. Section 6 makes a near-tie the intended output for a
+# genuinely contested finding ("surface both branches to the human"), so
+# "ToT usually ends with a human deciding" is the design working, not a
+# calibration defect. The one open lever, if this is ever revisited, is the
+# decision RULE (e.g. require the same top strategy across repeated
+# critiques), not the number; that costs extra LLM calls, so it is not
+# free to try. Mixed-vintage sample: tot.py last changed 2026-09-08 (agent
+# prompts live elsewhere and were not diffed against those runs).
 CLEAR_WINNER_MARGIN = 2.0
 
 

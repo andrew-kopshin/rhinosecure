@@ -792,6 +792,19 @@ no aggregate/total field at all, the same "the model never computes the number" 
 `score_finding` gives `risk_score` (Section 8 rule 2's spirit, applied to a computation
 `scoring.py` itself has nothing to do with).
 
+**Measured, and `CLEAR_WINNER_MARGIN = 2.0` deliberately left alone (2026-09-20).** Across the 27
+distinct resolved searches on disk (three datasets, 2026-09-03..09-20), 24 ended `near_tie` and 3
+picked a winner; a handoff had reported "4 of 4 never pick a winner", which undercounted. The
+final-round gap was under 1.0 for 17, 1.0-2.0 for 7, at least 2.0 for 3. Recalibration was
+considered and declined: the same finding lands on both sides of any threshold across runs (F11
+0.05 vs 2.05; F14 0.00 vs 1.60), so the gap is noisier than any margin one could choose, and every
+one of the 10 results with gap >= 1.0 named `emergency_change` on top -- a lower margin would only
+"decide" for the default answer to a KEV finding. A near-tie is this section's own intended output
+for a genuinely contested finding, so "a human usually decides" is the design working. If this is
+revisited the lever is the decision RULE (e.g. the same top strategy across repeated critiques),
+not the number, and that costs extra LLM calls. Full reasoning and caveats (mixed-vintage sample,
+prompts not diffed) sit beside the constant in `tot.py`.
+
 ---
 
 ## 7. Memory
