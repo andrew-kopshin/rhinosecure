@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 from crewai.types.usage_metrics import UsageMetrics
+from pydantic import ValidationError
 
 import rhinosecure.agents.schema_inference as schema_inference_module
 from rhinosecure.adapters.config_model import (
@@ -1335,7 +1336,10 @@ class _QueuedFakeCrew:
             )
         for task in self.tasks:
             _QueuedFakeCrew.descriptions.append(task.description)
-            task.output = SimpleNamespace(raw=_QueuedFakeCrew.queue.pop(0))
+            item = _QueuedFakeCrew.queue.pop(0)
+            if isinstance(item, Exception):
+                raise item  # the model call itself failing, not a bad answer
+            task.output = SimpleNamespace(raw=item)
         return None
 
 
@@ -1373,6 +1377,31 @@ def test_propose_contract_gives_up_after_max_attempts(data_dir):
     _QueuedFakeCrew.queue = [UNPARSEABLE, UNPARSEABLE]
     with pytest.raises(ProposalGenerationError, match="gave up after 2 attempt"):
         propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, max_attempts=2)
+
+
+def test_propose_contract_treats_a_failed_model_call_as_a_failed_attempt_and_retries(data_dir):
+    """An empty model response ("Invalid response from LLM call - None or
+    empty") used to escape `propose_contract` as a raw CrewAI traceback --
+    three attempts in a row on a real 27-column source -- because only
+    unparseable OUTPUT was handled, not the call itself failing."""
+    _QueuedFakeCrew.queue = [
+        RuntimeError("Task execution failed: Invalid response from LLM call - None or empty."),
+        json.dumps(_full_proposal_dict()),
+    ]
+    result = propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, max_attempts=3)
+    assert result.contract is not None
+    assert result.generator.attempts == 2
+    assert [u["outcome"] for u in result.attempt_usage] == ["llm_error", "parsed"]
+
+
+def test_propose_contract_reports_the_call_failure_when_every_attempt_raises(data_dir):
+    _QueuedFakeCrew.queue = [RuntimeError("Invalid response from LLM call - None or empty.")] * 2
+    with pytest.raises(ProposalGenerationError, match="the model call itself failed") as excinfo:
+        propose_contract(data_dir, "min-test", generated_at=_GENERATED_AT, max_attempts=2)
+    assert "Invalid response from LLM call" in str(excinfo.value)
+    # The spend of a failed call is still recorded, per attempt.
+    assert [u["outcome"] for u in excinfo.value.attempt_usage] == ["llm_error", "llm_error"]
+    assert excinfo.value.estimated_cost_usd > 0
 
 
 def test_propose_contract_degrades_instead_of_raising_when_retries_exhaust_on_an_illegal_mapping(data_dir):
@@ -3155,3 +3184,45 @@ def test_check_column_mapping_legal_values_direct():
         check_column_mapping_legal_values("finding.scanner_severity", "scanner_severity", missing_column_mapping, profile)
         == []
     )
+
+
+def _slot_with_status(status: str, mapping: dict | None):
+    slot = {
+        "status": status, "confidence": 0.85,
+        "evidence": {"columns_cited": [], "sample_values_cited": [], "note": "no such column"},
+    }
+    if mapping is not None:
+        slot["mapping"] = mapping
+    return slot
+
+
+def test_a_slot_whose_status_says_not_collected_but_whose_mapping_agrees_is_read_as_mapped():
+    """A model running without thinking wrote `status: "not_collected"` next to
+    the correct `mapping: {kind: "not_collected"}` in nine slots, on all three
+    attempts of a real 27-column propose, error fed back each time -- so it
+    never converged. The claim, mapping, confidence and evidence are its own;
+    only the first word is repaired."""
+    data = _full_proposal_dict()
+    data["asset"]["owner"] = _slot_with_status("not_collected", {"kind": "not_collected"})
+    proposal = AdapterProposal.model_validate(data)
+    slot = proposal.asset["owner"]
+    assert isinstance(slot, SlotMapped)
+    assert slot.mapping.kind == "not_collected"
+    assert slot.confidence == 0.85
+
+
+def test_a_bare_not_collected_status_with_no_agreeing_mapping_is_still_refused():
+    data = _full_proposal_dict()
+    data["asset"]["owner"] = _slot_with_status("not_collected", None)
+    with pytest.raises(ValidationError):
+        AdapterProposal.model_validate(data)
+    data["asset"]["owner"] = _slot_with_status("not_collected", {"kind": "column", "column": "Owner", "case": "exact", "blank": "gap"})
+    with pytest.raises(ValidationError):
+        AdapterProposal.model_validate(data)
+
+
+def test_an_unresolved_slot_is_never_converted_into_not_collected():
+    data = _full_proposal_dict()
+    data["asset"]["owner"] = {"status": "unresolved", "candidate_columns": [], "reason": "not sure"}
+    proposal = AdapterProposal.model_validate(data)
+    assert isinstance(proposal.asset["owner"], SlotUnresolved)

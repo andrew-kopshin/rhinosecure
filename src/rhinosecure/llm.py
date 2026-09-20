@@ -60,7 +60,38 @@ def _config_from_env() -> LLMConfig:
     )
 
 
-def get_llm(config: LLMConfig | None = None, *, max_tokens: int | None = None) -> BaseLLM:
+def _is_hosted_anthropic(cfg: LLMConfig) -> bool:
+    """`thinking` is an Anthropic Messages API parameter. A self-hosted
+    endpoint (`RHINO_LLM_BASE_URL`, a first-class deployment target) or a
+    non-Claude model has no such parameter to receive it, so it is simply not
+    sent -- the caller asked for a cap on reasoning, and a model with no
+    reasoning mode already satisfies it."""
+    return not cfg.base_url and "claude" in cfg.model.lower()
+
+
+def _thinking_config(thinking: dict[str, str | int]) -> object:
+    """crewai's `AnthropicThinkingConfig` serializes `{"type": "disabled"}` as
+    `{"type": "disabled", "budget_tokens": null}`, and the API rejects it
+    (`thinking.disabled.budget_tokens: Extra inputs are not permitted`) --
+    three attempts, each failing before a token was spent. The provider calls
+    `model_dump()` on this object, so a subclass that drops unset fields fixes
+    the wire format without patching the library."""
+    from crewai.llms.providers.anthropic.completion import AnthropicThinkingConfig
+
+    class _WireThinkingConfig(AnthropicThinkingConfig):
+        def model_dump(self, **kwargs):  # type: ignore[override]
+            kwargs.setdefault("exclude_none", True)
+            return super().model_dump(**kwargs)
+
+    return _WireThinkingConfig(**thinking)
+
+
+def get_llm(
+    config: LLMConfig | None = None,
+    *,
+    max_tokens: int | None = None,
+    thinking: dict[str, str | int] | None = None,
+) -> BaseLLM:
     """Construct the object every CrewAI `Agent`'s `llm=` field receives.
 
     No request is made here -- this only builds the client. A missing
@@ -79,6 +110,16 @@ def get_llm(config: LLMConfig | None = None, *, max_tokens: int | None = None) -
     unrelated failure discards all of it (PROGRESS.md 2026-09-06: a 5-row,
     20-column ingest_propose job spent ~50k completion tokens on at least one
     of its three attempts when the accepted proposal needed ~8k).
+
+    `thinking` is left unset by every caller except the propose agent, for
+    the same reason. Left unset, `claude-sonnet-5` thinks adaptively, and
+    thinking tokens count against `max_tokens`: a 27-column source spent all
+    24,000 of them on a thinking block and returned no answer at all
+    (`stop_reason: max_tokens`, content `['thinking']`), which CrewAI reports
+    as "None or empty" -- on every retry, identically. `{"type": "disabled"}`
+    is the only setting crewai's Anthropic provider can pass for this model
+    (`enabled` is rejected by the API, and the provider has no way to send
+    `output_config.effort`).
     """
     cfg = config or _config_from_env()
     if not cfg.api_key and not cfg.base_url:
@@ -87,11 +128,13 @@ def get_llm(config: LLMConfig | None = None, *, max_tokens: int | None = None) -
             ".env) and no RHINO_LLM_BASE_URL configured for a self-hosted model."
         )
 
-    kwargs: dict[str, str | int] = {"model": cfg.model}
+    kwargs: dict[str, object] = {"model": cfg.model}
     if cfg.api_key:
         kwargs["api_key"] = cfg.api_key
     if cfg.base_url:
         kwargs["base_url"] = cfg.base_url
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
+    if thinking is not None and _is_hosted_anthropic(cfg):
+        kwargs["thinking"] = _thinking_config(thinking)
     return LLM(**kwargs)

@@ -113,3 +113,38 @@ def test_env_with_no_key_and_no_base_url_raises(monkeypatch):
 
     with pytest.raises(LLMConfigError):
         get_llm()
+
+
+def test_thinking_is_unset_by_default_and_reaches_the_constructed_llm_when_given():
+    """Thinking tokens count against max_tokens. A 27-column source spent the
+    whole 24,000-token propose budget on a thinking block and returned no
+    answer, three attempts running -- so the propose agent turns it off, and
+    every other agent keeps the model's default."""
+    cfg = LLMConfig(model="claude-sonnet-5", api_key="sk-test-key")
+    assert get_llm(cfg).thinking is None
+    llm = get_llm(cfg, max_tokens=24_000, thinking={"type": "disabled"})
+    assert llm.thinking is not None and llm.thinking.type == "disabled"
+
+
+def test_the_propose_agent_disables_thinking_and_does_not_resend_failed_requests():
+    from rhinosecure.agents.schema_inference import PROPOSE_THINKING, build_propose_agent
+
+    agent = build_propose_agent(None)
+    assert agent.llm.thinking.type == PROPOSE_THINKING["type"] == "disabled"
+    assert agent.max_retry_limit == 0
+
+
+def test_thinking_disabled_goes_over_the_wire_without_a_null_budget():
+    """crewai serializes this config with `budget_tokens: null`, which the API
+    rejects outright ("Extra inputs are not permitted") -- every call failed
+    before a token was spent. This asserts the request the provider actually
+    builds, not just the object handed to it."""
+    llm = get_llm(LLMConfig(model="claude-sonnet-5", api_key="sk-test-key"), max_tokens=24_000, thinking={"type": "disabled"})
+    params = llm._prepare_completion_params([{"role": "user", "content": "hi"}])
+    assert params["thinking"] == {"type": "disabled"}
+    assert params["max_tokens"] == 24_000
+
+
+def test_thinking_is_not_sent_to_a_self_hosted_endpoint():
+    llm = get_llm(LLMConfig(model="claude-sonnet-5", api_key=None, base_url="http://localhost:11434"), thinking={"type": "disabled"})
+    assert getattr(llm, "thinking", None) is None

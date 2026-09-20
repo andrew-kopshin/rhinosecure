@@ -143,6 +143,16 @@ DEFAULT_MAX_ATTEMPTS = 3
 #: other agent in this codebase sets this.
 PROPOSE_MAX_OUTPUT_TOKENS = 24_000
 
+#: Thinking counts against `PROPOSE_MAX_OUTPUT_TOKENS`. Measured on a real
+#: 27-column source with the identical prompt: adaptive thinking (the model's
+#: default) spent all 24,000 tokens reasoning and emitted no answer at all --
+#: three attempts running, plus CrewAI's own silent re-sends, about $0.28 a
+#: call and unreported -- while the same call with thinking disabled finished
+#: in 54 seconds with a complete draft. The draft's format errors are what
+#: `propose_contract`'s validated retry loop exists to repair; an empty
+#: response is something it can never repair.
+PROPOSE_THINKING = {"type": "disabled"}
+
 #: A previous attempt's failure, embedded in the next attempt's retry prompt
 #: (see `build_propose_task`'s `previous_error`) after `_condense_retry_error`
 #: has already collapsed repeated per-field validation blocks down to one
@@ -366,6 +376,47 @@ class AdapterProposal(BaseModel):
     enrichment: Enrichment | None = None
     unmapped_columns: dict[str, dict[str, ProposedUnmappedColumn]] = PydanticField(default_factory=dict)
     open_questions: list[str] = PydanticField(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_self_contradicting_not_collected_status(cls, data: Any) -> Any:
+        """A slot the model writes as `{"status": "not_collected", "mapping":
+        {"kind": "not_collected"}, "confidence": ..., "evidence": ...}` says
+        the same thing twice and disagrees with the schema only in what it
+        calls the first word: `not_collected` is a mapping KIND, and the
+        status of a slot that carries one is `mapped`. The prompt states this
+        outright ("never status: 'not_collected' directly") and a model
+        running without thinking still wrote it in nine slots, on all three
+        attempts, with the validation error fed back each time -- so no
+        retry ever converged on a 27-column source.
+
+        Rewritten only when `mapping.kind` independently says `not_collected`,
+        so nothing is inferred: the claim, its mapping, its confidence and its
+        evidence are exactly the model's own. A bare `status: "not_collected"`
+        with no such mapping is left alone and still refused, and an
+        `unresolved` slot is never converted -- the distinction the prompt
+        insists on ("not_collected and unresolved are different claims") is
+        untouched. The same precedent as `agents/parsing.py`: accept the other
+        legal encoding of a fact the model plainly stated, never invent one."""
+        if not isinstance(data, dict):
+            return data
+        fixed = dict(data)
+        for section in ("asset", "finding"):
+            slots = fixed.get(section)
+            if not isinstance(slots, dict):
+                continue
+            fixed[section] = {
+                target: (
+                    {**slot, "status": "mapped"}
+                    if isinstance(slot, dict)
+                    and slot.get("status") == "not_collected"
+                    and isinstance(slot.get("mapping"), dict)
+                    and slot["mapping"].get("kind") == "not_collected"
+                    else slot
+                )
+                for target, slot in slots.items()
+            }
+        return fixed
 
     @model_validator(mode="after")
     def _slots_exact(self) -> "AdapterProposal":
@@ -2428,9 +2479,14 @@ def build_propose_agent(llm: BaseLLM | None = None) -> Agent:
             "that leaves gaps honestly marked is more useful than one that looks complete but lies."
         ),
         tools=[],
-        llm=llm or get_llm(max_tokens=PROPOSE_MAX_OUTPUT_TOKENS),
+        llm=llm or get_llm(max_tokens=PROPOSE_MAX_OUTPUT_TOKENS, thinking=PROPOSE_THINKING),
         verbose=True,
         max_execution_time=MAX_AGENT_EXECUTION_SECONDS,
+        # `propose_contract` already retries with the previous failure fed back
+        # to the model. CrewAI's own default (2) silently re-sends the SAME
+        # request inside each of those attempts -- a repeat of a call that
+        # failed deterministically -- and none of that spend is recorded.
+        max_retry_limit=0,
     )
 
 
@@ -2802,6 +2858,9 @@ def propose_contract(
         call_log_parts: list[str] = []
         attempt_usage_list: list[dict[str, object]] = []
         last_error: Exception | None = None
+        #: Set only when the model call itself raised (see the `try` around
+        #: `crew.kickoff()` below); cleared by the next call that returns.
+        last_call_failure: Exception | None = None
         proposal = None
         #: The most recent candidate that parsed, matched the requested meta
         #: facts, but still failed `_check_mapped_slots_legal` -- kept around
@@ -2831,7 +2890,21 @@ def propose_contract(
                 previous_error=str(last_error) if last_error is not None else None,
             )
             crew = Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=verbose)
-            crew.kickoff()
+            # The call to the model itself can fail in ways that are not a bad
+            # answer: an empty response ("Invalid response from LLM call -
+            # None or empty", seen three attempts running on a 27-column
+            # source), a timeout, a transport error. Nothing guarded this
+            # call, so any of them escaped `propose_contract` as a raw
+            # CrewAI traceback -- exit 1, no message, per-attempt cost lost --
+            # while the retry loop below only ever handled unparseable
+            # output. It is now one more failed attempt: its spend is still
+            # recorded, and exhausting every attempt raises the same
+            # `ProposalGenerationError` a parse failure does.
+            kickoff_error: Exception | None = None
+            try:
+                crew.kickoff()
+            except Exception as exc:  # noqa: BLE001 -- any failure of the call is a failed attempt
+                kickoff_error = exc
             attempt_prompt_tokens = 0
             attempt_completion_tokens = 0
             if isinstance(agent.llm, BaseLLM):
@@ -2840,6 +2913,18 @@ def propose_contract(
                 attempt_prompt_tokens = attempt_delta.prompt_tokens
                 attempt_completion_tokens = attempt_delta.completion_tokens
                 usage_baseline = usage_now
+            if kickoff_error is not None:
+                last_call_failure = kickoff_error
+                attempt_usage_list.append(
+                    {
+                        "attempt": attempt,
+                        "prompt_tokens": attempt_prompt_tokens,
+                        "completion_tokens": attempt_completion_tokens,
+                        "outcome": "llm_error",
+                    }
+                )
+                continue
+            last_call_failure = None
             call_log_parts.append(task.description + "\n---\n" + task.output.raw)
             try:
                 candidate = parse_structured_output(task.output.raw, AdapterProposal)
@@ -2886,11 +2971,17 @@ def propose_contract(
         total_usage = usage_baseline
 
         if proposal is None and last_illegal_candidate is None:
+            cause = last_call_failure if last_call_failure is not None else last_error
+            what = (
+                f"the model call itself failed ({type(cause).__name__}: {cause})"
+                if last_call_failure is not None
+                else str(cause)
+            )
             raise ProposalGenerationError(
-                f"gave up after {max_attempts} attempt(s): {last_error}",
+                f"gave up after {max_attempts} attempt(s): {what}",
                 attempt_usage=attempt_usage,
                 estimated_cost_usd=_estimate_cost_usd(total_usage),
-            ) from last_error
+            ) from cause
 
         if proposal is None:
             # Every attempt parsed and matched the requested facts, but kept
