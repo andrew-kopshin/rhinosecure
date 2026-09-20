@@ -2550,3 +2550,72 @@ extended to assert the real job handlers actually wrote the row, in the same db 
 `JobConfig` points at — not just that the `Memory` method works in isolation. `rhino run --data
 demo --seed 42 --offline` reproduces `Contested: 3/24 (12.5%)` unchanged (this change never
 touches ingest or scoring). Full suite: 1460 passed (up from 1449), zero regressions.
+
+---
+
+## Resolve-slots: a grounding row source, and what itco showed (2026-09-20)
+
+**The gap (docs/handoff.md 4.2.1).** The browser's resolve-slots panel had two row sources,
+`unresolved` and `illegal`. A slot that is mapped, individually legal, and fails only grounding
+matched neither, so it drew no row, and its Resubmit was a no-op that reproduced the identical
+refusal. The 2026-09-16 fixes (`4816aa3`, `ea932c8`, `84c14f7`) made that state survivable and made
+its reason visible; they did not give the human anything to click.
+
+**Built.**
+- `GroundingIssue.kind` (`agents/schema_inference.py`, `GroundingKind`): ten values, one per emit
+  site, no catch-all, so a new check has to say what kind of claim it is checking. Five are checked
+  against the real file (`missing_column`, `invented_table_key`, `parser_no_resolve`,
+  `illegal_column_value`, `ungrounded_literal`), three against the proposal's own consistency, one
+  against the schema registry (`registry_anchor`), one has no slot (`unprofiled_file`). Also carried
+  on `ingest_propose`'s `grounding.failures`/`caveats`.
+- `GET /api/adapters/{name}/proposal` gained `grounding_failed` (`web/adapters.py`,
+  `_grounding_failed_detail`): one row per failing slot **or structural reference**
+  (`asset_grouping.*`, `enrichment.*`, `unmapped_columns[...]`, flagged `structural`), so no failure
+  is invisible. A slot already in `unresolved` is skipped; one already in `illegal` gets the
+  grounding text merged into that row, because the JS looks rows up by `data-slot`. Candidate columns
+  are filtered to columns the file has; the one exception is a `missing_column` failure on a
+  free-text target, which is offered the file's whole real header. A closed-vocabulary target with a
+  missing column stays uncorrectable (the per-value picker needs one column and its profile) and
+  names the recourse. A saved proposal naming files the upload lacks is a 409, never an empty list.
+- **Not an override.** A `registry_anchor` row shows the disagreement and the same per-value
+  pickers; a table that still contradicts the anchor is refused by the same `check_grounding` gate.
+  Whether a human may overrule an anchor stays undecided, as the survey recommended.
+- `fatal_legal` on rows, and the column picker falls back to `blank: "fatal"` when that is the only
+  legal policy. `hostname`, `cve_id`, `asset_id` and `finding_id` have only `fatal`, and the picker
+  used to require `gap` or `absent_fact`, so those slots could never be corrected from the form.
+- Two form defects found live while verifying, both predating this work, both fixed in `app.js`:
+  a value-picker row left untouched built an **empty vocabulary table**, which the server refuses
+  (`table must not be empty`), taking the whole submission down, so resolving one slot forced the
+  human to fill every other row; and a column picker **pre-selected its first candidate**, so an
+  untouched Resubmit silently mapped itco's `os` to `Affected_Product` (a column the model had said
+  is not an OS field) and stamped it `authored_by: human`. Pickers now default to "(leave
+  unresolved)" and an all-blank table is "declined" (null), the same principle the unchecked
+  not-collected box already followed. Only a column the human actually chose is a human's mapping.
+- `web/jobs.py` now **saves every outcome, refused grounding resubmits included**. The old skip
+  existed only because there was no row to correct the persisted edit with, and its own
+  MAINTENANCE NOTE said to revisit it once one existed. The invariant it protected is pinned by
+  `test_a_refused_grounding_resubmit_stays_visible_and_correctable`: after a refused resubmit the
+  endpoint still returns a row for the slot, and a corrective resubmit through it succeeds.
+
+**Decided (asked, not assumed).** For itco: `finding.cve_id` maps as a plain `column` (already
+legal; `Finding.cve_id`'s own pattern is `^[A-Za-z0-9._-]+$`, only the `cve_id` *parser* insists on
+`CVE-YYYY-NNNN+`, and the model's own `open_questions` had flagged it); `asset.hostname` maps from
+`Asset_ID`, human-authored. The `cve_id` parser is not widened.
+
+**Verified live**, in the browser pane against the real itco file: the panel rendered 5 rows
+including both blockers, an untouched Resubmit changed nothing, and with only those two choices
+made the contract was written with exactly two human-authored slots (`asset.hostname`,
+`finding.cve_id`), `os`/`criticality` degraded to `not_collected`, `role` to the neutral
+placeholder, and `review.state` still `proposed` (nothing was signed). `app.js` has no regression
+tests, so the JS half is verified live only; the Python half is covered (1597 passed, was 1574).
+
+**Still open, named so it is not assumed done.** (1) **itco still does not reach a plan.** The
+adapter refuses at ingest, correctly: three assets appear on several rows with conflicting values
+(`FW-10` Production vs Development, `COLL-09` internet_exposed No vs Yes, `SRV-08` Development vs
+Staging) and `asset_grouping` has no recency signal to prefer one. `Date_Detected` is a candidate
+`order_by`, but it dates a *finding*, not an asset attribute, so whether it is a legitimate recency
+signal is a representation decision, and the form cannot author `order_by` in any case. (2) The
+model's `Environment: Corporate -> prod` guess (0.72) sits just above `LOW_CONFIDENCE_THRESHOLD`
+(0.7), so no list surfaces it for review. (3) A proposal that is fully mapped and grounded but fails
+whole-contract validation still opens the panel with zero rows and a no-op Resubmit (the reason
+lives only in `incomplete_reason`, which this endpoint does not carry).
