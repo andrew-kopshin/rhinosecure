@@ -520,11 +520,43 @@ def load_saved_proposal(path: Path) -> SavedProposal:
 # ---------------------------------------------------------------------------
 
 
+#: Why a grounding check fired, as a value rather than as words inside
+#: `GroundingIssue.message`. Before this existed the only way to tell "the
+#: model cited a column the file does not have" from "the model's table
+#: disagrees with the schema registry" was to parse English -- which is what
+#: kept the resolve-slots panel from ever having a row source for a
+#: grounding failure (docs/handoff.md 4.2.1). Every emit site below names one;
+#: there is deliberately no catch-all member, so a new check has to say what
+#: kind of claim it is checking.
+#:
+#: Checked against the real FILE: `missing_column`, `invented_table_key`,
+#: `parser_no_resolve`, `illegal_column_value`, `ungrounded_literal`.
+#: Checked against the PROPOSAL's own internal consistency: `undefined_derivation`,
+#: `misplaced_kind`, `composed_cross_file`. Checked against the schema REGISTRY
+#: (published knowledge, not this file's data): `registry_anchor` -- the one
+#: kind whose failure is a disagreement rather than a data-quality problem.
+#: `unprofiled_file` is a failure with no slot at all (an `unmapped_columns`
+#: entry naming a file that was never profiled).
+GroundingKind = Literal[
+    "missing_column",
+    "invented_table_key",
+    "parser_no_resolve",
+    "illegal_column_value",
+    "ungrounded_literal",
+    "undefined_derivation",
+    "misplaced_kind",
+    "composed_cross_file",
+    "registry_anchor",
+    "unprofiled_file",
+]
+
+
 @dataclass(frozen=True)
 class GroundingIssue:
     slot: str
     severity: Literal["fail", "caveat"]
     message: str
+    kind: GroundingKind
 
 
 @dataclass(frozen=True)
@@ -562,6 +594,7 @@ def _check_column_exists(
             GroundingIssue(
                 slot, "fail",
                 f"cites column {column!r}, not present in {profile.path.name}'s header {sorted(profile.columns)}",
+                "missing_column",
             )
         )
     return False
@@ -595,6 +628,7 @@ def _ground_table(
                 f"the true count is larger) -- {len(missing)} of {len(keys)} cited token(s) (post-case) were "
                 f"not found among the values tracked so far: {shown}{more}. Grounding is INCOMPLETE for this "
                 "column: these could be real values seen later in the file, or hallucinated -- verify by hand.",
+                "invented_table_key",
             )
         )
     else:
@@ -603,6 +637,7 @@ def _ground_table(
                 slot, "fail",
                 f"{column!r}: {len(missing)} of {len(keys)} cited token(s) (post-case={case!r}) not found "
                 f"among its {len(col.distinct_values)} measured distinct value(s): {shown}{more}",
+                "invented_table_key",
             )
         )
 
@@ -673,6 +708,7 @@ def _ground_parsed_value(issues: list[GroundingIssue], slot: str, mapping: Parse
             slot, "fail",
             f"{mapping.column!r}: parser {mapping.parser!r} (params={mapping.params!r}) does not resolve "
             f"{len(failed)} of {len(col.distinct_values)} real observed value(s): {shown}{more}",
+            "parser_no_resolve",
         )
     )
 
@@ -694,6 +730,7 @@ def _ground_literal(issues: list[GroundingIssue], slot: str, value: object, evid
                 "literal mapping cites no column tagged 'constant' in its evidence "
                 f"(columns_cited={evidence.columns_cited!r}) -- a literal must be grounded in an observed "
                 "constant, not asserted from nothing",
+                "ungrounded_literal",
             )
         )
         return
@@ -704,6 +741,7 @@ def _ground_literal(issues: list[GroundingIssue], slot: str, value: object, evid
             GroundingIssue(
                 slot, "fail",
                 f"literal value {value!r} does not match the observed constant value of any cited column: {observed}",
+                "ungrounded_literal",
             )
         )
 
@@ -713,7 +751,12 @@ def _ground_derivation(
 ) -> None:
     derivation = proposal.derived.get(derivation_name)
     if derivation is None:
-        issues.append(GroundingIssue(slot, "fail", f"references derived {derivation_name!r}, which this proposal does not define"))
+        issues.append(
+            GroundingIssue(
+                slot, "fail", f"references derived {derivation_name!r}, which this proposal does not define",
+                "undefined_derivation",
+            )
+        )
         return
     if _check_column_exists(issues, slot, derivation.column, assets_profile):
         _ground_table(issues, slot, derivation.column, list(derivation.table), derivation.case, assets_profile)
@@ -770,6 +813,7 @@ def _check_alias_contradiction(issues: list[GroundingIssue], slot: str, target: 
                     f"table key {key!r} case-normalizes to a known schema-registry alias that resolves "
                     f"to {resolved!r}, but this table maps it to {declared_value!r} instead -- a real "
                     "disagreement with published schema knowledge, not something to silently correct",
+                    "registry_anchor",
                 )
             )
 
@@ -854,7 +898,11 @@ def _ground_slot(
         # here directly, rather than silently grounding an asset-side
         # citation against the (wrong) findings file and risking a
         # coincidental column-name match reporting false success.
-        issues.append(GroundingIssue(slot, "fail", f"{kind} is legal only for a finding.* target, not this asset.* slot"))
+        issues.append(
+            GroundingIssue(
+                slot, "fail", f"{kind} is legal only for a finding.* target, not this asset.* slot", "misplaced_kind"
+            )
+        )
         return
     if kind in ("column", "parsed"):
         exists = _check_column_exists(issues, slot, mapping.column, own_profile, optional=mapping.optional)
@@ -869,7 +917,7 @@ def _ground_slot(
             # parser name -- is checked separately, below.
             target = slot.split(".", 1)[1]
             for problem in check_column_mapping_legal_values(slot, target, mapping, own_profile):
-                issues.append(GroundingIssue(slot, "fail", problem))
+                issues.append(GroundingIssue(slot, "fail", problem, "illegal_column_value"))
         elif exists and kind == "parsed":
             _ground_parsed_value(issues, slot, mapping, own_profile)
     elif kind == "vocabulary":
@@ -891,6 +939,7 @@ def _ground_slot(
                         slot, "fail",
                         f"cites column {column!r}, which is in {assets_profile.path.name}'s header, not "
                         f"{findings_profile.path.name}'s -- composed has no cross-file join",
+                        "composed_cross_file",
                     )
                 )
     elif kind == "content_address":
@@ -951,7 +1000,12 @@ def check_grounding(proposal: AdapterProposal, profiles: dict[str, FileProfile])
     for filename, entries in proposal.unmapped_columns.items():
         profile = profiles.get(filename)
         if profile is None:
-            issues.append(GroundingIssue(f"unmapped_columns[{filename}]", "fail", f"{filename!r} is not among the profiled file(s) {sorted(profiles)}"))
+            issues.append(
+                GroundingIssue(
+                    f"unmapped_columns[{filename}]", "fail",
+                    f"{filename!r} is not among the profiled file(s) {sorted(profiles)}", "unprofiled_file",
+                )
+            )
             continue
         for column in entries:
             _check_column_exists(issues, f"unmapped_columns[{filename}]", column, profile)

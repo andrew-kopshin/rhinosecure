@@ -1937,6 +1937,163 @@ def test_grounding_refuses_composed_on_an_asset_slot(profiles):
     assert any("legal only for a finding.* target" in i.message for i in report.failures)
 
 
+# --- GroundingIssue.kind: every check says what KIND of claim it checked ----------
+#
+# The kind is what lets the resolve-slots panel (web/adapters.py's
+# `grounding_failed`) treat "the file does not support this" differently from
+# "the schema registry disagrees with this" without parsing English out of
+# `message`. One assertion per emit site, so a wrong or swapped label at any
+# one of them fails a test.
+
+
+def _kinds_for(report, slot: str) -> set[str]:
+    return {i.kind for i in report.issues if i.slot == slot}
+
+
+def test_kind_missing_column(profiles):
+    data = _full_proposal_dict(overrides_asset={
+        "owner": _mapped({"kind": "column", "column": "Ghost", "case": "exact", "blank": "gap"}),
+    })
+    report = check_grounding(AdapterProposal.model_validate(data), profiles)
+    assert _kinds_for(report, "asset.owner") == {"missing_column"}
+
+
+def test_kind_missing_column_also_covers_an_unresolved_slots_hallucinated_candidate(profiles):
+    data = _full_proposal_dict(overrides_asset={"owner": _unresolved(candidates=["Ghost"])})
+    report = check_grounding(AdapterProposal.model_validate(data), profiles)
+    assert _kinds_for(report, "asset.owner") == {"missing_column"}
+
+
+def test_kind_invented_table_key_for_both_the_failure_and_the_overflow_caveat(profiles, tmp_path):
+    from rhinosecure.adapters.probe import MAX_DISTINCT_TRACKED
+
+    data = _full_proposal_dict(overrides_asset={
+        "role": _mapped(
+            {"kind": "vocabulary", "column": "Col", "case": "lower", "blank": "fatal", "table": {"srv": "dc", "never": "sql"}},
+            columns_cited=["Col"],
+        ),
+    })
+    failure = check_grounding(AdapterProposal.model_validate(data), profiles)
+    assert [(i.severity, i.kind) for i in failure.issues if i.slot == "asset.role"] == [("fail", "invented_table_key")]
+
+    rows = [["A%03d" % i, f"HOST{i}", "F%03d" % i, "CVE-2021-0001", f"role-{i}"] for i in range(MAX_DISTINCT_TRACKED + 5)]
+    _write_csv(tmp_path, _HEADER, rows)
+    overflowed = {p.path.name: p for p in profile_source(tmp_path)}
+    data["asset"]["role"]["mapping"]["table"] = {"role-0": "dc", "never-seen": "sql"}
+    caveat = check_grounding(AdapterProposal.model_validate(data), overflowed)
+    assert [(i.severity, i.kind) for i in caveat.issues if i.slot == "asset.role"] == [("caveat", "invented_table_key")]
+
+
+def test_kind_parser_no_resolve(profiles):
+    # `Col` holds "srv"/"wks", neither of which is a CVE id.
+    data = _full_proposal_dict(overrides_finding={
+        "cve_id": _mapped(
+            {"kind": "parsed", "column": "Col", "case": "upper", "blank": "fatal", "parser": "cve_id"}, columns_cited=["Col"]
+        ),
+    })
+    report = check_grounding(AdapterProposal.model_validate(data), profiles)
+    assert _kinds_for(report, "finding.cve_id") == {"parser_no_resolve"}
+
+
+def test_kind_illegal_column_value(profiles):
+    # A plain column mapping passes "srv"/"wks" through verbatim to a closed
+    # vocabulary that does not contain them.
+    data = _full_proposal_dict(overrides_asset={
+        "role": _mapped({"kind": "column", "column": "Col", "case": "exact", "blank": "fatal"}, columns_cited=["Col"]),
+    })
+    report = check_grounding(AdapterProposal.model_validate(data), profiles)
+    assert _kinds_for(report, "asset.role") == {"illegal_column_value"}
+
+
+def test_kind_ungrounded_literal_for_both_of_its_checks(tmp_path, profiles):
+    no_constant = _full_proposal_dict(overrides_asset={"environment": _mapped({"kind": "literal", "value": "prod"})})
+    assert _kinds_for(check_grounding(AdapterProposal.model_validate(no_constant), profiles), "asset.environment") == {
+        "ungrounded_literal"
+    }
+
+    _write_csv(tmp_path, _HEADER, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "srv"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "srv"],
+    ])
+    constant = {p.path.name: p for p in profile_source(tmp_path)}
+    wrong_value = _full_proposal_dict(overrides_asset={
+        "environment": _mapped({"kind": "literal", "value": "prod"}, columns_cited=["Col"]),
+    })
+    assert _kinds_for(check_grounding(AdapterProposal.model_validate(wrong_value), constant), "asset.environment") == {
+        "ungrounded_literal"
+    }
+
+
+def test_kind_undefined_derivation(profiles):
+    data = _full_proposal_dict(overrides_asset={
+        "role": _mapped({"kind": "derived", "from": "does_not_exist", "output": "role_guess"}),
+    })
+    report = check_grounding(AdapterProposal.model_validate(data), profiles)
+    assert _kinds_for(report, "asset.role") == {"undefined_derivation"}
+
+
+def test_kind_misplaced_kind(profiles):
+    data = _full_proposal_dict(overrides_asset={
+        "owner": _mapped({"kind": "composed", "join": "; ", "max_chars": 4096, "parts": [{"prefix": None, "join_nonblank": ["Col"], "join": " "}]}),
+    })
+    report = check_grounding(AdapterProposal.model_validate(data), profiles)
+    assert _kinds_for(report, "asset.owner") == {"misplaced_kind"}
+
+
+def test_kind_composed_cross_file(two_file_profiles):
+    data = _two_file_proposal_dict()
+    data["finding"]["evidence"] = _mapped(
+        {"kind": "composed", "join": "; ", "max_chars": 4096, "parts": [
+            {"template": "seen on {Hostname}", "required_non_blank": [], "emit_if_any": None},
+        ]},
+    )
+    report = check_grounding(AdapterProposal.model_validate(data), two_file_profiles)
+    assert _kinds_for(report, "finding.evidence") == {"composed_cross_file"}
+
+
+def test_kind_registry_anchor(tmp_path):
+    _write_csv(tmp_path, _HEADER, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "Critical"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "Low"],
+    ])
+    profiles_map = {p.path.name: p for p in profile_source(tmp_path)}
+    data = _full_proposal_dict(overrides_asset={
+        "criticality": _mapped(
+            {"kind": "vocabulary", "column": "Col", "case": "exact", "blank": "fatal", "table": {"Critical": 4, "Low": 2}},
+            columns_cited=["Col"],
+        ),
+    })
+    data["asset"]["role"]["mapping"]["table"] = {"Critical": "dc", "Low": "workstation"}
+    data["asset"]["role"]["mapping"]["case"] = "exact"
+    data["finding"]["scanner_severity"]["mapping"]["table"] = {"Critical": "critical", "Low": "low"}
+    data["finding"]["scanner_severity"]["mapping"]["case"] = "exact"
+    report = check_grounding(AdapterProposal.model_validate(data), profiles_map)
+    assert _kinds_for(report, "asset.criticality") == {"registry_anchor"}
+    assert [i.slot for i in report.failures] == ["asset.criticality"]  # and nothing else failed
+
+
+def test_kind_unprofiled_file(profiles):
+    data = _full_proposal_dict()
+    data["unmapped_columns"] = {"never_uploaded.csv": {"Col": {"disposition": "ignored", "reason": "test", "profile_cited": "n/a"}}}
+    report = check_grounding(AdapterProposal.model_validate(data), profiles)
+    assert [(i.slot, i.kind) for i in report.failures] == [("unmapped_columns[never_uploaded.csv]", "unprofiled_file")]
+
+
+def test_every_grounding_kind_is_exercised_by_some_check():
+    """The `GroundingKind` literal and the tests above must not drift: a
+    kind nobody can produce is dead vocabulary, and a check emitting one
+    the literal does not name is a typing lie."""
+    import typing
+
+    from rhinosecure.agents.schema_inference import GroundingKind
+
+    covered = {
+        "missing_column", "invented_table_key", "parser_no_resolve", "illegal_column_value", "ungrounded_literal",
+        "undefined_derivation", "misplaced_kind", "composed_cross_file", "registry_anchor", "unprofiled_file",
+    }
+    assert set(typing.get_args(GroundingKind)) == covered
+
+
 # --- finding.detected_date vs a real full-timestamp column -------------------
 #
 # Reproduces the live failure on northgate_fleet_14.csv's own "First
