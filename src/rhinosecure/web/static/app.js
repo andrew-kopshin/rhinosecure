@@ -2937,6 +2937,119 @@ async function maybeTransitionToPlanView(step) {
   }
 }
 
+/* ---------------- run agents + Tree-of-Thought from the plan view ---------------- */
+
+/* Before this existed, a plan that had been produced deterministically had
+ * NO way to reach the agents or Tree-of-Thought from the browser at all: the
+ * post-plan chat box is Q&A only ("I have no mechanism to trigger a new
+ * run"), the Router input is hidden once a plan is loaded, and the sidebar
+ * just said "run without --agents". The only path was to start over with an
+ * empty workspace, or leave the app for the CLI.
+ *
+ * A direct control instead of routing every post-plan message through the
+ * Router: the Router puts an approval click and an extra model call in front
+ * of a plain question, which is worse than today for the common case. This
+ * posts the same `run_agents` job the Router dispatches, with the same
+ * `source_ref` (the plan's own source), and the inline confirmation is the
+ * approval -- it costs real money, so it is never one click.
+ *
+ * $0.27/finding is the cost MEASURED on the 24-finding demo fixture (2.58M
+ * tokens, 189 requests, at the project's own $2/$10-per-million rate), shown
+ * as "about", never as a quote. */
+const AGENTS_COST_PER_FINDING_USD = 0.27;
+let runAgentsPollTimer = null;
+
+function renderRunAgentsControl(data) {
+  const box = document.getElementById("run-agents-control");
+  if (!box) return;
+  clearTimeout(runAgentsPollTimer);
+  if (!jobsEnabled || data.run.agents) {
+    box.hidden = true;
+    box.innerHTML = "";
+    return;
+  }
+  const n = data.summary.total_findings || 0;
+  const contested = (data.summary.contested_rate || {}).contested || 0;
+  const cost = (n * AGENTS_COST_PER_FINDING_USD).toFixed(2);
+  box.hidden = false;
+  box.innerHTML = `
+    <button type="button" class="secondary-btn" id="run-agents-btn">Run agents + Tree-of-Thought</button>
+    <p class="hint">Real LLM calls: about $${cost} for ${n} finding(s), at the rate measured on the demo fixture. Tree-of-Thought runs only on contested findings (${contested} here). Replaces this plan.</p>
+  `;
+  document.getElementById("run-agents-btn").addEventListener("click", () => confirmRunAgents(data, cost));
+}
+
+function confirmRunAgents(data, cost) {
+  const box = document.getElementById("run-agents-control");
+  box.innerHTML = `
+    <p class="hint"><strong>Run the agents on ${esc(baseName(data.run.data_dir))}?</strong> This spends real LLM budget, about $${cost}.</p>
+    <button type="button" class="secondary-btn" id="run-agents-confirm-btn">Yes, run it</button>
+    <button type="button" class="secondary-btn" id="run-agents-cancel-btn">Cancel</button>
+  `;
+  document.getElementById("run-agents-confirm-btn").addEventListener("click", () => startRunAgents(data));
+  document.getElementById("run-agents-cancel-btn").addEventListener("click", () => renderRunAgentsControl(data));
+}
+
+function setRunAgentsStatus(kind, html) {
+  const box = document.getElementById("run-agents-control");
+  box.hidden = false;
+  box.innerHTML = `<p class="hint ${kind === "error" ? "chat-msg-error" : ""}">${html}</p>`;
+}
+
+async function startRunAgents(data) {
+  setRunAgentsStatus("progress", `<span class="spinner"></span> Submitting…`);
+  let jobId;
+  try {
+    const res = await fetch("/api/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "run_agents", input: { source_ref: baseName(data.run.data_dir) } }),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+    jobId = body.job_id;
+  } catch (err) {
+    setRunAgentsStatus("error", `Could not start: ${esc(err.message)}`);
+    runAgentsPollTimer = setTimeout(() => renderRunAgentsControl(data), 6000);
+    return;
+  }
+  pollRunAgents(jobId, data);
+}
+
+function pollRunAgents(jobId, data) {
+  const tick = async () => {
+    let job;
+    try {
+      job = await (await fetch(`/api/jobs/${jobId}`)).json();
+    } catch (err) {
+      runAgentsPollTimer = setTimeout(tick, 2500); // transient network hiccup -- keep polling this job
+      return;
+    }
+    if (job.status === "pending" || job.status === "running") {
+      setRunAgentsStatus("progress", `<span class="spinner"></span> ${esc(jobStageLabel(job.stage))}…`);
+      runAgentsPollTimer = setTimeout(tick, 2500);
+      return;
+    }
+    if (job.status === "succeeded" && job.export_written) {
+      try {
+        const res = await fetch("/api/export");
+        if (res.ok) {
+          renderAll(await res.json());
+          return;
+        }
+      } catch (err) {
+        // the run DID succeed -- fall through to the message below rather than hide that
+      }
+      setRunAgentsStatus("info", "The run finished, but the refreshed plan could not be loaded -- reload the page.");
+      return;
+    }
+    const message = job.status === "failed" ? (job.error && job.error.message) || "failed" : "finished without writing a plan";
+    setRunAgentsStatus("error", `Agents run did not complete: ${esc(message)}`);
+    runAgentsPollTimer = setTimeout(() => renderRunAgentsControl(data), 8000);
+  };
+  tick();
+}
+
 /* ---------------- boot ---------------- */
 
 function renderAll(data) {
@@ -2944,6 +3057,7 @@ function renderAll(data) {
   document.title = `RhinoSecure — ${baseName(data.run.data_dir)} (${data.run.agents ? "agents" : "deterministic"})`;
   renderRunMeta(data);
   renderPipeline(data);
+  renderRunAgentsControl(data);
   renderOverview(data);
   renderFindings(data);
   renderContested(data);
