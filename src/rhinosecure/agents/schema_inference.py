@@ -490,6 +490,11 @@ def saved_proposal_from_dict(data: Any) -> SavedProposal:
             generator=Generator.model_validate(data["generator"]),
             attempt_usage=tuple(data.get("attempt_usage") or ()),
         )
+    except TypeError as exc:
+        # `attempt_usage` is the one field validated by nothing but `tuple()`:
+        # a hand-edited non-iterable (say `5`) raised a bare TypeError past
+        # every caller's `except SchemaInferenceError`.
+        raise SchemaInferenceError(f"'attempt_usage' must be a list of per-attempt records -- {exc}") from exc
     except ValidationError as exc:
         # A hand-edited proposal is exactly where a typo (a bad `kind`,
         # `parser`, or `case` literal, a missing required field) is likely --
@@ -505,6 +510,14 @@ def load_saved_proposal(path: Path) -> SavedProposal:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise SchemaInferenceError(f"{path}: could not be read -- {exc}") from exc
+    except UnicodeDecodeError as exc:
+        # A ValueError, not an OSError, so it escaped the clause above and
+        # every caller's `except SchemaInferenceError`: a file saved as UTF-16
+        # (Windows PowerShell 5.1's `>`, Notepad's "Unicode") or cp1252 by a
+        # hand-edit -- the very recourse the UI's own text recommends -- took
+        # `GET .../proposal`, and any other reader of the saved proposal, down
+        # with a 500.
+        raise SchemaInferenceError(f"{path}: could not be decoded as UTF-8 -- {exc}") from exc
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -779,7 +792,7 @@ def _ground_enrichment(issues: list[GroundingIssue], enrichment: Enrichment, fin
         )
 
 
-def _check_alias_contradiction(issues: list[GroundingIssue], slot: str, target: str, table: dict[str, Any], case: str) -> None:
+def _check_alias_contradiction(issues: list[GroundingIssue], slot: str, target: str, table: dict[str, Any]) -> None:
     """A `VocabularyMapping`/`Derivation` table entry whose KEY case-
     normalizes to a known `schema_registry` alias, but whose VALUE disagrees
     with what that alias resolves to, is a genuine contradiction -- a
@@ -798,19 +811,34 @@ def _check_alias_contradiction(issues: list[GroundingIssue], slot: str, target: 
     never against an already-confirmed `Contract`. `bluepeak-gen.json` and
     `mdvm-gen.json` are both already confirmed and never re-proposed, so
     this check can never reach -- and so can never affect -- either one,
-    even in principle."""
+    even in principle.
+
+    Compared CASE-INSENSITIVELY, whatever `case` the mapping declares. This
+    used to resolve keys under the mapping's own case, and the registry
+    stores its aliases in one spelling (title case), so a mapping declaring
+    `case="exact"` was compared literally: `critical` matched no alias and
+    `{critical: 4}` passed a check that refused the identical `{critical: 4}`
+    under `case="lower"`. The browser's resolve form rebuilds every
+    vocabulary as `case="exact"`, so the refusal could be walked around by
+    an untouched Resubmit, with the result stamped authored-by-human --
+    which made the "no override" claim on registry-anchor rows false (found
+    by adversarial review, 2026-09-21). Whether a word means "critical" does
+    not depend on how the engine will later fold case, so the question
+    asked here is "does this token, ignoring case, name a registry alias".
+    Only the DISAGREEMENT check is folded; `_apply_registry_aliases`'s
+    table augmentation still follows the mapping's own case."""
     if target not in REGISTRY_BACKED_TARGETS:
         return
     for key, declared_value in table.items():
         resolved = (
-            resolve_criticality_anchor(key, case) if target == "criticality"
-            else resolve_enum_alias(target, key, case)
+            resolve_criticality_anchor(key, "lower") if target == "criticality"
+            else resolve_enum_alias(target, key, "lower")
         )
         if resolved is not None and resolved != declared_value:
             issues.append(
                 GroundingIssue(
                     slot, "fail",
-                    f"table key {key!r} case-normalizes to a known schema-registry alias that resolves "
+                    f"table key {key!r} names (ignoring case) a known schema-registry alias that resolves "
                     f"to {resolved!r}, but this table maps it to {declared_value!r} instead -- a real "
                     "disagreement with published schema knowledge, not something to silently correct",
                     "registry_anchor",
@@ -923,7 +951,7 @@ def _ground_slot(
     elif kind == "vocabulary":
         if _check_column_exists(issues, slot, mapping.column, own_profile, optional=mapping.optional):
             _ground_table(issues, slot, mapping.column, list(mapping.table), mapping.case, own_profile)
-        _check_alias_contradiction(issues, slot, slot.split(".", 1)[1], mapping.table, mapping.case)
+        _check_alias_contradiction(issues, slot, slot.split(".", 1)[1], mapping.table)
     elif kind == "literal":
         _ground_literal(issues, slot, mapping.value, sp.evidence, own_profile)
     elif kind == "composed":
@@ -956,7 +984,7 @@ def _ground_slot(
             # a multi-output derivation is out of scope here for the same
             # reason it's out of scope there (see that function's docstring).
             single_output_table = {key: values[0] for key, values in derivation.table.items()}
-            _check_alias_contradiction(issues, slot, target, single_output_table, derivation.case)
+            _check_alias_contradiction(issues, slot, target, single_output_table)
     elif kind == "default_by":
         _ground_derivation(issues, slot, mapping.keyed_by.from_, proposal, assets_profile)
     elif kind == "not_collected":

@@ -144,6 +144,7 @@ from rhinosecure.adapters.config_model import (
     PARSER_POSITIONS,
     REGISTERED_DEFAULT_TABLES,
     SCORING_ENUM_TARGETS,
+    _composed_columns,
     describe_target_vocabulary,
     missing_attestations,
     required_attestations,
@@ -211,6 +212,24 @@ def _mapping_source_columns(mapping: Any, derived: dict) -> list[str]:
         deriv = derived.get(mapping.keyed_by.from_)
         return [deriv.column] if deriv else []
     return []
+
+
+def _mapping_all_columns(mapping: Any, derived: dict) -> list[str]:
+    """EVERY column a mapping reads, for the form's column bookkeeping.
+
+    Deliberately not `_mapping_source_columns`, which answers a different
+    question ("which single column can a picker or a profile point at?") and
+    so returns `[]` for `content_address` and `composed`. Settling from that
+    list left a replaced content_address's columns in neither `mapped` nor
+    `unmapped_columns`: `settle_columns` came out empty, the form settled
+    nothing, and the contract was refused with no row left to repair it
+    (found by the second adversarial-review round, 2026-09-21)."""
+    kind = getattr(mapping, "kind", None)
+    if kind == "content_address":
+        return list(dict.fromkeys(mapping.columns))
+    if kind == "composed":
+        return sorted(_composed_columns(mapping))
+    return _mapping_source_columns(mapping, derived)
 
 
 def _predict_current_values(mapping: Any, derived: dict[str, Any], distinct_values: dict[str, int]) -> dict[str, Any]:
@@ -315,11 +334,14 @@ def _low_confidence_detail(
         slot = proposal.asset[target]
         if not isinstance(slot, SlotMapped) or slot.confidence >= LOW_CONFIDENCE_THRESHOLD:
             continue
-        candidate_columns = _mapping_source_columns(slot.mapping, proposal.derived)
+        filename = _side_filename(proposal, "asset", slot.mapping)
+        candidate_columns = _real_columns(
+            profiles, _mapping_source_columns(slot.mapping, proposal.derived), filename
+        )
         column_profiles = {
             column: profile
             for column in candidate_columns
-            if (profile := _column_profile_dict(profiles, column)) is not None
+            if (profile := _column_profile_dict(profiles, column, filename)) is not None
         }
         # Predicted per-value, not just the raw mapping JSON: the browser
         # corrector pre-fills "proposed: X" from this, and it has to be
@@ -343,6 +365,9 @@ def _low_confidence_detail(
                 "current_mapping": slot.mapping.model_dump(mode="json"),
                 "current_values": current_values,
                 "candidate_columns": candidate_columns,
+                "settle_columns": _real_columns(
+                    profiles, _mapping_all_columns(slot.mapping, proposal.derived), filename
+                ),
                 "column_profiles": column_profiles,
                 # Whether "mark not collected" is even a legal correction for
                 # THIS target -- `role` is not a `NOT_COLLECTED_DEFAULTS` key
@@ -388,11 +413,14 @@ def _illegal_mapped_detail(proposal: AdapterProposal, profiles: dict) -> list[di
     for slot, problems in illegal_mapped_slots(proposal, profiles).items():
         section, _, target = slot.partition(".")
         sp = (proposal.asset if section == "asset" else proposal.finding)[target]
-        candidate_columns = _mapping_source_columns(sp.mapping, proposal.derived)
+        filename = _side_filename(proposal, section, sp.mapping)
+        candidate_columns = _real_columns(
+            profiles, _mapping_source_columns(sp.mapping, proposal.derived), filename
+        )
         column_profiles = {
             column: profile
             for column in candidate_columns
-            if (profile := _column_profile_dict(profiles, column)) is not None
+            if (profile := _column_profile_dict(profiles, column, filename)) is not None
         }
         current_values: dict[str, Any] = {}
         if candidate_columns:
@@ -407,6 +435,9 @@ def _illegal_mapped_detail(proposal: AdapterProposal, profiles: dict) -> list[di
                 "current_mapping": sp.mapping.model_dump(mode="json"),
                 "current_values": current_values,
                 "candidate_columns": candidate_columns,
+                "settle_columns": _real_columns(
+                    profiles, _mapping_all_columns(sp.mapping, proposal.derived), filename
+                ),
                 "column_profiles": column_profiles,
                 "gap_legal": target in GAP_LEGAL_TARGETS,
                 "absent_fact_legal": target in ABSENT_FACT_LEGAL_TARGETS,
@@ -435,8 +466,7 @@ def _grounding_failed_detail(
     profiles: dict,
     failures: list[GroundingIssue],
     *,
-    unresolved: set[str],
-    illegal_by_slot: dict[str, dict[str, Any]],
+    existing_by_slot: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """One row per slot (or structural reference) that fails grounding --
     the row source docs/handoff.md 4.2.1 found missing. A slot that IS
@@ -455,38 +485,61 @@ def _grounding_failed_detail(
     the identical `check_grounding` gate as before -- this only makes the
     refusal visible and fixable in place.
 
-    Three de-duplications, so the panel never shows one slot twice:
-    - a slot already in `unresolved` is skipped (its own row exists; a
-      hallucinated CANDIDATE column on it is grounding's `missing_column`
-      but changes nothing about what the human has to do);
-    - a slot already in `illegal_by_slot` gets the grounding text MERGED
-      into that row's `reason` rather than a second row, since one
-      `.resolve-slot` per `data-slot` is what the JS looks rows up by;
+    Two de-duplications, so the panel never shows one slot twice:
+    - a slot that already has a row in `existing_by_slot` (an `unresolved`
+      or `illegal` one) gets the grounding text MERGED into that row's
+      `reason` rather than a second row, since one `.resolve-slot` per
+      `data-slot` is what the JS looks rows up by. This used to SKIP an
+      unresolved slot on the claim that a hallucinated candidate column
+      "changes nothing about what the human has to do". It does: that
+      failure is what blocks assembly, and skipping it left the panel
+      silent about the only thing stopping the contract (found by
+      adversarial review, 2026-09-21);
     - issues are grouped by slot, so two failures on one slot are one row.
 
-    `candidate_columns` is filtered to columns the file really has: a
-    column picker must never offer the very column that failed. The one
-    exception is deliberate and narrow -- a `missing_column` failure on a
-    FREE-TEXT target (no closed vocabulary), where the whole real header
-    of that slot's file is offered instead, because picking a real column
-    IS the correction. For a closed-vocabulary target the form's per-value
-    picker needs one specific column and its profile, which a missing
-    column cannot supply, so the row stays uncorrectable and says so."""
+    `candidate_columns` is filtered to columns the slot's OWN file really
+    has (`_side_filename`): a column picker must never offer the very
+    column that failed, and in a two-file source "a file" is not enough.
+    The one exception is deliberate and narrow -- a `missing_column`
+    failure on a FREE-TEXT target (no closed vocabulary), where the whole
+    real header of that slot's file is offered instead, because picking a
+    real column IS the correction. For a closed-vocabulary target the
+    form's per-value picker needs one specific column and its profile,
+    which a missing column cannot supply, so the row stays uncorrectable
+    and says so.
+
+    `settle_columns` is a DIFFERENT list, and the difference is the point:
+    the columns the CURRENT mapping (or the model's own candidates) read,
+    which the form must account for when it replaces them. The picker's
+    list is "what the human may choose from"; only the settle list is "what
+    this edit is responsible for". The form used one list for both, so the
+    whole-header picker made a one-slot fix declare every unaccounted
+    column ignored (found by adversarial review, 2026-09-21)."""
     by_slot: dict[str, list[GroundingIssue]] = {}
     for issue in failures:
         by_slot.setdefault(issue.slot, []).append(issue)
 
     detail: list[dict[str, Any]] = []
     for slot, issues in by_slot.items():
-        if slot in unresolved:
-            continue
         reason = "; ".join(i.message for i in issues)
         kinds = sorted({i.kind for i in issues})
 
-        merged = illegal_by_slot.get(slot)
+        merged = existing_by_slot.get(slot)
         if merged is not None:
             merged["reason"] = f"{merged['reason']}; also fails grounding: {reason}"
             merged["grounding_kinds"] = kinds
+            # A FREE-TEXT slot whose every candidate was hallucinated has
+            # nothing left to choose from after filtering, and for a target
+            # like `hostname` "not collected" is illegal too, so the row was
+            # a dead end. Offer the slot's real header, exactly as an already
+            # mapped slot with a missing column gets (found by the second
+            # adversarial-review round, 2026-09-21). Only when NOTHING real
+            # is left: a real candidate the model did name stays the
+            # suggestion. A closed-vocabulary target is not widened: its
+            # picker needs one column and that column's profile.
+            if "missing_column" in kinds and merged.get("target_vocabulary") is None and not merged["candidate_columns"]:
+                section = slot.partition(".")[0]
+                merged["candidate_columns"] = list(profiles[_side_filename(proposal, section)].columns)
             continue
 
         section, _, target = slot.partition(".")
@@ -506,6 +559,7 @@ def _grounding_failed_detail(
                     "current_mapping": None,
                     "current_values": {},
                     "candidate_columns": [],
+                    "settle_columns": [],
                     "column_profiles": {},
                     "gap_legal": False,
                     "absent_fact_legal": False,
@@ -516,23 +570,26 @@ def _grounding_failed_detail(
             continue
 
         vocabulary = describe_target_vocabulary(target)
-        own_columns = [
-            c for c in _mapping_source_columns(sp.mapping, proposal.derived)
-            if _column_profile_dict(profiles, c) is not None
-        ]
+        filename = _side_filename(proposal, section, sp.mapping)
+        own_columns = _real_columns(profiles, _mapping_source_columns(sp.mapping, proposal.derived), filename)
         candidate_columns = list(own_columns)
         if vocabulary is None and "missing_column" in kinds:
-            filename = proposal.meta.assets_filename if section == "asset" else proposal.meta.findings_filename
             candidate_columns = list(profiles[filename].columns)
+        # Profiles only for the columns the mapping ACTUALLY reads, never for
+        # a widened whole-header list: the free-text picker needs names, not
+        # profiles (resolveSlotControls builds a value picker only for a
+        # closed vocabulary), and a real source can have hundreds of columns
+        # each carrying a distinct-value table.
         column_profiles = {
             column: profile
-            for column in candidate_columns
-            if (profile := _column_profile_dict(profiles, column)) is not None
+            for column in own_columns
+            if (profile := _column_profile_dict(profiles, column, filename)) is not None
         }
         current_values: dict[str, Any] = {}
         if own_columns:
             current_values = _predict_current_values(
-                sp.mapping, proposal.derived, _column_profile_dict(profiles, own_columns[0])["distinct_values"]
+                sp.mapping, proposal.derived,
+                _column_profile_dict(profiles, own_columns[0], filename)["distinct_values"],
             )
         detail.append(
             {
@@ -543,6 +600,9 @@ def _grounding_failed_detail(
                 "current_mapping": sp.mapping.model_dump(mode="json"),
                 "current_values": current_values,
                 "candidate_columns": candidate_columns,
+                "settle_columns": _real_columns(
+                    profiles, _mapping_all_columns(sp.mapping, proposal.derived), filename
+                ),
                 "column_profiles": column_profiles,
                 "gap_legal": target in GAP_LEGAL_TARGETS,
                 "absent_fact_legal": target in ABSENT_FACT_LEGAL_TARGETS,
@@ -553,8 +613,36 @@ def _grounding_failed_detail(
     return detail
 
 
-def _column_profile_dict(profiles: dict, column: str) -> dict[str, Any] | None:
-    for profile in profiles.values():
+def _side_filename(proposal: AdapterProposal, section: str, mapping: Any = None) -> str:
+    """The file a slot's columns live in: `asset.*` reads the assets file and
+    `finding.*` the findings file. A `derived`/`default_by` mapping is the
+    exception -- `check_grounding` grounds a derivation against the assets
+    file whichever side asks (`_ground_derivation`), so this does too. Equal
+    for a single-file source; for two files, looking a column up in the
+    OTHER file is a wrong answer, not a harmless one."""
+    kind = getattr(mapping, "kind", None)
+    if section == "asset" or kind in ("derived", "default_by"):
+        return proposal.meta.assets_filename
+    return proposal.meta.findings_filename
+
+
+def _real_columns(profiles: dict, columns: list[str], filename: str) -> list[str]:
+    """`columns`, in order, restricted to those `filename` actually has."""
+    profile = profiles.get(filename)
+    return [c for c in columns if profile is not None and c in profile.columns]
+
+
+def _column_profile_dict(profiles: dict, column: str, filename: str | None = None) -> dict[str, Any] | None:
+    """One column's measured profile. With `filename`, looks in THAT file
+    only; without it, in the first file that has the name (kept for callers
+    with no side to name). Every slot-shaped caller passes `filename`:
+    searching every file returned the assets file's `Kind` for a findings
+    slot in a two-file source, so a row showed values the mapping never
+    reads and offered a column the slot's own file lacked."""
+    candidates = [profiles[filename]] if filename is not None and filename in profiles else (
+        [] if filename is not None else list(profiles.values())
+    )
+    for profile in candidates:
         column_profile = profile.columns.get(column)
         if column_profile is not None:
             return {
@@ -641,17 +729,25 @@ def mount_adapter_routes(app: FastAPI) -> None:
             section, _, target = slot.partition(".")
             slot_map = saved.proposal.asset if section == "asset" else saved.proposal.finding
             entry = slot_map[target]
+            # Only columns the slot's own file has: the model's candidate list
+            # is unverified, and `resolveSlotControls` takes candidate_columns[0]
+            # and needs its profile, so a hallucinated FIRST candidate hid the
+            # value picker entirely. The failure itself is not lost: it is
+            # merged into this row's reason below, where the human can read it.
+            filename = _side_filename(saved.proposal, section)
+            real_candidates = _real_columns(profiles, list(entry.candidate_columns), filename)
             column_profiles = {
                 column: profile
-                for column in entry.candidate_columns
-                if (profile := _column_profile_dict(profiles, column)) is not None
+                for column in real_candidates
+                if (profile := _column_profile_dict(profiles, column, filename)) is not None
             }
             unresolved_detail.append(
                 {
                     "slot": slot,
                     "kind": "unresolved",
                     "reason": entry.reason,
-                    "candidate_columns": list(entry.candidate_columns),
+                    "candidate_columns": real_candidates,
+                    "settle_columns": list(real_candidates),
                     "column_profiles": column_profiles,
                     "target_vocabulary": describe_target_vocabulary(target),
                     # A free-text target (target_vocabulary is None, e.g.
@@ -689,8 +785,7 @@ def mount_adapter_routes(app: FastAPI) -> None:
             saved.proposal,
             profiles,
             report.failures,
-            unresolved={e["slot"] for e in unresolved_detail},
-            illegal_by_slot={e["slot"]: e for e in illegal},
+            existing_by_slot={e["slot"]: e for e in (*unresolved_detail, *illegal)},
         )
 
         return {

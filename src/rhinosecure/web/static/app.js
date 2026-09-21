@@ -2432,14 +2432,44 @@ function _mappingColumns(mapping) {
  * validate_contract's own "mapped AND unmapped" contradiction rather than
  * silently corrupting anything -- this is bookkeeping, not a semantic
  * judgment call. */
-function _isColumnUsedElsewhere(proposal, column, excludeSlotKey) {
+function _isColumnUsedElsewhere(proposal, column, excludeSlotKey, filename) {
+  // `filename`: the file `column` belongs to. In a TWO-file source
+  // validate_contract accounts columns per file (assets.csv is accounted only
+  // by asset-side mappings, `derived` blocks and asset_grouping; findings.csv
+  // only by finding-side mappings and enrichment), so a same-NAMED column in
+  // the other file is not a reader of this one. Comparing bare names made
+  // such a column count as "used", never get declared, and end up neither
+  // mapped nor in unmapped_columns -- a refusal with no row left to fix it
+  // (found by the second adversarial-review round, 2026-09-21). For a
+  // single-file source every reader is in the same file, so nothing changes;
+  // omitted, every file counts (the old behavior).
+  const meta = proposal.meta || {};
+  const sameFile = (readerFile) => filename === undefined || readerFile === filename;
   for (const section of ["asset", "finding"]) {
+    const readerFile = section === "asset" ? meta.assets_filename : meta.findings_filename;
+    if (!sameFile(readerFile)) continue;
     for (const [target, sp] of Object.entries(proposal[section] || {})) {
       if (`${section}.${target}` === excludeSlotKey) continue;
       if (sp.status === "mapped" && _mappingColumns(sp.mapping).includes(column)) return true;
     }
   }
-  if (Object.values(proposal.derived || {}).some((d) => d.column === column)) return true;
+  if (sameFile(meta.assets_filename) && Object.values(proposal.derived || {}).some((d) => d.column === column)) {
+    return true;
+  }
+  // enrichment.severity_score / known_exploited / attack_technique read a
+  // column exactly as much as any mapping does: validate_contract counts
+  // them as accounted for, so listing one ALSO in unmapped_columns is its
+  // "both mapped and listed" hard stop. Missing here, the form declared a
+  // severity column "ignored" and the refusal that followed was persisted
+  // as the new baseline (found by adversarial review, 2026-09-21). Enrichment
+  // is finding-side, so it only counts against the findings file.
+  const enrichment = proposal.enrichment || {};
+  if (sameFile(meta.findings_filename)) {
+    for (const key of ["severity_score", "known_exploited", "attack_technique"]) {
+      if (enrichment[key] && enrichment[key].column === column) return true;
+    }
+  }
+  if (!sameFile(meta.assets_filename)) return false;
   const grouping = proposal.asset_grouping || {};
   if (grouping.key === column) return true;
   return !!(grouping.order_by && grouping.order_by.column === column);
@@ -2479,10 +2509,25 @@ function applySlotEditToProposal(proposal, slot, row) {
   proposal.unmapped_columns[filename] = proposal.unmapped_columns[filename] || {};
   const unmapped = proposal.unmapped_columns[filename];
 
-  for (const candidate of slot.candidate_columns) {
-    if (usedColumns.has(candidate)) {
-      delete unmapped[candidate];
-    } else if (!(candidate in unmapped) && !_isColumnUsedElsewhere(proposal, candidate, slot.slot)) {
+  // Whatever the new mapping reads is mapped now, so it can never also sit
+  // in unmapped_columns -- true for any column it reads, not only the ones
+  // this slot happened to list.
+  for (const column of usedColumns) delete unmapped[column];
+
+  // Only the columns this slot was itself RESPONSIBLE for get declared
+  // ignored when the new mapping does not read them: what the replaced
+  // mapping read, or the model's own candidates. `settle_columns` is that
+  // list, sent by the server. It is NOT `candidate_columns`, which is what
+  // the picker may offer -- for a missing-column free-text row that is the
+  // file's WHOLE header, and settling all of it declared every unaccounted
+  // column "ignored" on a one-slot fix, hiding the very "neither mapped nor
+  // in unmapped_columns" problem validate_contract exists to raise (found by
+  // adversarial review, 2026-09-21). Falls back to candidate_columns for a
+  // server that predates the field, which is the old behavior exactly.
+  const settle = Array.isArray(slot.settle_columns) ? slot.settle_columns : slot.candidate_columns;
+  for (const candidate of settle) {
+    if (usedColumns.has(candidate)) continue;
+    if (!(candidate in unmapped) && !_isColumnUsedElsewhere(proposal, candidate, slot.slot, filename)) {
       unmapped[candidate] = {
         disposition: "ignored",
         reason: `Not used by ${slot.slot}'s resolved mapping (resolved via the browser slot-resolution form).`,
@@ -2746,6 +2791,21 @@ async function applyLowConfidenceCorrection(card, name, uploadId, slot) {
   const row = item.querySelector(".resolve-slot");
   const statusEl = item.querySelector(".confirm-low-confidence-status");
   const btn = item.querySelector(".low-confidence-apply-btn");
+  // buildSlotMapping returns null when it built nothing: the row is not
+  // correctable from this form, or every value is still on "(exclude this
+  // value)". Posting anyway sends the proposal back UNCHANGED, the job
+  // rewrites the same contract, and the card reported "Correction applied."
+  // for a decision that was discarded. Since an all-blank table stopped
+  // being an empty (server-refused) vocabulary this is no longer refused
+  // loudly downstream, so say so here (found by adversarial review,
+  // 2026-09-21).
+  if (!buildSlotMapping(slot, row)) {
+    statusEl.hidden = false;
+    statusEl.innerHTML = slotIsCorrectable(slot)
+      ? `Nothing was applied: every value is set to "(exclude this value)". Choose a value for at least one, or leave the mapping as proposed and attest below.`
+      : `Nothing was applied: this mapping cannot be corrected from this form.`;
+    return;
+  }
   btn.disabled = true;
   statusEl.hidden = false;
   statusEl.innerHTML = `<span class="spinner"></span> Re-checking against the real file…`;

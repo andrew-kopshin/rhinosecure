@@ -558,7 +558,10 @@ def test_grounding_failed_row_for_a_missing_column_on_a_free_text_target_offers_
     assert row["grounding_kinds"] == ["missing_column"]
     assert row["candidate_columns"] == _HEADER
     assert "Nope" not in row["candidate_columns"]
-    assert set(row["column_profiles"]) == set(_HEADER)
+    # No profiles for a widened whole-header list: the free-text picker needs
+    # names, not profiles, and a real source can have hundreds of columns
+    # each carrying a distinct-value table. This mapping reads no real column.
+    assert row["column_profiles"] == {}
     assert row["current_values"] == {}
     assert row["absent_fact_legal"] is True
 
@@ -657,6 +660,255 @@ def test_get_proposal_409s_when_the_saved_proposal_names_files_the_upload_does_n
     resp = client.get("/api/adapters/upload-gf-mismatch/proposal", params={"upload_id": other})
     assert resp.status_code == 409
     assert "does not match this upload" in resp.json()["detail"]
+
+
+# ---------------- adversarial-review fixes (2026-09-21) ----------------
+
+
+def test_get_proposal_404s_for_a_saved_proposal_that_is_not_utf8(client: TestClient, tmp_path: Path):
+    """A hand-edit saved as UTF-16 (Windows PowerShell 5.1's `>`), which the
+    UI's own recourse text recommends. `UnicodeDecodeError` escaped
+    `load_saved_proposal` and 500ed the endpoint instead of being the clean
+    "cannot read this proposal" it is for every other unreadable file."""
+    upload_id = _upload(client)
+    _propose(client, upload_id, "upload-badenc", _proposal_dict(name="upload-badenc"))
+    saved_path = tmp_path / "out" / "propose_upload-badenc.json"
+    saved_path.write_bytes(saved_path.read_text(encoding="utf-8").encode("utf-16"))
+
+    resp = client.get("/api/adapters/upload-badenc/proposal", params={"upload_id": upload_id})
+    assert resp.status_code == 404
+    assert "could not be decoded" in resp.json()["detail"]
+
+
+def test_unresolved_row_drops_a_hallucinated_candidate_and_shows_why(client: TestClient):
+    """The model's candidate list is unverified. A hallucinated FIRST
+    candidate hid the value picker (the browser reads candidate_columns[0]
+    and needs its profile), and the failure itself was skipped, so the panel
+    was silent about the only thing blocking the contract."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-gf-ghost", environment_status="unresolved")
+    proposal["asset"]["environment"]["candidate_columns"] = ["Ghost", "Env"]
+    _propose_edited(client, upload_id, "upload-gf-ghost", proposal)
+
+    body, found = _grounding_rows(client, "upload-gf-ghost", upload_id)
+    row = {u["slot"]: u for u in body["unresolved"]}["asset.environment"]
+    assert row["candidate_columns"] == ["Env"]
+    assert row["settle_columns"] == ["Env"]
+    assert set(row["column_profiles"]) == {"Env"}
+    assert "also fails grounding" in row["reason"] and "Ghost" in row["reason"]
+    assert row["grounding_kinds"] == ["missing_column"]
+    assert "asset.environment" not in found  # merged, never a second row
+
+
+def test_settle_columns_are_the_slots_own_columns_not_the_pickers_whole_header(client: TestClient):
+    """`candidate_columns` is what the picker may offer; `settle_columns` is
+    what an edit is responsible for accounting for. Conflating them made a
+    one-slot fix declare every unaccounted column 'ignored'."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-gf-settle")
+    proposal["finding"]["product"] = _mapped(
+        {"kind": "column", "column": "Nope", "case": "exact", "blank": "absent_fact"}, columns_cited=["Nope"]
+    )
+    proposal["asset"]["role"]["mapping"]["table"] = {"srv": "dc", "never-seen": "file"}
+    proposal["asset_grouping"]["key"] = "Nope"
+    _propose_edited(client, upload_id, "upload-gf-settle", proposal)
+
+    _, found = _grounding_rows(client, "upload-gf-settle", upload_id)
+    missing = found["finding.product"]
+    assert missing["candidate_columns"] == _HEADER  # the picker may offer any real column
+    assert missing["settle_columns"] == []  # but the hallucinated column being replaced is not a real one
+    invented = found["asset.role"]
+    assert invented["settle_columns"] == ["Col"]  # the real column the replaced table read
+    assert found["asset_grouping.key"]["settle_columns"] == []  # structural: nothing to settle
+
+
+def _upload_two_file_set(client: TestClient) -> str:
+    assets = b"Asset_ID,Hostname,Col,Env\nA01,HOST01,srv,Production\nA02,HOST02,wks,Corporate\n"
+    findings = b"Finding_ID,Asset_ID,Cve,Col\nF01,A01,CVE-2021-0001,alpha\nF02,A02,CVE-2021-0002,beta\n"
+    upload_id = client.post("/api/uploads", files={"file": ("assets.csv", assets, "text/csv")}).json()["upload_id"]
+    client.post("/api/uploads", files={"file": ("findings.csv", findings, "text/csv")}, data={"upload_id": upload_id})
+    client.post(f"/api/uploads/{upload_id}/label", json={"filename": "assets.csv", "label": "inventory"})
+    client.post(f"/api/uploads/{upload_id}/label", json={"filename": "findings.csv", "label": "findings"})
+    return upload_id
+
+
+def _two_file_proposal(name: str) -> dict:
+    proposal = _proposal_dict(name=name)
+    proposal["meta"].update(source_layout="two_file", assets_filename="assets.csv", findings_filename="findings.csv")
+    return proposal
+
+
+def test_two_file_rows_are_built_from_the_slots_own_file(client: TestClient):
+    """`Col` exists in BOTH files with different values. Looking it up in
+    whichever profile came first showed a findings slot the ASSETS file's
+    values."""
+    upload_id = _upload_two_file_set(client)
+    # finding.scanner_severity reads findings.csv's Col (alpha/beta), but the
+    # default table is keyed on assets.csv's values (srv/wks): an invented key.
+    _propose_edited(client, upload_id, "upload-two-scope", _two_file_proposal("upload-two-scope"))
+
+    _, found = _grounding_rows(client, "upload-two-scope", upload_id)
+    row = found["finding.scanner_severity"]
+    assert row["grounding_kinds"] == ["invented_table_key"]
+    assert set(row["column_profiles"]["Col"]["distinct_values"]) == {"alpha", "beta"}
+
+
+def test_a_column_only_the_other_file_has_is_not_offered_as_a_candidate(client: TestClient):
+    """asset.role cites a column that exists only in findings.csv. It is a
+    missing column for an ASSETS slot, and offering it as the candidate is
+    offering the very column that failed."""
+    assets = b"Asset_ID,Hostname,Env\nA01,HOST01,Production\n"
+    findings = b"Finding_ID,Asset_ID,Cve,Col\nF01,A01,CVE-2021-0001,srv\n"
+    upload_id = client.post("/api/uploads", files={"file": ("assets.csv", assets, "text/csv")}).json()["upload_id"]
+    client.post("/api/uploads", files={"file": ("findings.csv", findings, "text/csv")}, data={"upload_id": upload_id})
+    client.post(f"/api/uploads/{upload_id}/label", json={"filename": "assets.csv", "label": "inventory"})
+    client.post(f"/api/uploads/{upload_id}/label", json={"filename": "findings.csv", "label": "findings"})
+    _propose_edited(client, upload_id, "upload-two-cross", _two_file_proposal("upload-two-cross"))
+
+    _, found = _grounding_rows(client, "upload-two-cross", upload_id)
+    row = found["asset.role"]  # vocabulary over Col, which assets.csv lacks
+    assert row["grounding_kinds"] == ["missing_column"]
+    assert row["candidate_columns"] == []  # findings.csv's Col is not this slot's
+    assert row["column_profiles"] == {}
+
+
+def test_a_two_file_resolve_form_resubmit_succeeds(client: TestClient):
+    """Every resubmit for a two-file source failed with CLI wording ("Pass
+    --assets-file NAME --findings-file NAME") because the edit path never
+    passed the filenames the saved proposal already carries -- so no row of
+    any kind could be submitted from the browser for one."""
+    upload_id = _upload_two_file_set(client)
+    proposal = _two_file_proposal("upload-two-resubmit")
+    proposal["finding"]["scanner_severity"]["mapping"]["table"] = {"alpha": "low", "beta": "low"}
+    job = _propose_edited(client, upload_id, "upload-two-resubmit", proposal)
+    assert job["status"] == "succeeded", job.get("error")
+    assert job["result"]["grounding"]["failures"] == []
+    assert job["result"]["contract_written"] is True
+
+
+def test_the_form_style_exact_case_rebuild_cannot_walk_around_a_registry_anchor(client: TestClient):
+    """The model's `case: lower` mapping of {critical: 4} was refused, and the
+    form rebuilds every vocabulary as `case: exact`: it must be refused too,
+    or an untouched Resubmit overrides the registry and stamps it human."""
+    rows = [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "critical", "Production"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "low", "Corporate"],
+    ]
+    upload_id = _upload(client, content=_csv_bytes(rows))
+
+    def proposal_with(case: str, table: dict) -> dict:
+        p = _proposal_dict(name="upload-anchor-case")
+        p["asset"]["role"]["mapping"].update(table={"critical": "dc", "low": "workstation"}, case="exact")
+        p["finding"]["scanner_severity"]["mapping"].update(table={"critical": "critical", "low": "low"}, case="exact")
+        p["asset"]["criticality"] = _mapped(
+            {"kind": "vocabulary", "column": "Col", "case": case, "blank": "fatal", "table": table},
+            columns_cited=["Col"],
+        )
+        return p
+
+    for case in ("lower", "exact"):
+        job = _propose_edited(client, upload_id, "upload-anchor-case", proposal_with(case, {"critical": 4, "low": 2}))
+        assert job["result"]["contract_written"] is False, case
+        assert [f["kind"] for f in job["result"]["grounding"]["failures"]] == ["registry_anchor"], case
+
+    ok = _propose_edited(client, upload_id, "upload-anchor-case", proposal_with("exact", {"critical": 5, "low": 2}))
+    assert ok["result"]["grounding"]["failures"] == []
+
+
+# ---------------- second review round (2026-09-21) ----------------
+
+
+def test_settle_columns_cover_every_column_a_content_address_mapping_reads(client: TestClient):
+    """`_mapping_source_columns` returns [] for the multi-column kinds (it
+    answers "which one column can a picker point at"), so settling from it
+    left a replaced content_address's columns in neither `mapped` nor
+    `unmapped_columns`: the contract was refused and no row was left."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-settle-ca")
+    proposal["finding"]["finding_id"] = _mapped(
+        {"kind": "content_address", "algorithm": "sha256", "columns": ["Env", "Ghost"], "join": "|",
+         "prefix": "t-", "hex_len": 16, "case": "lower", "recipe_version": 1},
+        columns_cited=["Env", "Ghost"],
+    )
+    _propose_edited(client, upload_id, "upload-settle-ca", proposal)
+
+    _, found = _grounding_rows(client, "upload-settle-ca", upload_id)
+    row = found["finding.finding_id"]
+    assert row["grounding_kinds"] == ["missing_column"]
+    assert row["candidate_columns"] == _HEADER  # free text: any real column may replace it
+    assert row["settle_columns"] == ["Env"]  # the real column the replaced mapping read; Ghost is not one
+
+
+def test_settle_columns_cover_a_composed_mapping(client: TestClient):
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-settle-comp")
+    # composed is legal only finding-side; on an asset slot it is a grounding failure
+    proposal["asset"]["owner"] = _mapped(
+        {"kind": "composed", "join": "; ", "max_chars": 4096, "parts": [{"prefix": None, "join_nonblank": ["Col"], "join": " "}]}
+    )
+    _propose_edited(client, upload_id, "upload-settle-comp", proposal)
+
+    _, found = _grounding_rows(client, "upload-settle-comp", upload_id)
+    assert found["asset.owner"]["grounding_kinds"] == ["misplaced_kind"]
+    assert found["asset.owner"]["settle_columns"] == ["Col"]
+
+
+def test_a_free_text_unresolved_slot_with_only_hallucinated_candidates_is_offered_the_real_header(client: TestClient):
+    """After hallucinated candidates are filtered nothing is left to choose
+    from, and for `hostname` "not collected" is illegal too, so the row was a
+    dead end."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-widen-unres")
+    proposal["asset"]["hostname"] = _unresolved("the source has no machine name", ["fqdn"])
+    _propose_edited(client, upload_id, "upload-widen-unres", proposal)
+
+    body, found = _grounding_rows(client, "upload-widen-unres", upload_id)
+    row = {u["slot"]: u for u in body["unresolved"]}["asset.hostname"]
+    assert row["candidate_columns"] == _HEADER
+    assert row["settle_columns"] == []  # nothing real was ever read
+    assert row["column_profiles"] == {}
+    assert row["fatal_legal"] is True
+    assert "asset.hostname" not in found  # merged, not a second row
+
+
+def test_a_free_text_illegal_slot_with_a_missing_column_is_offered_the_real_header(client: TestClient):
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-widen-illegal")
+    # blank='gap' is illegal for product (absent_fact/fatal only) AND the column is not there
+    proposal["finding"]["product"] = _mapped(
+        {"kind": "column", "column": "Ghost", "case": "exact", "blank": "gap"}, columns_cited=["Ghost"]
+    )
+    _propose_edited(client, upload_id, "upload-widen-illegal", proposal)
+
+    body, found = _grounding_rows(client, "upload-widen-illegal", upload_id)
+    row = {e["slot"]: e for e in body["illegal"]}["finding.product"]
+    assert row["candidate_columns"] == _HEADER
+    assert "finding.product" not in found
+
+
+def test_a_real_candidate_the_model_named_stays_the_suggestion(client: TestClient):
+    """Only widen when NOTHING real is left."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-widen-keep")
+    proposal["finding"]["product"] = _unresolved("no product column", ["Ghost", "Col"])
+    _propose_edited(client, upload_id, "upload-widen-keep", proposal)
+
+    body, _ = _grounding_rows(client, "upload-widen-keep", upload_id)
+    assert {u["slot"]: u for u in body["unresolved"]}["finding.product"]["candidate_columns"] == ["Col"]
+
+
+def test_a_closed_vocabulary_slot_with_only_hallucinated_candidates_stays_uncorrectable(client: TestClient):
+    """The per-value picker needs ONE column and that column's profile, which
+    the whole header cannot supply."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-widen-vocab", environment_status="unresolved")
+    proposal["asset"]["environment"]["candidate_columns"] = ["Ghost"]
+    _propose_edited(client, upload_id, "upload-widen-vocab", proposal)
+
+    body, _ = _grounding_rows(client, "upload-widen-vocab", upload_id)
+    row = {u["slot"]: u for u in body["unresolved"]}["asset.environment"]
+    assert row["candidate_columns"] == []
+    assert row["target_vocabulary"]["kind"] == "enum"
 
 
 def test_get_proposal_404s_for_an_unknown_name(client: TestClient):

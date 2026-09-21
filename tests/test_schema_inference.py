@@ -52,6 +52,7 @@ from rhinosecure.agents.schema_inference import (
     dump_saved_proposal,
     illegal_mapped_slots,
     load_saved_proposal,
+    saved_proposal_from_dict,
     placeholder_axes,
     propose_contract,
     unresolved_slots,
@@ -2092,6 +2093,102 @@ def test_every_grounding_kind_is_exercised_by_some_check():
         "undefined_derivation", "misplaced_kind", "composed_cross_file", "registry_anchor", "unprofiled_file",
     }
     assert set(typing.get_args(GroundingKind)) == covered
+
+
+# --- registry anchors are compared case-insensitively (review finding, 2026-09-21) ----
+#
+# The alias check used to resolve keys under the MAPPING'S own case, and the
+# registry stores aliases in title case, so `case="exact"` compared literally:
+# `{critical: 4}` was refused under case="lower" and accepted under "exact".
+# The browser form rebuilds every vocabulary as "exact", so an untouched
+# Resubmit walked around the refusal and stamped the result human-authored.
+
+
+def _lowercase_critical_profiles(tmp_path):
+    _write_csv(tmp_path, _HEADER, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "critical"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "low"],
+    ])
+    return {p.path.name: p for p in profile_source(tmp_path)}
+
+
+def _criticality_proposal(case: str, table: dict):
+    data = _full_proposal_dict(overrides_asset={
+        "criticality": _mapped(
+            {"kind": "vocabulary", "column": "Col", "case": case, "blank": "fatal", "table": table},
+            columns_cited=["Col"],
+        ),
+    })
+    data["asset"]["role"]["mapping"]["table"] = {"critical": "dc", "low": "workstation"}
+    data["asset"]["role"]["mapping"]["case"] = "exact"
+    data["finding"]["scanner_severity"]["mapping"]["table"] = {"critical": "critical", "low": "low"}
+    data["finding"]["scanner_severity"]["mapping"]["case"] = "exact"
+    return AdapterProposal.model_validate(data)
+
+
+@pytest.mark.parametrize("case", ["exact", "lower", "upper"])
+def test_anchor_disagreement_is_caught_whatever_case_the_mapping_declares(tmp_path, case):
+    profiles_map = _lowercase_critical_profiles(tmp_path)
+    key = "CRITICAL" if case == "upper" else "critical"
+    proposal = _criticality_proposal(case, {key: 4, ("LOW" if case == "upper" else "low"): 2})
+    report = check_grounding(proposal, profiles_map)
+    kinds = _kinds_for(report, "asset.criticality")
+    if case == "upper":
+        # The observed values are lowercase, so an uppercase key is ALSO an
+        # invented table key; the anchor disagreement must still be reported.
+        assert "registry_anchor" in kinds
+    else:
+        assert kinds == {"registry_anchor"}
+
+
+def test_an_agreeing_anchor_is_accepted_under_every_case(tmp_path):
+    profiles_map = _lowercase_critical_profiles(tmp_path)
+    for case in ("exact", "lower"):
+        report = check_grounding(_criticality_proposal(case, {"critical": 5, "low": 2}), profiles_map)
+        assert report.failures == [], case
+
+
+def test_an_enum_alias_disagreement_is_caught_under_exact_case_too(tmp_path):
+    """The same gap existed for every registry-backed enum, not only criticality."""
+    _write_csv(tmp_path, _HEADER, [
+        ["A01", "HOST01", "F01", "CVE-2021-0001", "production"],
+        ["A02", "HOST02", "F02", "CVE-2021-0002", "development"],
+    ])
+    profiles_map = {p.path.name: p for p in profile_source(tmp_path)}
+    data = _full_proposal_dict(overrides_asset={
+        # "production" is a known alias of prod; declaring it dev disagrees.
+        "environment": _mapped(
+            {"kind": "vocabulary", "column": "Col", "case": "exact", "blank": "fatal",
+             "table": {"production": "dev", "development": "dev"}},
+            columns_cited=["Col"],
+        ),
+    })
+    data["asset"]["role"]["mapping"]["table"] = {"production": "dc", "development": "workstation"}
+    data["asset"]["role"]["mapping"]["case"] = "exact"
+    data["finding"]["scanner_severity"]["mapping"]["table"] = {"production": "high", "development": "low"}
+    data["finding"]["scanner_severity"]["mapping"]["case"] = "exact"
+    report = check_grounding(AdapterProposal.model_validate(data), profiles_map)
+    assert _kinds_for(report, "asset.environment") == {"registry_anchor"}
+
+
+# --- load_saved_proposal never lets a bad file escape as a non-SchemaInferenceError ----
+
+
+def test_load_saved_proposal_wraps_an_undecodable_file(tmp_path):
+    path = tmp_path / "propose_x.json"
+    path.write_bytes('{"proposal": "x"}'.encode("utf-16"))  # what Windows PowerShell 5.1 `>` writes
+    with pytest.raises(SchemaInferenceError, match="could not be decoded as UTF-8"):
+        load_saved_proposal(path)
+
+
+def test_saved_proposal_from_dict_wraps_a_non_iterable_attempt_usage():
+    saved = SavedProposal(
+        AdapterProposal.model_validate(_full_proposal_dict()), _generator(), ()
+    )
+    data = dump_saved_proposal(saved)
+    data["attempt_usage"] = 5
+    with pytest.raises(SchemaInferenceError, match="attempt_usage"):
+        saved_proposal_from_dict(data)
 
 
 # --- finding.detected_date vs a real full-timestamp column -------------------

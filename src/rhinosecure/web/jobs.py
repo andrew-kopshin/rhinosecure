@@ -965,37 +965,36 @@ def _run_ingest_propose(job: Job, plan_state: PlanState, on_stage: Callable[[str
         # the result either way -- a plan whose authorship record is
         # coarser than it looks must say so, not decide it quietly.
         #
-        # `UnicodeDecodeError` alongside `SchemaInferenceError`, and not
-        # by preference: `load_saved_proposal` wraps a missing file, bad
-        # JSON and a wrong shape into `SchemaInferenceError`, but its own
-        # `read_text(encoding="utf-8")` sits inside an `except OSError`,
-        # and `UnicodeDecodeError` is a `ValueError` -- so a baseline that
-        # exists but is not valid UTF-8 escapes that wrapper entirely
-        # (confirmed against a real file, not inferred from the source).
-        # A file that cannot be decoded is exactly as absent a baseline as
-        # one that is missing, so it takes the same fallback here rather
-        # than failing the job. Widening `load_saved_proposal`'s own catch
-        # would fix this for its other two callers too and is deliberately
-        # NOT done here -- that is a change to a shared function's stated
-        # contract, not to this path.
+        # A baseline that is missing, undecodable, not JSON, or the wrong shape
+        # is exactly as absent as one that never existed, and every one of
+        # those is a `SchemaInferenceError` from `load_saved_proposal` (its
+        # `UnicodeDecodeError` used to escape it; widened at the root on
+        # 2026-09-21, which also stopped `GET .../proposal` and every other
+        # reader of the saved proposal from 500ing on the same file), so they
+        # all take the same fallback
+        # here rather than failing the job.
         baseline_proposal = None
         try:
             baseline_proposal = load_saved_proposal(saved_path).proposal
-        except (SchemaInferenceError, UnicodeDecodeError) as exc:
-            # load_saved_proposal already prefixes its own messages with the
-            # path; a raw UnicodeDecodeError does not, and an operator
-            # reading this needs to know WHICH file to go look at. Mirrors
-            # that function's own "<path>: could not be read -- ..." wording
-            # rather than inventing a second phrasing for the same thing.
-            reason = str(exc) if isinstance(exc, SchemaInferenceError) else f"{saved_path}: could not be decoded -- {exc}"
+        except SchemaInferenceError as exc:
+            # load_saved_proposal prefixes its own messages with the path, so
+            # an operator knows WHICH file to go look at.
             authorship_baseline = (
-                f"unavailable -- {reason}; every mapped slot stamped 'human' (coarse: a slot the model "
+                f"unavailable -- {exc}; every mapped slot stamped 'human' (coarse: a slot the model "
                 "authored and the human never saw is attributed to the human)"
             )
         else:
             authorship_baseline = f"diffed against {saved_path}"
+        # The saved proposal already names which file is assets and which is
+        # findings. Without passing them, a TWO-file source failed here every
+        # time ("ambiguous which is assets and which is findings ... Pass
+        # --assets-file", CLI wording the browser cannot act on), so no
+        # resolve-slots row of any kind could be submitted for one. A
+        # single-file source ignores both arguments.
         result = propose_contract(
             data_dir, name, generated_at=_now(), from_proposal=from_proposal, baseline_proposal=baseline_proposal,
+            assets_filename=from_proposal.proposal.meta.assets_filename,
+            findings_filename=from_proposal.proposal.meta.findings_filename,
         )
     else:
         on_stage("proposing")
