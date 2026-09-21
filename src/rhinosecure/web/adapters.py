@@ -78,6 +78,11 @@ signature):
   identical `check_grounding`/`assemble_contract` gate a bad model output
   already goes through, never a second validator built for this surface
   that could disagree with it.
+  Both endpoints also carry `open_questions`: what the model itself asked while
+  proposing and nothing has answered. Display only. On `/proposal` it is the
+  saved proposal's own list; on `/review` (the signing form) it is shown only
+  when the saved proposal descends from the same model call as that contract
+  (`_open_questions_for_contract`; lineage, not proof), and is empty otherwise.
 - `GET /api/adapters/{name}/review?upload_id=...` and `POST /api/adapters
   /{name}/confirm` -- the dedicated confirmation form, calling `adapters
   .review.review_contract` with `sign=False`/`sign=True` exactly as `rhino
@@ -448,6 +453,45 @@ def _illegal_mapped_detail(proposal: AdapterProposal, profiles: dict) -> list[di
     return detail
 
 
+def _open_questions_for_contract(name: str, contract: Any) -> list[str]:
+    """The model's own `open_questions` for the proposal that produced
+    `contract` -- shown next to the signature, where an unanswered question
+    matters most. Empty unless the saved proposal DESCENDS FROM THE SAME
+    MODEL CALL as this contract: their `generator.call_log_digest` (the
+    phase-1 LLM call's own log, copied unchanged into the contract by every
+    assembly path and carried through every human edit) must match.
+
+    That is lineage, not proof that this proposal produced this contract,
+    and the docstring used to say "provably". A refused resubmit saves the
+    edited proposal but leaves the older contract in place, and the two
+    still share a digest, so a signer can then see the questions of an
+    edited proposal beside the contract it did not produce (found by
+    adversarial review, 2026-09-21). Accepted as display-only and narrow:
+    the edit is a human's own, and the browser form cannot reach it.
+
+    What the check does catch is the common way the two files disagree:
+    `rhino adapt propose` under a name that already has a contract writes
+    its new proposal even when assembly is refused, so an old contract can
+    sit beside a newer proposal from a different model call. A hand-authored
+    contract has no saved proposal at all, and a contract with no
+    `generator` cannot be matched; both show nothing rather than guess.
+    (The existing `low_confidence` list trusts the pairing without this
+    check; it is not changed here.)
+
+    Never raises: a saved proposal that cannot be read, decoded or parsed
+    is `SchemaInferenceError` from `load_saved_proposal` (its
+    `UnicodeDecodeError` and `attempt_usage` `TypeError` used to escape it
+    and 500 the signing form over a display-only lookup)."""
+    try:
+        saved = load_saved_proposal(_saved_proposal_path(name))
+    except SchemaInferenceError:
+        return []
+    generator = getattr(contract, "generator", None)
+    if generator is None or generator.call_log_digest != saved.generator.call_log_digest:
+        return []
+    return list(saved.proposal.open_questions)
+
+
 def _fatal_legal(target: str) -> bool:
     """Whether `blank: "fatal"` (refuse the batch on a blank) is a legal
     policy for `target`, read off the same registry `validate_contract`
@@ -807,6 +851,11 @@ def mount_adapter_routes(app: FastAPI) -> None:
             "illegal": illegal,
             "grounding_failed": grounding_failed,
             "low_confidence": _low_confidence_detail(saved.proposal, profiles),
+            # What the model itself asked while proposing this mapping and
+            # nothing has answered (AdapterProposal.open_questions). Display
+            # only: no gate, no attestation, never read by anything that
+            # decides. Model-authored free text, so the browser must escape it.
+            "open_questions": list(saved.proposal.open_questions),
         }
 
     @app.get("/api/adapters/{name}/review")
@@ -835,10 +884,12 @@ def mount_adapter_routes(app: FastAPI) -> None:
         # adapt confirm` does, and that call DOES see the real numbers.
         required = required_attestations(contract)
         still_missing = missing_attestations(contract)
+        open_questions = _open_questions_for_contract(name, contract)
         if still_missing:
             return {
                 "ok": False,
                 "written": False,
+                "open_questions": open_questions,
                 "measurement": None,
                 # The dialect is a structural fact of the contract itself,
                 # not something the real measurement below computes -- a
@@ -855,7 +906,7 @@ def mount_adapter_routes(app: FastAPI) -> None:
             outcome = review_contract(config_path, contract, data_dir, at=_now(), sign=False)
         except ReviewError as exc:
             raise HTTPException(400, str(exc))
-        return _review_outcome_dict(outcome)
+        return {**_review_outcome_dict(outcome), "open_questions": open_questions}
 
     @app.post("/api/adapters/{name}/confirm")
     def post_confirm(name: str, body: ConfirmRequest) -> dict[str, Any]:

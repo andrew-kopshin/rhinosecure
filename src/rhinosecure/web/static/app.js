@@ -2066,7 +2066,31 @@ async function openResolvePanel(name, uploadId) {
   const rows = [...data.unresolved, ...(data.illegal || []), ...(data.grounding_failed || [])].map((slot) =>
     Object.assign({ saved_proposal_path: data.saved_proposal_path, format_name: data.name }, slot)
   );
-  renderResolvePanel(card, rows);
+  renderResolvePanel(card, rows, data.open_questions || []);
+}
+
+/* The model's own unanswered questions about a mapping it proposed
+ * (AdapterProposal.open_questions -- web/adapters.py serves them on both the
+ * proposal and the review endpoints). Until this existed nothing in the UI
+ * showed them, so the model could ask exactly the question that mattered
+ * ("how many tiers does this scale have? needed to place 'Low'") and no human
+ * would ever read it.
+ *
+ * Display only, on purpose: they are not checked against the file, they gate
+ * nothing, and neither editing a row nor confirming answers them -- the
+ * wording says so, so a signer does not read a shown question as a resolved
+ * one. Model-authored text derived from the uploaded source, so every string
+ * goes through esc(). Empty for a hand-authored contract or a proposal that
+ * asked nothing. */
+function openQuestionsHtml(questions) {
+  if (!questions || !questions.length) return "";
+  const count = questions.length === 1 ? "a question" : `${questions.length} questions`;
+  return `
+    <div class="open-questions">
+      <p class="hint"><strong>The model raised ${count} while proposing this mapping.</strong> Nothing has answered ${questions.length === 1 ? "it" : "them"}: they are not checked against the file, and neither editing a row nor confirming answers them.</p>
+      <ul>${questions.map((q) => `<li>${esc(q)}</li>`).join("")}</ul>
+    </div>
+  `;
 }
 
 /* Shared by the unresolved-slot resolver and the low-confidence-mapping
@@ -2301,10 +2325,11 @@ function resolveSlotRowHtml(slot) {
   `;
 }
 
-function renderResolvePanel(card, slots) {
+function renderResolvePanel(card, slots, openQuestions = []) {
   card.innerHTML = `
     <h3>Resolve slot(s) needing attention</h3>
     <p class="hint">Only values the real file actually contains, and only target values this schema actually accepts -- the same closed grammar the model itself is held to. An illegal or incomplete resolution is refused, not silently accepted.</p>
+    ${openQuestionsHtml(openQuestions)}
     ${slots.map((slot) => resolveSlotRowHtml(slot)).join("")}
     <div class="route-step-result resolve-status" hidden></div>
     <button type="button" class="secondary-btn resolve-submit-btn">Resubmit</button>
@@ -2719,6 +2744,7 @@ function renderConfirmPanel(card, name, uploadId, review, lowConfidence = []) {
     <h3>Review &amp; confirm — ${esc(name)}</h3>
     ${dialectHtml}
     ${measurementHtml}
+    ${openQuestionsHtml(review.open_questions)}
     <label class="confirm-identity-label">Signed by <input type="text" class="confirm-identity-input" placeholder="your name" /></label>
     ${attestHtml}
     <div class="route-step-result confirm-status" hidden></div>

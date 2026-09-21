@@ -1130,6 +1130,122 @@ def test_get_review_names_a_required_attestation(client: TestClient):
     assert body["still_missing"] == ["finding_id.synthesized"]
 
 
+# ---------------- open_questions: what the model asked and nothing answered ----------------
+
+_QUESTIONS = [
+    "How many total tiers does the source's own scale have? Needed to place 'Low'.",
+    "Is <b>Corporate</b> prod, or a distinct tier?",  # markup must survive the server untouched; the browser escapes
+]
+
+
+def test_get_proposal_carries_the_models_open_questions(client: TestClient):
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-oq-prop")
+    proposal["open_questions"] = list(_QUESTIONS)
+    _propose(client, upload_id, "upload-oq-prop", proposal)
+
+    resp = client.get("/api/adapters/upload-oq-prop/proposal", params={"upload_id": upload_id})
+    assert resp.json()["open_questions"] == _QUESTIONS
+
+
+def test_get_proposal_open_questions_is_empty_when_the_model_asked_nothing(client: TestClient):
+    upload_id = _upload(client)
+    _propose(client, upload_id, "upload-oq-none", _proposal_dict(name="upload-oq-none"))
+    resp = client.get("/api/adapters/upload-oq-none/proposal", params={"upload_id": upload_id})
+    assert resp.json()["open_questions"] == []
+
+
+def test_get_review_carries_open_questions_on_the_measured_path(client: TestClient):
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-oq-clean")
+    proposal["open_questions"] = list(_QUESTIONS)
+    job = _propose(client, upload_id, "upload-oq-clean", proposal)
+    assert job["result"]["contract_written"] is True
+
+    body = client.get("/api/adapters/upload-oq-clean/review", params={"upload_id": upload_id}).json()
+    assert body["measurement"] is not None  # really the measured branch
+    assert body["open_questions"] == _QUESTIONS
+
+
+def test_get_review_carries_open_questions_on_the_attestation_needed_path(client: TestClient):
+    """The other return path: a contract that still needs an attestation
+    returns before any measurement. The signer needs the questions most
+    here, so it must not be the branch that forgets them."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-oq-attest", content_address_finding_id=True)
+    proposal["open_questions"] = list(_QUESTIONS)
+    _propose(client, upload_id, "upload-oq-attest", proposal)
+
+    body = client.get("/api/adapters/upload-oq-attest/review", params={"upload_id": upload_id}).json()
+    assert body["measurement"] is None and body["still_missing"]  # really the early-return branch
+    assert body["open_questions"] == _QUESTIONS
+
+
+def test_get_review_keeps_open_questions_after_a_human_edit(client: TestClient):
+    """A resubmit through the form carries the saved proposal's generator
+    along unchanged, so contract and proposal still pair up."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-oq-edited")
+    proposal["open_questions"] = list(_QUESTIONS)
+    job = _propose_edited(client, upload_id, "upload-oq-edited", proposal)
+    assert job["result"]["contract_written"] is True
+
+    body = client.get("/api/adapters/upload-oq-edited/review", params={"upload_id": upload_id}).json()
+    assert body["open_questions"] == _QUESTIONS
+
+
+def test_get_review_omits_open_questions_when_the_proposal_did_not_produce_the_contract(
+    client: TestClient, tmp_path: Path
+):
+    """`rhino adapt propose` under an existing name writes its new proposal
+    even when assembly is refused, so an old contract can sit beside a newer
+    proposal. The signer must not read questions about a mapping they are not
+    signing -- but the proposal endpoint, which is about the proposal, still
+    shows them."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-oq-stale")
+    proposal["open_questions"] = list(_QUESTIONS)
+    _propose(client, upload_id, "upload-oq-stale", proposal)
+
+    saved_path = tmp_path / "out" / "propose_upload-oq-stale.json"
+    saved = json.loads(saved_path.read_text(encoding="utf-8"))
+    saved["generator"]["call_log_digest"] = "sha256:" + "f" * 64  # a different LLM call
+    saved_path.write_text(json.dumps(saved), encoding="utf-8")
+
+    review = client.get("/api/adapters/upload-oq-stale/review", params={"upload_id": upload_id}).json()
+    assert review["open_questions"] == []
+    proposal_body = client.get("/api/adapters/upload-oq-stale/proposal", params={"upload_id": upload_id}).json()
+    assert proposal_body["open_questions"] == _QUESTIONS
+
+
+def test_get_review_omits_open_questions_when_there_is_no_saved_proposal(client: TestClient, tmp_path: Path):
+    """A hand-authored contract never went through propose."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-oq-nosaved")
+    proposal["open_questions"] = list(_QUESTIONS)
+    _propose(client, upload_id, "upload-oq-nosaved", proposal)
+    (tmp_path / "out" / "propose_upload-oq-nosaved.json").unlink()
+
+    resp = client.get("/api/adapters/upload-oq-nosaved/review", params={"upload_id": upload_id})
+    assert resp.status_code == 200
+    assert resp.json()["open_questions"] == []
+
+
+def test_get_review_survives_a_saved_proposal_that_is_not_utf8(client: TestClient, tmp_path: Path):
+    """The signing form must not depend on a display-only lookup: a saved
+    proposal that cannot be decoded shows no questions instead of a 500."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-badenc-review")
+    proposal["open_questions"] = list(_QUESTIONS)
+    _propose(client, upload_id, "upload-badenc-review", proposal)
+    saved_path = tmp_path / "out" / "propose_upload-badenc-review.json"
+    saved_path.write_bytes(saved_path.read_text(encoding="utf-8").encode("utf-16"))
+
+    review = client.get("/api/adapters/upload-badenc-review/review", params={"upload_id": upload_id})
+    assert review.status_code == 200
+    assert review.json()["open_questions"] == []
+
+
 def test_get_review_names_the_low_confidence_attestation_and_the_slot(client: TestClient):
     """This one is pure -- computable from Contract.mapping_confidence
     alone, unlike `exclusions` -- so it shows up at PREVIEW time, before
