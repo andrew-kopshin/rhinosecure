@@ -2571,15 +2571,19 @@ its reason visible; they did not give the human anything to click.
 - `GET /api/adapters/{name}/proposal` gained `grounding_failed` (`web/adapters.py`,
   `_grounding_failed_detail`): one row per failing slot **or structural reference**
   (`asset_grouping.*`, `enrichment.*`, `unmapped_columns[...]`, flagged `structural`), so no failure
-  is invisible. A slot already in `unresolved` is skipped; one already in `illegal` gets the
-  grounding text merged into that row, because the JS looks rows up by `data-slot`. Candidate columns
-  are filtered to columns the file has; the one exception is a `missing_column` failure on a
-  free-text target, which is offered the file's whole real header. A closed-vocabulary target with a
+  is invisible. A slot that already has an `unresolved` or `illegal` row gets the grounding text
+  merged into that row, because the JS looks rows up by `data-slot` (as first built, an unresolved
+  slot was skipped, which hid the only failure blocking its contract; corrected 2026-09-21, see the
+  review entry below). Candidate columns are filtered to columns the slot's own file has; the one
+  exception is a `missing_column` failure on a free-text target, which is offered the file's whole
+  real header. A closed-vocabulary target with a
   missing column stays uncorrectable (the per-value picker needs one column and its profile) and
   names the recourse. A saved proposal naming files the upload lacks is a 409, never an empty list.
 - **Not an override.** A `registry_anchor` row shows the disagreement and the same per-value
   pickers; a table that still contradicts the anchor is refused by the same `check_grounding` gate.
-  Whether a human may overrule an anchor stays undecided, as the survey recommended.
+  Whether a human may overrule an anchor stays undecided, as the survey recommended. (That claim
+  was false as first shipped: the check compared under the mapping's own case, so the form's
+  rebuild to `case: "exact"` walked around it. Closed 2026-09-21, see the review entry below.)
 - `fatal_legal` on rows, and the column picker falls back to `blank: "fatal"` when that is the only
   legal policy. `hostname`, `cve_id`, `asset_id` and `finding_id` have only `fatal`, and the picker
   used to require `gap` or `absent_fact`, so those slots could never be corrected from the form.
@@ -2616,6 +2620,90 @@ Staging) and `asset_grouping` has no recency signal to prefer one. `Date_Detecte
 `order_by`, but it dates a *finding*, not an asset attribute, so whether it is a legitimate recency
 signal is a representation decision, and the form cannot author `order_by` in any case. (2) The
 model's `Environment: Corporate -> prod` guess (0.72) sits just above `LOW_CONFIDENCE_THRESHOLD`
-(0.7), so no list surfaces it for review. (3) A proposal that is fully mapped and grounded but fails
+(0.7), so the low-confidence list does not flag it. The model's own question about it is now
+shown (2026-09-21, below), but nothing gates on it. (3) A proposal that is fully mapped and grounded but fails
 whole-contract validation still opens the panel with zero rows and a no-op Resubmit (the reason
 lives only in `incomplete_reason`, which this endpoint does not carry).
+
+---
+
+## Resolve-slots: open questions surfaced, and two adversarial-review rounds (2026-09-21)
+
+**Built: the model's own `open_questions` are now shown.** `AdapterProposal.open_questions` (what the
+model asked while proposing and nothing answered) was never rendered anywhere, so the model could ask
+exactly the question that mattered and no human would read it. The preserved 2026-09-16 incident's
+proposal had asked "how many tiers does the source's scale have? Needed to place 'Low'", the one
+value nothing anchors, and nothing showed it. Now `GET /api/adapters/{name}/proposal` and `.../review`
+both carry `open_questions`, and the resolve panel and the signing form render them (`openQuestionsHtml`,
+`app.js`; every string through `esc()`; verified with hostile markup). **Display only, on purpose:** no
+gate, no attestation, and the wording says nothing has answered them and that confirming does not. On
+the signing form they appear only when the saved proposal descends from the same model call as the
+contract (`_open_questions_for_contract`, comparing `generator.call_log_digest`). That is lineage, not
+proof: a refused resubmit saves the edited proposal beside the older contract and the two still share
+a digest. Accepted as narrow and display-only. The existing `low_confidence` list trusts the pairing
+without even that check and is unchanged.
+
+**Replayed live: the original incident.** Against the preserved `northgate_flat_3.csv` and its saved
+proposal (copied, the original untouched): the panel that had drawn zero rows now draws one, with the
+real reason and `4`/`2` pre-filled. Insisting on `4` is refused; `5` writes an unsigned contract.
+
+**Two adversarial-review rounds** (Workflow: independent finders per risk area, one skeptic per
+finding instructed to refute it; all read-only). **Round 1 reported 12 and confirmed 11, every one in
+this session's own work.** Grouped by root cause, not by symptom:
+- *The form's column bookkeeping trusted `candidate_columns` as "columns this slot settles"* (3 findings,
+  the worst of them my own design). Offering the whole header as candidates made a one-slot fix
+  declare every unaccounted column "ignored", hiding the "neither mapped nor in unmapped_columns"
+  problem `validate_contract` exists to raise; `_isColumnUsedElsewhere` never counted enrichment
+  columns, so any enrichment-bearing proposal hit a "both mapped and listed" hard stop that was then
+  persisted as the baseline. Fix: the server sends `settle_columns` (what the replaced mapping or the
+  model's candidates read), separate from `candidate_columns` (what the picker may offer); the form
+  settles only that, removes any column the new mapping reads from `unmapped_columns`, and counts
+  enrichment.
+- *The registry-anchor check compared under the mapping's own case* (1 finding, high). The registry
+  stores aliases in one spelling, so `{critical: 4}` was refused under `case: "lower"` and accepted under
+  `"exact"`, and the form rebuilds every vocabulary as `"exact"`. Fix: `_check_alias_contradiction`
+  compares case-insensitively whatever the mapping declares, so the "no override" claim is now true.
+  Only the disagreement check is folded; `_apply_registry_aliases` still follows the mapping's case.
+  A second-round finding that `{"CRITICAL": 4}` is now refused was **refuted as the intended effect**.
+- *Candidate lists and profile lookups ignored which file a slot reads* (3 findings). Profile lookups
+  searched every file, and unresolved rows kept hallucinated candidates (a hallucinated first candidate
+  hid the value picker) with their grounding failure skipped. Fix: `_side_filename`/`_real_columns`
+  scope every lookup to the slot's own file; unresolved candidates are filtered to real columns and the
+  failure is merged into the row's reason.
+- *Two-file sources could not be resubmitted at all* (1 finding, predating this work). The edit path
+  never passed the filenames the saved proposal already carries, so every resubmit failed with CLI
+  wording the browser cannot act on. Fix: `_run_ingest_propose` passes `meta.assets_filename` and
+  `meta.findings_filename`.
+- *A display-only lookup could take the signing form down* (2 findings). `load_saved_proposal` let a
+  `UnicodeDecodeError` (a UTF-16 hand-edit, which the UI's own recourse text recommends) and a
+  non-iterable `attempt_usage` escape as non-`SchemaInferenceError`, 500ing `/proposal` and `/review`.
+  Fixed at the root in the shared loader, which `web/jobs.py`'s own comment had said not to widen
+  while it had two callers; it has four.
+- *A declined correction was reported as "Correction applied."* (1 finding). `applyLowConfidenceCorrection`
+  now says nothing was applied instead of posting the unchanged proposal.
+
+**Round 2 targeted the fixes and reported 5, confirmed 4, refuted 1 (above).** All four were gaps in
+round-1's own fixes, low-to-medium: the used-elsewhere check compared bare column names across files
+(a same-named column in the other file of a two-file source blocked settling); `settle_columns` was
+empty for `content_address`/`composed` mappings because `_mapping_source_columns` returns `[]` for
+them; and a free-text slot whose every candidate was hallucinated was left with no picker. Fixed:
+`_isColumnUsedElsewhere` takes the column's file and counts a reader only in the same file (a
+single-file source is unchanged); `_mapping_all_columns` settles every column a mapping reads;
+`_grounding_failed_detail` widens an unresolved/illegal free-text row to the slot's real header only
+when nothing real is left to choose. One scale fix found on the way: a widened whole-header row no
+longer ships a profile per column, since the free-text picker uses names, not profiles.
+
+**Verified.** 1624 passed (was 1597 at the start of this work), and every new server-side fix has a
+test that fails when the fix is broken, checked by breaking each one. The JS half has no tests and no
+`node` exists here, so it was verified in the browser pane: the enrichment scenario (`unmapped_columns`
+byte-identical before and after a form resubmit, contract written), the declined-correction guard
+with a fetch spy, the file-aware check against the reviewer's exact two-file scenario plus single-file
+and enrichment controls, and an all-hallucinated-candidate `hostname` resolved through the real form.
+The corpwide and demo baselines are unchanged and both confirmed contracts still rereview clean.
+
+**Still open.** (1) itco still refuses at ingest for three assets with conflicting per-row values
+(unchanged; awaiting a decision on `Date_Detected` versus fixing the source). (2) A proposal that is
+fully mapped and grounded but fails whole-contract validation still opens the panel with zero rows and
+a no-op Resubmit; the reason lives only in `incomplete_reason`. Two of the round-2 defects reached
+this same dead end, which makes it worth doing next. (3) `app.js` still has no regression tests; four
+behaviors were fixed in it this round and each is pinned only by the live checks above.
