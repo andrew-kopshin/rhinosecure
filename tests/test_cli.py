@@ -134,6 +134,15 @@ class _FakeCoordinator:
     # the same "no research on file" defaults (False/None) real cli.py code
     # already falls back to when research_by_id.get(fid) is None.
     research_by_id: dict = {}
+    # Per-stage crewai UsageMetrics -- None by default, matching the real
+    # RunState's own default (agents/coordinator.py) for a stage that never
+    # dispatched. _print_usage_summary (cli.py) reads all four; a test that
+    # wants a usage line printed sets one or more of these before calling
+    # main()/run_agents().
+    research_usage = None
+    environment_usage = None
+    risk_usage = None
+    tot_usage = None
 
     def __init__(
         self,
@@ -162,6 +171,10 @@ class _FakeCoordinator:
             tot_by_id=_FakeCoordinator.tot_by_id,
             last_raw_output=_FakeCoordinator.last_raw_output,
             research_by_id=_FakeCoordinator.research_by_id,
+            research_usage=_FakeCoordinator.research_usage,
+            environment_usage=_FakeCoordinator.environment_usage,
+            risk_usage=_FakeCoordinator.risk_usage,
+            tot_usage=_FakeCoordinator.tot_usage,
         )
 
     def run(self, findings):
@@ -185,6 +198,10 @@ def _reset_fake_coordinator():
     _FakeCoordinator.last_ingest_format = None
     _FakeCoordinator.last_contract = None
     _FakeCoordinator.research_by_id = {}
+    _FakeCoordinator.research_usage = None
+    _FakeCoordinator.environment_usage = None
+    _FakeCoordinator.risk_usage = None
+    _FakeCoordinator.tot_usage = None
 
 
 def _fake_recommendation(finding_id="F01", risk_score=42.0, bucket="next_window"):
@@ -390,6 +407,66 @@ def test_agents_path_prints_contested_rate(monkeypatch, capsys):
     assert main(["run", "--data", "demo", "--agents"]) == 0
     out = capsys.readouterr().out
     assert "Contested: 1/2 (50.0%) of scored findings" in out
+
+
+# --- usage/cost summary (CLAUDE.md Safety and guardrails, "Open" item 2) ----
+
+
+def test_agents_path_prints_usage_and_cost_summed_across_stages(monkeypatch, capsys):
+    from crewai.types.usage_metrics import UsageMetrics
+
+    monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
+    _FakeCoordinator.result = [_fake_recommendation()]
+    # 1M prompt + 1M completion tokens combined across all four stages, at
+    # $2/$10 per MTok (llm.py) -- $2.00 + $10.00 = $12.00 total, chosen so a
+    # transposed rate or a dropped stage is obvious in the assertion below
+    # rather than lost in rounding.
+    _FakeCoordinator.research_usage = UsageMetrics(prompt_tokens=500_000, completion_tokens=100_000, total_tokens=600_000, successful_requests=3)
+    _FakeCoordinator.environment_usage = UsageMetrics(prompt_tokens=300_000, completion_tokens=200_000, total_tokens=500_000, successful_requests=2)
+    _FakeCoordinator.risk_usage = UsageMetrics(prompt_tokens=200_000, completion_tokens=300_000, total_tokens=500_000, successful_requests=2)
+    _FakeCoordinator.tot_usage = UsageMetrics(prompt_tokens=0, completion_tokens=400_000, total_tokens=400_000, successful_requests=4)
+
+    assert main(["run", "--data", "demo", "--agents"]) == 0
+    out = capsys.readouterr().out
+    assert "Usage: 1,000,000 prompt + 1,000,000 completion tokens (11 request(s)), est. $12.00" in out
+    assert "research: 500,000 prompt + 100,000 completion tokens, est. $2.00" in out
+    assert "environment: 300,000 prompt + 200,000 completion tokens, est. $2.60" in out
+    assert "risk: 200,000 prompt + 300,000 completion tokens, est. $3.40" in out
+    assert "tot: 0 prompt + 400,000 completion tokens, est. $4.00" in out
+
+
+def test_agents_path_prints_nothing_about_usage_when_no_stage_ran(monkeypatch, capsys):
+    """All four default to None (agents/coordinator.py's own RunState
+    default) -- a pathological all-findings-failed run, say. Nothing here
+    should print a $0.00 line for a stage that never returned a usage
+    report at all; the whole block should simply be absent."""
+    monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
+    _FakeCoordinator.result = [_fake_recommendation()]
+
+    assert main(["run", "--data", "demo", "--agents"]) == 0
+    out = capsys.readouterr().out
+    assert "Usage:" not in out
+
+
+def test_agents_path_omits_a_stage_that_never_dispatched_from_usage_breakdown(monkeypatch, capsys):
+    """The common real case: no finding was contested, so tot_usage stays
+    None while the other three stages genuinely ran. tot must be absent
+    from the breakdown, not printed as a $0.00 line -- that would misreport
+    a stage that never dispatched as one that ran for free."""
+    from crewai.types.usage_metrics import UsageMetrics
+
+    monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
+    _FakeCoordinator.result = [_fake_recommendation()]
+    _FakeCoordinator.research_usage = UsageMetrics(prompt_tokens=100, completion_tokens=50, total_tokens=150, successful_requests=1)
+    _FakeCoordinator.environment_usage = UsageMetrics(prompt_tokens=100, completion_tokens=50, total_tokens=150, successful_requests=1)
+    _FakeCoordinator.risk_usage = UsageMetrics(prompt_tokens=100, completion_tokens=50, total_tokens=150, successful_requests=1)
+    # tot_usage left at its default (None): nothing was contested.
+
+    assert main(["run", "--data", "demo", "--agents"]) == 0
+    out = capsys.readouterr().out
+    assert "Usage:" in out
+    assert "tot:" not in out
+    assert "research:" in out and "environment:" in out and "risk:" in out
 
 
 def test_agents_explain_prints_the_tot_winner_for_a_contested_finding(monkeypatch, capsys):
@@ -1181,12 +1258,31 @@ def test_remediation_mark_unknown_finding_id_warns_but_still_records(tmp_path, c
     exit_code = main(["remediation", "mark", "NOPE-999", "deferred", "--db", str(db_path)])
     assert exit_code == 0
     captured = capsys.readouterr()
-    assert "no scored run has ever seen finding_id 'NOPE-999'" in captured.err
+    assert "no AGENT run has recorded finding_id 'NOPE-999'" in captured.err
     assert "Recorded: NOPE-999" in captured.out
 
     from rhinosecure.memory import Memory
 
     assert Memory(db_path).latest_remediation_event_for_finding("NOPE-999").status == "deferred"
+
+
+def test_remediation_mark_warns_for_a_real_finding_id_only_scored_deterministically(tmp_path, capsys):
+    """The actual motivating case for this warning's reworded text (docs/
+    handoff-2026-09-20.md section 5): F01 is a real, valid finding_id in the
+    demo fixture -- the OLD wording ("no scored run has ever seen
+    finding_id") was simply false for it, and would tell a human to go
+    check for a typo that doesn't exist. `decisions_for_finding` is
+    populated only by Coordinator.run (the --agents/constraint paths), so a
+    plain `rhino run` never touches it -- the warning should still fire
+    (nothing here claims the id doesn't exist), but must name what was
+    actually checked, not overclaim omniscience about every scored run."""
+    db_path = tmp_path / "track.db"
+    exit_code = main(["remediation", "mark", "F01", "deferred", "--db", str(db_path)])
+    assert exit_code == 0
+    err = capsys.readouterr().err
+    assert "no AGENT run has recorded finding_id 'F01'" in err
+    assert "never persists one" in err
+    assert "not a sign of a typo by itself" in err
 
 
 def test_remediation_mark_known_finding_id_prints_no_warning(tmp_path, capsys):
@@ -1204,7 +1300,7 @@ def test_remediation_mark_known_finding_id_prints_no_warning(tmp_path, capsys):
 
     exit_code = main(["remediation", "mark", "F14", "remediated", "--note", "fixed", "--db", str(db_path)])
     assert exit_code == 0
-    assert "no scored run has ever seen" not in capsys.readouterr().err
+    assert "no AGENT run has recorded" not in capsys.readouterr().err
 
 
 def test_remediation_mark_open_from_remediated_without_note_is_refused(tmp_path, capsys):

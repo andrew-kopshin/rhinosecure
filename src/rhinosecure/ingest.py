@@ -230,6 +230,29 @@ def open_csv(path: Path) -> tuple[IO[str], csv.DictReader]:
     except UnicodeDecodeError as exc:
         f.close()
         raise IngestError(_decode_error_message(path, encoding, exc)) from exc
+    # The native/defender/bluepeak formats all assume comma -- csv.DictReader
+    # is never told otherwise -- so a semicolon- or tab-delimited export
+    # parses as exactly ONE column, whatever the header line's full text is.
+    # Every row then has that one field; Asset/Finding.model_validate fails
+    # because the required fields are simply absent as keys, and the raw
+    # pydantic ValidationError plus the row's own repr (a dict with one long
+    # mangled key) reached the user with no hint that the delimiter, not the
+    # data, was the actual problem. Diagnosed here, at the one place every
+    # adapter's CSV read already goes through, the same way `_non_text_
+    # container`/`_decode_error_message` diagnose the two OTHER ways a file
+    # isn't the comma-separated text this reader assumes -- this doesn't
+    # change what's accepted (a semicolon/tab file is still refused either
+    # way), only what the refusal says.
+    if len(fieldnames) == 1:
+        header = fieldnames[0]
+        for char, label in ((";", "semicolon"), ("\t", "tab"), ("|", "pipe")):
+            if char in header:
+                f.close()
+                raise IngestError(
+                    f"{path}: the header parsed as a single column {header!r} -- this looks like a "
+                    f"{label}-delimited CSV, not a comma-delimited one. This format expects comma-"
+                    "separated files; re-export with commas."
+                )
     duplicates = sorted({name for name in fieldnames if fieldnames.count(name) > 1})
     if duplicates:
         f.close()

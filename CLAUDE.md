@@ -2807,3 +2807,227 @@ human's own conflicting rows would need to be. **The user's answer: keep the ref
 change. `itco` (`data/itco/synthetic_it_company_cve_dataset_50.csv`) does not reach a plan today, and
 won't until either the source rows themselves are corrected or a genuinely conservative resolution
 rule is proposed and decided on its own -- neither is being built now.
+
+---
+
+## `app.js` gets regression tests: a browser-based harness (2026-09-22)
+
+**Decided, asked not assumed.** "`app.js` has no regression tests" has been a recurring caveat on
+every recent client-side fix (this file's own entries above say so repeatedly), and the entry right
+above this one is exactly why it stopped being tolerable: a syntax error that would have silently
+disabled the entire web UI shipped into the working tree and was only caught because a human happened
+to load the file in a real JS engine before it was committed. Two real options exist, and they are not
+close to equivalent in cost: install Node.js and a real framework (Vitest/Jest -- standard, CI-friendly,
+but an entirely new toolchain for a project whose Section 11 is Python-only by deliberate choice, on a
+machine that has neither Node nor npm installed at all), or a checked-in HTML page that loads the real
+`app.js` and runs assertions in the browser pane's own JS engine -- the same tool that caught the bug
+this entry follows up on, made repeatable instead of ad hoc. **The user's answer: the browser-based
+harness.** No new toolchain, no new install.
+
+**Built.** `tests/js/app_test.html` -- a real copy of `index.html`'s DOM skeleton (so `boot()`'s own
+sequence runs to completion without throwing on a missing element, though no test depends on `boot()`
+succeeding), the real `app.js` loaded via `<script src="../../src/rhinosecure/web/static/app.js">` (not
+a copy -- every run exercises the CURRENT source), and a minimal dependency-free test runner
+(`test()`/`assert()`/`assertEqual()`, no framework) below it. Results read three ways: the page title
+(`N/M passed`), a color-coded `#test-report` block, and `window.__TEST_RESULTS__` for
+`javascript_tool` to read directly. `tests/js/README.md` documents how to run it and how to extend it.
+
+Seventeen tests, scoped to exactly what this session's bugs touched, not a claim of full coverage:
+load integrity (functions spot-checked at the file's start/middle/end -- a syntax error anywhere aborts
+parsing of the WHOLE classic `<script>`, so this is the cheapest check with the broadest reach); `esc()`;
+`recourseCommand()`/`recourseHtml()` across both fixed bugs (the Windows-backslash normalization and the
+leading-`-` argparse-ambiguity guard) plus their existing single-file/two-file/space-quoting/refusal
+behavior; `renderResolvePanel()` for the zero-row case, the ordinary correctable-row case, and a clean
+no-op control.
+
+**A real, load-bearing defect found while building the harness itself, not a hypothetical.** The
+built-in browser pane cannot open `file://` URLs at all (confirmed via the built-in-browser skill: it
+runs somewhere other than where Claude's shell runs), so the harness needs an HTTP server in front of
+it. The obvious choice, a bare `python -m http.server`, sends no `Cache-Control` header at all --
+confirmed live: editing `app.js` on disk and reloading the test page, even in a brand-new tab, kept
+reporting the OLD file's results. A test harness that can silently report stale, cached code as passing
+is worse than no harness at all -- it launders exactly the false confidence this work exists to remove.
+`tests/js/serve_no_cache.py` (new, replacing the bare module in the `rhino-js-tests` entry in
+`.claude/launch.json`) sends `Cache-Control: no-store, no-cache, must-revalidate` on every response --
+the same property the real `rhino web` server already has, for the identical reason (`Cache-Control:
+no-cache`, commit `71dd50d`).
+
+**Verified the harness has real teeth, not just that it runs clean.** A passing test never confirmed to
+fail against the bug it targets proves nothing -- which is exactly how the syntax error this harness
+exists to catch shipped in the first place. Both real bugs fixed this session were reintroduced one at a
+time, confirmed to turn the harness red with the expected diagnosis, then reverted and confirmed green
+again, with `git diff --stat` empty afterward each time (proof the revert round-tripped back to the
+exact committed version, not an approximation of it): reintroducing the missing-backslash regex dropped
+the suite to 0/17, with the load-integrity test naming `esc` as undefined and pointing at a parse
+failure, not a generic assertion error; reintroducing the permissive (no-leading-`-`-guard) `SAFE_WORD`/
+`SAFE_PATH` failed exactly the three tests that exercise that guard and nothing else. Full Python suite
+unaffected throughout (1629 passed) -- this entry touches no Python code.
+
+**Left open, stated so it isn't assumed done by omission.** Coverage is scoped to this session's own
+bug fixes, not the file's ~3,300 lines -- `boot()`'s fetch/render sequence, chat, uploads, jobs, and
+most tab-rendering functions remain untested, exactly as the caveat on every recent client-side entry
+already says. The extension pattern (`tests/js/README.md`) is meant to make adding to this cheap, not
+to claim the gap is closed.
+
+---
+
+## Decided: no registry-anchor override, ever (2026-09-22)
+
+The question the 2026-09-20 survey left explicitly undecided ("Row source and anchor override
+(deferred design)", above): whether a human should ever be able to override a `registry_anchor`
+disagreement -- a mapped value that contradicts `adapters/schema_registry.py`'s canonical vocabulary
+-- through the resolve panel, versus the current absolute refusal. Presented with the concrete
+options (no override at all; an override gated behind a signed attestation record) before being
+decided, not assumed. **The user's answer: no override, ever.** The registry's canonical vocabulary
+stays absolute; a `registry_anchor` disagreement is always refused, the same as before this entry.
+No code change. `resolve_criticality_anchor`/`resolve_enum_alias` continue to classify a disputed key
+for display only, never to unlock accepting it.
+
+---
+
+## `rhino run --agents` prints its own cost (2026-09-22)
+
+Closes Safety and guardrails' "Open" item 2: `Coordinator.state` has collected
+`research_usage`/`environment_usage`/`risk_usage`/`tot_usage` (one `crewai` `UsageMetrics` per
+stage) since the ToT gate landed, but nothing ever read them back out -- the 24-finding run's own
+`$3.3` cost figure elsewhere in this file could only ever be an extrapolation from an earlier,
+smaller run's measured rate, for exactly this reason.
+
+**The pricing rate moves to `llm.py`, not duplicated.** `_INPUT_USD_PER_MILLION_TOKENS`/
+`_OUTPUT_USD_PER_MILLION_TOKENS`/`_estimate_cost_usd` already existed, privately, in
+`agents/schema_inference.py` (`rhino adapt propose`'s own cost line). `cli.py` has no reason to
+import an `agents/` module just for a pricing constant, and a second, independently-maintained
+copy of the same two numbers is exactly the kind of drift this project avoids everywhere else --
+moved to `llm.py` (public names, `estimate_cost_usd`), the "single seam for LLM client
+construction and dispatch" this project already designates for anything about the pinned model,
+cost included. `schema_inference.py` now imports and calls the shared version; behavior-inert
+(same formula, same two numbers), confirmed by its own full test suite passing unmodified.
+Deliberately still a plain, undiscounted estimate -- ignores `cached_prompt_tokens`/
+`cache_creation_tokens`, since neither this function nor its callers have a per-call cache-hit/miss
+breakdown to apply the right multiplier to, and a wrong multiplier would be exactly the
+confident-looking, fabricated number this project's not-collected/refuse-rather-than-guess
+discipline argues against elsewhere. Documented as a known simplification in `llm.py` itself, not
+silently treated as exact.
+
+**Built:** `cli.py`'s `_print_usage_summary(state)`, called right after `_print_contested_rate` in
+the `--agents` dispatch path, mirrors `_print_failures`'s own `stages = (("research", ...),
+("environment", ...), ("risk", ...), ("tot", ...))` shape. Sums whichever stages actually
+dispatched (`UsageMetrics.add_usage_metrics`, the identical pattern `_dispatch_tot` already uses to
+accumulate `tot_usage` across contested findings) into one total line, then a per-stage breakdown.
+A stage that never dispatched (`tot_usage` is `None` when nothing was contested; `research`/
+`environment`/`risk` stay `None` only in a pathological all-findings-failed run) is OMITTED, never
+printed as a `$0.00` line -- a `$0.00` line would read as "this stage ran and cost nothing,"
+misreporting a stage that simply never returned a usage report at all. Imports (`crewai.types
+.usage_metrics.UsageMetrics`, `rhinosecure.llm.estimate_cost_usd`) are local to the function, the
+same lazy-import convention the `--agents` branch already uses for everything crewai-touching --
+confirmed by the existing `test_cli_module_does_not_import_crewai_at_module_level` AST-based test
+passing unmodified.
+
+**Verified deterministically, not against a real paid run.** The underlying usage data isn't new --
+already real, already tested crewai plumbing (`tests/test_coordinator.py`'s own `tot_usage`
+accumulation assertions) -- so this is a new READER of already-correct data, not new
+usage-tracking logic. Three new tests in `tests/test_cli.py`, via the existing `_FakeCoordinator`
+harness (extended with `research_usage`/`environment_usage`/`risk_usage`/`tot_usage` fields,
+`None` by default matching `RunState`'s own default -- every existing `--agents` CLI test was
+silently exercising the new call site already and needed this to keep passing): summation math
+across all four stages ($2/$10 per MTok, chosen so a transposed rate or a dropped stage is obvious
+rather than lost in rounding); the all-`None` case prints nothing; a stage that never dispatched
+(`tot_usage=None`, the common real case -- nothing contested) is omitted from the breakdown, not
+printed as free. Spending several real dollars on a live agents run to re-confirm pure,
+already-unit-tested Python summation and print logic was judged the wrong tradeoff and skipped;
+offered, not assumed, if tighter confidence is wanted.
+
+---
+
+## The small-defects batch: docs/handoff-2026-09-20.md section 5, closed (2026-09-22)
+
+Seven items, each looked like "just a small defect" but three turned out to have a real decision
+hiding inside -- investigated and presented with concrete options before touching any code, not
+assumed. All decisions were the recommended (status-quo or safest) option.
+
+**Decided, no code change (2 of 7).**
+- **"0 patches fit this window" as a capacity limit.** Not actually a bug: `apply_capacity_limit`
+  handles `limit=0` correctly and deterministically (every `next_window` finding becomes
+  `deferred_capacity`, nothing downstream breaks), and a dedicated regression test
+  (`test_submit_capacity_constraint_limit_zero_is_a_real_limit_not_a_decline`, predating this
+  session) already pins 0 as a real, meaningful limit distinct from `None` (a parse failure) --
+  0 is falsy in Python, so a naive `if not patch_limit` would have silently misrouted it. The
+  actual question was never "is this a bug," it was "should this tested, deliberate decision be
+  reversed" -- presented that way. **Kept as-is**: 0 is honored as a legitimate freeze/moratorium
+  ("no capacity this cycle, defer everything"), not routed into extra friction.
+- **Constraint "why" narrative can claim the constraint "moderated the score" when only the bucket
+  moved.** A scoped instance of this file's own already-open "Grounding validation" item (Safety
+  and guardrails), which explicitly rejects both a general fix and "an LLM checking another LLM's
+  prose" as a second unreliable opinion -- "unsupported claim"/"invented detail" is exactly the
+  class of error that item already names as unsolved on purpose, not a fresh gap. **Left as the
+  documented limitation it already was.**
+
+**Fixed (5 of 7).**
+- **`remediation mark`'s false "no scored run has ever seen finding_id X" warning.** `decisions_
+  for_finding` is populated only by `Coordinator.run` (the `--agents`/constraint paths) --
+  `memory.py`'s own `record_decision` is never called on the deterministic path at all, by design
+  (`export.py`'s own docstring says so), so the warning fired, wrongly worded, for every real,
+  validly-scored finding that was only ever run through plain `rhino run`. Message-only fix (the
+  cheaper of two real options; the other -- making the deterministic path persist runs too --
+  would reverse a documented architectural boundary stated in three places and was declined):
+  reworded in `cli.py` and `web/jobs.py`'s `_run_remediation_mark` docstring to say what's
+  actually checked ("no AGENT run has recorded...") instead of overclaiming omniscience about
+  every scored run. New test uses a REAL demo-fixture finding_id (`F01`), not a fabricated one --
+  the old wording's actual failure mode was telling a human to go check for a typo that didn't
+  exist.
+- **A semicolon-delimited CSV in the native format got a cryptic "invalid asset row" dump.**
+  `csv.DictReader` is never told a delimiter, so a semicolon/tab/pipe file parses as exactly one
+  mangled column, and every row then failed `Asset`/`Finding.model_validate` with a raw pydantic
+  repr naming nothing about the real cause. `ingest.open_csv` now recognizes a single-column
+  header containing `;`/`\t`/`|` and names the likely delimiter directly -- the same shape its
+  existing ZIP-container check (`.xlsx` renamed to `.csv`) already uses for a different
+  misconfiguration: diagnosed, not silently accepted (a semicolon file is still refused either
+  way). Five new tests, including a genuinely single-column file (must NOT be misdiagnosed) and a
+  normal comma file (must be unaffected).
+- **The web Constraints tab had no remove control (the CLI had `retract`).** New synchronous route,
+  `POST /api/constraints/{id}/retract` (`web/jobs.py`) -- not a job kind: a single SQLite
+  soft-delete, no LLM, no ingest, the same "cheapest possible write" instinct `rhino remediation
+  mark` already applies. Mirrors the CLI exactly, including the one thing that could look like a
+  UX decision but isn't: it does NOT refresh the displayed plan (`/api/export` is a static snapshot
+  from the last run -- refreshing it would show the exact same, now-stale "active" state, not the
+  retraction that just happened; the CLI's own message already says "unchanged until re-run").
+  Frontend: a `Remove` button on `assetConstraintHtml`, shown only for an active constraint with
+  jobs enabled, updating the card in place client-side rather than re-rendering the page. Capacity
+  constraints get no button, matching `memory.py`'s own "no active/deactivate concept" for that
+  table. 6 new pytest tests (`tests/test_web_constraints.py`) plus 5 new `app_test.html` tests;
+  verified live end to end (real server, real click, real SQLite row flipping to `active=0`), not
+  just against fakes.
+- **The Overview "Deferred (Capacity)" bar could never be non-zero.** Confirmed, not fixed as a
+  bug: `Bucket.DEFERRED_CAPACITY` is assigned in exactly one place (`apply_capacity_limit`, only
+  reachable via a capacity-constraint submission), which writes only to `Memory`, never back onto
+  `Coordinator.state`/`.ranked()` -- so the LIVE findings list the Overview bar and coverage
+  summary read from can structurally never contain that bucket. The real historical data was
+  already shown correctly, just in the right place (the Constraints tab's own capacity-delta
+  table). Removed the dead segment/note/table-row rather than repurposing it (the recommended,
+  simplest option): `LIVE_BUCKET_ORDER` (`app.js`) is `BUCKET_ORDER` minus `deferred_capacity`,
+  used only by the two live-distribution render sites; `BUCKET_ORDER`/`BUCKET_LABELS` themselves
+  keep all six entries, since the Constraints tab's capacity table still uses the label/CSS class
+  directly. 4 new `app_test.html` tests, confirmed live (the real Overview page now renders five
+  bars, not six).
+- **The run-agents control silently lost `--format`/`--adapter-config` on re-run.** The control
+  posted `baseName(data.run.data_dir)` as `source_ref`; `resolve_source_ref`'s own bare-directory
+  fallback ALWAYS resolves as native (confirmed by reading it -- there is no way for a bare
+  directory name to carry a non-native `fmt` at all), silently breaking any plan started with
+  `--format`/`--adapter-config`. Fixed with a recognized sentinel, `RERUN_CURRENT_PLAN_SOURCE_REF`
+  (`"__current_plan__"`, defined identically in `web/jobs.py` and `app.js`, kept in sync by
+  comment/discipline the same way `"uploads/<id>"` already is across both languages) -- NOT an
+  empty `source_ref`, because `validate_job_input`'s fast, pre-dispatch 400 check
+  (`_REQUIRED_JOB_INPUT_FIELDS`) has no access to `plan_state` and can't itself know an empty
+  value would be legal here; weakening that shared, documented safety net for one caller was
+  rejected in favor of a non-empty value with special meaning, the same shape `source_ref` already
+  has. `_run_run_agents` recognizes the sentinel and reuses `plan_state.active_source` --
+  server-side, no string round-trip -- directly, bypassing `resolve_source_ref` entirely for this
+  case. Verified three ways: a white-box test proving `resolve_source_ref` is never called and the
+  exact `ResolvedSource` object (fmt `"defender"` included) passes through unchanged; a real HTTP
+  end-to-end dispatch (native format, proving the full job pipeline still works); and a frontend
+  test confirming `startRunAgents` sends the sentinel, never a reconstructed basename.
+
+**Verified throughout, not just narrated.** Every fix above has a test that was confirmed to fail
+when the fix is reverted (checked by actually reverting each one and re-running), not merely
+written and trusted. Full suite: 1647 passed (was 1629 before this batch). `app.js`'s own
+regression harness (the entry above this one): 26/26.

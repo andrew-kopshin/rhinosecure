@@ -1,0 +1,554 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>app.js regression tests</title>
+  <link rel="stylesheet" href="../../src/rhinosecure/web/static/styles.css" />
+  <style>
+    /* Test-harness-only styling. Kept separate from styles.css (the app's
+     * own stylesheet, loaded above for visual fidelity, not correctness)
+     * so nothing here can be confused for an app style or vice versa. */
+    #test-report {
+      font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+      white-space: pre-wrap;
+      padding: 1rem;
+      margin: 1rem;
+      border: 1px solid #8884;
+      border-radius: 6px;
+    }
+    #test-report.all-pass { color: #1a7f37; }
+    #test-report.has-fail { color: #cf222e; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <!-- ============================================================
+       Everything from here to the closing </div> of #app, plus the
+       two siblings after it, is a VERBATIM copy of the real
+       src/rhinosecure/web/static/index.html skeleton. It exists so
+       app.js's own boot() sequence (registered below, at the bottom
+       of app.js, via document.addEventListener("DOMContentLoaded",
+       boot)) has every element it expects (#error-banner,
+       #empty-workspace, .tab-btn, etc.) and runs to completion
+       without throwing on a missing element -- not because the tests
+       below depend on boot() succeeding (they don't: they call
+       functions directly with hand-built arguments), but so a test
+       run's console/output is never polluted by an unrelated,
+       environment-shaped error that has nothing to do with what
+       broke.
+
+       This is a COPY, not a shared include (no build step, no
+       template engine here -- app.js itself is plain vanilla JS for
+       the same reason). If index.html's skeleton changes in a way
+       app.js's boot()/setupTabs()/showError()/showEmptyWorkspace()
+       depend on, this needs the same change, or the load-integrity
+       test below may start reporting unrelated console noise as if
+       it were a real failure. It won't report a FALSE PASS either
+       way: boot() failing does not stop the test script below from
+       running, since boot()'s own try/catch keeps a fetch failure
+       from throwing synchronously, and any remaining unhandled
+       rejection is isolated to boot()'s own async call stack. -->
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">&#128058;</span>
+        <span class="brand-name">RhinoSecure</span>
+        <span class="brand-sub">read-only plan viewer</span>
+      </div>
+      <div id="run-meta" class="run-meta"></div>
+      <button id="chat-toggle-btn" class="chat-toggle-btn" type="button" hidden>Chat</button>
+    </header>
+
+    <div class="layout">
+      <aside class="sidebar">
+        <h2 class="sidebar-title">Pipeline</h2>
+        <ol id="pipeline-stages" class="stage-list"></ol>
+        <div id="run-agents-control" class="run-agents-control" hidden></div>
+      </aside>
+
+      <main class="main">
+        <nav class="tabs" id="tabs">
+          <button class="tab-btn active" data-tab="overview" type="button">Overview</button>
+          <button class="tab-btn" data-tab="findings" type="button">Findings</button>
+          <button class="tab-btn" data-tab="contested" type="button">Contested</button>
+          <button class="tab-btn" data-tab="scenarios" type="button">Scenarios</button>
+          <button class="tab-btn" data-tab="constraints" type="button">Constraints</button>
+        </nav>
+
+        <section id="tab-overview" class="tab-panel active"></section>
+        <section id="tab-findings" class="tab-panel"></section>
+        <section id="tab-contested" class="tab-panel"></section>
+        <section id="tab-scenarios" class="tab-panel"></section>
+        <section id="tab-constraints" class="tab-panel"></section>
+      </main>
+
+      <aside id="chat-panel" class="chat-panel" hidden>
+        <div class="chat-panel-head">
+          <h2>Chat — this plan only</h2>
+          <button id="chat-close-btn" class="chat-close-btn" type="button" aria-label="Close chat">&times;</button>
+        </div>
+        <p class="chat-panel-hint">
+          Answers are grounded in this export only — no CVE knowledge, no live lookups. Every
+          citation shows the finding's real score and bucket, taken from the export, never from
+          the model.
+        </p>
+        <div id="chat-messages" class="chat-messages"></div>
+        <form id="chat-form" class="chat-form">
+          <textarea id="chat-input" rows="2" placeholder="Ask about this plan..."></textarea>
+          <button id="chat-send-btn" type="submit">Send</button>
+        </form>
+      </aside>
+    </div>
+
+    <div id="empty-workspace" class="empty-workspace" hidden>
+      <div class="empty-workspace-inner">
+        <h1 class="empty-workspace-title">No plan yet</h1>
+        <p class="hint">Upload a vulnerability scan, or just say what you'd like to do.</p>
+
+        <div class="card empty-upload-card">
+          <h3>Upload a file</h3>
+          <p class="hint">
+            One file (a self-describing export), or two (an inventory file and a findings
+            file — you'll be asked to label which is which).
+          </p>
+          <input type="file" id="empty-upload-input" />
+          <div id="empty-upload-status" class="empty-upload-status"></div>
+        </div>
+
+        <div class="card empty-route-card">
+          <h3>Or just ask</h3>
+          <div id="empty-route-messages" class="chat-messages empty-route-messages"></div>
+          <form id="empty-route-form" class="chat-form">
+            <textarea
+              id="empty-route-input"
+              rows="2"
+              placeholder='e.g. "run the demo plan" or "analyze the file I just uploaded"'
+            ></textarea>
+            <button id="empty-route-send-btn" type="submit">Send</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="error-banner" class="error-banner" hidden></div>
+  <div id="job-status" class="job-status" hidden></div>
+
+  <!-- The real, current source -- not a copy. Every test below is
+       exercising THIS file, loaded exactly as production loads it: a
+       plain classic <script>, no type="module", no build step. That
+       matters for the load-integrity test immediately below: a
+       classic-script function declaration attaches to `window`, which
+       is what lets that test tell "the whole file parsed" apart from
+       "these specific names happen to exist". -->
+  <script src="../../src/rhinosecure/web/static/app.js"></script>
+
+  <hr />
+  <div id="test-report">Running…</div>
+
+  <script>
+    /* ================================================================
+     * Minimal, dependency-free test runner. No framework: this project
+     * has no Node.js/npm toolchain (CLAUDE.md Section 11 is Python-only
+     * by deliberate choice), and the browser pane's own JS engine is
+     * already proven infrastructure for exercising this file live --
+     * see the CLAUDE.md entry this test file was written to follow up
+     * on ("Resolve-slots: the zero-row panel closed, and a shipped
+     * syntax error caught before it landed"). This is that verification
+     * made repeatable and checked in, not a new tool.
+     *
+     * Run it by opening this file in the browser pane (a real server is
+     * not required -- every skeleton element app.js's boot() sequence
+     * touches is present above, and its own try/catch already tolerates
+     * fetch() failing under file://). Read the result three ways: the
+     * page title ("N/M passed -- app.js tests"), the #test-report block
+     * (color-coded), or window.__TEST_RESULTS__ (a plain object, for
+     * driving this from javascript_tool without scraping text).
+     *
+     * To add a test: call test("description", () => { ...assertions... }).
+     * A thrown exception (assert/assertEqual, or anything else) fails
+     * that one test and is reported with its message; nothing here stops
+     * at the first failure. `fn` may also be `async () => { ... }` (or
+     * return any Promise) -- test() awaits it before scoring pass/fail, and
+     * the report at the bottom waits for every test to actually settle
+     * before reading `results`. This matters: a naive runner that just
+     * calls `fn()` and immediately records "pass" would mark an async test
+     * green the instant it STARTS, not when it finishes -- exactly the kind
+     * of false confidence this whole file exists to prevent elsewhere.
+     * Confirmed live while adding the first async test here: without this,
+     * a deliberately-broken assertion inside a `.then()` callback still
+     * reported "pass". ================================================================ */
+    (async function () {
+      "use strict";
+      const results = [];
+
+      async function test(name, fn) {
+        const record = { name, pass: null };
+        results.push(record);
+        try {
+          await fn(); // awaiting a non-Promise return value is a harmless no-op
+          record.pass = true;
+        } catch (e) {
+          record.pass = false;
+          record.error = e && e.message ? e.message : String(e);
+        }
+      }
+
+      function assert(condition, message) {
+        if (!condition) throw new Error(message || "assertion failed");
+      }
+
+      function assertEqual(actual, expected, label) {
+        if (actual !== expected) {
+          throw new Error(
+            `${label ? label + ": " : ""}expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`
+          );
+        }
+      }
+
+      // ---------------------------------------------------------------
+      // Load integrity. A JavaScript syntax error anywhere in a classic
+      // (non-module) <script> aborts parsing of the WHOLE file -- this
+      // is exactly how a missing backslash in one regex literal, deep in
+      // the file, once silently disabled every function in app.js for
+      // every visitor (CLAUDE.md, "Resolve-slots: the zero-row panel
+      // closed..."). Checking one function proves nothing about the
+      // rest of the file; checking functions spread across the file's
+      // start, middle and end is what actually proves the whole thing
+      // parsed. If this test ever fails, look for a syntax error, not a
+      // logic bug -- everything below it will ALSO be failing, because
+      // none of these names will exist at all.
+      // ---------------------------------------------------------------
+      await test("app.js parses and executes without a syntax error (spot-checked start/middle/end)", () => {
+        const expected = [
+          "esc", "bucketLabel", "setupTabs", // early
+          "recourseCommand", "recourseHtml", "renderResolvePanel", "resolveSlotRowHtml", // middle
+          "renderAll", "boot", // late
+        ];
+        for (const name of expected) {
+          assert(
+            typeof window[name] === "function",
+            `window.${name} should be a function, was ${typeof window[name]} -- app.js likely failed to parse`
+          );
+        }
+      });
+
+      // ---------------------------------------------------------------
+      // esc() -- the HTML-escaping helper nearly every render function
+      // in this file routes untrusted text through.
+      // ---------------------------------------------------------------
+      await test("esc() escapes every HTML-significant character", () => {
+        assertEqual(esc(`<b>"'&`), "&lt;b&gt;&quot;&#39;&amp;");
+      });
+      await test("esc() renders null/undefined as an empty string, not the literal word", () => {
+        assertEqual(esc(null), "");
+        assertEqual(esc(undefined), "");
+      });
+
+      // ---------------------------------------------------------------
+      // recourseCommand() / recourseHtml() -- the printed CLI recourse
+      // text. Regression coverage for the two real, live-confirmed bugs
+      // fixed alongside this test file: a missing backslash in the
+      // Windows-path normalization regex (a JS SYNTAX ERROR, caught by
+      // the load-integrity test above too, if it recurs) and a leading
+      // "-" in a filename/name/id being read by argparse as another
+      // flag rather than a value, regardless of shell quoting.
+      // ---------------------------------------------------------------
+      await test("recourseCommand: normalizes a Windows backslash path to forward slashes", () => {
+        const cmd = recourseCommand(
+          "upload-x", "abc123",
+          "C:\\Users\\akops\\out\\propose_upload-x.json", null
+        );
+        assertEqual(
+          cmd,
+          "rhino adapt propose upload-x --data uploads/abc123 --from-proposal C:/Users/akops/out/propose_upload-x.json"
+        );
+      });
+      await test("recourseCommand: a normal single-file source", () => {
+        const cmd = recourseCommand("bluepeak-gen", "abc123", "out/propose_bluepeak-gen.json", null);
+        assertEqual(
+          cmd,
+          "rhino adapt propose bluepeak-gen --data uploads/abc123 --from-proposal out/propose_bluepeak-gen.json"
+        );
+      });
+      await test("recourseCommand: a two-file source includes both filenames", () => {
+        const cmd = recourseCommand("itco", "abc123", "out/propose_itco.json", {
+          assets_filename: "devices.csv",
+          findings_filename: "vulns.csv",
+        });
+        assertEqual(
+          cmd,
+          "rhino adapt propose itco --data uploads/abc123 --assets-file devices.csv --findings-file vulns.csv --from-proposal out/propose_itco.json"
+        );
+      });
+      await test("recourseCommand: a single-file source (assets_filename === findings_filename) omits --assets-file/--findings-file", () => {
+        const cmd = recourseCommand("bluepeak", "abc123", "out/propose_bluepeak.json", {
+          assets_filename: "inventory.csv",
+          findings_filename: "inventory.csv",
+        });
+        assert(!cmd.includes("--assets-file"), "a single-file source should not print --assets-file");
+      });
+      await test("recourseCommand: quotes a path containing a space", () => {
+        const cmd = recourseCommand("name1", "abc123", "out/propose one.json", null);
+        assertEqual(cmd, 'rhino adapt propose name1 --data uploads/abc123 --from-proposal "out/propose one.json"');
+      });
+      await test("recourseCommand: refuses (returns null) a leading-hyphen assets_filename", () => {
+        const cmd = recourseCommand("itco", "abc123", "out/propose_itco.json", {
+          assets_filename: "-weird.csv",
+          findings_filename: "vulns.csv",
+        });
+        assertEqual(cmd, null);
+      });
+      await test("recourseCommand: refuses a leading-hyphen name", () => {
+        assertEqual(recourseCommand("-rf", "abc123", "out/propose.json", null), null);
+      });
+      await test("recourseCommand: refuses a name containing a shell metacharacter", () => {
+        assertEqual(recourseCommand("foo;rm -rf", "abc123", "out/propose.json", null), null);
+        assertEqual(recourseCommand("$(whoami)", "abc123", "out/propose.json", null), null);
+        assertEqual(recourseCommand("foo`id`", "abc123", "out/propose.json", null), null);
+      });
+      await test("recourseCommand: refuses an empty path", () => {
+        assertEqual(recourseCommand("foo", "abc123", "", null), null);
+      });
+      await test("recourseHtml: falls back to generic instructions when the command is unsafe, and never prints the unsafe name", () => {
+        const html = recourseHtml("-rf", "abc123", "out/propose.json", null);
+        assert(!html.includes("<code>rhino adapt propose -rf"), "must not print the unsafe command");
+        assert(html.includes("not safe to paste into a shell"), "must explain why nothing is printed");
+      });
+      await test("recourseHtml: shows the real (unnormalized) path for the human, the normalized command for the shell", () => {
+        const html = recourseHtml("upload-x", "abc123", "C:\\Users\\out\\propose_upload-x.json", null);
+        assert(
+          html.includes("C:\\Users\\out\\propose_upload-x.json"),
+          "the human-facing 'Edit ... by hand' text should show the real, unnormalized path"
+        );
+        assert(
+          html.includes("--from-proposal C:/Users/out/propose_upload-x.json"),
+          "the shell command itself should use forward slashes"
+        );
+      });
+
+      // ---------------------------------------------------------------
+      // renderResolvePanel() -- the zero-row panel (CLAUDE.md, "Still
+      // open" (2) in the 2026-09-21 entry, closed in the 2026-09-22
+      // one) and the ordinary correctable-row case, as a control so a
+      // future change can't silently make EVERY panel hide Resubmit.
+      // ---------------------------------------------------------------
+      await test("renderResolvePanel: a zero-row proposal with a reason shows the reason and hides Resubmit", () => {
+        const card = document.createElement("div");
+        card.dataset.name = "upload-zero-row";
+        card.dataset.uploadId = "abc123";
+        card.savedProposalPath = "out/propose_upload-zero-row.json";
+        renderResolvePanel(card, [], [], "column 'Env' is read by nothing and is not declared in unmapped_columns");
+        assert(card.innerHTML.includes("No contract can be written"), "should show the incomplete_reason");
+        assert(card.innerHTML.includes("Env"), "the reason text itself should be present");
+        assert(!card.querySelector(".resolve-submit-btn"), "Resubmit must not be offered when nothing here can be corrected");
+      });
+      await test("renderResolvePanel: a correctable unresolved row still offers Resubmit", () => {
+        const card = document.createElement("div");
+        card.dataset.name = "upload-normal";
+        card.dataset.uploadId = "abc123";
+        const slot = {
+          slot: "asset.role",
+          kind: "unresolved",
+          reason: "no candidate column",
+          candidate_columns: ["Col"],
+          settle_columns: ["Col"],
+          column_profiles: {},
+          target_vocabulary: { kind: "enum", values: ["dc", "workstation"] },
+          gap_legal: false,
+          absent_fact_legal: false,
+          fatal_legal: false,
+        };
+        renderResolvePanel(card, [slot], [], null);
+        assert(!!card.querySelector(".resolve-submit-btn"), "Resubmit should be offered when at least one row is correctable");
+      });
+      await test("renderResolvePanel: no incomplete_reason and no rows renders cleanly (nothing to report)", () => {
+        const card = document.createElement("div");
+        card.dataset.name = "upload-clean";
+        card.dataset.uploadId = "abc123";
+        renderResolvePanel(card, [], [], null);
+        assert(!card.innerHTML.includes("No contract can be written"), "should not show a reason that was never given");
+      });
+
+      // ---------------------------------------------------------------
+      // LIVE_BUCKET_ORDER / computeCoverage / coverageSummaryHtml --
+      // deferred_capacity is structurally never a live finding's bucket
+      // (docs/handoff-2026-09-20.md section 5, "the Overview 'Deferred
+      // (Capacity)' bar can never be non-zero"); confirmed dead, then
+      // removed from the two live-distribution render sites rather than
+      // "fixed" as a bug. BUCKET_ORDER/BUCKET_LABELS themselves keep all
+      // six entries (the Constraints tab's capacity-delta table still uses
+      // the label/CSS class directly) -- only LIVE_BUCKET_ORDER narrows.
+      // ---------------------------------------------------------------
+      function _fakeFinding(id, bucket, overrides = {}) {
+        return Object.assign(
+          {
+            finding_id: id,
+            bucket,
+            is_kev: false,
+            risk_score: 10,
+            cve_id: "CVE-2021-0001",
+            hostname: "HOST01",
+            asset: { internet_exposed: false, role: "workstation" },
+          },
+          overrides
+        );
+      }
+      await test("LIVE_BUCKET_ORDER excludes deferred_capacity but BUCKET_ORDER still has all six", () => {
+        assert(BUCKET_ORDER.includes("deferred_capacity"), "BUCKET_ORDER itself must be untouched");
+        assert(!LIVE_BUCKET_ORDER.includes("deferred_capacity"), "LIVE_BUCKET_ORDER must exclude it");
+        assertEqual(LIVE_BUCKET_ORDER.length, BUCKET_ORDER.length - 1);
+      });
+      await test("computeCoverage: bucketBreakdown has no deferred_capacity row even when a finding somehow carries that bucket", () => {
+        // findings[] should never actually contain this bucket (that's the
+        // whole point), but the function must not depend on that INVARIANT
+        // holding to produce a clean breakdown -- it should filter the
+        // bucket out of the OUTPUT regardless of what's in the input.
+        const findings = [_fakeFinding("F01", "patch_now"), _fakeFinding("F02", "deferred_capacity")];
+        const coverage = computeCoverage(findings, new Set());
+        const buckets = coverage.bucketBreakdown.map((row) => row.bucket);
+        assert(!buckets.includes("deferred_capacity"), "deferred_capacity must not appear in bucketBreakdown");
+        assert(buckets.includes("patch_now"), "a real bucket with data must still appear");
+      });
+      await test("computeCoverage: no longer reports a deferredCapacityCount field at all", () => {
+        const coverage = computeCoverage([_fakeFinding("F01", "patch_now")], new Set());
+        assert(!("deferredCapacityCount" in coverage), "the dead field should be gone, not just always 0");
+      });
+      await test("coverageSummaryHtml: never renders a capacity note or a deferred_capacity table row", () => {
+        const coverage = computeCoverage([_fakeFinding("F01", "patch_now")], new Set());
+        const html = coverageSummaryHtml(coverage);
+        assert(!html.includes("coverage-capacity-note"), "the dead capacity-note element must not render");
+        assert(!html.includes("bumped by a fleet-wide capacity limit"), "the dead capacity-note text must not render");
+        assert(!html.includes("bucket-deferred_capacity"), "no deferred_capacity row in the breakdown table");
+      });
+
+      // ---------------------------------------------------------------
+      // assetConstraintHtml() / retractConstraint() -- web parity for
+      // `rhino constraint retract` (docs/handoff-2026-09-20.md section 5).
+      // ---------------------------------------------------------------
+      function _fakeConstraint(overrides = {}) {
+        return Object.assign(
+          {
+            constraint_id: 7,
+            asset_id: "A02",
+            active: true,
+            constraint_text: "payroll server only reboots on Sundays",
+            effect_kind: "patch_window",
+            effect_value: "Sun 02:00-06:00",
+            created_at: "2026-09-22T00:00:00Z",
+            note: null,
+            deltas: [],
+          },
+          overrides
+        );
+      }
+      await test("assetConstraintHtml: shows a Remove button for an active constraint when jobs are enabled", () => {
+        const prior = jobsEnabled;
+        jobsEnabled = true;
+        try {
+          const html = assetConstraintHtml(_fakeConstraint());
+          assert(html.includes('data-constraint-id="7"'), "the card and button must carry the real constraint id");
+          assert(html.includes("constraint-retract-btn"), "Remove button must render");
+        } finally {
+          jobsEnabled = prior;
+        }
+      });
+      await test("assetConstraintHtml: no Remove button for an already-retracted constraint", () => {
+        const prior = jobsEnabled;
+        jobsEnabled = true;
+        try {
+          const html = assetConstraintHtml(_fakeConstraint({ active: false }));
+          assert(!html.includes("constraint-retract-btn"), "an inactive constraint has nothing left to retract");
+        } finally {
+          jobsEnabled = prior;
+        }
+      });
+      await test("assetConstraintHtml: no Remove button when jobs are disabled (the endpoint isn't even mounted)", () => {
+        const prior = jobsEnabled;
+        jobsEnabled = false;
+        try {
+          const html = assetConstraintHtml(_fakeConstraint());
+          assert(!html.includes("constraint-retract-btn"), "must not offer a control with nothing to call");
+        } finally {
+          jobsEnabled = prior;
+        }
+      });
+      await test("retractConstraint: on success, updates the card in place without touching the rest of the page", async () => {
+        const prior = jobsEnabled;
+        jobsEnabled = true; // assetConstraintHtml only renders the button when this is true
+        const card = document.createElement("div");
+        card.innerHTML = assetConstraintHtml(_fakeConstraint());
+        document.body.appendChild(card.firstElementChild.cloneNode(true)); // put the real card in the live DOM
+        const liveCard = document.querySelector('.constraint-card[data-constraint-id="7"]');
+        const btn = liveCard.querySelector(".constraint-retract-btn");
+        assert(!!btn, "test setup: the button must exist before exercising retractConstraint on it");
+
+        const originalFetch = window.fetch;
+        let calledUrl = null;
+        window.fetch = async (url) => {
+          calledUrl = url;
+          return { ok: true, json: async () => ({ constraint_id: 7, retracted: true, note: "kept on file, inactive." }) };
+        };
+        try {
+          await retractConstraint("7", btn);
+          assertEqual(calledUrl, "/api/constraints/7/retract");
+          assert(liveCard.classList.contains("inactive"), "card should be marked inactive");
+          assert(liveCard.querySelector(".status-pill").textContent === "Retracted", "pill text should update");
+          assert(!liveCard.querySelector(".constraint-retract-btn"), "the button should remove itself");
+        } finally {
+          window.fetch = originalFetch;
+          liveCard.remove();
+          jobsEnabled = prior;
+        }
+      });
+
+      // ---------------------------------------------------------------
+      // startRunAgents() -- docs/handoff-2026-09-20.md section 5: the
+      // control used to post baseName(data.run.data_dir), which
+      // resolve_source_ref's bare-directory fallback always resolves as
+      // native, losing any --format/--adapter-config the current plan was
+      // actually built with. Fixed to send RERUN_CURRENT_PLAN_SOURCE_REF
+      // instead (web/jobs.py's own constant of the identical name/value).
+      // ---------------------------------------------------------------
+      await test("startRunAgents: posts the RERUN_CURRENT_PLAN_SOURCE_REF sentinel, never a reconstructed basename", async () => {
+        const originalFetch = window.fetch;
+        let capturedBody = null;
+        window.fetch = async (url, opts) => {
+          if (url === "/api/jobs") {
+            capturedBody = JSON.parse(opts.body);
+            return { ok: true, json: async () => ({ job_id: "fake-job-1" }) };
+          }
+          // pollRunAgents' first GET -- report succeeded-but-no-export so the
+          // poll loop ends immediately without scheduling another timer.
+          return { ok: true, json: async () => ({ status: "succeeded", export_written: false }) };
+        };
+        try {
+          await startRunAgents({ run: { data_dir: "C:\\some\\path\\uploads\\deadbeef" } });
+          assert(capturedBody !== null, "must have POSTed to /api/jobs");
+          assertEqual(capturedBody.kind, "run_agents");
+          assertEqual(capturedBody.input.source_ref, RERUN_CURRENT_PLAN_SOURCE_REF);
+          assert(capturedBody.input.source_ref !== "deadbeef", "must not send a reconstructed basename");
+        } finally {
+          window.fetch = originalFetch;
+          clearTimeout(runAgentsPollTimer);
+        }
+      });
+
+      // ---------------------------------------------------------------
+      // report
+      // ---------------------------------------------------------------
+      const passed = results.filter((r) => r.pass).length;
+      const failed = results.length - passed;
+      document.title = `${passed}/${results.length} passed -- app.js tests`;
+      const lines = results.map((r) => (r.pass ? `PASS  ${r.name}` : `FAIL  ${r.name}\n      ${r.error}`));
+      lines.push("", `${passed}/${results.length} passed${failed ? `, ${failed} FAILED` : "."}`);
+      const report = document.getElementById("test-report");
+      report.textContent = lines.join("\n");
+      report.className = failed ? "has-fail" : "all-pass";
+      // Structured, for javascript_tool / a future headless runner to read
+      // without scraping text.
+      window.__TEST_RESULTS__ = { passed, failed, total: results.length, results };
+    })();
+  </script>
+</body>
+</html>

@@ -126,7 +126,13 @@ from rhinosecure.adapters.schema_registry import (
 from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.parsing import AgentOutputParseError, parse_structured_output
 from rhinosecure.adapters.probe import DEFAULT_SAMPLE_ROWS, ColumnProfile, FileProfile, profile_source
-from rhinosecure.llm import DEFAULT_MODEL, get_llm
+from rhinosecure.llm import (
+    DEFAULT_MODEL,
+    INPUT_USD_PER_MILLION_TOKENS,
+    OUTPUT_USD_PER_MILLION_TOKENS,
+    estimate_cost_usd,
+    get_llm,
+)
 from rhinosecure.scoring import IMPACT_AXIS_TARGETS, THREAT_AXIS_TARGETS
 
 ROLE = "Schema Inference"
@@ -191,14 +197,6 @@ _PYDANTIC_DOC_URL_LINE = re.compile(r"[ \t]*For further information visit https:
 #: only the genuine tag matches.
 _PYDANTIC_ERROR_TYPE = re.compile(r"\[type=([\w.]+), input_value=")
 
-#: Claude Sonnet 5's first-party API rate (CLAUDE.md Section 11 pins this
-#: model for every agent call). Sourced from Anthropic's published pricing,
-#: not recalled -- re-check before changing either number. Cost estimation
-#: is CLAUDE.md Section 8's open item 4 ("no run prints its actual dollar
-#: cost"); this is the first place in the codebase that computes one.
-_INPUT_USD_PER_MILLION_TOKENS = 2.00
-_OUTPUT_USD_PER_MILLION_TOKENS = 10.00
-
 #: What `rhino adapt propose` writes -- see the two committed hand-authored
 #: contracts (data/adapters/*-gen.json), both declaring this same string.
 #: No code-owned constant defines "the current schema version" yet; this
@@ -241,7 +239,7 @@ class ProposalGenerationError(RuntimeError):
     was ever attached to anything, discarding it along with the exception's
     local variables. `estimated_cost_usd` is precomputed rather than left
     for a caller to derive from `attempt_usage`, since a caller reporting a
-    failure has no reason to also re-implement `_estimate_cost_usd`."""
+    failure has no reason to also re-implement `llm.estimate_cost_usd`."""
 
     def __init__(self, message: str, *, attempt_usage: tuple[dict[str, object], ...] = (), estimated_cost_usd: float = 0.0):
         super().__init__(message)
@@ -2873,14 +2871,6 @@ def _mapped_slot_legality_problems(
     return by_slot
 
 
-def _estimate_cost_usd(usage: UsageMetrics | None) -> float:
-    if usage is None:
-        return 0.0
-    return (usage.prompt_tokens / 1_000_000) * _INPUT_USD_PER_MILLION_TOKENS + (
-        usage.completion_tokens / 1_000_000
-    ) * _OUTPUT_USD_PER_MILLION_TOKENS
-
-
 def propose_contract(
     data_dir: Path,
     name: str,
@@ -3062,7 +3052,7 @@ def propose_contract(
             raise ProposalGenerationError(
                 f"gave up after {max_attempts} attempt(s): {what}",
                 attempt_usage=attempt_usage,
-                estimated_cost_usd=_estimate_cost_usd(total_usage),
+                estimated_cost_usd=estimate_cost_usd(total_usage),
             ) from cause
 
         if proposal is None:
@@ -3093,7 +3083,7 @@ def propose_contract(
             model=model_name,
             prompt_tokens=total_usage.prompt_tokens,
             completion_tokens=total_usage.completion_tokens,
-            estimated_cost_usd=_estimate_cost_usd(total_usage),
+            estimated_cost_usd=estimate_cost_usd(total_usage),
             attempts=attempt,
             # Every attempt's prompt+response, including failed ones -- a
             # partial-spend retry must not vanish from the audit trail.

@@ -124,6 +124,15 @@
         "8428"
       ],
       "port": 8428
+    },
+    {
+      "name": "rhino-js-tests",
+      "runtimeExecutable": ".venv312/Scripts/python.exe",
+      "runtimeArgs": [
+        "tests/js/serve_no_cache.py",
+        "8500"
+      ],
+      "port": 8500
     }
   ]
 }

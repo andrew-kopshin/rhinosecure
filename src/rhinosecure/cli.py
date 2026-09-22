@@ -155,7 +155,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from rhinosecure.agents.coordinator import Coordinator
+    from rhinosecure.agents.coordinator import Coordinator, RunState
     from rhinosecure.agents.schema_inference import ProposeResult
 
 from rhinosecure.adapters import (
@@ -523,6 +523,52 @@ def _print_failures(coordinator: Coordinator, *, verbose: bool = False) -> None:
 
 def _print_contested_rate(rate: ContestedRate) -> None:
     print(f"\nContested: {rate.contested}/{rate.total} ({rate.pct:.1f}%) of scored findings")
+
+
+def _print_usage_summary(state: "RunState") -> None:
+    """Total tokens and an estimated dollar cost across every agent-run
+    stage -- CLAUDE.md Safety and guardrails, "Open" item 2: `RunState`
+    (agents/coordinator.py) has collected `research_usage`/
+    `environment_usage`/`risk_usage`/`tot_usage` since the ToT gate landed,
+    but nothing ever read them back out, so a run's actual cost was
+    invisible from the CLI -- PROGRESS.md's own 24-finding cost figure could
+    only ever be an EXTRAPOLATION from a smaller run's measured rate for
+    exactly this reason. Imports are local, matching the lazy-import
+    convention the `--agents` branch above already uses for everything
+    crewai-touching, so a plain `rhino run` (no --agents, no usage data to
+    report) never pays for importing crewai just to reach this function.
+
+    A stage that never dispatched (`tot_usage` is `None` when nothing was
+    contested; `research`/`environment`/`risk` stay `None` only in a
+    pathological all-findings-failed run) is OMITTED, never printed as a
+    $0.00 line -- a $0.00 line reads as "this stage ran and cost nothing,"
+    which would misreport a stage that simply never returned a usage report
+    at all."""
+    from crewai.types.usage_metrics import UsageMetrics
+
+    from rhinosecure.llm import estimate_cost_usd
+
+    stages = (
+        ("research", state.research_usage),
+        ("environment", state.environment_usage),
+        ("risk", state.risk_usage),
+        ("tot", state.tot_usage),
+    )
+    present = [(name, usage) for name, usage in stages if usage is not None]
+    if not present:
+        return
+    total = UsageMetrics()
+    for _, usage in present:
+        total.add_usage_metrics(usage)
+    print(
+        f"\nUsage: {total.prompt_tokens:,} prompt + {total.completion_tokens:,} completion "
+        f"tokens ({total.successful_requests} request(s)), est. ${estimate_cost_usd(total):.2f}"
+    )
+    for name, usage in present:
+        print(
+            f"  {name}: {usage.prompt_tokens:,} prompt + {usage.completion_tokens:,} completion "
+            f"tokens, est. ${estimate_cost_usd(usage):.2f}"
+        )
 
 
 _TERMINATION_LABELS = {
@@ -1813,6 +1859,7 @@ def main(argv: list[str] | None = None) -> int:
             _print_agent_table(recommendations)
             _print_failures(coordinator, verbose=args.verbose)
             _print_contested_rate(contested_rate(r.bucket for r in recommendations))
+            _print_usage_summary(coordinator.state)
 
             if args.track_remediation:
                 if is_provisional(coordinator.contract):
@@ -2030,9 +2077,17 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         if not mark_memory.decisions_for_finding(args.finding_id):
+            # decisions_for_finding is populated only by Coordinator.run
+            # (the --agents/constraint paths, memory.py's record_decision) --
+            # a plain `rhino run` (no --agents) never writes a runs/decisions
+            # row at all, by design (export.py's own docstring on this).
+            # So this is silent for every deterministically-scored finding,
+            # not just a mistyped one: worded to say what was actually
+            # checked, not to claim an omniscience this check doesn't have.
             print(
-                f"warning: no scored run has ever seen finding_id {args.finding_id!r} -- check for "
-                "a typo. Recording it anyway.",
+                f"warning: no AGENT run has recorded finding_id {args.finding_id!r} in decision "
+                "history (a plain `rhino run`, without --agents, never persists one -- this is not "
+                "a sign of a typo by itself). Recording it anyway.",
                 file=sys.stderr,
             )
 

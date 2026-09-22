@@ -316,6 +316,74 @@ def test_a_real_docx_is_also_recognized_as_a_zip_container(tmp_path):
     assert "ZIP archive" in message
 
 
+# --- a wrong delimiter (docs/handoff-2026-09-20.md section 5) -----------
+#
+# csv.DictReader is never told a delimiter -- native/defender/bluepeak all
+# assume comma -- so a semicolon/tab/pipe-delimited export parses as exactly
+# ONE column, and every row then fails Asset/Finding.model_validate with a
+# raw pydantic dump naming a mangled single-key dict, nothing hinting at the
+# real cause. This doesn't change what's accepted (still refused either
+# way); only the message changes, from a random ValidationError repr to a
+# direct diagnosis -- the same shape as the ZIP-container check above.
+
+
+def test_a_semicolon_delimited_csv_names_the_real_problem(tmp_path):
+    path = tmp_path / "assets.csv"
+    path.write_text("asset_id;hostname;role\nA01;DC01;dc\n", encoding="utf-8")
+
+    with pytest.raises(IngestError) as excinfo:
+        ingest.open_csv(path)
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert "semicolon-delimited" in message
+    assert "comma-delimited" in message
+    # The old failure mode: a raw, unexplained pydantic dump of the mangled
+    # single-column row. Must not appear alongside the new, direct message.
+    assert "ValidationError" not in message
+
+
+def test_a_tab_delimited_csv_names_the_real_problem(tmp_path):
+    path = tmp_path / "assets.csv"
+    path.write_text("asset_id\thostname\trole\nA01\tDC01\tdc\n", encoding="utf-8")
+
+    with pytest.raises(IngestError) as excinfo:
+        ingest.open_csv(path)
+    assert "tab-delimited" in str(excinfo.value)
+
+
+def test_a_pipe_delimited_csv_names_the_real_problem(tmp_path):
+    path = tmp_path / "assets.csv"
+    path.write_text("asset_id|hostname|role\nA01|DC01|dc\n", encoding="utf-8")
+
+    with pytest.raises(IngestError) as excinfo:
+        ingest.open_csv(path)
+    assert "pipe-delimited" in str(excinfo.value)
+
+
+def test_a_genuinely_single_column_csv_with_no_alternate_delimiter_is_not_misdiagnosed(tmp_path):
+    """A real, legitimate single-column file (unusual, but not illegal on
+    its own -- open_csv doesn't require a minimum column count) must not be
+    reported as a wrong-delimiter file just because it happens to have one
+    column. The check only fires when the lone header contains a character
+    that's a common delimiter elsewhere; a plain single-word header has
+    none of those."""
+    path = tmp_path / "assets.csv"
+    path.write_text("asset_id\nA01\n", encoding="utf-8")
+
+    f, reader = ingest.open_csv(path)
+    f.close()
+    assert reader.fieldnames == ["asset_id"]
+
+
+def test_a_normal_comma_delimited_csv_is_unaffected_by_the_delimiter_check(tmp_path):
+    path = tmp_path / "assets.csv"
+    path.write_text("asset_id,hostname,role\nA01,DC01,dc\n", encoding="utf-8")
+
+    f, reader = ingest.open_csv(path)
+    f.close()
+    assert reader.fieldnames == ["asset_id", "hostname", "role"]
+
+
 # --- end to end through a real adapter ----------------------------------
 
 

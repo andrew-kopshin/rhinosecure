@@ -14,6 +14,25 @@ const BUCKET_ORDER = [
   "contested",
   "deferred_capacity",
 ];
+// deferred_capacity is structurally never a LIVE finding's bucket: it's
+// assigned in exactly one place (scoring.apply_capacity_limit), which only
+// ever runs inside a capacity-constraint submission -- a one-time
+// historical reallocation written to Memory, never back onto
+// Coordinator.state/coordinator.ranked() or the deterministic path's own
+// result. So every findings[] this file ever renders is guaranteed to have
+// zero findings in this bucket, always -- not a bug, a property of how
+// capacity constraints are deliberately scoped (CLAUDE.md Section 3's own
+// note on the bucket). LIVE_BUCKET_ORDER is BUCKET_ORDER minus that one
+// permanently-empty entry, for the two places that render a live
+// distribution over real findings (the Overview bars, the coverage
+// breakdown table) -- confirmed dead UI, not fixed as a bug (docs/handoff-
+// 2026-09-20.md section 5; the actual historical capacity-constraint data
+// is real and already shown correctly on the Constraints tab, keyed off
+// export.js's own _capacity_history, a completely separate data source
+// from findings[].bucket). BUCKET_ORDER/BUCKET_LABELS themselves keep the
+// full six-entry set: deferred_capacity's own label and CSS class are
+// still used directly by the Constraints tab's capacity-delta table.
+const LIVE_BUCKET_ORDER = BUCKET_ORDER.filter((b) => b !== "deferred_capacity");
 const BUCKET_LABELS = {
   patch_now: "Patch Now",
   next_window: "Next Window",
@@ -200,9 +219,9 @@ function renderOverview(data) {
   const el = document.getElementById("tab-overview");
   const dist = data.summary.bucket_distribution;
   const total = data.summary.total_findings || 0;
-  const maxCount = Math.max(1, ...BUCKET_ORDER.map((b) => dist[b] || 0));
+  const maxCount = Math.max(1, ...LIVE_BUCKET_ORDER.map((b) => dist[b] || 0));
 
-  const bars = BUCKET_ORDER.map((b) => {
+  const bars = LIVE_BUCKET_ORDER.map((b) => {
     const count = dist[b] || 0;
     const pct = Math.round((count / maxCount) * 100);
     return `
@@ -792,12 +811,16 @@ function filteredScenarioFindings(data) {
 
 /* "What this selection leaves exposed" -- most severe first, each with
  * real identities (not just a count) up to COVERAGE_ITEM_CAP, plus a
- * bucket-by-bucket addressed/exposed breakdown. `filter` on each category
- * is the partial scenarioFilters a "+N more" click applies -- see
- * wireCoverageLinks. deferred_capacity is deliberately NOT one of these
- * categories (a separate callout below): it means "lost a rank-position
- * race under a capacity limit", not "the plan has nothing to say about
- * this," and folding it into "exposed" would misrepresent that. */
+ * bucket-by-bucket addressed/exposed breakdown (LIVE_BUCKET_ORDER, not
+ * BUCKET_ORDER -- deferred_capacity is structurally never a live finding's
+ * bucket, see that constant's own comment). `filter` on each category is
+ * the partial scenarioFilters a "+N more" click applies -- see
+ * wireCoverageLinks. deferred_capacity is also deliberately NOT one of
+ * these five categories even before that exclusion: it means "lost a
+ * rank-position race under a capacity limit", not "the plan has nothing to
+ * say about this," and folding it into "exposed" would misrepresent that
+ * -- moot in practice today (it can't appear in `findings` at all), but the
+ * distinction is the reason, not the current absence of data. */
 function computeCoverage(findings, selectedIds) {
   const exposed = findings.filter((f) => !selectedIds.has(f.finding_id));
 
@@ -834,7 +857,7 @@ function computeCoverage(findings, selectedIds) {
     },
   ];
 
-  const bucketBreakdown = BUCKET_ORDER.map((b) => ({
+  const bucketBreakdown = LIVE_BUCKET_ORDER.map((b) => ({
     bucket: b,
     addressed: findings.filter((f) => f.bucket === b && selectedIds.has(f.finding_id)).length,
     exposed: findings.filter((f) => f.bucket === b && !selectedIds.has(f.finding_id)).length,
@@ -847,7 +870,6 @@ function computeCoverage(findings, selectedIds) {
     categories: categories.filter((c) => c.items.length > 0),
     allClear: categories.every((c) => c.items.length === 0),
     bucketBreakdown,
-    deferredCapacityCount: findings.filter((f) => f.bucket === "deferred_capacity").length,
   };
 }
 
@@ -863,9 +885,6 @@ function coverageCategoryHtml(cat) {
 }
 
 function coverageSummaryHtml(coverage) {
-  const capacityNote = coverage.deferredCapacityCount
-    ? `<p class="coverage-capacity-note">${coverage.deferredCapacityCount} finding(s) were bumped by a fleet-wide capacity limit this cycle and are not scheduled — see the Constraints tab.</p>`
-    : "";
   const body = coverage.allClear
     ? `<p class="coverage-all-clear">No KEV, contested, or high-blast-radius-asset findings left exposed.</p>`
     : `<ul class="coverage-list">${coverage.categories.map(coverageCategoryHtml).join("")}</ul>`;
@@ -887,7 +906,6 @@ function coverageSummaryHtml(coverage) {
         <strong>${coverage.addressedCount}</strong> of ${coverage.total} finding(s) selected —
         leaves <strong>${coverage.exposedCount}</strong> unaddressed
       </p>
-      ${capacityNote}
       ${body}
       <table class="bucket-breakdown-table">
         <thead><tr><th>Bucket</th><th>Addressed</th><th>Exposed</th></tr></thead>
@@ -1320,6 +1338,9 @@ function renderConstraints(data) {
       const text = input.value.trim();
       if (text) submitConstraint(text, input);
     });
+    el.querySelectorAll(".constraint-retract-btn").forEach((btn) => {
+      btn.addEventListener("click", () => retractConstraint(btn.dataset.constraintId, btn));
+    });
   }
 }
 
@@ -1473,8 +1494,20 @@ function assetConstraintHtml(c) {
       </table>`
     : `<p class="empty-note">No findings affected in this run.</p>`;
 
+  // The remove control -- web parity for `rhino constraint retract` (docs/
+  // handoff-2026-09-20.md section 5). Only on an ACTIVE asset-scoped
+  // constraint, and only when jobs are enabled (the endpoint this posts to
+  // is mounted only then -- the same gate the submit form above already
+  // uses). Capacity constraints have no equivalent button:
+  // capacityConstraintHtml never had one to add, matching memory.py's own
+  // "no active/deactivate concept" for that table.
+  const removeBtn =
+    c.active && jobsEnabled
+      ? `<button type="button" class="secondary-btn constraint-retract-btn" data-constraint-id="${esc(c.constraint_id)}">Remove</button>`
+      : "";
+
   return `
-    <div class="card constraint-card ${c.active ? "" : "inactive"}">
+    <div class="card constraint-card ${c.active ? "" : "inactive"}" data-constraint-id="${esc(c.constraint_id)}">
       <div class="constraint-head">
         <h4>#${esc(c.constraint_id)} on <code>${esc(c.asset_id)}</code></h4>
         <span class="status-pill ${c.active ? "status-active" : "status-inactive"}">${c.active ? "Active" : "Retracted"}</span>
@@ -1483,8 +1516,47 @@ function assetConstraintHtml(c) {
       <p class="constraint-meta">${esc(c.effect_kind)} = ${esc(c.effect_value)} · filed ${formatTime(c.created_at)}</p>
       ${c.note ? `<p class="constraint-note">${esc(c.note)}</p>` : ""}
       ${deltas}
+      ${removeBtn}
     </div>
   `;
+}
+
+/* Retracting is a plain, synchronous REST call (web/jobs.py's own note on
+ * why it's not a job), so this is deliberately NOT pollJob()/
+ * handleJobSucceeded() -- there's no stage to poll. Reuses the same shared
+ * #job-status banner as constraint submission, for one consistent place a
+ * human looks for feedback, but updates the CARD ITSELF in place rather
+ * than refreshing the export: retraction never changes the currently
+ * displayed plan (the CLI's own retract message says so explicitly --
+ * "plans already exported are unchanged until re-run" -- and /api/export
+ * is a static snapshot from the last run, so re-fetching it would show the
+ * exact same, now-stale "active" state, not the retraction that just
+ * happened). A full re-render would be actively wrong here, not just
+ * unnecessary. */
+async function retractConstraint(constraintId, btn) {
+  btn.disabled = true;
+  setJobStatus("progress", `<span class="spinner"></span> Retracting #${esc(constraintId)}…`);
+  let body;
+  try {
+    const res = await fetch(`/api/constraints/${constraintId}/retract`, { method: "POST" });
+    body = await res.json();
+    if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+  } catch (err) {
+    setJobStatus("error", `Could not retract #${esc(constraintId)}: ${esc(err.message)}`);
+    btn.disabled = false;
+    return;
+  }
+  setJobStatus("success", `Retracted #${esc(constraintId)} — ${esc(body.note)}`);
+  const card = document.querySelector(`.constraint-card[data-constraint-id="${CSS.escape(String(constraintId))}"]`);
+  if (card) {
+    card.classList.add("inactive");
+    const pill = card.querySelector(".status-pill");
+    if (pill) {
+      pill.textContent = "Retracted";
+      pill.classList.replace("status-active", "status-inactive");
+    }
+    btn.remove();
+  }
 }
 
 function capacityConstraintHtml(c) {
@@ -3227,6 +3299,19 @@ function setRunAgentsStatus(kind, html) {
   box.innerHTML = `<p class="hint ${kind === "error" ? "chat-msg-error" : ""}">${html}</p>`;
 }
 
+// Must match web/jobs.py's own RERUN_CURRENT_PLAN_SOURCE_REF exactly -- kept
+// in sync by comment/discipline on both sides, the same way this file and
+// jobs.py already agree on the "uploads/<id>" source_ref shape (there is no
+// shared build step between the two languages to enforce it mechanically).
+// Sending this instead of baseName(data.run.data_dir) is the actual fix for
+// docs/handoff-2026-09-20.md section 5's defect: a reconstructed bare
+// directory name loses fmt/adapter_config entirely, so resolve_source_ref
+// -- correctly, for a genuinely NEW source -- fell back to native for any
+// plan started with --format/--adapter-config. The sentinel instead tells
+// the backend to reuse plan_state.active_source, the exact triple this
+// plan was actually built from, with no round trip through a lossy string.
+const RERUN_CURRENT_PLAN_SOURCE_REF = "__current_plan__";
+
 async function startRunAgents(data) {
   setRunAgentsStatus("progress", `<span class="spinner"></span> Submitting…`);
   let jobId;
@@ -3234,7 +3319,7 @@ async function startRunAgents(data) {
     const res = await fetch("/api/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kind: "run_agents", input: { source_ref: baseName(data.run.data_dir) } }),
+      body: JSON.stringify({ kind: "run_agents", input: { source_ref: RERUN_CURRENT_PLAN_SOURCE_REF } }),
     });
     const body = await res.json();
     if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);

@@ -100,9 +100,12 @@ one "failed" bucket:
 - `remediation_mark` raises `IngestError` for the same two CLI-mirrored
   reasons `rhino remediation mark` exits 1 for: an unrecognized `status`,
   or a missing `note` on the one transition (`remediated` -> `open`) where
-  it's required. A `finding_id` no scored run has ever seen is NOT a
-  failure -- recorded anyway, with `result["seen_before_in_a_scored_run"]
-  is False` naming the gap, mirroring the CLI's own warn-not-refuse choice.
+  it's required. A `finding_id` with no AGENT-run decision history (the
+  deterministic path never calls `record_decision` at all, so this is not
+  proof the id is wrong -- CLAUDE.md, docs/handoff-2026-09-20.md section 5)
+  is NOT a failure -- recorded anyway, with
+  `result["seen_before_in_a_scored_run"]` is False naming the gap,
+  mirroring the CLI's own warn-not-refuse choice and its corrected wording.
 """
 
 from __future__ import annotations
@@ -1221,6 +1224,20 @@ def _run_run_deterministic(job: Job, plan_state: PlanState, on_stage: Callable[[
     )
 
 
+#: What the web UI's run-agents control (app.js's startRunAgents) sends as
+#: source_ref to mean "rerun the plan that's already loaded" -- recognized
+#: ONLY inside _run_run_agents (below), never by resolve_source_ref or any
+#: other caller, the same "a string both sides of the wire agree has a
+#: specific meaning" shape _UPLOAD_SOURCE_REF_PREFIX ("uploads/<id>")
+#: already is. Exists because the control used to reconstruct a source_ref
+#: from the loaded plan's own data (baseName(data.run.data_dir)), which
+#: resolve_source_ref -- correctly, for genuinely new sources -- has no way
+#: to recover fmt/adapter_config from, so it silently fell back to native
+#: for any plan started with --format/--adapter-config (docs/handoff-2026-
+#: 09-20.md section 5).
+RERUN_CURRENT_PLAN_SOURCE_REF = "__current_plan__"
+
+
 def _run_run_agents(job: Job, plan_state: PlanState, on_stage: Callable[[str], None]) -> JobOutcome:
     """The Router's `run_agents` operation -- the full agent pipeline
     against a resolved `source_ref`, REPLACING whatever plan was current
@@ -1254,9 +1271,52 @@ def _run_run_agents(job: Job, plan_state: PlanState, on_stage: Callable[[str], N
     job (or Router `RUN_AGENTS` step, gated by `assert_step_approved`),
     exactly as before this branch existed."""
     on_stage("resolving source")  # before validation -- a bad input's error must not carry stage=null
+    # _require_source_ref still demands SOME non-empty string -- the fast,
+    # claim-the-job-slot-before-dispatching 400 in validate_job_input
+    # (_REQUIRED_JOB_INPUT_FIELDS) checks only presence/non-emptiness and
+    # has no access to plan_state, so it can't itself know whether an empty
+    # source_ref would be legal here; left completely unweakened rather
+    # than special-cased for this one branch. RERUN_CURRENT_PLAN_SOURCE_REF
+    # is a recognized non-empty VALUE instead, the same shape
+    # "uploads/<id>" already is: a string both sides of the wire agree has
+    # a specific meaning, checked here, resolved nowhere else.
     source_ref = _require_source_ref(job, "run_agents")
+    # "Rerun the current plan" reuses plan_state.active_source directly
+    # instead of resolving source_ref at all -- docs/handoff-2026-09-20.md
+    # section 5's own defect: the web UI's run-agents control used to post
+    # only baseName(data.run.data_dir) as source_ref (app.js's
+    # startRunAgents), and resolve_source_ref -- CORRECTLY, for its real
+    # job of resolving a brand-new Router-named source -- has no way to
+    # recover fmt/adapter_config from a bare directory name, so it fell
+    # back to native, silently breaking any plan started with --format/
+    # --adapter-config. active_source (set only by run_agents_pipeline's
+    # own commit step, PlanState) already holds the exact (data_dir, fmt,
+    # adapter_config) triple the CURRENT plan was actually built from -- no
+    # round trip through a lossy string needed. This can never collide
+    # with a provisional run: run_agents_pipeline's provisional branch
+    # deliberately never assigns active_source at all (this function's own
+    # docstring above), so a set active_source always names an
+    # already-confirmed source, and the provisional check below is skipped
+    # entirely for this case rather than redundantly re-checked. If the
+    # sentinel arrives with no plan current (shouldn't happen -- the
+    # control that sends it is only shown when a plan already is one --
+    # but not assumed impossible), it falls through to the else branch and
+    # resolve_source_ref refuses it loudly as the unresolvable literal
+    # string it then is, exactly like any other bad source_ref.
+    rerun_current_plan = source_ref == RERUN_CURRENT_PLAN_SOURCE_REF and plan_state.active_source is not None
+    if rerun_current_plan:
+        resolved: ResolvedSource | None = plan_state.active_source
+        found_provisional = None
+        # The literal sentinel is what dispatched this job, but the real
+        # directory is what a human reading job history actually wants to
+        # see -- reported in the result below, never used for resolution
+        # (resolution already happened above, from plan_state.active_source,
+        # not from this string).
+        source_ref = str(resolved.data_dir)
+    else:
+        found_provisional = _resolve_provisional(source_ref)
+        resolved = None if found_provisional is not None else resolve_source_ref(source_ref)
 
-    found_provisional = _resolve_provisional(source_ref)
     if found_provisional is not None:
         provisional_adapter, resolved = found_provisional
         coordinator, _findings = plan_state._build_and_run_coordinator(
@@ -1284,7 +1344,10 @@ def _run_run_agents(job: Job, plan_state: PlanState, on_stage: Callable[[str], N
         )
         provisional = True
     else:
-        resolved = resolve_source_ref(source_ref)
+        # `resolved` is already set above -- either plan_state.active_source
+        # (rerun_current_plan) or resolve_source_ref(source_ref) (a genuinely
+        # new source) -- never re-derived here, so there is exactly one place
+        # in this function that decides what "the source" means.
         coordinator = plan_state.run_agents_pipeline(resolved, on_stage)
         job_memory = plan_state.memory
         provisional = False
@@ -1554,3 +1617,47 @@ def mount_job_routes(app: FastAPI, job_config: JobConfig) -> None:
     @app.get("/api/jobs")
     def list_jobs() -> list[dict[str, Any]]:
         return [j.to_dict() for j in registry.list_recent()]
+
+    @app.post("/api/constraints/{constraint_id}/retract")
+    def retract_constraint(constraint_id: int) -> dict[str, Any]:
+        """Web parity for `rhino constraint retract` (docs/handoff-2026-09-
+        20.md section 5: "the web Constraints tab has no remove control").
+        Mirrors the CLI exactly, down to the wording: soft-delete only
+        (`Memory.deactivate_constraint` -- `active=0`, the record stays on
+        file), never a hard delete, and -- the one thing here that could
+        look like a UX decision but isn't -- deliberately does NOT touch
+        the currently-displayed plan. The CLI's own retract message already
+        states the intended behavior: "it stops applying on the next run;
+        plans already exported are unchanged until re-run." A capacity
+        constraint is out of scope by the same design memory.py's own
+        constraints table already enforces: it has no active/deactivate
+        concept at all (cycle-scoped, not a standing fact -- CLAUDE.md
+        Section 7), so it was never a candidate for this route; only an
+        asset-scoped `constraints` row can even be retracted.
+
+        A synchronous route, not a job: retraction is a single SQLite
+        UPDATE, no LLM call, no ingest -- the same "cheapest possible
+        write" instinct `rhino remediation mark` already applies for the
+        identical reason (CLAUDE.md Section 7's remediation-tracking
+        entry). Reuses `plan_state.memory` when a plan has been seeded, the
+        same not-yet-seeded fallback three other handlers in this module
+        already use, so retracting a constraint never requires a plan to
+        exist first -- `rhino constraint retract` itself has no such
+        requirement either."""
+        memory = plan_state.memory if plan_state.memory is not None else Memory(plan_state.config.db_path)
+        active_ids = {c.id for c in memory.all_active_constraints()}
+        if constraint_id not in active_ids:
+            raise HTTPException(
+                404,
+                f"no active constraint with id {constraint_id} (see GET /api/export's constraints "
+                "section; an already-retracted one cannot be retracted again)",
+            )
+        memory.deactivate_constraint(constraint_id)
+        return {
+            "constraint_id": constraint_id,
+            "retracted": True,
+            "note": (
+                "kept on file, inactive. It stops applying on the next run; plans already "
+                "exported are unchanged until re-run."
+            ),
+        }

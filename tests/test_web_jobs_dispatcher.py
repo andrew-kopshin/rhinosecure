@@ -29,9 +29,11 @@ from rhinosecure.web import uploads as uploads_module
 from rhinosecure.web.jobs import (
     FORMATS,
     IngestError,
+    Job,
     JobConfig,
     PlanNotSeededError,
     PlanState,
+    RERUN_CURRENT_PLAN_SOURCE_REF,
     ResolvedSource,
     resolve_source_ref,
 )
@@ -811,6 +813,123 @@ def test_run_agents_provisional_branch_never_clobbers_an_existing_confirmed_plan
     # so the export said data_dir "None" and the page title read "None (agents)".
     exported = json.loads((tmp_path / "export.json").read_text(encoding="utf-8"))
     assert exported["run"]["data_dir"] == str(data_dir_a)
+
+
+# --- the run-agents control's RERUN_CURRENT_PLAN_SOURCE_REF sentinel -----
+#
+# docs/handoff-2026-09-20.md section 5: the web UI's run-agents control used
+# to post baseName(data.run.data_dir) as source_ref -- a bare directory
+# name, which resolve_source_ref's own shape-2 fallback (a plain --data
+# directory) ALWAYS resolves as native, with no way to recover a non-native
+# fmt or an adapter_config from a basename alone. The sentinel instead
+# tells _run_run_agents to reuse plan_state.active_source directly.
+
+
+def test_run_agents_with_the_rerun_sentinel_reuses_the_current_plans_real_source(
+    tmp_path: Path, data_dir_a: Path, monkeypatch
+):
+    """End to end through the real job dispatcher (HTTP -> job thread ->
+    Coordinator), same shape as this file's other run_agents tests: dispatch
+    once with a real source_ref (establishing active_source), then again
+    with ONLY the sentinel -- confirming the second dispatch reproduces the
+    identical plan without the caller having to know or resend data_dir_a."""
+    monkeypatch.setattr(jobs_module, "REPO_ROOT", REPO_ROOT)
+    config = JobConfig(data_dir=None, db_path=tmp_path / "mem.db")
+    app = create_app(tmp_path / "export.json", jobs_enabled=True, job_config=config)
+    client = TestClient(app)
+    plan_state = app.state.plan_state
+
+    _queue_seed_run("F01", "CVE-2021-26855", "A01", "EXCH01")
+    first = client.post("/api/jobs", json={"kind": "run_agents", "input": {"source_ref": str(data_dir_a)}})
+    first_body = _wait_for_terminal(client, first.json()["job_id"])
+    assert first_body["status"] == "succeeded", first_body.get("error")
+    assert plan_state.active_source.data_dir == data_dir_a
+    assert plan_state.active_source.fmt == "native"
+    first_coordinator = plan_state.coordinator
+
+    _queue_seed_run("F01", "CVE-2021-26855", "A01", "EXCH01")
+    second = client.post(
+        "/api/jobs", json={"kind": "run_agents", "input": {"source_ref": RERUN_CURRENT_PLAN_SOURCE_REF}}
+    )
+    second_body = _wait_for_terminal(client, second.json()["job_id"])
+    assert second_body["status"] == "succeeded", second_body.get("error")
+    # The real directory, not the opaque sentinel, in the job's own result --
+    # reporting accuracy, not resolution (resolution already used
+    # active_source directly; this is just what gets displayed).
+    assert second_body["result"]["source_ref"] == str(data_dir_a)
+    assert plan_state.active_source.data_dir == data_dir_a
+    # A genuinely new Coordinator (the plan was legitimately re-run), over
+    # the SAME real source -- not a no-op, not a different one.
+    assert plan_state.coordinator is not first_coordinator
+    assert "A01" in plan_state.coordinator._asset_index
+
+
+def test_run_agents_rerun_sentinel_with_no_current_plan_refuses_loudly(tmp_path: Path, monkeypatch):
+    """The sentinel is only ever sent by a control that's shown just when a
+    plan already exists, but this must not be trusted blindly -- if it
+    somehow arrives first, it must refuse clearly, never silently resolve
+    the literal sentinel string as if it were a real directory name."""
+    monkeypatch.setattr(jobs_module, "REPO_ROOT", REPO_ROOT)
+    config = JobConfig(data_dir=None, db_path=tmp_path / "mem.db")
+    app = create_app(tmp_path / "export.json", jobs_enabled=True, job_config=config)
+    client = TestClient(app)
+    assert app.state.plan_state.active_source is None  # confirms the no-plan-yet state this test targets
+
+    resp = client.post("/api/jobs", json={"kind": "run_agents", "input": {"source_ref": RERUN_CURRENT_PLAN_SOURCE_REF}})
+    body = _wait_for_terminal(client, resp.json()["job_id"])
+    assert body["status"] == "failed"
+    assert RERUN_CURRENT_PLAN_SOURCE_REF in body["error"]["message"]
+
+
+def test_run_agents_dispatch_reuses_active_source_verbatim_without_calling_resolve_source_ref(monkeypatch, tmp_path):
+    """A lower-level, white-box check of the actual mechanism (not just the
+    end-to-end outcome above): with the sentinel and an active_source set,
+    _run_run_agents must never call resolve_source_ref at all -- confirmed
+    by making it raise if it is -- and must pass plan_state.active_source
+    through UNCHANGED, fmt and adapter_config included, to
+    run_agents_pipeline. This is what actually fixes the bug: a bare
+    source_ref string has no way to carry a non-native fmt or an
+    adapter_config at all (resolve_source_ref's own shape-2 fallback always
+    returns fmt=DEFAULT_FORMAT), so the fix has to avoid resolving a string
+    entirely, not just resolve it more cleverly."""
+
+    def _boom(source_ref):
+        raise AssertionError(f"resolve_source_ref must not be called for the rerun sentinel, got {source_ref!r}")
+
+    monkeypatch.setattr(jobs_module, "resolve_source_ref", _boom)
+
+    captured = {}
+
+    def _fake_run_agents_pipeline(self, resolved, on_stage):
+        captured["resolved"] = resolved
+        return SimpleNamespace(
+            contract=None,
+            ingest_format=resolved.fmt,
+            ranked=lambda: [],
+        )
+
+    monkeypatch.setattr(PlanState, "run_agents_pipeline", _fake_run_agents_pipeline)
+    # Only the dispatch/routing decision is under test here -- the fake
+    # coordinator above is intentionally too thin for export.write_run_export
+    # (real export-building is covered by the full HTTP test above and by
+    # test_export.py); stubbed out so this test isn't coupled to that
+    # function's own required coordinator shape.
+    monkeypatch.setattr(jobs_module.export, "write_run_export", lambda *a, **k: None)
+
+    config = JobConfig(data_dir=None, db_path=tmp_path / "mem.db")
+    plan_state = PlanState(config, export_path=tmp_path / "export.json")
+    # A non-native fmt/adapter_config -- exactly the combination a bare
+    # source_ref string cannot carry, and exactly what the bug used to lose.
+    plan_state.active_source = ResolvedSource(
+        data_dir=tmp_path / "some-upload-dir", fmt="defender", adapter_config=None
+    )
+    job = Job(id="test-job", kind="run_agents", input={"source_ref": RERUN_CURRENT_PLAN_SOURCE_REF})
+
+    outcome = jobs_module._run_run_agents(job, plan_state, on_stage=lambda s: None)
+
+    assert captured["resolved"] is plan_state.active_source  # the exact object, not a reconstruction
+    assert captured["resolved"].fmt == "defender"
+    assert outcome.result["format"] == "defender"
 
 
 def test_constraint_submit_still_raises_plan_not_seeded_after_only_a_provisional_run_agents_job(

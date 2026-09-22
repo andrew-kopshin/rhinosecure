@@ -28,11 +28,45 @@ from dataclasses import dataclass
 
 from crewai import LLM
 from crewai.llms.base_llm import BaseLLM
+from crewai.types.usage_metrics import UsageMetrics
 from dotenv import load_dotenv
 
 load_dotenv()
 
 DEFAULT_MODEL = "claude-sonnet-5"
+
+#: Claude Sonnet 5's first-party API rate (DEFAULT_MODEL above, CLAUDE.md
+#: Section 11 pins this model for every agent call). Sourced from Anthropic's
+#: published pricing, not recalled -- re-check before changing either
+#: number. Originally defined in `agents/schema_inference.py` (the first
+#: place in the codebase that needed a cost estimate) and moved here so
+#: `cli.py` -- which has no reason to import an agents/ module just for a
+#: pricing constant -- can reuse the SAME rate for `rhino run --agents`'s own
+#: usage/cost summary (CLAUDE.md Safety and guardrails, "Open" item 2)
+#: instead of a second, driftable copy of these two numbers.
+INPUT_USD_PER_MILLION_TOKENS = 2.00
+OUTPUT_USD_PER_MILLION_TOKENS = 10.00
+
+
+def estimate_cost_usd(usage: UsageMetrics | None) -> float:
+    """A plain, undiscounted estimate: prompt tokens at the input rate plus
+    completion tokens at the output rate. Deliberately ignores
+    `cached_prompt_tokens`/`cache_creation_tokens` -- prompt caching changes
+    the real per-token rate (a cache write costs more than a plain input
+    token, a cache read much less), and this function has no way to tell
+    which of `usage`'s plain `prompt_tokens` were actually cache hits versus
+    misses without a per-call breakdown no caller here currently threads
+    through. Folding in a wrong multiplier would be a confident-looking but
+    fabricated number -- the same "wrong-but-plausible" failure this
+    project's own not-collected/refuse-rather-than-guess discipline exists
+    to prevent elsewhere. Documented as a known simplification rather than
+    silently treated as exact; revisit if a caller ever needs the tighter
+    number badly enough to thread per-call cache stats through."""
+    if usage is None:
+        return 0.0
+    return (usage.prompt_tokens / 1_000_000) * INPUT_USD_PER_MILLION_TOKENS + (
+        usage.completion_tokens / 1_000_000
+    ) * OUTPUT_USD_PER_MILLION_TOKENS
 
 
 class LLMConfigError(RuntimeError):

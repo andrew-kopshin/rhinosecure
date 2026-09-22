@@ -163,7 +163,10 @@ def create_app(
     constraint-submission/upload/route or chat UI at all, without a route
     it would need to probe with a POST. `jobs_enabled=True` requires
     `job_config` (a `web.jobs.JobConfig`) and additionally mounts
-    `POST /api/jobs`, `GET /api/jobs/{id}`, `GET /api/jobs`;
+    `POST /api/jobs`, `GET /api/jobs/{id}`, `GET /api/jobs`,
+    `POST /api/constraints/{id}/retract` (a plain synchronous route, not a
+    job -- a single SQLite soft-delete, web parity for `rhino constraint
+    retract`);
     (from `web/uploads.py`) `POST /api/uploads`, `GET /api/uploads/{id}`,
     `POST /api/uploads/{id}/label`; (from `web/route.py`)
     `POST /api/route`, `GET /api/route/{id}`, `GET /api/route`,
