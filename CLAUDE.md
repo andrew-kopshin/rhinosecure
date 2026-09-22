@@ -3031,3 +3031,115 @@ assumed. All decisions were the recommended (status-quo or safest) option.
 when the fix is reverted (checked by actually reverting each one and re-running), not merely
 written and trusted. Full suite: 1647 passed (was 1629 before this batch). `app.js`'s own
 regression harness (the entry above this one): 26/26.
+
+---
+
+## The conversational front end fusion: the chat panel now dispatches Router operations (2026-09-22)
+
+Closes "Future direction: a conversational front end" Sections 5-6's own remaining piece, named
+there so it wasn't assumed done by omission: "fusing this into the EXISTING chat panel as one
+input box once a plan already exists." Everything it depended on -- the Router
+(`agents/router.py`), the job substrate, `web/route.py`'s dispatcher -- was already fully built;
+this was entirely frontend work, no backend route or job kind needed adding.
+
+**Three decisions, asked before building, not assumed.** (1) Every message from the fused box,
+including a plain question, goes through the Router and needs one explicit approval click --
+built exactly as `route.py`'s own docstring already specified ("`view_scenario`/`qa_question`
+still go through this same one-click-per-step gate... CLAUDE.md's own design makes no exception
+for them"), not shortcut for a snappier QA experience. (2) `view_scenario` now actually switches
+to the Scenarios tab and applies the matching filter mode, instead of the inert "N of M matched"
+text it rendered before. (3) `edit_step` (revising a proposed step's params before approving) is
+explicitly left out of scope -- a pre-existing gap unrelated to the fusion itself.
+
+**Built:** one unified `RouteConversation` mechanism (`app.js`'s `conv` object -- a container id,
+a send-button id, its own history array and poll timer) replacing the two previously-separate,
+near-duplicate implementations behind the empty-workspace's own route form and the post-plan chat
+panel. `appendRouteMessage`/`sendRouteMessage`/`renderRoutePlan`/`renderRouteStep`/
+`approveRouteStep`/`pollRoutePlan`/`appendFollowUpCard`/`openResolvePanel`/`openConfirmPanel` all
+now take `conv` (or, for the resolve/confirm panels reached from a route step's own follow-up
+buttons, read it off `card.conv` -- stashed the same way `card.dataset.name` already was) instead
+of hardcoding `#empty-route-messages`. The chat panel's box now calls `sendRouteMessage` directly
+-- `submitChatMessage`/`appendChatMessage`/`setChatTyping`, the old direct-`/api/chat` path, are
+gone from this UI entirely (the endpoint itself is untouched and still mounted -- nothing in this
+design retires it, per Section 5's own "Folding read-only chat into the job substrate... POST
+/api/chat is retired by nothing in this design").
+
+Two things preserved, not just carried over: a succeeded `qa_question` step renders through a new
+`routeStepResultHtml` special case -- real citation chips (`citationChipHtml`, clickable,
+wired to `jumpToFinding`) and the insufficient-data badge, not `formatStepResult`'s generic
+escaped-text fallback every other op uses; losing this would have been a real regression from
+what the direct `/api/chat` path already gave a plain chat bubble. A pending, approvable
+`run_agents` step now shows a cost-caution line before its approve button -- nothing in the
+original design flagged this, but the sidebar's own dedicated "Run agents" control already treats
+this exact operation as "never one click" for the identical reason (real money, replaces the
+current plan), and a Router-dispatched path deserves the same caution even though the underlying
+one-click-per-step rule itself is unchanged. No precise dollar figure is shown here the way the
+sidebar button shows one, since a Router step's `source_ref` can name a brand-new upload whose
+finding count isn't known until ingested.
+
+`applyViewScenarioResult` is the new `view_scenario` wiring: sets `scenarioMode` from the step's
+own `result.mode` ("recommended"/"selection" -- exactly the Scenarios tab's own existing two-mode
+toggle, reused rather than inventing a second notion of "what matters right now") and switches
+tabs; `handleStepSideEffects` calls it from both `approveRouteStep`'s immediate response
+(`view_scenario` is a synchronous op, always completes inline) and `pollRoutePlan`'s tick (for a
+job-backed op). `maybeTransitionToPlanView` is renamed `maybeRefreshAfterStep` and now handles
+both cases a step writing the export can mean: if the empty workspace is still showing, transition
+out of it (unchanged); if a plan is already showing (the chat panel dispatched this step),
+refresh it in place via `renderAll`, the same "the plan just changed under you" refresh
+`constraint_submit`'s direct-form path and the run-agents-control button already give.
+
+**A real, previously-undetected bug found and fixed while verifying this live, not filed and left
+for later.** `agents/router.py`'s `ConstraintSubmitParams` field is `raw_text` -- this file's own
+Section 3, written when the Router was designed, documents `CONSTRAINT_SUBMIT`'s param type as
+`{raw_text: str}` with its own stated reasoning (the model is not resolving which asset or
+finding this affects, only copying the human's own words verbatim). `web/jobs.py`'s
+`_run_constraint_submit` read `job.input.get("text")` instead, and `route.py`'s `dispatch_job`
+call passes `step.params` through as `job.input` completely unchanged -- so **every** Router-
+proposed `constraint_submit` step has failed outright since this was built, 100% of the time,
+with "constraint_submit requires non-empty input.text". No existing test ever caught it:
+`test_web_route.py`'s own `CONSTRAINT_SUBMIT` cases only ever exercised `edit_step`/`claim_step`'s
+editing mechanics, never a real dispatch through to `Coordinator.submit_constraint`, and
+`test_web_jobs.py`'s constraint tests post directly to `/api/jobs` with a hand-written body,
+never through the Router's own shape. Fixed by aligning the implementation to the already-written
+design (`_run_constraint_submit`, `_REQUIRED_JOB_INPUT_FIELDS`, and the direct Constraints-tab
+form's own `submitConstraint` all renamed to `raw_text`), not the other way -- the name the
+design chose has a real reason behind it, spelled out where it's declared. New regression test
+(`test_web_route.py`) dispatches a real Router-shaped `constraint_submit` step through the real
+HTTP/job pipeline (a tiny one-asset/one-finding fixture, its own seed-run Crew fake, `Coordinator
+.submit_constraint` itself monkeypatched to capture the exact text and raise a recognized
+sentinel exception) and confirms the real text arrives -- confirmed via break/fix to fail on the
+old key name.
+
+**Verified three ways.** Unit: 33 `app_test.html` tests (was 26), each confirmed to fail when the
+behavior it targets is reverted -- container isolation between the two conversations, citation
+rendering, the cost warning, the `view_scenario` tab-switch, in-place plan-wrapper updates,
+and the sentinel the run-agents-control button sends. Integration: the new `test_web_route.py`
+regression test above, plus the full existing suite (1648 passed). Live, end to end, real LLM
+calls throughout, not against fakes: opened the fused chat panel on a real seeded plan, asked
+"How many findings are contested?" -- Router correctly classified `qa_question`, approval
+produced a real grounded answer with three real, clickable citation chips, and clicking one
+correctly jumped to and expanded that finding on the Findings tab; asked to see the recommended
+findings -- Router correctly classified `view_scenario`, approval switched to the Scenarios tab
+showing exactly the 4 matching findings; stated "the payroll server can only be patched on
+weekends" -- Router correctly classified `constraint_submit` with `raw_text` populated, approval
+ran a full real 24-finding agents seed (`plan_state.seed()`, since this server had no
+already-established plan), Tree-of-Thought for the 3 contested findings, constraint
+interpretation (correctly resolved to A08/PAY01 via `search_assets`), a real replan for the 3
+affected findings, and a correct in-place refresh of the already-showing plan -- confirmed
+afterward on the Constraints tab: the real, persisted, active constraint with its real
+before/after delta table.
+
+**An honest cost note, not glossed over.** That last live check cost real money beyond what was
+planned -- `plan_state.seed()` had no already-seeded plan to attach the constraint to on this
+test server, so it ran a full agents pass (measured elsewhere in this file at about $6.48 for 24
+findings) plus Tree-of-Thought for 3 contested findings on top of that, not accounted for in the
+sidebar button's own plain-agents-run estimate. A real cost incurred by this session's own test
+setup (a server with no `--data` matching the export it was pointed at), not something the design
+itself requires for an ordinary constraint submission against an already-current plan.
+
+**Left open, stated so it isn't assumed done by omission.** `edit_step` still has no UI anywhere
+(decided out of scope for this work, above) -- the backend has fully supported it since it was
+built. `app.js` still has no coverage beyond what the regression harness (the entry above this
+one) reaches; the harness itself gained real coverage from this work but was not exhaustively
+extended to every corner of the route-plan rendering (e.g. `ingest_propose`'s own follow-up
+buttons, `constraint_submit`/`remediation_mark`'s plain-text result rendering).

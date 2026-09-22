@@ -768,7 +768,26 @@ def _run_constraint_submit(job: Job, plan_state: PlanState, on_stage: Callable[[
     (asset-scoped or fleet-wide capacity) internally, the same way
     `Coordinator.submit_constraint` itself branches -- a human's free
     text doesn't pre-declare its kind, so this isn't two job kinds."""
-    text = job.input.get("text") or ""
+    # "raw_text", not "text" -- CLAUDE.md's own Router design ("Future
+    # direction: a conversational front end", Section 3) documents
+    # CONSTRAINT_SUBMIT's param type as `{raw_text: str}`, with its own
+    # reasoning for the name (the model is NOT resolving which asset or
+    # finding this affects, only copying the human's own words verbatim).
+    # This job kind and the direct Constraints-tab form (app.js's
+    # submitConstraint) both used to send "text" instead -- a real,
+    # 100%-reproducible break for every Router-proposed constraint_submit
+    # step (every one failed with "constraint_submit requires non-empty
+    # input.text", since RouterOperation.params for this op is always
+    # {raw_text: ...}, never {text: ...} -- route.py's own dispatch_job
+    # call passes step.params through as job.input UNCHANGED, no key
+    # translation). Found live: no existing test ever dispatched a
+    # Router-proposed constraint_submit step through this real handler:
+    # test_web_route.py's own CONSTRAINT_SUBMIT tests only ever exercise
+    # edit_step/claim_step's OWN mechanics, never job completion. Fixed by
+    # aligning the implementation to the already-written design, not the
+    # other way around -- the name the design chose has a real reason
+    # behind it, spelled out above.
+    text = job.input.get("raw_text") or ""
 
     plan_state.seed(on_stage=on_stage)
     coordinator = plan_state.coordinator
@@ -1529,7 +1548,7 @@ def _execute_job(job: Job, registry: JobRegistry, plan_state: PlanState) -> None
 class SubmitJobRequest(BaseModel):
     """`input` is a free-form, kind-specific dict, deliberately not typed
     per-field here -- it becomes `Job.input` verbatim, and each handler
-    validates what it needs (see `_run_constraint_submit`'s `text`
+    validates what it needs (see `_run_constraint_submit`'s `raw_text`
     lookup). Adding a job kind never requires touching this model."""
 
     kind: str
@@ -1543,7 +1562,7 @@ class SubmitJobRequest(BaseModel):
 #: check below, since "a required field is present" doesn't cover "and its
 #: value is legal."
 _REQUIRED_JOB_INPUT_FIELDS: dict[str, tuple[str, ...]] = {
-    "constraint_submit": ("text",),
+    "constraint_submit": ("raw_text",),
     "ingest_propose": ("upload_id",),
     "run_deterministic": ("source_ref",),
     "run_agents": ("source_ref",),

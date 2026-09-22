@@ -88,13 +88,15 @@
           <button id="chat-close-btn" class="chat-close-btn" type="button" aria-label="Close chat">&times;</button>
         </div>
         <p class="chat-panel-hint">
-          Answers are grounded in this export only — no CVE knowledge, no live lookups. Every
-          citation shows the finding's real score and bucket, taken from the export, never from
-          the model.
+          Ask a question, or ask for something to be done (run agents, submit a constraint, show
+          the critical ones). Answers are grounded in this export only — no CVE knowledge, no live
+          lookups; every citation shows the finding's real score and bucket, taken from the
+          export, never from the model. Anything that isn't a plain question — including a
+          question — is shown as a proposed step you approve before it runs.
         </p>
         <div id="chat-messages" class="chat-messages"></div>
         <form id="chat-form" class="chat-form">
-          <textarea id="chat-input" rows="2" placeholder="Ask about this plan..."></textarea>
+          <textarea id="chat-input" rows="2" placeholder="Ask, or say what you'd like to do..."></textarea>
           <button id="chat-send-btn" type="submit">Send</button>
         </form>
       </aside>
@@ -531,6 +533,159 @@
         } finally {
           window.fetch = originalFetch;
           clearTimeout(runAgentsPollTimer);
+        }
+      });
+
+      // ---------------------------------------------------------------
+      // The conversational front end fusion (CLAUDE.md, "Future direction:
+      // a conversational front end", Sections 5-6): the post-plan chat
+      // panel and the empty-workspace's own route form now share ONE
+      // mechanism (a RouteConversation, `conv`) instead of two separate
+      // implementations. These tests exercise the fused pieces the earlier
+      // tests in this file never touched: which CONTAINER a conv renders
+      // into, citation rendering for a qa_question step reached through
+      // the Router (not the old direct /api/chat path), the run_agents
+      // cost warning, and the view_scenario tab-switch.
+      // ---------------------------------------------------------------
+      function _fakeRouteStep(overrides = {}) {
+        return Object.assign(
+          {
+            op: "qa_question",
+            params: { question: "how many are contested?" },
+            summary: "Answer a question about this plan.",
+            depends_on: null,
+            approved: false,
+            status: "pending",
+            job_id: null,
+            result: null,
+            error: null,
+            export_written: false,
+          },
+          overrides
+        );
+      }
+
+      await test("sendRouteMessage: posts to /api/route and renders the reply into THIS conv's own container, not the other one", async () => {
+        const conv = makeRouteConversation("chat-messages", "chat-send-btn", "chat-typing");
+        const originalFetch = window.fetch;
+        window.fetch = async (url, opts) => {
+          assertEqual(url, "/api/route");
+          const body = JSON.parse(opts.body);
+          assertEqual(body.message, "how many are contested?");
+          return {
+            ok: true,
+            json: async () => ({
+              route_id: "route-test-1",
+              message: body.message,
+              steps: [_fakeRouteStep()],
+              clarify: null,
+              issues: [],
+              created_at: "2026-01-01T00:00:00Z",
+            }),
+          };
+        };
+        const chatBefore = document.getElementById("chat-messages").children.length;
+        const emptyBefore = document.getElementById("empty-route-messages").children.length;
+        try {
+          await sendRouteMessage(conv, "how many are contested?");
+          assert(
+            document.getElementById("chat-messages").children.length > chatBefore,
+            "the user turn + route plan should render into #chat-messages"
+          );
+          assertEqual(
+            document.getElementById("empty-route-messages").children.length,
+            emptyBefore,
+            "must not touch the OTHER conversation's container at all"
+          );
+          assert(!!document.querySelector('#chat-messages .route-plan[data-route-id="route-test-1"]'), "the route plan itself should be in #chat-messages");
+        } finally {
+          window.fetch = originalFetch;
+          document.getElementById("chat-messages").innerHTML = "";
+          document.getElementById("empty-route-messages").innerHTML = "";
+        }
+      });
+
+      await test("renderRouteStep: a succeeded qa_question step renders citation chips, not escaped JSON/text", () => {
+        const conv = makeRouteConversation("chat-messages", "chat-send-btn", "chat-typing");
+        const step = _fakeRouteStep({
+          status: "succeeded",
+          approved: true,
+          result: {
+            answer: "3 findings are contested.",
+            citations: [{ finding_id: "F11", cve_id: "CVE-2023-23397", hostname: "WKS-FIN12", bucket: "contested", risk_score: 30.6 }],
+            insufficient_data: false,
+            insufficient_reason: null,
+          },
+        });
+        const el = renderRouteStep(conv, "route-test-2", step, 0, [step]);
+        assert(el.innerHTML.includes("3 findings are contested."), "the answer text should render");
+        assert(el.innerHTML.includes("citation-chip"), "a real citation should render as a clickable chip");
+        assert(el.innerHTML.includes("F11"), "the citation's finding_id should be visible");
+        assert(!el.innerHTML.includes('"citations"'), "must not fall back to raw JSON for a known op");
+      });
+
+      await test("renderRouteStep: a succeeded qa_question with insufficient_data shows the same badge appendRouteMessage already uses", () => {
+        const conv = makeRouteConversation("chat-messages", "chat-send-btn", "chat-typing");
+        const step = _fakeRouteStep({
+          status: "succeeded",
+          approved: true,
+          result: { answer: "I can't tell from this plan.", citations: [], insufficient_data: true, insufficient_reason: "no matching finding" },
+        });
+        const el = renderRouteStep(conv, "route-test-3", step, 0, [step]);
+        assert(el.innerHTML.includes("chat-insufficient"), "should render the insufficient-data note");
+        assert(el.innerHTML.includes("no matching finding"), "should include the real reason");
+      });
+
+      await test("renderRouteStep: a pending, approvable run_agents step warns about real cost before the approve button", () => {
+        const conv = makeRouteConversation("chat-messages", "chat-send-btn", "chat-typing");
+        const step = _fakeRouteStep({ op: "run_agents", params: { source_ref: "abc123" }, summary: "Run agents on the new upload." });
+        const el = renderRouteStep(conv, "route-test-4", step, 0, [step]);
+        assert(el.innerHTML.includes("real LLM budget"), "must warn about cost before the one approval click");
+        assert(!!el.querySelector(".route-approve-btn"), "the approve button should still be offered");
+      });
+
+      await test("renderRouteStep: a pending qa_question step does NOT show the run_agents cost warning", () => {
+        const conv = makeRouteConversation("chat-messages", "chat-send-btn", "chat-typing");
+        const step = _fakeRouteStep(); // op: qa_question, pending
+        const el = renderRouteStep(conv, "route-test-5", step, 0, [step]);
+        assert(!el.innerHTML.includes("real LLM budget"), "a free, synchronous op must not carry the cost warning");
+        assert(!!el.querySelector(".route-approve-btn"), "still needs its own one-click approval -- CLAUDE.md's 'no exception' rule");
+      });
+
+      await test("applyViewScenarioResult: switches to the Scenarios tab and sets scenarioMode from the step's own result", () => {
+        const priorMode = scenarioMode;
+        const priorExport = lastExportData;
+        lastExportData = { findings: [], run: { data_dir: "x", format: "native", seed: 42, agents: true } };
+        try {
+          applyViewScenarioResult({ result: { mode: "recommended", total: 24, matched: 3, findings: [] } });
+          assertEqual(scenarioMode, "recommended");
+          assert(document.getElementById("tab-scenarios").classList.contains("active"), "should switch to the Scenarios tab");
+
+          switchTab("overview"); // reset, then confirm "selection" mode also switches
+          applyViewScenarioResult({ result: { mode: "selection", total: 24, matched: 24, findings: [] } });
+          assertEqual(scenarioMode, "selection");
+          assert(document.getElementById("tab-scenarios").classList.contains("active"), "should switch tabs for selection mode too");
+        } finally {
+          scenarioMode = priorMode;
+          lastExportData = priorExport;
+          switchTab("overview");
+        }
+      });
+
+      await test("updateRoutePlanRendering: an existing plan re-renders in place, in the SAME conv's container it was first drawn in", () => {
+        const conv = makeRouteConversation("chat-messages", "chat-send-btn", "chat-typing");
+        const container = document.getElementById("chat-messages");
+        try {
+          const step = _fakeRouteStep({ status: "running" });
+          renderRoutePlan(conv, { route_id: "route-test-6", steps: [step], clarify: null });
+          assert(container.querySelector(".route-step.status-running"), "first render should show the running state");
+
+          const updatedStep = _fakeRouteStep({ status: "succeeded", approved: true, result: { answer: "done", citations: [], insufficient_data: false } });
+          updateRoutePlanRendering(conv, { route_id: "route-test-6", steps: [updatedStep], clarify: null });
+          assert(container.querySelector(".route-step.status-succeeded"), "should update the SAME wrapper in place, not append a second one");
+          assertEqual(container.querySelectorAll('.route-plan[data-route-id="route-test-6"]').length, 1, "must not duplicate the plan wrapper");
+        } finally {
+          container.innerHTML = "";
         }
       });
 

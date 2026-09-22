@@ -192,17 +192,17 @@ def _wait_for_terminal(client: TestClient, job_id: str, timeout: float = 5.0) ->
 
 def test_registry_enforces_one_job_at_a_time():
     registry = JobRegistry()
-    job1 = registry.create_and_start("constraint_submit", {"text": "a"})
+    job1 = registry.create_and_start("constraint_submit", {"raw_text": "a"})
     assert job1 is not None
     assert job1.status == "running"
     assert job1.started_at is not None
 
-    job2 = registry.create_and_start("constraint_submit", {"text": "b"})
+    job2 = registry.create_and_start("constraint_submit", {"raw_text": "b"})
     assert job2 is None  # rejected -- no job record created for it
     assert registry.list_recent() == [job1]
 
     registry.finish(job1.id, status="succeeded", result={"ok": True})
-    job3 = registry.create_and_start("constraint_submit", {"text": "c"})
+    job3 = registry.create_and_start("constraint_submit", {"raw_text": "c"})
     assert job3 is not None  # slot freed once job1 finished
 
 
@@ -251,14 +251,14 @@ def test_unknown_job_kind_is_a_400(app_and_client):
 
 def test_constraint_submit_requires_non_empty_text(app_and_client):
     _, client, _ = app_and_client
-    resp = client.post("/api/jobs", json={"kind": "constraint_submit", "input": {"text": "   "}})
+    resp = client.post("/api/jobs", json={"kind": "constraint_submit", "input": {"raw_text": "   "}})
     assert resp.status_code == 400
 
 
 def test_a_job_already_running_is_a_409(app_and_client):
     app, client, _ = app_and_client
-    app.state.job_registry.create_and_start("constraint_submit", {"text": "already running"})
-    resp = client.post("/api/jobs", json={"kind": "constraint_submit", "input": {"text": "another one"}})
+    app.state.job_registry.create_and_start("constraint_submit", {"raw_text": "already running"})
+    resp = client.post("/api/jobs", json={"kind": "constraint_submit", "input": {"raw_text": "another one"}})
     assert resp.status_code == 409
 
 
@@ -287,7 +287,7 @@ def test_happy_path_seeds_the_plan_submits_and_refreshes_the_whole_fleet_export(
         "/api/jobs",
         json={
             "kind": "constraint_submit",
-            "input": {"text": "the finance workstation now sits behind a WAF"},
+            "input": {"raw_text": "the finance workstation now sits behind a WAF"},
         },
     )
     assert resp.status_code == 202
@@ -315,7 +315,7 @@ def test_happy_path_seeds_the_plan_submits_and_refreshes_the_whole_fleet_export(
         _constraint_interpretation_json(asset_id=None, constraint_kind=None),
     ]
     resp2 = client.post(
-        "/api/jobs", json={"kind": "constraint_submit", "input": {"text": "please prioritize better"}}
+        "/api/jobs", json={"kind": "constraint_submit", "input": {"raw_text": "please prioritize better"}}
     )
     body2 = _wait_for_terminal(client, resp2.json()["job_id"])
     assert body2["status"] == "succeeded"
@@ -332,7 +332,7 @@ def test_a_refused_interpretation_is_not_a_failure(app_and_client):
     )
 
     resp = client.post(
-        "/api/jobs", json={"kind": "constraint_submit", "input": {"text": "please prioritize better"}}
+        "/api/jobs", json={"kind": "constraint_submit", "input": {"raw_text": "please prioritize better"}}
     )
     body = _wait_for_terminal(client, resp.json()["job_id"])
 
@@ -348,7 +348,7 @@ def test_interpretation_that_never_parses_fails_with_nothing_persisted(app_and_c
     _QueuedFakeCrew.queue += [UNPARSEABLE] * 3  # DEFAULT_MAX_PARSE_ATTEMPTS
 
     resp = client.post(
-        "/api/jobs", json={"kind": "constraint_submit", "input": {"text": "gibberish constraint"}}
+        "/api/jobs", json={"kind": "constraint_submit", "input": {"raw_text": "gibberish constraint"}}
     )
     body = _wait_for_terminal(client, resp.json()["job_id"])
 
@@ -388,7 +388,7 @@ def test_a_replan_dispatch_failure_still_persists_the_constraint_and_succeeds(ap
 
     resp = client.post(
         "/api/jobs",
-        json={"kind": "constraint_submit", "input": {"text": "the finance workstation now sits behind a WAF"}},
+        json={"kind": "constraint_submit", "input": {"raw_text": "the finance workstation now sits behind a WAF"}},
     )
     body = _wait_for_terminal(client, resp.json()["job_id"])
 
@@ -426,7 +426,7 @@ def test_export_write_failure_is_a_warning_not_an_error(app_and_client, monkeypa
 
     resp = client.post(
         "/api/jobs",
-        json={"kind": "constraint_submit", "input": {"text": "the finance workstation now sits behind a WAF"}},
+        json={"kind": "constraint_submit", "input": {"raw_text": "the finance workstation now sits behind a WAF"}},
     )
     body = _wait_for_terminal(client, resp.json()["job_id"])
 

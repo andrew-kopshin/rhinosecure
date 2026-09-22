@@ -47,13 +47,15 @@
           <button id="chat-close-btn" class="chat-close-btn" type="button" aria-label="Close chat">&times;</button>
         </div>
         <p class="chat-panel-hint">
-          Answers are grounded in this export only — no CVE knowledge, no live lookups. Every
-          citation shows the finding's real score and bucket, taken from the export, never from
-          the model.
+          Ask a question, or ask for something to be done (run agents, submit a constraint, show
+          the critical ones). Answers are grounded in this export only — no CVE knowledge, no live
+          lookups; every citation shows the finding's real score and bucket, taken from the
+          export, never from the model. Anything that isn't a plain question — including a
+          question — is shown as a proposed step you approve before it runs.
         </p>
         <div id="chat-messages" class="chat-messages"></div>
         <form id="chat-form" class="chat-form">
-          <textarea id="chat-input" rows="2" placeholder="Ask about this plan..."></textarea>
+          <textarea id="chat-input" rows="2" placeholder="Ask, or say what you'd like to do..."></textarea>
           <button id="chat-send-btn" type="submit">Send</button>
         </form>
       </aside>

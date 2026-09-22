@@ -1384,7 +1384,13 @@ async function submitConstraint(text, input) {
     const res = await fetch("/api/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kind: "constraint_submit", input: { text } }),
+      // The key is raw_text, not text -- matching what web/jobs.py's
+      // _run_constraint_submit actually reads (and what the Router's own
+      // ConstraintSubmitParams already used) after the real mismatch found
+      // live while verifying the chat/Router fusion: every Router-proposed
+      // constraint_submit step failed outright, since route.py passes
+      // params through unchanged and the Router never sent "text" at all.
+      body: JSON.stringify({ kind: "constraint_submit", input: { raw_text: text } }),
     });
     const body = await res.json();
     if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
@@ -1600,8 +1606,36 @@ function capacityConstraintHtml(c) {
  * exists ONLY for that cross-link; nothing renders from it directly. */
 let lastExportData = null;
 let chatEnabled = false;
-let chatHistory = []; // [{role: "user"|"assistant", content: string}, ...]
-const MAX_CLIENT_CHAT_HISTORY = 20;
+const MAX_CLIENT_ROUTE_HISTORY = 20;
+
+/* ---------------- unified Router conversation (CLAUDE.md, "Future
+ * direction: a conversational front end", Sections 5-6) ----------------
+ *
+ * ONE mechanism, TWO instances: the empty-workspace's own route form
+ * (shown before a plan exists) and the post-plan chat panel (shown once
+ * one does) are different SCREENS, but every message from either now goes
+ * through the identical path -- append the user's turn, POST /api/route,
+ * render whatever RoutePlan comes back (a clarifying question and/or one
+ * or more steps, each needing its own explicit approval click before it
+ * dispatches -- route.py's own "no exception, not even for a synchronous
+ * qa_question" rule, confirmed and kept as specified, not shortcut).
+ * `conv` (a RouteConversation) is what makes the SAME functions serve
+ * both DOM contexts without duplicating them: which container to render
+ * into, which button to disable while in flight, its own history array
+ * and poll timer, so the two conversations never step on each other's
+ * state. This is also why the OLD direct `/api/chat` call from the chat
+ * panel is gone: "one input box... every message goes to the Router
+ * first" (CLAUDE.md's own Section 5) means the panel's box no longer
+ * calls /api/chat itself -- the endpoint stays mounted (nothing in this
+ * design retires it; QA_QUESTION's own dispatch, route.py's
+ * _execute_synchronous_step, still calls the exact same agents.chat
+ * .answer_question underneath), just no longer reached directly from
+ * this UI's own input box. */
+function makeRouteConversation(messagesId, sendBtnId, typingId) {
+  return { messagesId, sendBtnId, typingId, history: [], pollTimer: null };
+}
+const emptyRouteConv = makeRouteConversation("empty-route-messages", "empty-route-send-btn", "empty-route-typing");
+const chatRouteConv = makeRouteConversation("chat-messages", "chat-send-btn", "chat-typing");
 
 function citationChipHtml(c) {
   return `
@@ -1614,14 +1648,21 @@ function citationChipHtml(c) {
   `;
 }
 
-function appendChatMessage(role, content, opts) {
+/* A plain conversational turn -- a user message, an error, or (for
+ * qa_question specifically) a fully-formed grounded answer with its own
+ * citation chips, rendered the identical way the old direct-/api/chat
+ * path already did (opts.citations/insufficientData/insufficientReason).
+ * A ROUTED step that ISN'T qa_question never calls this for its own
+ * result -- that's renderRouteStep's job, appended as a `.route-plan`
+ * block, not a plain chat bubble. */
+function appendRouteMessage(conv, role, content, opts) {
   opts = opts || {};
   const citations = opts.citations || [];
   const insufficient = Boolean(opts.insufficientData);
 
-  const container = document.getElementById("chat-messages");
+  const container = document.getElementById(conv.messagesId);
   const bubble = document.createElement("div");
-  bubble.className = `chat-msg chat-msg-${role}${insufficient ? " insufficient" : ""}`;
+  bubble.className = `chat-msg chat-msg-${role}${insufficient ? " insufficient" : ""}${opts.isError ? " chat-msg-error" : ""}`;
 
   const insufficientHtml = insufficient
     ? `<p class="chat-insufficient">Not answerable from this plan${opts.insufficientReason ? `: ${esc(opts.insufficientReason)}` : "."}</p>`
@@ -1644,13 +1685,13 @@ function appendChatMessage(role, content, opts) {
   return bubble;
 }
 
-function setChatTyping(on) {
-  const existing = document.getElementById("chat-typing");
+function setConvTyping(conv, on) {
+  const existing = document.getElementById(conv.typingId);
   if (existing) existing.remove();
   if (!on) return;
-  const container = document.getElementById("chat-messages");
+  const container = document.getElementById(conv.messagesId);
   const el = document.createElement("div");
-  el.id = "chat-typing";
+  el.id = conv.typingId;
   el.className = "chat-typing";
   el.innerHTML = `<span class="spinner"></span> Thinking…`;
   container.appendChild(el);
@@ -1672,35 +1713,33 @@ function jumpToFinding(findingId) {
   });
 }
 
-async function submitChatMessage(text) {
-  const sendBtn = document.getElementById("chat-send-btn");
-  const priorHistory = chatHistory.slice(-MAX_CLIENT_CHAT_HISTORY);
+async function sendRouteMessage(conv, text) {
+  clearTimeout(conv.pollTimer);
+  const sendBtn = document.getElementById(conv.sendBtnId);
+  const priorHistory = conv.history.slice(-MAX_CLIENT_ROUTE_HISTORY);
 
-  appendChatMessage("user", text);
-  chatHistory.push({ role: "user", content: text });
+  appendRouteMessage(conv, "user", text);
+  conv.history.push({ role: "user", content: text });
   if (sendBtn) sendBtn.disabled = true;
-  setChatTyping(true);
+  setConvTyping(conv, true);
 
   try {
-    const res = await fetch("/api/chat", {
+    const res = await fetch("/api/route", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message: text, history: priorHistory }),
     });
     const body = await res.json();
     if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
-
-    appendChatMessage("assistant", body.answer, {
-      citations: body.citations,
-      insufficientData: body.insufficient_data,
-      insufficientReason: body.insufficient_reason,
+    renderRoutePlan(conv, body);
+    conv.history.push({
+      role: "assistant",
+      content: body.clarify || `Proposed ${body.steps.length} step(s) -- see above.`,
     });
-    chatHistory.push({ role: "assistant", content: body.answer });
   } catch (err) {
-    const bubble = appendChatMessage("assistant", `Could not answer: ${err.message}`);
-    bubble.classList.add("chat-msg-error");
+    appendRouteMessage(conv, "assistant", `Could not route that: ${err.message}`, { isError: true });
   } finally {
-    setChatTyping(false);
+    setConvTyping(conv, false);
     if (sendBtn) sendBtn.disabled = false;
   }
 }
@@ -1728,7 +1767,7 @@ function setupChat() {
     const text = input.value.trim();
     if (!text) return;
     input.value = "";
-    submitChatMessage(text);
+    sendRouteMessage(chatRouteConv, text);
   });
 }
 
@@ -1743,8 +1782,6 @@ function setupChat() {
 
 let currentUploadId = null;
 let emptyWorkspaceSetUp = false;
-let emptyRoutePollTimer = null;
-let emptyRouteHistory = []; // [{role, content}, ...] -- threaded into POST /api/route same as chat
 
 function showEmptyWorkspace() {
   const layout = document.querySelector(".layout");
@@ -1770,7 +1807,7 @@ function setupEmptyWorkspaceOnce() {
     const text = input.value.trim();
     if (!text) return;
     input.value = "";
-    sendEmptyRouteMessage(text);
+    sendRouteMessage(emptyRouteConv, text);
   });
 }
 
@@ -1832,7 +1869,7 @@ function renderUploadStatus(upload) {
   const analyzeBtn = document.getElementById("empty-analyze-btn");
   if (analyzeBtn) {
     analyzeBtn.addEventListener("click", () =>
-      sendEmptyRouteMessage(`Analyze the file I just uploaded (upload_id ${upload.upload_id}).`)
+      sendRouteMessage(emptyRouteConv, `Analyze the file I just uploaded (upload_id ${upload.upload_id}).`)
     );
   }
 }
@@ -1853,81 +1890,65 @@ async function handleUploadLabelChange(uploadId, filename, label) {
   }
 }
 
-/* ---- chat/route entry point ---- */
+/* ---- rendering a RoutePlan (shared by both conversations) ---- */
 
-function appendEmptyRouteMessage(role, text, opts) {
-  opts = opts || {};
-  const container = document.getElementById("empty-route-messages");
-  const bubble = document.createElement("div");
-  bubble.className = `chat-msg chat-msg-${role}${opts.isError ? " chat-msg-error" : ""}`;
-  bubble.innerHTML = `<p class="chat-msg-content">${esc(text)}</p>`;
-  container.appendChild(bubble);
-  container.scrollTop = container.scrollHeight;
-  return bubble;
-}
-
-async function sendEmptyRouteMessage(text) {
-  clearTimeout(emptyRoutePollTimer);
-  const sendBtn = document.getElementById("empty-route-send-btn");
-  const container = document.getElementById("empty-route-messages");
-
-  appendEmptyRouteMessage("user", text);
-  emptyRouteHistory.push({ role: "user", content: text });
-  if (sendBtn) sendBtn.disabled = true;
-
-  const typing = document.createElement("div");
-  typing.className = "chat-typing";
-  typing.id = "empty-route-typing";
-  typing.innerHTML = `<span class="spinner"></span> Thinking…`;
-  container.appendChild(typing);
-  container.scrollTop = container.scrollHeight;
-
-  try {
-    const res = await fetch("/api/route", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text, history: emptyRouteHistory.slice(0, -1) }),
-    });
-    const body = await res.json();
-    if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
-    renderRoutePlan(body);
-    emptyRouteHistory.push({
-      role: "assistant",
-      content: body.clarify || `Proposed ${body.steps.length} step(s) -- see above.`,
-    });
-  } catch (err) {
-    appendEmptyRouteMessage("assistant", `Could not route that: ${err.message}`, { isError: true });
-  } finally {
-    document.getElementById("empty-route-typing")?.remove();
-    if (sendBtn) sendBtn.disabled = false;
-  }
-}
-
-function renderRoutePlan(plan) {
-  const container = document.getElementById("empty-route-messages");
+function renderRoutePlan(conv, plan) {
+  const container = document.getElementById(conv.messagesId);
   const wrapper = document.createElement("div");
   wrapper.className = "route-plan";
   wrapper.dataset.routeId = plan.route_id;
-  fillRoutePlanWrapper(wrapper, plan);
+  fillRoutePlanWrapper(conv, wrapper, plan);
   container.appendChild(wrapper);
   container.scrollTop = container.scrollHeight;
 }
 
-function fillRoutePlanWrapper(wrapper, plan) {
+function fillRoutePlanWrapper(conv, wrapper, plan) {
   wrapper.innerHTML = plan.clarify ? `<div class="route-clarify">${esc(plan.clarify)}</div>` : "";
-  plan.steps.forEach((step, index) => wrapper.appendChild(renderRouteStep(plan.route_id, step, index, plan.steps)));
+  plan.steps.forEach((step, index) => wrapper.appendChild(renderRouteStep(conv, plan.route_id, step, index, plan.steps)));
 }
 
-function updateRoutePlanRendering(plan) {
+/* Looks up the existing `.route-plan` wrapper by route_id regardless of
+ * which conversation's container it actually lives in -- route_id is
+ * globally unique (server-generated), so this never needs `conv` itself,
+ * only whichever `conv` renderRouteStep's own button handlers were
+ * originally built with (threaded through from the caller, e.g.
+ * approveRouteStep/pollRoutePlan, which already have it). */
+function updateRoutePlanRendering(conv, plan) {
   const wrapper = document.querySelector(`.route-plan[data-route-id="${plan.route_id}"]`);
   if (!wrapper) {
-    renderRoutePlan(plan);
+    renderRoutePlan(conv, plan);
     return;
   }
-  fillRoutePlanWrapper(wrapper, plan);
+  fillRoutePlanWrapper(conv, wrapper, plan);
 }
 
-function renderRouteStep(routeId, step, index, allSteps) {
+/* A succeeded qa_question step gets the SAME rich rendering the old direct
+ * /api/chat path always gave a plain chat bubble -- citation chips,
+ * insufficient-data badge -- rather than formatStepResult's generic
+ * escaped-text treatment every other op uses. Losing citations here would
+ * be a real regression from what this box already did before the fusion. */
+function routeStepResultHtml(step) {
+  if (!step.result) return "";
+  if (step.op === "qa_question") {
+    const r = step.result;
+    const insufficientHtml = r.insufficient_data
+      ? `<p class="chat-insufficient">Not answerable from this plan${r.insufficient_reason ? `: ${esc(r.insufficient_reason)}` : "."}</p>`
+      : "";
+    const chipsHtml = (r.citations || []).length
+      ? `<div class="citation-chips">${r.citations.map(citationChipHtml).join("")}</div>`
+      : "";
+    return `
+      <div class="route-step-result${r.insufficient_data ? " insufficient" : ""}">
+        <p class="chat-msg-content">${esc(r.answer || "").replace(/\n/g, "<br>")}</p>
+        ${insufficientHtml}
+        ${chipsHtml}
+      </div>
+    `;
+  }
+  return `<div class="route-step-result">${esc(formatStepResult(step))}</div>`;
+}
+
+function renderRouteStep(conv, routeId, step, index, allSteps) {
   const el = document.createElement("div");
   el.className = `route-step status-${esc(step.status)}`;
 
@@ -1938,14 +1959,26 @@ function renderRouteStep(routeId, step, index, allSteps) {
   if (step.status === "running") {
     bodyHtml = `<span class="spinner"></span> <span class="hint">Running…</span>`;
   } else if (step.status === "pending") {
-    bodyHtml = canApprove
-      ? `<button type="button" class="secondary-btn route-approve-btn">Approve &amp; run</button>`
-      : `<span class="hint">Waiting on an earlier step…</span>`;
+    if (canApprove) {
+      // run_agents costs real money and REPLACES the current plan -- the
+      // dedicated sidebar button treats this as "never one click" (its own
+      // comment, above), and a Router-dispatched run_agents deserves the
+      // same caution even though the one-click-per-step rule itself is
+      // unchanged (CLAUDE.md's own "no exception" design, confirmed, not
+      // shortcut). No precise dollar figure is possible here the way the
+      // sidebar button shows one: a Router step's source_ref can name a
+      // brand-new upload, whose finding count isn't known until ingested.
+      const costWarning =
+        step.op === "run_agents"
+          ? `<p class="hint">This spends real LLM budget and replaces the current plan -- cost isn't known until the source is ingested.</p>`
+          : "";
+      bodyHtml = `${costWarning}<button type="button" class="secondary-btn route-approve-btn">Approve &amp; run</button>`;
+    } else {
+      bodyHtml = `<span class="hint">Waiting on an earlier step…</span>`;
+    }
   }
 
-  const resultHtml = step.result
-    ? `<div class="route-step-result">${esc(formatStepResult(step))}</div>`
-    : "";
+  const resultHtml = routeStepResultHtml(step);
   const errorHtml = step.error
     ? `<div class="route-step-result" style="color: var(--status-failed)">${esc(step.error.message || "failed")}</div>`
     : "";
@@ -1966,18 +1999,22 @@ function renderRouteStep(routeId, step, index, allSteps) {
   `;
 
   const approveBtn = el.querySelector(".route-approve-btn");
-  if (approveBtn) approveBtn.addEventListener("click", () => approveRouteStep(routeId, index));
+  if (approveBtn) approveBtn.addEventListener("click", () => approveRouteStep(conv, routeId, index));
+
+  el.querySelectorAll(".citation-chip").forEach((btn) => {
+    btn.addEventListener("click", () => jumpToFinding(btn.dataset.findingId));
+  });
 
   const resolveBtn = el.querySelector(".ingest-resolve-btn");
   if (resolveBtn) {
     resolveBtn.addEventListener("click", () =>
-      openResolvePanel(resolveBtn.dataset.name, resolveBtn.dataset.uploadId)
+      openResolvePanel(conv, resolveBtn.dataset.name, resolveBtn.dataset.uploadId)
     );
   }
   const confirmBtn = el.querySelector(".ingest-confirm-btn");
   if (confirmBtn) {
     confirmBtn.addEventListener("click", () =>
-      openConfirmPanel(confirmBtn.dataset.name, confirmBtn.dataset.uploadId)
+      openConfirmPanel(conv, confirmBtn.dataset.name, confirmBtn.dataset.uploadId)
     );
   }
   return el;
@@ -2013,8 +2050,8 @@ function ingestProposeActionsHtml(step) {
   `;
 }
 
-function appendFollowUpCard(html) {
-  const container = document.getElementById("empty-route-messages");
+function appendFollowUpCard(conv, html) {
+  const container = document.getElementById(conv.messagesId);
   const card = document.createElement("div");
   card.className = "card follow-up-card";
   card.innerHTML = html;
@@ -2103,8 +2140,9 @@ function describeProvisionalCoverage(r) {
   return parts.length ? ` Provisional -- ${esc(parts.join("; "))}.` : " Provisional.";
 }
 
-async function openResolvePanel(name, uploadId) {
-  const card = appendFollowUpCard(`<span class="spinner"></span> Loading slot(s) needing attention…`);
+async function openResolvePanel(conv, name, uploadId) {
+  const card = appendFollowUpCard(conv, `<span class="spinner"></span> Loading slot(s) needing attention…`);
+  card.conv = conv; // so a nested "Review & confirm" click (submitResolvedProposal, below) knows where to render
   let data;
   try {
     const res = await fetch(`/api/adapters/${encodeURIComponent(name)}/proposal?upload_id=${encodeURIComponent(uploadId)}`);
@@ -2791,7 +2829,7 @@ async function submitResolvedProposal(card, slots) {
   // provisional write, so this is a no-op string splice on the happy path.
   statusEl.innerHTML = `Contract written.${describeProvisionalCoverage(result)} <button type="button" class="secondary-btn resolve-confirm-btn">Review &amp; confirm →</button>`;
   statusEl.querySelector(".resolve-confirm-btn").addEventListener("click", () =>
-    openConfirmPanel(card.dataset.name, card.dataset.uploadId)
+    openConfirmPanel(card.conv, card.dataset.name, card.dataset.uploadId)
   );
 }
 
@@ -2822,8 +2860,9 @@ function pollJobOnce(jobId) {
 
 /* ---------------- confirmation (a dedicated, non-conversational form) ---------------- */
 
-async function openConfirmPanel(name, uploadId) {
-  const card = appendFollowUpCard(`<span class="spinner"></span> Loading measurement…`);
+async function openConfirmPanel(conv, name, uploadId) {
+  const card = appendFollowUpCard(conv, `<span class="spinner"></span> Loading measurement…`);
+  card.conv = conv;
   let review;
   try {
     const res = await fetch(`/api/adapters/${encodeURIComponent(name)}/review?upload_id=${encodeURIComponent(uploadId)}`);
@@ -3040,7 +3079,7 @@ async function applyLowConfidenceCorrection(card, name, uploadId, slot) {
   // panel rather than patch this one card in place, so `still_missing`
   // reflects the correction before anything is ever signed.
   statusEl.innerHTML = `Correction applied.`;
-  openConfirmPanel(name, uploadId);
+  openConfirmPanel(card.conv, name, uploadId);
 }
 
 async function submitConfirm(card, name, uploadId) {
@@ -3186,54 +3225,91 @@ function formatStepResult(step) {
   }
 }
 
-async function approveRouteStep(routeId, index) {
+async function approveRouteStep(conv, routeId, index) {
   try {
     const res = await fetch(`/api/route/${routeId}/steps/${index}/approve`, { method: "POST" });
     const body = await res.json();
     if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
-    updateRoutePlanRendering(body);
+    updateRoutePlanRendering(conv, body);
     if (body.steps[index].status === "running") {
-      pollRoutePlan(routeId);
+      pollRoutePlan(conv, routeId);
     } else {
-      maybeTransitionToPlanView(body.steps[index]);
+      handleStepSideEffects(conv, body.steps[index]);
     }
   } catch (err) {
-    appendEmptyRouteMessage("assistant", `Could not approve that step: ${err.message}`, { isError: true });
+    appendRouteMessage(conv, "assistant", `Could not approve that step: ${err.message}`, { isError: true });
   }
 }
 
-function pollRoutePlan(routeId) {
+function pollRoutePlan(conv, routeId) {
   const tick = async () => {
     let body;
     try {
       const res = await fetch(`/api/route/${routeId}`);
       body = await res.json();
     } catch (err) {
-      emptyRoutePollTimer = setTimeout(tick, 1500); // transient network hiccup -- keep polling
+      conv.pollTimer = setTimeout(tick, 1500); // transient network hiccup -- keep polling
       return;
     }
-    updateRoutePlanRendering(body);
+    updateRoutePlanRendering(conv, body);
     if (body.steps.some((s) => s.status === "running")) {
-      emptyRoutePollTimer = setTimeout(tick, 1200);
+      conv.pollTimer = setTimeout(tick, 1200);
       return;
     }
-    body.steps.forEach(maybeTransitionToPlanView);
+    body.steps.forEach((step) => handleStepSideEffects(conv, step));
   };
   tick();
 }
 
-/* Once ANY step actually writes the shared export, this screen's job is
- * done -- the normal tabbed view (Scenarios tab included) is a strictly
- * richer place to do anything further than this constrained chat ever
- * was. Any other steps in the same route plan (e.g. a view_scenario that
- * depended on this one) are simply left behind, unapproved -- nothing
- * about a pending, never-approved step has any real-world effect. */
-async function maybeTransitionToPlanView(step) {
+/* Whatever a step's own success should DO beyond rendering its result
+ * text -- called from both approveRouteStep's immediate response (a
+ * synchronous op, view_scenario/qa_question, completes inline) and
+ * pollRoutePlan's tick (a job-backed op completes later). Never called for
+ * a step that isn't (yet) succeeded. */
+function handleStepSideEffects(conv, step) {
+  if (step.status !== "succeeded") return;
+  if (step.op === "view_scenario") applyViewScenarioResult(step);
+  maybeRefreshAfterStep(conv, step);
+}
+
+/* view_scenario never writes an export (route.py's _view_scenario is a
+ * pure read), so this can never fire from maybeRefreshAfterStep's own
+ * export_written gate below -- it needs its own hook. "recommended"/
+ * "selection" are exactly the Scenarios tab's own two modes
+ * (scenarioMode) -- reusing that existing toggle instead of inventing a
+ * second, parallel notion of "which findings currently matter" is what
+ * lets this be three lines: set the mode, switch tabs, let the tab's own
+ * already-correct rendering do the rest. */
+function applyViewScenarioResult(step) {
+  if (!step.result || !lastExportData) return;
+  scenarioMode = step.result.mode === "selection" ? "selection" : "recommended";
+  switchTab("scenarios");
+  renderScenarios();
+}
+
+/* Once ANY step actually writes the shared export: if this screen is
+ * still the empty workspace, its job is done -- transition into the
+ * normal tabbed view (Scenarios tab included), a strictly richer place to
+ * do anything further than this constrained chat ever was. If a plan is
+ * ALREADY showing (the post-plan chat panel dispatched this step), there
+ * is no screen to transition OUT of -- just refresh the now-stale plan in
+ * place, the same way constraint_submit/run-agents-control already do
+ * after their own direct job posts. Any other pending step in the same
+ * route plan (e.g. a view_scenario that depended on this one) is simply
+ * left behind, unapproved -- nothing about a pending, never-approved step
+ * has any real-world effect. */
+async function maybeRefreshAfterStep(conv, step) {
   if (!step.export_written) return;
   try {
     const res = await fetch("/api/export");
     if (!res.ok) return;
-    hideEmptyWorkspaceShowPlan(await res.json());
+    const data = await res.json();
+    const emptyWorkspace = document.getElementById("empty-workspace");
+    if (emptyWorkspace && !emptyWorkspace.hidden) {
+      hideEmptyWorkspaceShowPlan(data);
+    } else {
+      renderAll(data);
+    }
   } catch (err) {
     // the run DID succeed -- a transient refresh failure here isn't worth
     // turning into a hard error; the human can reload.

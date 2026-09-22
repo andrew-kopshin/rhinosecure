@@ -43,6 +43,7 @@ from rhinosecure.web.route import (
 from rhinosecure.web.server import create_app
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+DEMO_DIR = REPO_ROOT / "data" / "demo"
 
 
 def _step(op: OperationKind, params: dict, *, approved=False, status="pending", **overrides) -> RouteStep:
@@ -678,6 +679,146 @@ def test_export_written_propagates_from_the_underlying_job_to_the_step(tmp_path:
     body = _wait_for_step_terminal(client, route_id, 0, timeout=20.0)
     assert body["steps"][0]["status"] == "succeeded", body["steps"][0].get("error")
     assert body["steps"][0]["export_written"] is True
+
+
+def test_approving_a_constraint_submit_step_delivers_raw_text_to_the_coordinator(tmp_path: Path, monkeypatch):
+    """A real, live-testing-surfaced defect (found verifying the chat/
+    Router fusion, CLAUDE.md's dated entry on it): ConstraintSubmitParams'
+    own field is `raw_text` (CLAUDE.md's Router design names it that, with
+    its own reasoning), but web/jobs.py's `_run_constraint_submit` used to
+    read `job.input.get("text")` instead -- since route.py's dispatch_job
+    call passes step.params through as job.input UNCHANGED, EVERY
+    Router-proposed constraint_submit step failed outright with
+    "constraint_submit requires non-empty input.text", 100% of the time.
+    No existing test ever caught this: test_web_jobs.py's own
+    constraint_submit tests post directly to /api/jobs with a
+    hand-written body (never through the Router's own RouterOperation
+    shape), and this file's own CONSTRAINT_SUBMIT cases (edit_step's
+    tests, above) only ever exercise the approval/editing MECHANICS, never
+    a real dispatch through to Coordinator.submit_constraint.
+
+    `_run_constraint_submit` calls `plan_state.seed()` BEFORE
+    `Coordinator.submit_constraint` -- seed() itself dispatches a full
+    agents run (Research/Environment/Risk), which needs its own Crew
+    fake regardless of which data_dir is used, so a tiny (one asset, one
+    finding) local fixture is used here rather than the 24-finding demo
+    one, to keep that seed queue to three entries. Per this module's own
+    docstring, the ROUTER's own Crew is not faked here (route_message is
+    mocked directly, as every other test in this file already does) --
+    only the SEED run's Crew needs faking. `Coordinator.submit_constraint`
+    itself is then monkeypatched to capture the exact `text` it was
+    called with and raise a CoordinatorError (one of _execute_job's own
+    recognized exception types), so the job reaches a clean, real
+    "failed" terminal state without needing a fully-reconstructed
+    ConstraintSubmissionResult. The assertion that matters is what TEXT
+    arrived, and that the failure is the sentinel, never the old
+    "requires non-empty input.text" validation error."""
+    import json
+    from types import SimpleNamespace
+
+    from rhinosecure.agents import coordinator as coordinator_module
+    from rhinosecure.agents.coordinator import Coordinator, CoordinatorError
+
+    class _QueuedFakeCrew:
+        """Identical to test_web_jobs_dispatcher.py's own fake of the same
+        name (this file's convention is each test file owns its own
+        fixtures, not shared imports) -- Research/Environment pop one raw
+        JSON string per task; Risk (detected by the score_finding tool) pops
+        a finding_id and calls the REAL score_finding tool, since its output
+        has to satisfy RiskRecommendation's real schema, not a placeholder."""
+
+        queue: list = []
+
+        def __init__(self, agents, tasks, process=None, verbose=False):
+            self.tasks = tasks
+            self.agent = agents[0]
+            self.usage_metrics = None
+
+        def kickoff(self):
+            is_risk_stage = any(t.name == "score_finding" for t in self.agent.tools)
+            for task in self.tasks:
+                if is_risk_stage:
+                    finding_id = _QueuedFakeCrew.queue.pop(0)
+                    tool_result = json.loads(self.agent.tools[0].run(finding_id=finding_id))
+                    raw = json.dumps({
+                        "finding_id": tool_result["finding_id"], "cve_id": tool_result["cve_id"],
+                        "asset_id": tool_result["asset_id"], "hostname": tool_result["hostname"],
+                        "risk_score": tool_result["risk_score"], "bucket": tool_result["bucket"],
+                        "scoring_rationale": tool_result["rationale"],
+                        "constraints_applied": tool_result["constraints_applied"],
+                        "neutralized_axes": tool_result.get("neutralized_axes", []),
+                        "verdict_summary": "fake verdict summary.", "narrative": "fake narrative",
+                        "sources": ["fake"],
+                    })
+                else:
+                    raw = _QueuedFakeCrew.queue.pop(0)
+                task.output = SimpleNamespace(raw=raw)
+            return None
+
+    _QueuedFakeCrew.queue = [
+        json.dumps({
+            "finding_id": "F01", "cve_id": "CVE-2021-26855", "scanner_severity": "high", "is_kev": False,
+            "exploitation_summary": "fake", "sources": ["fake"],
+        }),
+        json.dumps({
+            "finding_id": "F01", "cve_id": "CVE-2021-26855", "asset_id": "A01", "hostname": "EXCH01",
+            "os": "Windows Server 2019", "os_build": "17763", "os_build_consistent": True,
+            "os_build_consistent_provenance": "model_judgment", "role": "exchange", "environment": "prod",
+            "internet_exposed": True, "compensating_controls": [], "has_patch_window": True,
+            "patch_window": "Sun 02:00-06:00", "patch_restrictions": "",
+            "applicability_summary": "fake", "sources": ["fake"],
+        }),
+        "F01",
+    ]
+    monkeypatch.setattr(coordinator_module, "Crew", _QueuedFakeCrew)
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "assets.csv").write_text(
+        "asset_id,hostname,os,os_build,role,business_function,criticality,internet_exposed,environment,"
+        "data_sensitivity,patch_window,patch_restrictions,compensating_controls,owner\n"
+        "A01,EXCH01,Windows Server 2019,17763,exchange,Mail server,5,True,prod,confidential,"
+        "Sun 02:00-06:00,,,messaging-team\n",
+        encoding="utf-8",
+    )
+    (data_dir / "findings.csv").write_text(
+        "finding_id,asset_id,cve_id,detected_date,scanner_severity,product,version,port,service,evidence\n"
+        "F01,A01,CVE-2021-26855,2026-08-01,critical,Microsoft Exchange Server,2016 CU19,443,https,OWA SSRF chain\n",
+        encoding="utf-8",
+    )
+
+    config = JobConfig(data_dir=data_dir, db_path=tmp_path / "mem.db", offline=True)
+    app = create_app(tmp_path / "export.json", jobs_enabled=True, job_config=config)
+    client = TestClient(app)
+    monkeypatch.setattr(
+        route_module, "route_message",
+        _fake_route_message(
+            grounded_operations=[
+                RouterOperation(
+                    op=OperationKind.CONSTRAINT_SUBMIT,
+                    params={"raw_text": "the payroll server only reboots on Sundays"},
+                    summary="submit the human's constraint",
+                )
+            ],
+            issues=[], clarify=None,
+        ),
+    )
+    captured = {}
+
+    def _fake_submit_constraint(self, text, findings, *, seed, on_stage=None):
+        captured["text"] = text
+        raise CoordinatorError("test sentinel: reached Coordinator.submit_constraint")
+
+    monkeypatch.setattr(Coordinator, "submit_constraint", _fake_submit_constraint)
+
+    route_id = client.post("/api/route", json={"message": "the payroll server only reboots on Sundays"}).json()["route_id"]
+    client.post(f"/api/route/{route_id}/steps/0/approve")
+    body = _wait_for_step_terminal(client, route_id, 0, timeout=20.0)
+
+    assert captured.get("text") == "the payroll server only reboots on Sundays", body["steps"][0].get("error")
+    assert body["steps"][0]["status"] == "failed"
+    assert body["steps"][0]["error"]["message"] == "test sentinel: reached Coordinator.submit_constraint"
+    assert "requires non-empty input" not in body["steps"][0]["error"]["message"]
 
 
 def test_approving_step_1_before_step_0_succeeds_is_refused(client: TestClient, monkeypatch):

@@ -798,7 +798,7 @@ def test_run_agents_provisional_branch_never_clobbers_an_existing_confirmed_plan
     ]
     constraint_resp = client.post(
         "/api/jobs",
-        json={"kind": "constraint_submit", "input": {"text": "EXCH01 now sits behind a new WAF rule"}},
+        json={"kind": "constraint_submit", "input": {"raw_text": "EXCH01 now sits behind a new WAF rule"}},
     )
     constraint_body = _wait_for_terminal(client, constraint_resp.json()["job_id"])
     assert constraint_body["status"] == "succeeded", constraint_body.get("error")
@@ -1008,7 +1008,7 @@ def test_constraint_submit_still_raises_plan_not_seeded_after_only_a_provisional
     assert run_body["result"]["provisional"] is True
 
     constraint_resp = client.post(
-        "/api/jobs", json={"kind": "constraint_submit", "input": {"text": "anything"}}
+        "/api/jobs", json={"kind": "constraint_submit", "input": {"raw_text": "anything"}}
     )
     constraint_body = _wait_for_terminal(client, constraint_resp.json()["job_id"])
     assert constraint_body["status"] == "failed"
@@ -1077,7 +1077,7 @@ def test_constraint_submit_job_reports_plan_not_seeded_cleanly_via_http(tmp_path
     app = create_app(tmp_path / "export.json", jobs_enabled=True, job_config=config)
     client = TestClient(app)
 
-    resp = client.post("/api/jobs", json={"kind": "constraint_submit", "input": {"text": "anything"}})
+    resp = client.post("/api/jobs", json={"kind": "constraint_submit", "input": {"raw_text": "anything"}})
     body = _wait_for_terminal(client, resp.json()["job_id"])
     assert body["status"] == "failed"
     assert body["error"]["type"] == "PlanNotSeededError"
