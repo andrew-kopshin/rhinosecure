@@ -911,6 +911,88 @@ def test_a_closed_vocabulary_slot_with_only_hallucinated_candidates_stays_uncorr
     assert row["target_vocabulary"]["kind"] == "enum"
 
 
+# ---------------- the zero-row panel: incomplete_reason ----------------
+
+
+def _orphaned_column_proposal(name: str) -> dict:
+    """Fully mapped, every slot individually legal, every citation real -- and
+    yet the ASSEMBLED contract is refused: `Env` is read by nothing and is not
+    declared in unmapped_columns."""
+    proposal = _proposal_dict(name=name)
+    proposal["asset"]["environment"] = _mapped({"kind": "not_collected"})
+    return proposal
+
+
+def test_a_whole_contract_refusal_with_no_row_is_reported_on_the_endpoint(client: TestClient):
+    """The zero-row panel (CLAUDE.md "Still open" (2)): nothing is unresolved,
+    illegal, ungrounded or low-confidence, so the panel had no row and a
+    Resubmit that reproduced the identical refusal. The reason lived only in
+    the job result."""
+    upload_id = _upload(client)
+    job = _propose_edited(client, upload_id, "upload-zero-row", _orphaned_column_proposal("upload-zero-row"))
+    assert job["result"]["contract_written"] is False
+
+    resp = client.get("/api/adapters/upload-zero-row/proposal", params={"upload_id": upload_id})
+    body = resp.json()
+    assert body["unresolved"] == [] and body["illegal"] == []
+    assert body["grounding_failed"] == [] and body["low_confidence"] == []  # really the zero-row shape
+    assert "neither mapped nor in unmapped_columns" in body["incomplete_reason"]
+    # It is what a resubmit reports, not a paraphrase of it.
+    assert body["incomplete_reason"] == job["result"]["incomplete_reason"]
+
+
+def test_incomplete_reason_is_none_when_a_contract_would_be_written(client: TestClient):
+    """A reason with nothing blocking would be a false alarm, and the panel
+    hides its Resubmit only when a reason is present."""
+    upload_id = _upload(client)
+    _propose(client, upload_id, "upload-reason-clean", _proposal_dict(name="upload-reason-clean"))
+    clean = client.get("/api/adapters/upload-reason-clean/proposal", params={"upload_id": upload_id}).json()
+    assert clean["incomplete_reason"] is None
+
+    # A slot the provisional path degrades and writes: also not blocked.
+    job = _propose(
+        client, upload_id, "upload-reason-prov", _proposal_dict(name="upload-reason-prov", environment_status="unresolved")
+    )
+    assert job["result"]["contract_written"] is True and job["result"]["provisional"] is True
+    prov = client.get("/api/adapters/upload-reason-prov/proposal", params={"upload_id": upload_id}).json()
+    assert prov["incomplete_reason"] is None
+
+
+def test_working_out_the_reason_does_not_change_the_proposal_the_panel_edits(client: TestClient, tmp_path: Path):
+    """`assemble_provisional_contract` DEGRADES unresolved slots into
+    placeholders. The panel edits and resubmits `saved_proposal` from this same
+    response, so a reason computed by mutating the proposal in place would
+    quietly turn every unresolved slot into a model-authored placeholder."""
+    upload_id = _upload(client)
+    proposal = _proposal_dict(name="upload-reason-pure", environment_status="unresolved")
+    proposal["asset"]["environment"]["candidate_columns"] = ["Env"]
+    _propose(client, upload_id, "upload-reason-pure", proposal)  # provisional: environment degraded in the CONTRACT
+    on_disk = json.loads((tmp_path / "out" / "propose_upload-reason-pure.json").read_text(encoding="utf-8"))
+
+    body = client.get("/api/adapters/upload-reason-pure/proposal", params={"upload_id": upload_id}).json()
+    assert body["saved_proposal"]["proposal"] == on_disk["proposal"]
+    assert body["saved_proposal"]["proposal"]["asset"]["environment"]["status"] == "unresolved"  # still unresolved
+    assert body["incomplete_reason"] is None  # a provisional write would succeed
+
+
+def test_incomplete_reason_never_takes_the_panel_down(client: TestClient, monkeypatch):
+    """Display-only: an unexpected failure while working out the reason is
+    shown AS the reason, not a 500 out of the endpoint the panel needs."""
+    import rhinosecure.web.adapters as adapters_module
+
+    upload_id = _upload(client)
+    _propose(client, upload_id, "upload-reason-boom", _proposal_dict(name="upload-reason-boom"))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("assembly exploded")
+
+    monkeypatch.setattr(adapters_module, "assemble_contract", boom)
+    resp = client.get("/api/adapters/upload-reason-boom/proposal", params={"upload_id": upload_id})
+    assert resp.status_code == 200
+    assert "could not be determined" in resp.json()["incomplete_reason"]
+    assert "assembly exploded" in resp.json()["incomplete_reason"]
+
+
 def test_get_proposal_404s_for_an_unknown_name(client: TestClient):
     upload_id = _upload(client)
     resp = client.get("/api/adapters/no-such-name/proposal", params={"upload_id": upload_id})

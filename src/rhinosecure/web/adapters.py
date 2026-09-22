@@ -161,8 +161,11 @@ from rhinosecure.adapters.schema_registry import TARGET_REGISTRY
 from rhinosecure.agents.schema_inference import (
     AdapterProposal,
     GroundingIssue,
+    ProposalIncompleteError,
     SchemaInferenceError,
     SlotMapped,
+    assemble_contract,
+    assemble_provisional_contract,
     check_grounding,
     dump_saved_proposal,
     illegal_mapped_slots,
@@ -451,6 +454,43 @@ def _illegal_mapped_detail(proposal: AdapterProposal, profiles: dict) -> list[di
             }
         )
     return detail
+
+
+def _incomplete_reason(proposal: AdapterProposal, profiles: dict, report: Any, generator: Any) -> str | None:
+    """Why a resubmit of this saved proposal would still not write a contract,
+    or `None` when it would (strictly, or provisionally).
+
+    Mirrors what `_run_ingest_propose` reports for an unedited resubmit: try
+    the strict assembly, then the provisional one, and take the provisional
+    hard-stop text when there is one. It exists because a proposal that is
+    fully mapped and grounded, yet whose ASSEMBLED contract fails
+    `validate_contract` (a column left neither mapped nor in
+    `unmapped_columns` is the usual way), has no `unresolved`, `illegal`,
+    `grounding_failed` or `low_confidence` row, so the resolve panel opened
+    with nothing on it and a Resubmit that reproduced the identical refusal.
+    The reason lived only in the job result, never on this endpoint (docs
+    /handoff-2026-09-20.md, CLAUDE.md "Still open" (2)).
+
+    Assembly builds from the profiles already in hand (no row scan), so this
+    is cheap. It is display-only, so it must never take the panel down: an
+    unexpected failure is reported AS the reason, visibly, instead of a 500."""
+    stamp = _now()
+    try:
+        assemble_contract(proposal, profiles, report, generator=generator, generated_at=stamp)
+        return None
+    except ProposalIncompleteError as exc:
+        strict_reason = str(exc)
+    except Exception as exc:  # noqa: BLE001 -- display-only; surfaced, not swallowed
+        return f"the reason could not be determined ({type(exc).__name__}: {exc})"
+    try:
+        contract, notes = assemble_provisional_contract(
+            proposal, profiles, report, generator=generator, generated_at=stamp
+        )
+    except Exception as exc:  # noqa: BLE001 -- as above
+        return f"the reason could not be determined ({type(exc).__name__}: {exc})"
+    if contract is not None:
+        return None
+    return notes.hard_stop_reason or strict_reason
 
 
 def _open_questions_for_contract(name: str, contract: Any) -> list[str]:
@@ -825,6 +865,7 @@ def mount_adapter_routes(app: FastAPI) -> None:
             # the alternative, an empty grounding list, would present a
             # proposal nobody has actually checked as though it were clean.
             raise HTTPException(409, f"the saved proposal does not match this upload: {exc}")
+        incomplete_reason = _incomplete_reason(saved.proposal, profiles, report, saved.generator)
         grounding_failed = _grounding_failed_detail(
             saved.proposal,
             profiles,
@@ -851,6 +892,9 @@ def mount_adapter_routes(app: FastAPI) -> None:
             "illegal": illegal,
             "grounding_failed": grounding_failed,
             "low_confidence": _low_confidence_detail(saved.proposal, profiles),
+            # Why a resubmit would still write no contract; None when it would.
+            # The only place a whole-contract refusal with NO row is visible.
+            "incomplete_reason": incomplete_reason,
             # What the model itself asked while proposing this mapping and
             # nothing has answered (AdapterProposal.open_questions). Display
             # only: no gate, no attestation, never read by anything that

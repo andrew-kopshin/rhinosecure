@@ -2707,3 +2707,103 @@ fully mapped and grounded but fails whole-contract validation still opens the pa
 a no-op Resubmit; the reason lives only in `incomplete_reason`. Two of the round-2 defects reached
 this same dead end, which makes it worth doing next. (3) `app.js` still has no regression tests; four
 behaviors were fixed in it this round and each is pinned only by the live checks above.
+
+---
+
+## Resolve-slots: the zero-row panel closed, and a shipped syntax error caught before it landed (2026-09-22)
+
+**Item (2) from the prior section's "Still open" list, finished.** A proposal that is fully mapped,
+every slot individually legal, and fully grounded can still have its ASSEMBLED contract refused by
+`validate_contract` -- a column read by nothing and not declared in `unmapped_columns` is the concrete
+case. Nothing in `unresolved`/`illegal`/`grounding_failed`/`low_confidence` describes that refusal, so
+the resolve panel opened with zero rows and a Resubmit that reproduced the identical refusal -- the
+reason existed only in the job result (`web/jobs.py`'s `_run_ingest_propose`), never on the endpoint
+the panel actually reads.
+
+**Built:** `web/adapters.py`'s `_incomplete_reason(proposal, profiles, report, generator)` mirrors
+exactly what an unedited resubmit would report: try `assemble_contract` (strict), catch
+`ProposalIncompleteError`, then try `assemble_provisional_contract`; return `None` only when either
+assembly would actually succeed, the provisional hard-stop text when there is one, else the strict
+reason. Display-only and never allowed to take the panel down: an unexpected exception is reported AS
+the reason (`"the reason could not be determined (...)"`), never a 500 -- assembly builds from the
+profiles already in hand, no row scan, so this is cheap on every call. Wired into `GET
+/api/adapters/{name}/proposal`'s response as `incomplete_reason`. `renderResolvePanel` (`app.js`) now
+shows it as the panel's own message when there are zero rows (`noRowExplainsIt`), and hides the
+Resubmit button when nothing on the form could change the outcome (`stuck`: a reason exists and no row
+is correctable) rather than offering a click that reproduces the identical refusal. Four new tests in
+`tests/test_web_adapters.py` cover: the reason appearing and matching the job's own reason verbatim;
+`None` when a contract (strict or provisional) would actually be written; that computing the reason
+never mutates the proposal the panel goes on to edit (`assemble_provisional_contract` degrades
+unresolved slots into placeholders -- doing that to the SAME object the panel resubmits would quietly
+turn an honestly-unresolved slot into a model-authored one); and that an unexpected exception surfaces
+as the reason text, not a 500.
+
+**The recourse text needed the same treatment, and had its own defect: the printed command was broken
+by construction, then broken again by a typo while fixing it.** The panel's fallback recourse sentence
+("Edit the saved proposal file by hand and re-run...") printed `rhino adapt propose <name>
+--from-proposal <path>` with no `--data` -- `adapt propose`/`adapt confirm` require it, deliberately
+never defaulted (a signature covers specific bytes) -- so the printed command failed immediately with
+an argparse usage error the moment anyone followed it, for every uncorrectable row and for the new
+zero-row case alike. Fixed with a shared `recourseCommand()`/`recourseHtml()` pair (`app.js`) so the
+panel-level and row-level text can't drift, printing `--data uploads/<id>` (the same form
+`web/jobs.py`'s own `next_step` hint already uses) and, for a two-file source, both
+`--assets-file`/`--findings-file`.
+
+That fix was itself reviewed, and the review found real problems in it -- but the version that reached
+this session's working tree had a worse one, undiscovered until now: **the backslash-to-forward-slash
+normalization, `.replace(/\/g, "/")`, was missing a backslash, and is not merely wrong -- it is a
+JavaScript syntax error.** Confirmed live (`new Function(...)` in the browser pane): `missing ) after
+argument list` -- the malformed regex literal swallows the intended second argument (`, "/"`) into its
+own pattern before finding a real closing `/`. `app.js` loads as a plain `<script src=...>`, not a
+module, so ONE syntax error anywhere in the file aborts parsing of the WHOLE file -- this was never a
+bug scoped to the resolve panel, it would have silently disabled every function in `app.js`, for every
+visitor, the moment this reached a running server. Fixed to `.replace(/\\/g, "/")` (`app.js`, the
+`recourseCommand` helper). Re-verified live in the running app, not just the isolated snippet:
+`typeof recourseCommand` read `"function"` after the fix (it silently degrades to `undefined` --
+nothing in the file runs -- when this regression recurs), and `renderResolvePanel` against a real
+saved proposal (`upload-zero-live`, a scratch artifact already on disk from live verification) rendered
+the "Edit ... by hand" text with the real Windows path (`C:\Users\...\out\propose_upload-zero-live
+.json`, display-only, correctly left as-is) alongside a shell command with the SAME path normalized to
+forward slashes (`--from-proposal C:/Users/.../out/propose_upload-zero-live.json`) -- then that exact
+printed command was run against the real CLI and it worked: "Result: every slot mapped and grounded,
+every column accounted for."
+
+**A second, independent gap found while completing this: a value passing every character-class check
+can still start with `-`.** `SAFE_WORD`/`SAFE_PATH` were, before this pass, plain allow-lists with no
+anchor on the first character, so a legitimately-shaped value -- most plausibly an uploaded FILENAME
+(`--assets-file`/`--findings-file`, sanitized server-side only by `Path(name).name`, which does not
+reject a leading `-`; unlike a format `name`, which `config_model.py`'s own `_FILENAME_PATTERN` already
+constrains the same way but also never disallowed a leading `-`) -- beginning with `-` breaks the
+printed command's own promise. Confirmed live, not assumed: `rhino adapt propose t --data d
+--assets-file -weird.csv --findings-file b.csv` fails with `argument --assets-file: expected one
+argument`, not a file-not-found error -- argparse reads a token starting with `-` as another flag,
+never as the previous flag's value, regardless of shell quoting (quoting changes what the SHELL does
+with a token, not what argparse does once it receives it). `SAFE_WORD`/`SAFE_PATH` now additionally
+require the first character not be `-` (`/^[A-Za-z0-9._][A-Za-z0-9._-]*$/` and
+`/^[A-Za-z0-9._:\/][A-Za-z0-9._:\/ -]*$/`); every other accepted string is unchanged. Confirmed via the
+same live checks that the normal single-file, two-file, and space-containing-path cases still print
+correctly, and that a leading-`-` filename now correctly falls back to the generic, no-command
+instructional text instead of a broken one.
+
+**Verified.** Full suite: 1629 passed (Python side; unaffected by the `app.js`-only fixes in this
+entry). `app.js` still has no regression tests (unchanged caveat) -- verified live instead: the
+isolated function in the browser's own JS engine across eight cases (Windows backslash path,
+single-file, two-file, space-containing path, leading-hyphen filename, leading-hyphen name, a
+shell-metacharacter name, an empty path), the real `renderResolvePanel` DOM output against a realistic
+zero-row `grounding_failed` slot, and the printed command executed against the real CLI and real
+upload data end to end.
+
+---
+
+## Decided: itco's ingest refusal stays (2026-09-22)
+
+The choice framed in the "Resolve-slots: a grounding row source" entry above -- a `Date_Detected`-based
+recency rule for `asset_grouping` to auto-resolve `FW-10` (Production vs Development), `COLL-09`
+(`internet_exposed` No vs Yes), and `SRV-08` (Development vs Staging) versus hand-fixing the source --
+was checked against the real data before being asked, not assumed: the recency reading does not
+consistently favor the higher-risk value across the three conflicts (it does for two, but resolves
+`SRV-08` to its SAFER value), so it is not the conservative default a rule silently overriding a
+human's own conflicting rows would need to be. **The user's answer: keep the refusal.** No code
+change. `itco` (`data/itco/synthetic_it_company_cve_dataset_50.csv`) does not reach a plan today, and
+won't until either the source rows themselves are corrected or a genuinely conservative resolution
+rule is proposed and decided on its own -- neither is being built now.

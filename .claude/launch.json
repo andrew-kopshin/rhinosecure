@@ -77,6 +77,53 @@
         "8424"
       ],
       "port": 8424
+    },
+    {
+      "name": "rhino-web-demo-agents",
+      "runtimeExecutable": ".venv312/Scripts/python.exe",
+      "runtimeArgs": [
+        "-m",
+        "rhinosecure.cli",
+        "web",
+        "--export",
+        "out/export_demo_web.json",
+        "--port",
+        "8426"
+      ],
+      "port": 8426
+    },
+    {
+      "name": "rhino-web-audit",
+      "runtimeExecutable": ".venv312/Scripts/python.exe",
+      "runtimeArgs": [
+        "-m",
+        "rhinosecure.cli",
+        "web",
+        "--enable-jobs",
+        "--enable-chat",
+        "--export",
+        "out/audit/export_web_audit.json",
+        "--db",
+        "out/audit/web_audit.db",
+        "--offline",
+        "--port",
+        "8427"
+      ],
+      "port": 8427
+    },
+    {
+      "name": "rhino-web-audit-scale",
+      "runtimeExecutable": ".venv312/Scripts/python.exe",
+      "runtimeArgs": [
+        "-m",
+        "rhinosecure.cli",
+        "web",
+        "--export",
+        "out/audit/scale.json",
+        "--port",
+        "8428"
+      ],
+      "port": 8428
     }
   ]
 }

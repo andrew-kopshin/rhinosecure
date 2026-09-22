@@ -2063,10 +2063,80 @@ async function openResolvePanel(name, uploadId) {
   // per entry server-side: an uncorrectable row needs to name the real
   // file and format to edit by hand, and both are properties of the
   // proposal, not of any one slot.
+  // `upload_id`/`source_meta` ride along for the same reason: the recourse
+  // command must name --data (the CLI requires it) and, for a two-file
+  // source, both filenames.
   const rows = [...data.unresolved, ...(data.illegal || []), ...(data.grounding_failed || [])].map((slot) =>
-    Object.assign({ saved_proposal_path: data.saved_proposal_path, format_name: data.name }, slot)
+    Object.assign(
+      {
+        saved_proposal_path: data.saved_proposal_path,
+        format_name: data.name,
+        upload_id: uploadId,
+        source_meta: data.saved_proposal.proposal.meta,
+      },
+      slot
+    )
   );
-  renderResolvePanel(card, rows, data.open_questions || []);
+  card.savedProposalPath = data.saved_proposal_path;
+  renderResolvePanel(card, rows, data.open_questions || [], data.incomplete_reason || null);
+}
+
+/* The command that re-runs a hand-edited saved proposal, or null when it
+ * cannot be printed SAFELY. `--data` is REQUIRED by `rhino adapt propose`
+ * (never defaulted: a signature covers specific bytes), and a two-file source
+ * also needs both filenames, so the text this UI used to print, without
+ * either, failed immediately with an argparse error the moment anyone
+ * followed it. `uploads/<id>` is the same `--data` form web/jobs.py's own
+ * `next_step` hint uses.
+ *
+ * This text is meant to be COPIED into a shell, and the shells here differ:
+ * both bash and PowerShell expand `$(...)` and backticks inside double quotes,
+ * `&`, `;`, `(`, `)` and `'` break parsing, and a bare Windows path loses its
+ * backslashes in Git Bash -- so it is normalized to forward slashes first
+ * (Windows accepts those everywhere), THEN checked, never the reverse: checking
+ * the raw backslashed path against a pattern that doesn't even list `\` would
+ * silently refuse every Windows path rather than print one. So nothing is
+ * interpolated unless it uses characters that mean the same in every shell
+ * here: names, filenames and ids must be `[A-Za-z0-9._-]` (exactly the
+ * contract's own filename rule, so a NAME this refuses could never have
+ * produced a contract anyway -- though an uploaded FILENAME has no such
+ * upstream guarantee, only `Path(name).name`, which is why it is checked here
+ * too, not assumed safe). None of the four may START with `-`, checked
+ * separately from the character class: `--assets-file -x.csv` is made of
+ * nothing but allowed characters and still isn't safe, because argparse reads
+ * a token starting with `-` as another flag, not as this flag's value --
+ * confirmed live (`rhino adapt propose t --data d --assets-file -weird.csv
+ * --findings-file b.csv` fails with "argument --assets-file: expected one
+ * argument", not a file-not-found error). Anything else returns null and the
+ * caller says so instead of printing a command that might do something other
+ * than what it says (found by the third adversarial-review round,
+ * 2026-09-21; the leading-`-` gap found and closed while completing that
+ * fix). */
+const SAFE_WORD = /^[A-Za-z0-9._][A-Za-z0-9._-]*$/;
+const SAFE_PATH = /^[A-Za-z0-9._:\/][A-Za-z0-9._:\/ -]*$/;
+function recourseCommand(name, uploadId, proposalPath, meta) {
+  const path = String(proposalPath || "").replace(/\\/g, "/");
+  if (!SAFE_WORD.test(name || "") || !SAFE_WORD.test(uploadId || "") || !SAFE_PATH.test(path)) return null;
+  const parts = [`rhino adapt propose ${name}`, `--data uploads/${uploadId}`];
+  if (meta && meta.assets_filename && meta.assets_filename !== meta.findings_filename) {
+    if (!SAFE_WORD.test(meta.assets_filename) || !SAFE_WORD.test(meta.findings_filename || "")) return null;
+    parts.push(`--assets-file ${meta.assets_filename}`, `--findings-file ${meta.findings_filename}`);
+  }
+  parts.push(`--from-proposal ${/\s/.test(path) ? `"${path}"` : path}`);
+  return parts.join(" ");
+}
+
+/* The whole recourse sentence, shared by the panel-level and row-level text so
+ * they cannot drift. The path in "Edit <path>" is DISPLAY only (escaped, as
+ * the server sent it); only the command needs to be shell-safe. */
+function recourseHtml(name, uploadId, proposalPath, meta) {
+  const edit = proposalPath
+    ? `Edit <code>${esc(proposalPath)}</code> by hand, then re-run `
+    : `Edit the saved proposal file by hand and re-run `;
+  const command = recourseCommand(name, uploadId, proposalPath, meta);
+  return command
+    ? `${edit}<code>${esc(command)}</code>.`
+    : `${edit}<code>rhino adapt propose</code> with <code>--data</code>, <code>--from-proposal</code> and, for a two-file source, <code>--assets-file</code> and <code>--findings-file</code> (the exact command is not printed because a name in it uses characters that are not safe to paste into a shell).`;
 }
 
 /* The model's own unanswered questions about a mapping it proposed
@@ -2293,9 +2363,7 @@ function resolveSlotRowHtml(slot) {
   // failing the WHOLE submission and discarding every other row the human
   // had filled in correctly.
   if (!slotIsCorrectable(slot)) {
-    const recourse = slot.saved_proposal_path
-      ? `Edit <code>${esc(slot.saved_proposal_path)}</code> by hand, then re-run <code>rhino adapt propose ${esc(slot.format_name || "&lt;name&gt;")} --from-proposal ${esc(slot.saved_proposal_path)}</code>.`
-      : `Edit the saved proposal file by hand and re-run "rhino adapt propose --from-proposal".`;
+    const recourse = recourseHtml(slot.format_name, slot.upload_id, slot.saved_proposal_path, slot.source_meta);
     // A structural reference (asset_grouping, enrichment, unmapped_columns)
     // is not a slot at all, so "no candidate column for this target" would
     // be the wrong sentence for it.
@@ -2325,16 +2393,37 @@ function resolveSlotRowHtml(slot) {
   `;
 }
 
-function renderResolvePanel(card, slots, openQuestions = []) {
+function renderResolvePanel(card, slots, openQuestions = [], incompleteReason = null) {
+  // A refusal no row explains: the proposal is fully mapped and grounded, yet
+  // the ASSEMBLED contract fails validation (a column left neither mapped nor
+  // in unmapped_columns is the usual way), so nothing is unresolved, illegal,
+  // ungrounded or low-confidence. The panel used to open with no rows and a
+  // Resubmit that reproduced the identical refusal, the reason visible only
+  // in a job result this panel never saw. `incompleteReason` is the server's
+  // account of what a resubmit would report (web/adapters.py's
+  // `_incomplete_reason`); null when a contract WOULD be written.
+  const noRowExplainsIt = slots.length === 0 && !!incompleteReason;
+  // A Resubmit is only worth offering if it can change something: at least
+  // one row the form can correct, or nothing blocking at all (then it writes
+  // the contract). With a reason and nothing correctable it is a no-op.
+  const stuck = !!incompleteReason && !slots.some(slotIsCorrectable);
+  const reasonHtml = noRowExplainsIt
+    ? `<p class="chat-msg-error" style="white-space: pre-wrap">No contract can be written: ${esc(incompleteReason)}</p>`
+    : "";
+  const panelRecourse = stuck
+    ? `<p class="hint">Nothing here can be corrected from this form. ${recourseHtml(card.dataset.name, card.dataset.uploadId, card.savedProposalPath, card.savedProposal && card.savedProposal.proposal.meta)}</p>`
+    : "";
   card.innerHTML = `
     <h3>Resolve slot(s) needing attention</h3>
     <p class="hint">Only values the real file actually contains, and only target values this schema actually accepts -- the same closed grammar the model itself is held to. An illegal or incomplete resolution is refused, not silently accepted.</p>
     ${openQuestionsHtml(openQuestions)}
+    ${reasonHtml}
     ${slots.map((slot) => resolveSlotRowHtml(slot)).join("")}
-    <div class="route-step-result resolve-status" hidden></div>
-    <button type="button" class="secondary-btn resolve-submit-btn">Resubmit</button>
+    ${panelRecourse}
+    ${stuck ? "" : `<div class="route-step-result resolve-status" hidden></div><button type="button" class="secondary-btn resolve-submit-btn">Resubmit</button>`}
   `;
-  card.querySelector(".resolve-submit-btn").addEventListener("click", () => submitResolvedProposal(card, slots));
+  const submit = card.querySelector(".resolve-submit-btn");
+  if (submit) submit.addEventListener("click", () => submitResolvedProposal(card, slots));
 }
 
 /* Shared by the unresolved-slot resolver and the low-confidence-mapping
