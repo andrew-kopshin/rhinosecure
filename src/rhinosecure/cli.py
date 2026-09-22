@@ -1817,6 +1817,34 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+    xlsx_parser = subparsers.add_parser(
+        "xlsx-to-csv",
+        help=(
+            "convert every sheet in an .xlsx workbook to a same-named CSV file -- a pre-processing "
+            "step; the resulting directory is an ordinary --data source from that point on, no "
+            "different from any hand-written CSV export"
+        ),
+    )
+    xlsx_parser.add_argument("xlsx_path", metavar="SOURCE.xlsx", help="the workbook to convert")
+    xlsx_parser.add_argument(
+        "--out-dir", required=True, metavar="DIR", help="directory to write <sheet name>.csv into, one file per sheet"
+    )
+    xlsx_parser.add_argument(
+        "--sheet", action="append", default=None, metavar="NAME",
+        help="convert only this sheet, repeatable -- default: every sheet in the workbook",
+    )
+    xlsx_parser.add_argument(
+        "--overwrite", action="store_true", help="allow converting into a --out-dir that already has files in it"
+    )
+    xlsx_parser.add_argument(
+        "--allow-merged-cells", action="store_true",
+        help=(
+            "accept a merged cell region instead of refusing -- every cell but each region's "
+            "top-left converts to a blank CSV cell, real and silent data loss unless that's what "
+            "you actually want"
+        ),
+    )
+
     args = parser.parse_args(argv)
     _ensure_utf8_stdio()
 
@@ -2337,6 +2365,31 @@ def main(argv: list[str] | None = None) -> int:
         if sign:
             return 0 if outcome.written else 1
         return 0 if outcome.rereview_clean else 1
+
+    if args.command == "xlsx-to-csv":
+        # Imported here, not at module level: this command is the only
+        # thing in the whole CLI that needs openpyxl, and every other
+        # command must keep working on an install that never brought it in
+        # (openpyxl lives in its own pyproject.toml extra -- see xlsx_convert
+        # .py's own module docstring for the full reasoning).
+        from rhinosecure.xlsx_convert import XlsxConversionError, convert_workbook
+
+        try:
+            results = convert_workbook(
+                Path(args.xlsx_path),
+                Path(args.out_dir),
+                sheets=args.sheet,
+                overwrite=args.overwrite,
+                unmerge=args.allow_merged_cells,
+            )
+        except XlsxConversionError as exc:
+            print(f"xlsx-to-csv: {exc}", file=sys.stderr)
+            return 1
+
+        for r in results:
+            print(f"{r.sheet_name}: {r.row_count} row(s), {r.column_count} column(s) -> {r.csv_path}")
+        print(f"\n{len(results)} sheet(s) converted into {args.out_dir}.")
+        return 0
 
     return 1
 

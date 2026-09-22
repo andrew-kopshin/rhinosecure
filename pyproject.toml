@@ -22,9 +22,20 @@ web = [
     "uvicorn",
     "python-multipart",
 ]
+# Its own extra, not folded into core `dependencies`: only `rhino xlsx-to-
+# csv` needs it, and every other command (including the deterministic
+# scoring path) must keep working on an install that never brought it in.
+# `dev` depends on this extra (via the self-reference below) rather than
+# duplicating the pin, since the existing ZIP-signature-refusal tests
+# already construct real .xlsx binaries with it (tests/test_ingest_csv_
+# source.py and others) -- one `pip install -e ".[dev]"` still gets
+# everything the full test suite needs.
+xlsx = [
+    "openpyxl~=3.1.5",
+]
 dev = [
     "pytest",
-    "openpyxl~=3.1.5",
+    "rhinosecure[xlsx]",
 ]
 
 [project.scripts]

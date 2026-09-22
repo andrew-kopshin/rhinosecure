@@ -3143,3 +3143,80 @@ built. `app.js` still has no coverage beyond what the regression harness (the en
 one) reaches; the harness itself gained real coverage from this work but was not exhaustively
 extended to every corner of the route-plan rendering (e.g. `ingest_propose`'s own follow-up
 buttons, `constraint_submit`/`remediation_mark`'s plain-text result rendering).
+
+---
+
+## XLSX intake: closed as a conversion step, not a new adapter (2026-09-22)
+
+Closes `docs/handoff.md`'s own "XLSX intake — a separate phase, not started" survey, which named
+four real technical constraints and deliberately decided nothing. Presented with three genuinely
+different paths before building anything: a new built-in adapter for a known workbook shape (like
+Defender/BluePeak); extending `rhino adapt propose` to profile and read arbitrary xlsx sources the
+way it already does arbitrary CSVs; or converting to CSV first, letting the entire existing
+ingest/adapter/propose pipeline handle everything downstream, completely unchanged. **The user's
+answer: convert to CSV first.**
+
+**Why this path closes all four of the survey's named constraints, not just works around them.**
+Typed cells (openpyxl returns real `int`/`float`/`date`/`bool` objects, and every parser downstream
+of a CSV row assumes `str` throughout the ingest layer) are resolved once, in `xlsx_convert.py`'s
+own `_stringify`, rather than by making `ParsedMapping`/`_apply_case`/the delimiter logic newly
+tolerant of non-`str` input everywhere they touch a cell. Sheet selection (`Source.layout` has no
+dimension for "which sheet") stays a CLI concern of this one tool (`--sheet`), never a question the
+ingest schema has to grow an answer for. Ragged-row protection is not reimplemented at all -- the
+output is a real CSV file, so `ingest.py`'s own already-tested ragged-row detection
+(`iter_csv_rows`) applies to it downstream, for free, exactly as it does to any hand-written CSV.
+The memory-vs-merge-detection tension in openpyxl's own API is resolved by always loading the full
+worksheet (never `read_only=True` streaming) -- CLAUDE.md's own stated target scale (hundreds to
+thousands of findings) is trivially small for an in-memory worksheet load, so the tension the
+survey named only bites at a scale this project isn't targeting; recorded here as a real, named
+scope limit (a workbook with genuinely hundreds of thousands of rows needs a different tool), not
+silently assumed away.
+
+**Built:** `src/rhinosecure/xlsx_convert.py` (new, no adapter/ingest.py changes at all -- confirmed
+by the full existing suite passing unmodified) and `rhino xlsx-to-csv SOURCE.xlsx --out-dir DIR
+[--sheet NAME]... [--overwrite] [--allow-merged-cells]`. Converts every sheet (or just the named
+ones) to a same-named CSV in `--out-dir` -- point `--data` at the result, or `--assets-file`/
+`--findings-file`/`rhino adapt propose` at the exact converted filenames, indistinguishable from
+any other CSV source from that point on. `openpyxl` moves to its own `pyproject.toml` extra
+(`xlsx`, not core `dependencies`) -- only this one command needs it, and `dev` depends on the new
+extra via a self-reference rather than a duplicated pin, since the existing ZIP-signature-refusal
+tests already construct real `.xlsx` binaries with it.
+
+**Two things refused, not silently mis-converted, matching this project's not-collected/refuse-
+rather-than-guess discipline applied to a new kind of input.** A merged cell region -- a flat CSV
+grid cannot represent one losslessly (every cell but the top-left reads back empty), so it's
+refused by default, naming every merged range, with an explicit opt-in (`--allow-merged-cells`) to
+accept that flattening. A formula cell with no cached calculated value -- openpyxl with
+`data_only=True` returns `None` for this, indistinguishable from a genuinely blank cell from that
+load alone; told apart by loading the workbook a second time (`data_only=False`, checking
+`data_type == "f"`) and refusing by cell coordinate and formula text rather than silently writing
+an empty CSV cell where a real value belongs. Typed-cell stringification matches this project's own
+existing fixture conventions exactly (confirmed against `data/demo/assets.csv`): `True`/`False` for
+booleans, a whole-number float rendered as a plain int string (`5`, not `5.0` -- openpyxl/Excel's
+own round-trip already normalizes most whole-number floats to int on save, confirmed live, but a
+genuine float still must not produce a string a strict int-typed schema field would reject), and
+ISO dates matching `detected_date`'s own convention.
+
+**Verified three ways, including the actual point of the whole module.** 18 unit tests
+(`tests/test_xlsx_convert.py`) covering every stringification rule, the two refusal paths (and
+their explicit opt-outs), trailing blank-row/column trimming, and output-directory handling (never
+silently overwrites an unrelated non-empty directory). 8 CLI wiring tests (`tests/test_cli_xlsx.py`)
+-- exit codes, `--help`, repeatable `--sheet`, clean (non-traceback) refusal messages. And the
+actual point of this whole module, proven not assumed: `test_converted_output_ingests_cleanly_
+through_the_real_native_adapter` builds a real assets/findings workbook, converts it, and runs the
+result through the real `ingest.load_batch` + `NativeAdapter` -- the exact call `rhino run` itself
+makes -- confirming a converted file is genuinely indistinguishable from a hand-written CSV export,
+not just superficially CSV-shaped. Confirmed live, end to end, through the real CLI on a fresh
+sample workbook (`data/xlsx-sample/synthetic_fleet.xlsx`, new -- an asset/finding shape matching
+`data/demo/`'s own column conventions): `rhino xlsx-to-csv` converted cleanly, and `rhino run --data
+<converted> --seed 42 --offline` scored all 3 findings correctly (`patch_now`/`next_window`/
+`contested`), the identical deterministic pipeline every other source already goes through. Full
+suite: 1674 passed (was 1648).
+
+**Left open, deliberately.** The other two paths presented -- a built-in adapter for a specific
+known xlsx shape, and extending `rhino adapt propose` to profile arbitrary xlsx sources directly --
+remain genuinely unbuilt. Either is a real, separate piece of future work if a source ever needs
+"drop an arbitrarily-shaped xlsx in and let the model infer the mapping" rather than "convert, then
+use the existing CSV-shaped tooling" -- `probe.py`'s column profiler is hard-coded to `.csv` files
+today (`profile_source` raises `ProbeError` outright on an xlsx-only directory) and would need a
+genuine new xlsx-reading path to support that, not a small extension.
