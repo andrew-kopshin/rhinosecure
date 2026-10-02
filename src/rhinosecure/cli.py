@@ -70,16 +70,27 @@ Section 7's worked example ("persists and is applied automatically on
 the next run without being restated") applies to every `--agents` run,
 not just the one that just submitted a constraint.
 
-The plain (non-`--agents`) deterministic path stays constraint-free BY
-DEFAULT, and never even constructs a `Memory` unless asked -- but, as of
+The plain (non-`--agents`) deterministic path's SCORING stays
+constraint-free BY DEFAULT: `run_with_report` never folds a stored
+constraint into a finding's `risk_score`/`bucket` unless `--apply-
+constraints` is passed, and with it omitted, `run_with_report` itself
+never constructs a `Memory` or reads `memory.py` at all -- as of
 CLAUDE.md's machine-identity constraint scoping entry (2026-10-02), it is
 no longer true that it NEVER can: `--apply-constraints` is the one flag
-that makes it construct one, fold in stored constraints matched by the
-resolved asset's own `(asset_id, hostname)` pair (never `agents.*` --
+that makes SCORING construct one, fold in stored constraints matched by
+the resolved asset's own `(asset_id, hostname)` pair (never `agents.*` --
 `constraint_apply.py` is crewai-free specifically so this path doesn't
 have to import it), and print/export what it did. Omit the flag and
-every byte of this path's output is exactly as before that flag existed
--- see `run_with_report`'s own docstring and `ConstraintApplicator`.
+every byte of SCORING's own output is exactly as before that flag
+existed -- see `run_with_report`'s own docstring and `ConstraintApplicator`.
+This is narrower than "the whole `run` subcommand never touches
+`memory.py`": `--export`'s and `--track-remediation`'s own `Memory`
+construction (both pre-existing, both unrelated to scoring) still happen
+on the plain dispatch branch exactly as they did before this flag
+existed, independent of `--apply-constraints` -- an adversarial review of
+this feature's first version caught this module's own docstring, and
+CLAUDE.md's matching prose, overclaiming "never constructs a Memory at
+all" when those two pre-existing paths already could and still do.
 
 `--format` (default `native`) picks the ingest adapter (`adapters/`) --
 CLAUDE.md Section 1's "swapping in a real scanner export should require a
@@ -179,7 +190,7 @@ from rhinosecure.adapters import (
 from rhinosecure.adapters.config_model import Contract
 from rhinosecure.adapters.probe import ColumnProfile, FileProfile, ProbeError, profile_source
 from rhinosecure.adapters.review import Measurement, ReviewError, ReviewOutcome, is_provisional, review_contract
-from rhinosecure.constraint_apply import apply_constraints, match_constraints
+from rhinosecure.constraint_apply import apply_constraints, has_usable_effect, match_constraints
 from rhinosecure.enrich.attack import load_index as load_attack_index
 from rhinosecure.enrich.cache import OfflineCacheMissError, SnapshotCache
 from rhinosecure.enrich.kev import load_catalog as load_kev_catalog
@@ -396,9 +407,21 @@ class ConstraintApplicator:
                     reason="identity_mismatch",
                 ),
             )
-        if not match.applied:
+        # Identity-matched is not the same claim as "changed something" --
+        # an adversarial review caught that counting/digesting match.applied
+        # directly would report, hash, and print a constraint that resolved
+        # an asset but was never interpreted into a structured effect (a
+        # real, legitimate row shape -- memory.py's own add_constraint
+        # docstring anticipates it), contradicting this feature's own
+        # digest-stability contract. has_usable_effect is the same
+        # recognized-kind-and-truthy-value check apply_constraints' own
+        # loop already applies internally -- filtering here means an
+        # effect-less constraint is simply invisible to the overlay AND to
+        # this reporting, never counted as applied, legacy, or mismatch.
+        effective = [c for c in match.applied if has_usable_effect(c)]
+        if not effective:
             return enriched
-        for c in match.applied:
+        for c in effective:
             self._applied.setdefault(
                 c.id,
                 AppliedConstraintRecord(
@@ -409,7 +432,7 @@ class ConstraintApplicator:
                     effect_value=c.effect_value,
                 ),
             )
-        return enriched.model_copy(update={"asset": apply_constraints(asset, list(match.applied))})
+        return enriched.model_copy(update={"asset": apply_constraints(asset, effective)})
 
     def record_delta(self, before: ScoredFinding, after: ScoredFinding) -> None:
         self._deltas[after.finding_id] = _build_deterministic_delta(before, after)
@@ -497,12 +520,20 @@ def run_with_report(
     stored, identity-matched constraints (CLAUDE.md's machine-identity
     constraint scoping entry) -- `None` (the default) reproduces every
     byte of this function's prior behavior exactly, since nothing below
-    does anything differently when `memory is None`. The plain `rhino
-    run` CLI dispatch never passes one unless `--apply-constraints` was
-    given, and never even imports `Memory` otherwise -- see `main`'s own
-    dispatch and its docstring's "must never open the database at all"
-    rule. The web `run_deterministic` job always passes a real one
-    (CLAUDE.md Section 10's web/CLI asymmetry, decided deliberately)."""
+    does anything differently when `memory is None`. This function itself
+    never constructs a `Memory` and never imports `rhinosecure.memory` at
+    module level (confirmed by a dedicated test spawning a fresh
+    subprocess) -- the plain `rhino run` CLI dispatch's SCORING call to
+    this function never passes one unless `--apply-constraints` was given.
+    This is a claim about THIS function/scoring only, not about the whole
+    `run` subcommand: `main`'s `--export`/`--track-remediation` branches
+    construct their own, separate `Memory` instances regardless of this
+    flag, exactly as they did before this parameter existed -- an
+    adversarial review of this feature's first version caught this
+    docstring overclaiming the broader, false "never constructs a Memory
+    at all" invariant. The web `run_deterministic` job always passes a
+    real one here (CLAUDE.md Section 10's web/CLI asymmetry, decided
+    deliberately)."""
     # Scoring is fully deterministic (no sampling); the seed is accepted
     # now so the CLI contract does not change once Slice 4's ToT beam
     # search introduces anything seed-sensitive.
@@ -1806,9 +1837,11 @@ def main(argv: list[str] | None = None) -> int:
             "into the deterministic pipeline before scoring -- the same LLM-free overlay "
             "'rhino run --agents'/'rhino constraint add' already apply, keyed to the resolved "
             "asset's own (asset_id, hostname) pair, not the file or run a constraint was "
-            "originally submitted against. Opt-in: without this flag, the deterministic path "
-            "never touches memory.py at all, exactly as before this flag existed -- 'rhino run "
-            "--data demo' reads identically regardless of what's in your database. Prints an "
+            "originally submitted against. Opt-in: without this flag, SCORING never reads "
+            "memory.py, and 'rhino run --data demo' (with no --export/--track-remediation "
+            "either) reads identically regardless of what's in your database -- --export and "
+            "--track-remediation still construct their own Memory for their own unrelated "
+            "display/tracking purposes, exactly as they did before this flag existed. Prints an "
             "applied/skipped-by-reason summary and a digest after the Contested: line, and "
             "writes the same detail into --export's output"
         ),

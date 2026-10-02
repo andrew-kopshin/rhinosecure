@@ -49,9 +49,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
 
-from rhinosecure.memory import Constraint
 from rhinosecure.schema import Asset
+
+if TYPE_CHECKING:
+    # Type-hint only: constraint_apply.py must stay crewai-free, but it must
+    # also not pull rhinosecure.memory into sys.modules just by being
+    # imported -- an adversarial review of this feature's first version
+    # caught that cli.py's own module-level import of this file was
+    # transitively loading memory.py (and the real Memory class) the
+    # instant `import rhinosecure.cli` ran, contradicting this module's own
+    # "memory requires a Coordinator... stays out of that path's import
+    # graph" convention even though no Memory instance was ever actually
+    # CONSTRUCTED. `Constraint` is never instantiated or isinstance-checked
+    # here, only used in type hints, so TYPE_CHECKING-only is correct and
+    # `from __future__ import annotations` (above) makes every annotation
+    # in this file a lazily-evaluated string regardless.
+    from rhinosecure.memory import Constraint
 
 
 class ConstraintEffectKind(str, Enum):
@@ -110,6 +125,42 @@ def match_constraints(constraints: list[Constraint], asset_id: str, hostname: st
         skipped_legacy=tuple(skipped_legacy),
         skipped_identity_mismatch=tuple(skipped_identity_mismatch),
     )
+
+
+_RECOGNIZED_EFFECT_KINDS = {k.value for k in ConstraintEffectKind}
+
+
+def has_usable_effect(c: Constraint) -> bool:
+    """Whether `c` would actually change anything if folded into an asset
+    by `apply_constraints` -- a recognized `effect_kind` AND a truthy
+    `effect_value`, the identical condition `apply_constraints`'s own loop
+    checks internally (`if not c.effect_value: continue`, then an `elif`
+    chain over the three recognized kinds). `Memory.add_constraint`'s own
+    docstring explicitly allows recording "a constraint that hasn't been
+    interpreted into a structured effect yet" -- a real, legitimate row
+    shape, reachable in practice whenever `agents/coordinator.py`'s
+    `submit_constraint` resolves an asset but the Interpreter returned no
+    `effect_kind`/`effect_value` (it is not asked to enforce that as a
+    refusal condition; only `verify_constraint_matches_tool` checks
+    `asset_id`/`affected_finding_ids`, never effect completeness).
+
+    An adversarial review of this feature's first version caught that
+    `match_constraints` alone could not distinguish this case from a real,
+    effect-bearing match: identity alone put a constraint into `.applied`,
+    so a caller that counted/digested/reported `.applied` directly (as
+    `cli.ConstraintApplicator` now does) would count, hash, and print a
+    constraint that changes nothing about the scored plan -- contradicting
+    this project's own stated digest-stability contract ("only a change to
+    what scoring actually reads [churns it]"). This function is the filter
+    a caller applies to `ConstraintMatch.applied` AFTER identity matching,
+    to get the subset that is both identity-matched AND would actually do
+    something -- it is deliberately NOT folded into `match_constraints`
+    itself, because "no usable effect yet" is not an identity failure (not
+    `legacy`, not `identity_mismatch` -- CLAUDE.md's decision 7 names only
+    those two skip reasons) and must not be reported as either; it is
+    simply invisible to both the overlay and this feature's own counting,
+    the same way it is already invisible to `apply_constraints` itself."""
+    return c.effect_kind in _RECOGNIZED_EFFECT_KINDS and bool(c.effect_value)
 
 
 def apply_constraints(asset: Asset, constraints: list[Constraint]) -> Asset:

@@ -398,6 +398,67 @@ def test_deterministic_export_legacy_and_mismatched_constraints_are_named_not_si
     assert f14["bucket"] == "contested"
 
 
+def test_agents_export_asset_scoped_constraints_are_honest_about_legacy_and_mismatched_rows(
+    monkeypatch, agents_data_dir, tmp_path
+):
+    """Adversarial-review finding, fixed: on a CONFIRMED agents run, the
+    coordinator-is-not-None branch of _asset_scoped_constraints used to set
+    note=None and compute a (changed=False) delta unconditionally once a
+    constraint's asset_id was in the current run -- with no identity check
+    at all -- rendering a legacy or hostname-mismatched constraint
+    identically to a genuinely-applied-but-zero-effect one. The real
+    per-finding scoring (score_finding_tool) already correctly skips both;
+    this section must say so too, not silently show an unexplained no-op."""
+    from rhinosecure.agents import coordinator as coordinator_module
+    from rhinosecure.agents.coordinator import Coordinator
+    from rhinosecure.export import write_run_export
+    from rhinosecure.ingest import join_findings
+
+    monkeypatch.setattr(coordinator_module, "Crew", _QueuedFakeCrew)
+
+    memory = Memory(tmp_path / "mem.db")
+    memory.add_constraint(  # legacy -- A02's real hostname is WKS01
+        "A02", "predates hostname recording", effect_kind="compensating_control", effect_value="WAF rule enabled",
+    )
+    memory.add_constraint(  # identity_mismatch
+        "A02", "recorded against the wrong machine",
+        effect_kind="compensating_control", effect_value="a different control", hostname="SOME-OTHER-MACHINE",
+    )
+
+    findings = list(join_findings(agents_data_dir / "findings.csv", agents_data_dir / "assets.csv"))
+    _QueuedFakeCrew.queue = [
+        _research_json("F01", "CVE-2021-26855"),
+        _research_json("F02", "CVE-2018-8410"),
+        _research_json("F03", "CVE-2020-1472"),
+        _environment_json("F01", "CVE-2021-26855", "A01", "EXCH01"),
+        _environment_json("F02", "CVE-2018-8410", "A02", "WKS01"),
+        _environment_json("F03", "CVE-2020-1472", "A03", "WKS02"),
+        "F01", "F02", "F03",
+    ]
+    coordinator = Coordinator(agents_data_dir, memory=memory)
+    coordinator.run(findings)
+
+    export_path = tmp_path / "export.json"
+    write_run_export(
+        export_path, fmt="native", data_dir=agents_data_dir, seed=42, offline=False,
+        agents=True, coordinator=coordinator, memory=memory,
+    )
+    data = json.loads(export_path.read_text(encoding="utf-8"))
+
+    # Real scoring correctly skipped both -- the ground truth this section
+    # must agree with, not contradict.
+    [f02] = [f for f in data["findings"] if f["finding_id"] == "F02"]
+    assert f02["constraints_applied"] == []
+    assert f02["decomposition"]["impact"]["compensating_controls"] == []
+
+    for entry in data["constraints"]["asset_scoped"]:
+        assert entry["deltas"] == []  # neither constraint actually changed anything
+        if entry["hostname"] is None:
+            assert "no recorded hostname" in entry["note"]
+        else:
+            assert "does not match this asset's current hostname" in entry["note"]
+
+
 def test_agents_export_constraint_application_block_is_the_fixed_not_applicable_shape(
     monkeypatch, agents_data_dir, tmp_path
 ):

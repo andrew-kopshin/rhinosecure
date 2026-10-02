@@ -184,6 +184,71 @@ def test_apply_constraints_legacy_row_with_no_hostname_is_skipped_and_counted(ca
     assert "Constraints applied: 0 (skipped: 1 legacy, 0 identity_mismatch) -- digest sha256:" in out
 
 
+def test_apply_constraints_an_uninterpreted_constraint_is_not_counted_as_applied(capsys, tmp_path):
+    """Adversarial-review finding, fixed: identity match alone (asset_id +
+    hostname) is not the same claim as 'changed something.' A constraint
+    recorded with no effect_kind/effect_value (memory.py's own
+    add_constraint docstring: 'hasn't been interpreted into a structured
+    effect yet', reachable whenever Coordinator.submit_constraint resolves
+    an asset the Interpreter gave no effect for) must not be counted,
+    digested, or printed as applied -- it changes nothing, so the plan and
+    the empty-set digest must match a run with no constraint at all."""
+    from rhinosecure.memory import Memory
+
+    db_path = tmp_path / "mem.db"
+    seed_memory = Memory(db_path)
+    seed_memory.add_constraint("A09", "a vague statement, never interpreted", hostname="WKS-FIN12")
+    seed_memory.close()
+
+    baseline = run_with_report(DEMO_DIR, 42, offline=True)
+    with_uninterpreted = run_with_report(DEMO_DIR, 42, offline=True, memory=Memory(db_path))
+
+    assert with_uninterpreted.constraint_application.applied_count == 0
+    assert [(s.finding_id, s.bucket, s.risk_score) for s in with_uninterpreted.scored] == [
+        (s.finding_id, s.bucket, s.risk_score) for s in baseline.scored
+    ]
+
+    no_constraints_at_all = run_with_report(DEMO_DIR, 42, offline=True, memory=Memory(tmp_path / "empty.db"))
+    assert with_uninterpreted.constraint_application.digest == no_constraints_at_all.constraint_application.digest
+
+    assert main([
+        "run", "--data", "demo", "--seed", "42", "--offline", "--db", str(db_path), "--apply-constraints",
+    ]) == 0
+    out = capsys.readouterr().out
+    assert "Contested: 3/24 (12.5%) of scored findings" in out
+    assert "Constraints applied: 0 (skipped: 0 legacy, 0 identity_mismatch)" in out
+
+
+def test_apply_constraints_digest_is_independent_of_insertion_order(tmp_path):
+    """Adversarial-review gap, closed: decision 5 requires the digest to be
+    stable against incidental DB state (row ids, insertion order), not just
+    against reopening the identical database twice -- the prior test could
+    not distinguish 'sorted by content' from 'sorted by constraint_id',
+    since it only ever persisted one constraint. Seeds the SAME two
+    constraints (on demo's real A01/DC01 and A09/WKS-FIN12) in opposite
+    insertion order across two separate databases -- content identical,
+    only which asset's row gets the lower autoincrement id differs."""
+    from rhinosecure.memory import Memory
+
+    forward_db = tmp_path / "forward.db"
+    forward = Memory(forward_db)
+    forward.add_constraint("A01", "DC01 window", effect_kind="patch_window", effect_value="Sat 01:00-03:00", hostname="DC01")
+    forward.add_constraint("A09", "WKS-FIN12 window", effect_kind="patch_window", effect_value="Sun 02:00-06:00", hostname="WKS-FIN12")
+    forward.close()
+
+    reverse_db = tmp_path / "reverse.db"
+    reverse = Memory(reverse_db)
+    reverse.add_constraint("A09", "WKS-FIN12 window", effect_kind="patch_window", effect_value="Sun 02:00-06:00", hostname="WKS-FIN12")
+    reverse.add_constraint("A01", "DC01 window", effect_kind="patch_window", effect_value="Sat 01:00-03:00", hostname="DC01")
+    reverse.close()
+
+    forward_result = run_with_report(DEMO_DIR, 42, offline=True, memory=Memory(forward_db))
+    reverse_result = run_with_report(DEMO_DIR, 42, offline=True, memory=Memory(reverse_db))
+
+    assert forward_result.constraint_application.applied_count == 2
+    assert forward_result.constraint_application.digest == reverse_result.constraint_application.digest
+
+
 def test_apply_constraints_digest_is_stable_and_changes_with_the_constraint_set(tmp_path):
     """Decision 5: sha256 of the sorted (asset_id, hostname, effect_kind,
     effect_value) tuples actually applied -- the identical constraint set
@@ -251,6 +316,32 @@ def test_cli_module_does_not_import_crewai_at_module_level():
 
     assert not any(name.startswith("crewai") for name in top_level_imports)
     assert not any(name.startswith("rhinosecure.agents") for name in top_level_imports)
+
+
+def test_importing_cli_does_not_import_rhinosecure_memory_via_a_fresh_subprocess():
+    """Adversarial-review finding, fixed: cli.py's own module docstring and
+    run_with_report's docstring both say memory 'stays out of that path's
+    import graph' unless asked -- importing rhinosecure.memory (even
+    without ever constructing a Memory instance) would contradict that.
+    constraint_apply.py's own Constraint import moved under TYPE_CHECKING
+    to close this (see test_constraint_apply.py's own AST check for that
+    half). Checked here via a genuinely FRESH subprocess interpreter, not
+    by deleting/re-importing modules in-process -- an earlier version of
+    this test did that and corrupted sys.modules for every test that ran
+    after it in the same session (21 unrelated test_cli.py failures,
+    confirmed by reverting this one test and re-running the full file
+    clean). A subprocess is the safe way to observe a real, first-import
+    effect without touching this process's own module state at all."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import rhinosecure.cli; import sys; print('rhinosecure.memory' in sys.modules)"],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False"
 
 
 class _FakeCoordinator:

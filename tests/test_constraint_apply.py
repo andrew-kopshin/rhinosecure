@@ -8,8 +8,9 @@ import ast
 import inspect
 from pathlib import Path
 
-from rhinosecure.constraint_apply import ConstraintMatch, match_constraints
+from rhinosecure.constraint_apply import ConstraintMatch, apply_constraints, has_usable_effect, match_constraints
 from rhinosecure.memory import Constraint
+from rhinosecure.schema import Asset
 
 ASSET_ID = "A09"
 HOSTNAME = "WKS-FIN12"
@@ -80,6 +81,75 @@ def test_empty_candidate_list_matches_nothing():
     assert match_constraints([], ASSET_ID, HOSTNAME) == ConstraintMatch()
 
 
+ASSET = Asset(
+    asset_id=ASSET_ID,
+    hostname=HOSTNAME,
+    os="Windows 10",
+    os_build="19045",
+    role="workstation",
+    business_function="Finance analyst workstation",
+    criticality=2,
+    internet_exposed=False,
+    environment="prod",
+    data_sensitivity="confidential",
+    patch_window="",
+    patch_restrictions="",
+    compensating_controls="",
+    owner="it-helpdesk",
+)
+
+
+# --- compensating_control accumulation across multiple distinct rows -------
+# (adversarial-review gap, closed: the existing apply_constraints tests in
+# test_constraint_intake.py only ever pass a SINGLE compensating_control
+# Constraint object; none exercise two separate rows of the same kind.)
+
+
+def test_two_compensating_control_constraints_both_accumulate():
+    first = Constraint(
+        id=1, asset_id=ASSET_ID, constraint_text="first control", created_at="2026-10-02T00:00:00+00:00",
+        active=True, effect_kind="compensating_control", effect_value="WAF rule enabled", hostname=HOSTNAME,
+    )
+    second = Constraint(
+        id=2, asset_id=ASSET_ID, constraint_text="second control", created_at="2026-10-02T00:00:01+00:00",
+        active=True, effect_kind="compensating_control", effect_value="network segmentation", hostname=HOSTNAME,
+    )
+
+    result = apply_constraints(ASSET, [first, second])
+
+    assert result.compensating_control_list == ("WAF rule enabled", "network segmentation")
+
+
+# --- has_usable_effect (adversarial-review fix: identity match != real effect) ---
+
+
+def test_has_usable_effect_is_true_for_a_recognized_kind_and_truthy_value():
+    c = _constraint(id_=1, hostname=HOSTNAME)  # patch_window / "Sun 02:00-06:00"
+    assert has_usable_effect(c) is True
+
+
+def test_has_usable_effect_is_false_when_never_interpreted():
+    """memory.py's own add_constraint docstring: 'a constraint that hasn't
+    been interpreted into a structured effect yet' -- a real, legitimate
+    row shape, not an identity failure (not legacy, not identity_mismatch)
+    and not a usable effect either."""
+    c = Constraint(
+        id=1, asset_id=ASSET_ID, constraint_text="not yet interpreted",
+        created_at="2026-10-02T00:00:00+00:00", active=True,
+        effect_kind=None, effect_value=None, hostname=HOSTNAME,
+    )
+    assert has_usable_effect(c) is False
+
+
+def test_has_usable_effect_is_false_for_an_empty_effect_value():
+    c = Constraint(
+        id=1, asset_id=ASSET_ID, constraint_text="effect_value is blank",
+        created_at="2026-10-02T00:00:00+00:00", active=True,
+        effect_kind="patch_window", effect_value="", hostname=HOSTNAME,
+    )
+    assert has_usable_effect(c) is False
+
+
 def test_importing_constraint_apply_does_not_import_crewai():
     """The whole point of extracting this module out of
     agents/constraint_intake.py: the deterministic path must be able to
@@ -100,3 +170,14 @@ def test_importing_constraint_apply_does_not_import_crewai():
 
     assert not any(name.startswith("crewai") for name in top_level_imports)
     assert not any(name.startswith("rhinosecure.agents") for name in top_level_imports)
+    # Adversarial-review finding, fixed: Constraint used to be imported
+    # eagerly here (type-hint only, never instantiated) -- harmless on its
+    # own, but it made cli.py's own module-level import of this file
+    # transitively load rhinosecure.memory (and the real Memory class) the
+    # instant `import rhinosecure.cli` ran, contradicting that module's own
+    # "memory stays out of the import graph unless asked" convention. Moved
+    # under `if TYPE_CHECKING:` -- which this same top-level-only AST walk
+    # already correctly ignores (it's nested inside an ast.If, not a direct
+    # child of tree.body), the identical mechanism that lets cli.py's own
+    # TYPE_CHECKING imports pass its analogous crewai/agents check above.
+    assert not any(name == "rhinosecure.memory" for name in top_level_imports)

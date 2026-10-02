@@ -511,6 +511,39 @@ def test_run_deterministic_job_skips_a_legacy_constraint_with_no_recorded_hostna
     assert by_id["F14"]["bucket"] == "contested"  # unchanged -- the legacy row never applied
 
 
+def test_run_deterministic_job_skips_a_hostname_mismatched_constraint(
+    client: TestClient, tmp_path: Path, monkeypatch
+):
+    """Adversarial-review gap, closed: the two existing dispatcher tests for
+    this feature only ever exercised 'fully matched' and 'legacy' -- never
+    a hostname MISMATCH through the real HTTP/job pipeline, even though the
+    identical scenario is covered one layer down at the CLI level
+    (test_cli.py::test_apply_constraints_with_wrong_hostname_is_skipped_and_finding_stays_contested).
+    A wiring regression specific to this one field could have shipped
+    undetected at this layer."""
+    from rhinosecure.memory import Memory
+
+    monkeypatch.setattr(jobs_module, "REPO_ROOT", REPO_ROOT)
+    seed_memory = Memory(tmp_path / "mem.db")
+    seed_memory.add_constraint(
+        "A09", "recorded against the wrong machine",
+        effect_kind="patch_window", effect_value="Sun 02:00-06:00", hostname="SOME-OTHER-HOST",
+    )
+    seed_memory.close()
+
+    resp = client.post("/api/jobs", json={"kind": "run_deterministic", "input": {"source_ref": "demo"}})
+    body = _wait_for_terminal(client, resp.json()["job_id"])
+
+    assert body["status"] == "succeeded", body.get("error")
+    assert body["result"]["constraints_applied"] == 0
+    assert body["result"]["constraints_skipped_legacy"] == 0
+    assert body["result"]["constraints_skipped_identity_mismatch"] == 1
+
+    export_data = json.loads((tmp_path / "export.json").read_text(encoding="utf-8"))
+    by_id = {f["finding_id"]: f for f in export_data["findings"]}
+    assert by_id["F14"]["bucket"] == "contested"  # unchanged -- the mismatched row never applied
+
+
 def test_run_deterministic_never_touches_plan_state_coordinator(client: TestClient, monkeypatch):
     """run_deterministic is a throwaway, Coordinator-free view -- it must
     not become "the current plan" constraint_submit would replan against."""

@@ -3474,10 +3474,14 @@ hostnames differ. A machine that gets renamed stops matching -- surfaced as a re
 and every agents-path site that reads stored constraints -- a second, divergent rule is exactly
 how `--apply-constraints` and `--agents` would end up scoring the same finding differently, the
 concrete failure the second survey's own Q2 constructed; (2) `rhino run` stays constraint-free
-unless `--apply-constraints` is passed, and with it omitted the deterministic path never
-constructs a `Memory` at all -- confirmed live via a monkeypatched `Memory.__init__` that raises,
-run through the real CLI, that never fires; the web `run_deterministic` job always applies, no
-flag, no opt-out, a deliberate asymmetry; (3) the fold reuses the exact LLM-free mechanism the
+unless `--apply-constraints` is passed, and with it omitted SCORING never constructs a `Memory`
+at all -- confirmed live via a monkeypatched `Memory.__init__` that raises, run through the real
+CLI with no `--export`/`--track-remediation`, that never fires. Narrower than "the whole `run`
+subcommand never touches `memory.py`": `--export`/`--track-remediation` already, independently,
+construct their own `Memory` regardless of this flag (pre-existing, unrelated to scoring) -- an
+adversarial review of this feature's first version caught this decision's own first write-up
+overclaiming the broader invariant; the web `run_deterministic` job always applies, no flag, no
+opt-out, a deliberate asymmetry; (3) the fold reuses the exact LLM-free mechanism the
 capacity-constraint path already uses (`constraints_for_asset` → `apply_constraints` →
 `score_finding`), not new scoring logic; (4) `apply_constraints`/`ConstraintEffectKind` are
 extracted out of `agents/constraint_intake.py` (which imports `crewai` at module level) into a
@@ -3536,18 +3540,26 @@ and skipped constraints by reason.
   finding), matches, folds matched ones in via the shared `apply_constraints`, and records real
   before/after deltas (the finding is scored twice -- once plain, once overlaid -- whenever a
   constraint actually matched its asset) for the export's own honest delta display. A new
-  `--apply-constraints` flag is the only thing that ever constructs a `Memory` on the plain
-  dispatch branch; when given, the same instance is reused for `--track-remediation`/`--export`
-  too rather than reopening the database file more than once per invocation.
+  `--apply-constraints` flag is the only thing that ever makes SCORING construct a `Memory` on the
+  plain dispatch branch; when given, the same instance is reused for `--track-remediation`/
+  `--export` too rather than reopening the database file more than once per invocation. This is
+  narrower than "the plain dispatch branch never constructs a `Memory` at all" -- `--export` and
+  `--track-remediation` already, independently, construct their own (pre-existing, unrelated to
+  scoring) regardless of this flag, exactly as they did before it existed; an adversarial review of
+  this feature's first version caught this entry (and two of `cli.py`'s own docstrings) overclaiming
+  the broader invariant, corrected here and in `cli.py`.
 - **`export.py`**: `EXPORT_SCHEMA_VERSION` bumps `1.2.0 → 1.3.0` -- this project's own precedent
   (both prior bumps were triggered by a previously-absent field becoming exported, never a
   breaking change to an existing one) points the same way here. The new `constraint_application`
   block is deliberately minimal to avoid duplicating the existing `constraints.asset_scoped`
-  section: each applied/skipped entry carries only a `constraint_id` plus the one or two NEW facts
-  this run discovered (which bucket it fell in; for a mismatch, the asset's actual current
-  hostname) -- everything else about the row (`constraint_text`, `effect_kind`, `effect_value`,
-  `created_at`, its own recorded `hostname` -- a new field added to the existing section's
-  per-constraint dict) is already there, joinable by that same id. **The `live` flag is honest
+  section: `applied` is a bare list of constraint ids, and each `skipped` entry carries only
+  `constraint_id`/`asset_id` plus, for a mismatch, the one genuinely new fact this run
+  discovered -- the asset's actual current hostname. No bucket/delta information lives in this
+  block at all (a finding's own bucket transition is in `constraints.asset_scoped[].deltas`,
+  not duplicated here); everything else about a constraint's own row (`constraint_text`,
+  `effect_kind`, `effect_value`, `created_at`, its own recorded `hostname` -- a new field added
+  to the existing section's per-constraint dict) is already there, joinable by that same id.
+  **The `live` flag is honest
   now**: `_asset_scoped_constraints`/`_constraints_section` gained a third case (`coordinator is
   None` with `live=True`, meaning a deterministic run that actually used `--apply-constraints`) --
   a legacy or identity-mismatched constraint whose asset IS in the current run gets its own
@@ -3592,14 +3604,6 @@ and `Memory.__init__` never fires when monkeypatched to raise.
 would newly treat as legacy: zero active constraints exist in it at all**, so there is nothing to
 restate.
 
-**Full suite: 1,726 passed (was 1,707 before this entry; 19 net new tests, zero regressions, zero
-rewrites of a pre-existing assertion's intent).** Every new test was confirmed to fail when its
-own fix was reverted and to pass again afterward with `git diff` clean, checked by actually
-reverting and restoring each targeted piece of code (`constraint_apply.match_constraints`'s
-hostname branches; `run_with_report`'s applicator gate; `memory.py`'s hostname migration entry;
-`export.py`'s skip-reason note lookup; `web/jobs.py`'s `memory=job_memory` passthrough) rather
-than written and trusted.
-
 **Explicitly out of scope for this entry, named so they are not assumed folded in by omission:**
 group-scoped constraints (a role- or business-function-wide statement) -- the contested-clustering
 survey's own subject, not decided or touched here; contested clustering and the Contested tab;
@@ -3607,3 +3611,72 @@ the missing `.resolve()` call on `data_dir` the source-scoping survey measured a
 shipped defect in `_capacity_history`'s own staleness check -- real, but it gets its own commit,
 not folded into this one; the agents path's own copy of the snapshot-read redundancy (the Fleet-
 scale audit's own still-open item); CLI `--top N`.
+
+**Adversarial review before the final commit (5 dimensions, each finding independently
+re-verified by a skeptic agent before being trusted) found 8 real, confirmed defects in the first
+version of this feature -- all fixed, none disputed.** Two were correctness bugs, not just
+polish:
+
+1. **High: a confirmed agents run's `constraints.asset_scoped[]` never checked identity for the
+   `coordinator is not None` branch** -- only the new deterministic-path branch got an honest
+   legacy/mismatch note; a legacy or hostname-mismatched constraint on a real `rhino run --agents`
+   run rendered identically to a genuinely-applied-but-zero-effect one (`note: null`, a
+   `changed: false` delta), even though the real per-finding scoring already correctly skipped it.
+   Fixed: this branch now runs the same `match_constraints` check against the asset's real,
+   current hostname (read off any enriched finding on that asset) before deciding note vs. delta --
+   the identical honesty the deterministic path's own third case already had. Confirmed live
+   against a real confirmed `Coordinator` run with both a legacy and a mismatched constraint.
+2. **Medium: identity match alone was treated as "applied."** A constraint that resolved an asset
+   (and, per this feature, a real hostname) but was never interpreted into a structured effect --
+   `memory.py`'s own `add_constraint` docstring explicitly allows recording exactly this, and
+   `Coordinator.submit_constraint` records a hostname unconditionally once an asset resolves,
+   regardless of whether the Interpreter also extracted an effect -- was counted as `applied`,
+   included in the digest, and printed, even though it changed nothing about the scored plan.
+   This directly contradicted the digest's own documented stability contract ("only a change to
+   what scoring actually reads [churns it]"). Fixed: a new `constraint_apply.has_usable_effect`
+   (the identical recognized-kind-and-truthy-value check `apply_constraints`'s own loop already
+   applies internally) filters `ConstraintApplicator`'s accounting -- an effect-less,
+   identity-matched constraint is now simply invisible to counting/digest/export, the same way it
+   was already invisible to the overlay itself. Deliberately not folded into `match_constraints`
+   or reported as a third skip reason: "no usable effect yet" is not an identity failure (not
+   `legacy`, not `identity_mismatch` -- decision 7 names only those two).
+3. **Low, a real gap nonetheless: `cli.py`'s own module-level import of `constraint_apply.py`
+   transitively loaded `rhinosecure.memory`** (for a type-hint-only `Constraint` reference) the
+   instant `import rhinosecure.cli` ran, regardless of any flag -- never constructing a `Memory`
+   instance, but contradicting this module's own "memory stays out of the import graph" framing.
+   Fixed by moving that one import under `TYPE_CHECKING` (safe: `Constraint` is never instantiated
+   or isinstance-checked in `constraint_apply.py`, only used in annotations, and
+   `from __future__ import annotations` already makes every annotation in the file a lazy string).
+4. **Two documentation overclaims, corrected in both `cli.py` and this file**: this entry and two
+   of `cli.py`'s own docstrings said the deterministic path (or `--apply-constraints`) "never
+   constructs a `Memory` at all" when the flag is omitted -- true for SCORING, false for the whole
+   `run` subcommand, since `--export` and `--track-remediation` already, independently,
+   pre-existingly construct their own `Memory` for unrelated display/tracking purposes regardless
+   of this flag. Narrowed throughout to the claim that's actually true and actually tested.
+   Separately, this entry and `export.py`'s own docstring claimed the new `constraint_application`
+   export block carries "which bucket [a finding] fell in" -- it never did (`applied_constraint_ids`
+   is a bare list of integers; no bucket field exists anywhere in the block or its backing
+   dataclasses). Corrected to describe the shape actually shipped, not the other way around.
+5. **Three test-coverage gaps, each closed with a new test, each confirmed via break/fix**: the
+   digest's documented insertion-order independence (decision 5) had zero coverage that could tell
+   "sorted by content" from "sorted by constraint_id" -- the one existing digest test never
+   persisted more than one constraint; a new test seeds the identical two constraints on two real
+   demo assets in opposite insertion order and confirms identical digests. `compensating_control`
+   accumulation across TWO separate constraint rows on one asset (the specific additive case this
+   feature's own docstring documents) was exercised by zero tests, old or new -- a new unit test
+   closes it. The web job's `constraints_skipped_identity_mismatch` result field was the only one
+   of the three new counters never asserted with a real nonzero value through the actual HTTP/job
+   pipeline -- a new dispatcher test closes it, mirroring the CLI-level test that already covered
+   the identical scenario one layer down.
+
+**Full suite after all fixes: 1,735 passed (was 1,707 before this feature; 28 net new tests --
+19 from the feature itself, 9 from the review's own fixes -- zero regressions).** Every fix above
+has its own break/fix verification (the targeted code reverted, the new test confirmed to fail,
+the code restored, `git diff` confirmed clean), not just written and trusted -- including one
+genuine near-miss caught during this process itself: an early version of the subprocess-avoidance
+test for finding 3 instead deleted `rhinosecure.cli`/`rhinosecure.memory`/`constraint_apply` from
+`sys.modules` and re-imported in-process, which silently corrupted the Python import-system's
+package-attribute cache for the rest of the test session and broke 21 unrelated, already-passing
+`test_cli.py` tests the moment the full file ran (a 5-minute run where the first, narrower
+targeted run had shown nothing wrong) -- replaced with a genuinely isolated subprocess check
+before it was ever committed.

@@ -128,6 +128,7 @@ from typing import TYPE_CHECKING, Any
 
 from rhinosecure.adapters.config_model import Contract
 from rhinosecure.adapters.review import is_provisional
+from rhinosecure.constraint_apply import apply_constraints, match_constraints
 from rhinosecure.enrich.cache import SnapshotCache
 from rhinosecure.ingest import GapTally, IngestReport, IngestStats
 from rhinosecure.memory import Memory
@@ -442,7 +443,6 @@ def _agents_decomposition(coordinator: Coordinator, enriched: Any, research: Any
     if research is None:
         return None
     from rhinosecure.agents.risk import merge_research_into_enriched
-    from rhinosecure.constraint_apply import apply_constraints, match_constraints
 
     merged = merge_research_into_enriched(enriched, research)
     if coordinator.memory is not None:
@@ -679,8 +679,33 @@ def _asset_scoped_constraints(
         elif not applies:
             note = _NO_FINDINGS_NOTE
         elif coordinator is not None:
-            note = None
-            deltas = _asset_constraint_deltas(coordinator, c.asset_id)
+            # An adversarial review of this feature's first version caught a
+            # real gap here: this branch used to set note=None and compute a
+            # delta unconditionally once a constraint's asset_id was in the
+            # current run, with no identity check at all -- so a legacy or
+            # hostname-mismatched constraint on a CONFIRMED agents run
+            # rendered identically to a genuinely-applied-but-zero-effect
+            # one (deltas=[{..., "changed": false}], note=None), even though
+            # the real per-finding scoring (agents/risk.py's score_finding_
+            # tool) correctly never applied it. Confirmed live: a legacy and
+            # a hostname-mismatched constraint on a confirmed run both
+            # produced that exact misleading shape before this fix. Uses
+            # the SAME match_constraints the other three agents-path sites
+            # already call -- "one matcher" per CLAUDE.md's own decision --
+            # against this one constraint and this asset's real, current
+            # hostname (read off any enriched finding on that asset; applies
+            # is already True, so at least one exists).
+            hostname = next(
+                e.asset.hostname for e in coordinator.state.enriched_by_id.values() if e.asset.asset_id == c.asset_id
+            )
+            match = match_constraints([c], c.asset_id, hostname)
+            if match.skipped_legacy:
+                note = _DET_SKIPPED_LEGACY_NOTE
+            elif match.skipped_identity_mismatch:
+                note = _DET_SKIPPED_MISMATCH_NOTE
+            else:
+                note = None
+                deltas = _asset_constraint_deltas(coordinator, c.asset_id)
         else:
             reason = (deterministic_skip_reason_by_id or {}).get(c.id)
             if reason == "legacy":
@@ -816,13 +841,20 @@ def _constraint_application_dict(summary: ConstraintApplicationSummary | None) -
     -- a fixed, DB-independent shape, since computing anything real here
     would require the very Memory this run never constructed. Deliberately
     minimal to avoid duplicating the existing `constraints.asset_scoped`
-    section (CLAUDE.md's own "no duplicated data" instruction): each
-    applied/skipped entry carries only `constraint_id` plus the one or two
-    NEW facts this run discovered (which bucket it fell in; for a
-    mismatch, what the asset's hostname actually is now) -- everything
-    else about the row (constraint_text, effect_kind, effect_value,
-    created_at, its recorded hostname) is already in `constraints
-    .asset_scoped[]`, joinable by that same `constraint_id`."""
+    section (CLAUDE.md's own "no duplicated data" instruction): `applied`
+    is a bare list of constraint ids, and each `skipped` entry carries only
+    `constraint_id`/`asset_id` plus, for a mismatch, the one genuinely NEW
+    fact this run discovered -- what the asset's hostname actually is now.
+    No bucket/before-after information lives here; a finding's own
+    bucket transition from an applied constraint is in `constraints
+    .asset_scoped[].deltas`, not duplicated into this block. Everything
+    else about a constraint's own row (constraint_text, effect_kind,
+    effect_value, created_at, its recorded hostname) is already in
+    `constraints.asset_scoped[]` too, joinable by that same
+    `constraint_id` -- an adversarial review of this feature's first
+    version caught this docstring (and CLAUDE.md's matching prose)
+    claiming a bucket field that was never actually implemented; both were
+    corrected to describe the shape below, not the other way around."""
     if summary is None:
         return {
             "applied": False,
