@@ -68,11 +68,18 @@ and passes it to `Coordinator`, so a plain `rhino run --agents` picks up
 whatever constraints are already on file automatically -- CLAUDE.md
 Section 7's worked example ("persists and is applied automatically on
 the next run without being restated") applies to every `--agents` run,
-not just the one that just submitted a constraint. The plain
-(non-`--agents`) deterministic path never touches `memory.py` -- `memory`
-requires a `Coordinator`, and this module's own docstring already
-explains why `agents.*` (and now `memory` alongside it, imported lazily
-in the same places) stays out of that path's import graph.
+not just the one that just submitted a constraint.
+
+The plain (non-`--agents`) deterministic path stays constraint-free BY
+DEFAULT, and never even constructs a `Memory` unless asked -- but, as of
+CLAUDE.md's machine-identity constraint scoping entry (2026-10-02), it is
+no longer true that it NEVER can: `--apply-constraints` is the one flag
+that makes it construct one, fold in stored constraints matched by the
+resolved asset's own `(asset_id, hostname)` pair (never `agents.*` --
+`constraint_apply.py` is crewai-free specifically so this path doesn't
+have to import it), and print/export what it did. Omit the flag and
+every byte of this path's output is exactly as before that flag existed
+-- see `run_with_report`'s own docstring and `ConstraintApplicator`.
 
 `--format` (default `native`) picks the ingest adapter (`adapters/`) --
 CLAUDE.md Section 1's "swapping in a real scanner export should require a

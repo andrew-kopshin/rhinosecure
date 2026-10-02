@@ -157,7 +157,11 @@ The Interpreter's own rationale recorded that it relied on the hostname match an
 asset's `patch_window`, "since it appears in not_collected" — the marker reaching a model's
 reasoning, not just the CLI's output. Constraints apply on `--agents` runs (which construct a
 `Memory`), not on the plain deterministic path, which never touches `memory.py` — pre-existing
-behavior, documented in `cli.py`.
+behavior, documented in `cli.py`. **Superseded in part (2026-10-02):** the plain deterministic
+path can now touch `memory.py` too, opt-in, via `--apply-constraints` — see the dated
+"Machine-identity constraint scoping" entry near the end of this file. Unchanged, still true: a
+bare `rhino run`/`rhino run --agents` with no new flag behaves exactly as this paragraph
+describes.
 
 **Resolving an asset off a placeholder is refused.** `search_assets` skips any field named in
 `Asset.not_collected` when matching (`constraint_intake._matches`) and reports the marker on every
@@ -1543,7 +1547,10 @@ into what was scored. `_asset_scoped_constraints`/`_constraints_section` now tak
 (`coordinator.memory is not None` on the agents path; always `False` on the deterministic path,
 which never touches `memory.py` at all) plus a caller-supplied `not_live_note`, so each path states
 its own honest reason (`_DETERMINISTIC_NOTE` vs. the new `_PROVISIONAL_NO_MEMORY_NOTE`) instead of
-this function guessing which applies. Confirmed live (`tests/test_export.py`): a real constraint,
+this function guessing which applies. **Superseded in part (2026-10-02):** "always `False` on the
+deterministic path" was true only until `--apply-constraints` existed — `live` is now `True` for a
+deterministic run that actually used it, with its own honest per-constraint notes for a legacy or
+identity-mismatched row; see the dated "Machine-identity constraint scoping" entry. Confirmed live (`tests/test_export.py`): a real constraint,
 added to a real `Memory`, genuinely applicable to an asset with findings in a memory-less
 Coordinator's run, now correctly shows `deltas=[]` and the new note — not a fabricated "applied"
 delta. `_build_agents_export`'s stale `"provisional": ... # Always False on this path` comment
@@ -3431,3 +3438,172 @@ open for the agents path specifically (`_build_agents_export`'s `_sources_for_cv
 same shape, deliberately not fixed here, for the staleness reason stated above. Chat context
 strategy, Findings/Contested/Recommended pagination, and CLI `--top N` remain exactly as part 1
 left them: real design forks, not touched by this entry.
+
+---
+
+## Machine-identity constraint scoping: the deterministic path honors stored constraints (2026-10-02)
+
+**Closes Section 10's own exit criteria for a real gap this project's own survey work found:**
+two prior sessions produced `out/contested-clustering-survey.md` and
+`out/constraint-source-scoping-survey.md` (both read-only, both still on disk, both authoritative
+for the file:line traces this entry builds on) investigating whether the deterministic path
+should honor stored constraints at all, and if so, scoped by what. The second survey's own
+framing -- scope a constraint to the *source* (upload id, directory, confirmed-contract name) it
+was submitted against -- was checked against measured, real data and found to fail in both
+directions at once: scoping by exact directory silently drops a constraint across a
+byte-identical re-upload of the same fleet (three separately-named generated fixtures,
+`full-5000`/`full-5000-kev3`/`full-survey-5000`, were confirmed to share one identical
+`assets.csv` by SHA-256, yet would never share a constraint under that scheme); scoping by format
+collides two unrelated real assets that happen to share one adapter's bare name (`demo`'s `A01`,
+a domain controller, and `cp1252-sample`'s `A01`, a workstation, confirmed to carry the identical
+literal id for nothing but coincidence).
+
+**Decided (asked, not assumed; the "source" framing from the second survey was explicitly
+abandoned, not extended):** key a constraint to the MACHINE it describes, not the file or run it
+arrived through. `Asset.hostname` is required on every `Asset` regardless of source
+(`schema.py:70`), so it is always collected, unlike any notion of a run's "source." A constraint
+applies to an asset only when BOTH its recorded `asset_id` AND its recorded `hostname` match the
+asset currently being scored. This sidesteps both measured failures directly: a re-upload of the
+same machine still carries the identical `(asset_id, hostname)` pair regardless of path; two
+different real machines that happen to share one `asset_id` are told apart because their
+hostnames differ. A machine that gets renamed stops matching -- surfaced as a reported
+`identity_mismatch`, never silently dropped.
+
+**Seven more decisions followed from that one, recorded together since they were made together:**
+(1) one matcher (`constraint_apply.match_constraints`), used identically by the deterministic path
+and every agents-path site that reads stored constraints -- a second, divergent rule is exactly
+how `--apply-constraints` and `--agents` would end up scoring the same finding differently, the
+concrete failure the second survey's own Q2 constructed; (2) `rhino run` stays constraint-free
+unless `--apply-constraints` is passed, and with it omitted the deterministic path never
+constructs a `Memory` at all -- confirmed live via a monkeypatched `Memory.__init__` that raises,
+run through the real CLI, that never fires; the web `run_deterministic` job always applies, no
+flag, no opt-out, a deliberate asymmetry; (3) the fold reuses the exact LLM-free mechanism the
+capacity-constraint path already uses (`constraints_for_asset` → `apply_constraints` →
+`score_finding`), not new scoring logic; (4) `apply_constraints`/`ConstraintEffectKind` are
+extracted out of `agents/constraint_intake.py` (which imports `crewai` at module level) into a
+new, crewai-free `src/rhinosecure/constraint_apply.py` -- `constraint_intake.py` re-exports both,
+unchanged in behavior, so the deterministic path can reuse the identical overlay without ever
+importing `crewai`; (5) the digest is a sha256 of the sorted, canonical-JSON `(asset_id, hostname,
+effect_kind, effect_value)` tuples actually applied -- row ids and timestamps excluded, so an
+unrelated free-text edit or a retract-then-identical-resubmit never churns it, reusing the exact
+`sha256:` + canonical-JSON convention `adapters/config_model.py`'s `compute_content_digest`
+already established in this codebase; (6) one line, printed right after the `Contested:` line,
+only when constraints were actually applied this run: the applied count, skipped counts by
+reason, and a digest prefix; (7) skip reasons are `legacy` (no hostname ever recorded) and
+`identity_mismatch` (asset_id matches, hostname doesn't), counted only for constraints whose
+asset_id is present in this run -- a constraint for an asset outside the current dataset is
+another fleet's business and is not counted, true by construction since the matcher is only ever
+consulted per-asset for an asset actually being scored, never swept over the whole table; (8) a
+new top-level `constraint_application` export block carries the digest, applied constraint ids,
+and skipped constraints by reason.
+
+**Built, file by file:**
+
+- **`src/rhinosecure/constraint_apply.py` (new, crewai-free).** `ConstraintEffectKind` and
+  `apply_constraints` moved here verbatim from `agents/constraint_intake.py`; `ConstraintMatch`
+  and `match_constraints` are new -- the one matcher, used everywhere. A dedicated
+  AST-based test (`tests/test_constraint_apply.py`, mirroring `cli.py`'s own existing
+  `test_cli_module_does_not_import_crewai_at_module_level`) confirms importing this module pulls
+  in neither `crewai` nor `rhinosecure.agents`.
+- **`agents/constraint_intake.py`** re-exports both moved names (`__all__`); every existing
+  importer (`agents/risk.py`, `agents/coordinator.py`, `tests/test_export.py`) keeps working
+  unchanged.
+- **Four read sites now use the identical matcher** -- `agents/risk.py`'s `score_finding_tool`,
+  `agents/environment.py`'s `lookup_asset_context`, `agents/coordinator.py`'s
+  `_submit_capacity_constraint`, and `export.py`'s `_agents_decomposition`. That fourth site is
+  not one of the three the source-scoping survey's Q2 named (its search was scoped to
+  `constraints_for_asset` call sites in `agents/risk.py`/`agents/environment.py`/
+  `agents/coordinator.py` only) -- found by re-reading `export.py` directly while wiring this up:
+  it reads and applies stored constraints too, to recompute a live decomposition for display, and
+  leaving it on the old, unscoped read would have made that display disagree with what
+  `score_finding_tool` actually used to produce the same finding's real `risk_score`/`bucket`.
+  Fixed as part of this work, not filed separately, since it shares the identical mechanism.
+- **`memory.py`**: a nullable `constraints.hostname TEXT` column, declared directly in
+  `_SCHEMA_SQL` for a fresh database and added via `_migrate`'s existing idempotent
+  `PRAGMA table_info`-guarded `ALTER TABLE` pattern for an existing one (the identical mechanism
+  `runs.ingest_format` already uses) -- a pre-existing row with no hostname reads back `None`,
+  "legacy" to every reader. `add_constraint` gained an optional `hostname` keyword.
+- **`agents/coordinator.py`'s `submit_constraint`** records the resolved asset's hostname at the
+  single call site every submission path (CLI, the web Constraints-tab form, a Router-dispatched
+  `constraint_submit`) already funnels through (`self.memory.add_constraint(...)`,
+  confirmed by the source-scoping survey's own Q4 to be the one shared write site) --
+  `affected[0].asset.hostname`, since `affected` is non-empty by construction at that point and
+  every element shares the resolved `asset_id`.
+- **`cli.py`**: a new `ConstraintApplicator` (plus `AppliedConstraintRecord`/
+  `SkippedConstraintRecord`/`ConstraintApplicationSummary`) runs inside `run_with_report`, gated
+  on a new `memory: Memory | None = None` parameter that changes nothing when omitted -- looks up
+  and caches each asset's stored constraints once per asset actually touched by the run (not per
+  finding), matches, folds matched ones in via the shared `apply_constraints`, and records real
+  before/after deltas (the finding is scored twice -- once plain, once overlaid -- whenever a
+  constraint actually matched its asset) for the export's own honest delta display. A new
+  `--apply-constraints` flag is the only thing that ever constructs a `Memory` on the plain
+  dispatch branch; when given, the same instance is reused for `--track-remediation`/`--export`
+  too rather than reopening the database file more than once per invocation.
+- **`export.py`**: `EXPORT_SCHEMA_VERSION` bumps `1.2.0 → 1.3.0` -- this project's own precedent
+  (both prior bumps were triggered by a previously-absent field becoming exported, never a
+  breaking change to an existing one) points the same way here. The new `constraint_application`
+  block is deliberately minimal to avoid duplicating the existing `constraints.asset_scoped`
+  section: each applied/skipped entry carries only a `constraint_id` plus the one or two NEW facts
+  this run discovered (which bucket it fell in; for a mismatch, the asset's actual current
+  hostname) -- everything else about the row (`constraint_text`, `effect_kind`, `effect_value`,
+  `created_at`, its own recorded `hostname` -- a new field added to the existing section's
+  per-constraint dict) is already there, joinable by that same id. **The `live` flag is honest
+  now**: `_asset_scoped_constraints`/`_constraints_section` gained a third case (`coordinator is
+  None` with `live=True`, meaning a deterministic run that actually used `--apply-constraints`) --
+  a legacy or identity-mismatched constraint whose asset IS in the current run gets its own
+  specific note explaining exactly why it didn't apply, instead of silently showing an empty,
+  unexplained delta list the way `live=False`'s blanket note used to for every constraint
+  regardless of reason. The agents path's own `constraint_application` block is the fixed
+  `{"applied": false, ...}` shape always -- that mechanism is deterministic-path-only; the agents
+  path's own per-finding constraint fold is unaffected and already visible elsewhere in its export
+  (`constraints_applied`, the live `decomposition`).
+- **`web/jobs.py`'s `_run_run_deterministic`** now constructs `job_memory` *before* calling
+  `run_with_report` (it used to be constructed only afterward, for provisional-provenance
+  bookkeeping and the export's display section) and passes it in as a real scoring input -- the
+  one code change that makes decision (2)'s web/CLI asymmetry real rather than asserted.
+
+**Four existing tests asserted a constraint applies unconditionally once persisted via a bare
+`memory.add_constraint(asset_id, text, ...)` call with no hostname** -- now "legacy" under the new
+matcher, so each needed a real hostname to keep testing what it always meant to test:
+`test_risk_agent.py::test_an_active_compensating_control_constraint_changes_the_score_and_is_reported`,
+`test_environment_agent.py::test_lookup_asset_context_surfaces_active_constraints_separately_from_asset_fields`,
+`test_coordinator.py::test_submit_capacity_constraint_applies_an_active_asset_constraint_before_ranking`,
+`test_export.py::test_agents_export_full_shape_with_contested_finding_and_constraint`. The
+source-scoping survey's own Q2 had named only two of these four as load-bearing
+(`test_coordinator.py`'s and `test_export.py`'s) -- its search was scoped to seven specific test
+files that happened not to include `test_risk_agent.py`/`test_environment_agent.py`, even though
+both directly exercise two of the four read sites. Each fix is additive only (one new `hostname=`
+keyword argument, the asset's own real, already-documented-in-the-test hostname) -- no assertion's
+intent changed.
+
+**Verified live against the real demo fixture**, not just in unit tests: a scratch database
+constraint on `A09`/`WKS-FIN12` (`asset_id` + `hostname`) supplying a patch window moves both
+`F07` and `F14` (demo's two real contested findings on that asset -- CVE-2022-30190/Follina and
+CVE-2023-23397, both KEV-listed, both contested because `A09`'s `patch_window`/
+`compensating_controls` are blank) from `contested` to `next_window`, `risk_score` unchanged
+(the constraint changes which bucket is honest, not the arithmetic -- the same property the
+Defender fill-in-loop worked example above already demonstrated for the agents path); prints and
+exports a matching digest; the identical constraint under the wrong hostname is skipped as
+`identity_mismatch` and both findings stay `contested`; a hostname-less row is skipped as
+`legacy`. Flag omitted: `Contested: 3/24 (12.5%)` unchanged regardless of what's in the database,
+and `Memory.__init__` never fires when monkeypatched to raise.
+
+**The real `rhinosecure.db` at the repo root was checked (read-only) for constraints this change
+would newly treat as legacy: zero active constraints exist in it at all**, so there is nothing to
+restate.
+
+**Full suite: 1,726 passed (was 1,707 before this entry; 19 net new tests, zero regressions, zero
+rewrites of a pre-existing assertion's intent).** Every new test was confirmed to fail when its
+own fix was reverted and to pass again afterward with `git diff` clean, checked by actually
+reverting and restoring each targeted piece of code (`constraint_apply.match_constraints`'s
+hostname branches; `run_with_report`'s applicator gate; `memory.py`'s hostname migration entry;
+`export.py`'s skip-reason note lookup; `web/jobs.py`'s `memory=job_memory` passthrough) rather
+than written and trusted.
+
+**Explicitly out of scope for this entry, named so they are not assumed folded in by omission:**
+group-scoped constraints (a role- or business-function-wide statement) -- the contested-clustering
+survey's own subject, not decided or touched here; contested clustering and the Contested tab;
+the missing `.resolve()` call on `data_dir` the source-scoping survey measured as a real, already-
+shipped defect in `_capacity_history`'s own staleness check -- real, but it gets its own commit,
+not folded into this one; the agents path's own copy of the snapshot-read redundancy (the Fleet-
+scale audit's own still-open item); CLI `--top N`.
