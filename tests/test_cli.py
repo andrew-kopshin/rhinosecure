@@ -68,6 +68,150 @@ def test_deterministic_path_prints_contested_rate_on_the_real_fixture(capsys):
     assert "Contested: 3/24 (12.5%) of scored findings" in out
 
 
+# --- --apply-constraints (CLAUDE.md's machine-identity constraint scoping) --
+#
+# F07 and F14 are both on A09/WKS-FIN12 (CVE-2022-30190 Follina and
+# CVE-2023-23397, both KEV-listed, both contested per demo/assets.csv's
+# blank patch_window/compensating_controls for A09) -- the real fixture's
+# own two-finding "one asset, two contested findings" case these tests
+# exercise against real data, not a synthetic fixture.
+
+
+def test_apply_constraints_flag_omitted_never_constructs_memory_and_output_is_unaffected(
+    capsys, monkeypatch, tmp_path
+):
+    """The flag-off half of the acceptance contract: a matching, real
+    constraint sitting in the database must change nothing, and the
+    deterministic path must not even construct a Memory to find out --
+    proven, not asserted, by making Memory.__init__ raise."""
+    from rhinosecure.memory import Memory
+
+    seed_memory = Memory(tmp_path / "mem.db")
+    seed_memory.add_constraint(
+        "A09", "WKS-FIN12 can only patch on Sundays",
+        effect_kind="patch_window", effect_value="Sun 02:00-06:00", hostname="WKS-FIN12",
+    )
+    seed_memory.close()
+
+    def _boom(self, *a, **kw):
+        raise AssertionError("Memory was constructed on the flag-off deterministic path")
+
+    monkeypatch.setattr(Memory, "__init__", _boom)
+
+    assert main(["run", "--data", "demo", "--seed", "42", "--offline"]) == 0
+    out = capsys.readouterr().out
+    assert "Contested: 3/24 (12.5%) of scored findings" in out
+    assert "Constraints applied" not in out  # the summary line never prints without the flag
+
+
+def test_apply_constraints_flag_on_moves_matching_contested_findings_with_unchanged_risk_score(
+    capsys, tmp_path
+):
+    from rhinosecure.memory import Memory
+
+    db_path = tmp_path / "mem.db"
+    seed_memory = Memory(db_path)
+    seed_memory.add_constraint(
+        "A09", "WKS-FIN12 can only patch on Sundays",
+        effect_kind="patch_window", effect_value="Sun 02:00-06:00", hostname="WKS-FIN12",
+    )
+    seed_memory.close()
+
+    before = run(DEMO_DIR, seed=42, offline=True)
+    before_by_id = {s.finding_id: s for s in before}
+    assert before_by_id["F07"].bucket.value == "contested"
+    assert before_by_id["F14"].bucket.value == "contested"
+
+    assert main([
+        "run", "--data", "demo", "--seed", "42", "--offline", "--db", str(db_path), "--apply-constraints",
+    ]) == 0
+    out = capsys.readouterr().out
+
+    assert "Contested: 1/24 (4.2%) of scored findings" in out  # F07 and F14 both left contested
+    assert "F07         CVE-2022-30190  WKS-FIN12  next_window" in out
+    assert "F14         CVE-2023-23397  WKS-FIN12  next_window" in out
+    # risk_score unchanged -- the constraint only resolves which bucket is
+    # honest (a declared window now exists), never the arithmetic itself.
+    assert f"{before_by_id['F07'].risk_score:<10.1f}" in out
+    assert f"{before_by_id['F14'].risk_score:<10.1f}" in out
+    assert "Constraints applied: 1 (skipped: 0 legacy, 0 identity_mismatch) -- digest sha256:" in out
+
+
+def test_apply_constraints_with_wrong_hostname_is_skipped_and_finding_stays_contested(capsys, tmp_path):
+    """The measured hazard this whole feature exists to close: an
+    asset_id match alone is not enough -- demo's A09 really is
+    WKS-FIN12, so a constraint recorded under any other hostname must be
+    refused, not silently applied to the wrong machine."""
+    from rhinosecure.memory import Memory
+
+    db_path = tmp_path / "mem.db"
+    seed_memory = Memory(db_path)
+    seed_memory.add_constraint(
+        "A09", "recorded against the wrong machine",
+        effect_kind="patch_window", effect_value="Sun 02:00-06:00", hostname="SOME-OTHER-HOST",
+    )
+    seed_memory.close()
+
+    assert main([
+        "run", "--data", "demo", "--seed", "42", "--offline", "--db", str(db_path), "--apply-constraints",
+    ]) == 0
+    out = capsys.readouterr().out
+
+    assert "Contested: 3/24 (12.5%) of scored findings" in out  # unchanged -- nothing applied
+    assert "F14         CVE-2023-23397  WKS-FIN12  contested" in out
+    assert "Constraints applied: 0 (skipped: 0 legacy, 1 identity_mismatch) -- digest sha256:" in out
+
+
+def test_apply_constraints_legacy_row_with_no_hostname_is_skipped_and_counted(capsys, tmp_path):
+    """A constraint predating this feature (or written directly with no
+    hostname) is reported, never silently dropped and never applied."""
+    from rhinosecure.memory import Memory
+
+    db_path = tmp_path / "mem.db"
+    seed_memory = Memory(db_path)
+    seed_memory.add_constraint(
+        "A09", "a constraint from before hostnames were recorded",
+        effect_kind="patch_window", effect_value="Sun 02:00-06:00",
+    )
+    seed_memory.close()
+
+    assert main([
+        "run", "--data", "demo", "--seed", "42", "--offline", "--db", str(db_path), "--apply-constraints",
+    ]) == 0
+    out = capsys.readouterr().out
+
+    assert "Contested: 3/24 (12.5%) of scored findings" in out  # unchanged -- nothing applied
+    assert "Constraints applied: 0 (skipped: 1 legacy, 0 identity_mismatch) -- digest sha256:" in out
+
+
+def test_apply_constraints_digest_is_stable_and_changes_with_the_constraint_set(tmp_path):
+    """Decision 5: sha256 of the sorted (asset_id, hostname, effect_kind,
+    effect_value) tuples actually applied -- the identical constraint set
+    must digest identically across two separate runs, and a changed
+    effect_value must change it."""
+    from rhinosecure.memory import Memory
+
+    db_path = tmp_path / "mem.db"
+    seed_memory = Memory(db_path)
+    seed_memory.add_constraint(
+        "A09", "WKS-FIN12 can only patch on Sundays",
+        effect_kind="patch_window", effect_value="Sun 02:00-06:00", hostname="WKS-FIN12",
+    )
+    seed_memory.close()
+
+    first = run_with_report(DEMO_DIR, 42, offline=True, memory=Memory(db_path))
+    second = run_with_report(DEMO_DIR, 42, offline=True, memory=Memory(db_path))
+    assert first.constraint_application.digest == second.constraint_application.digest
+
+    changed_memory = Memory(db_path)
+    changed_memory.add_constraint(
+        "A09", "WKS-FIN12's window moved",
+        effect_kind="patch_window", effect_value="Sat 02:00-06:00", hostname="WKS-FIN12",
+    )
+    third = run_with_report(DEMO_DIR, 42, offline=True, memory=changed_memory)
+    assert third.constraint_application.digest != first.constraint_application.digest
+
+
 def test_deterministic_explain_wraps_long_rationale_bullets_on_the_real_fixture(capsys):
     """F14 (CVE-2023-23397, contested) has a scoring_rationale bullet that
     runs to 319 characters unwrapped -- confirms the fix against real

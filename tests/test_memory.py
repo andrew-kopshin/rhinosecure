@@ -105,6 +105,20 @@ def test_add_constraint_returns_an_id_and_is_retrievable(db_path: Path):
         assert constraint.created_at  # non-empty timestamp
         assert constraint.effect_kind is None  # not given -- not yet interpreted
         assert constraint.effect_value is None
+        assert constraint.hostname is None  # not given -- "legacy" to constraint_apply.match_constraints
+
+
+def test_add_constraint_records_the_resolved_asset_hostname(db_path: Path):
+    """CLAUDE.md's machine-identity constraint scoping entry: hostname,
+    once supplied, round-trips exactly, and is independent of
+    effect_kind/effect_value's own optionality."""
+    with Memory(db_path) as db:
+        db.add_constraint(
+            "A09", "WKS-FIN12 can only patch on Sundays",
+            effect_kind="patch_window", effect_value="Sun 02:00-06:00", hostname="WKS-FIN12",
+        )
+        [constraint] = db.constraints_for_asset("A09")
+        assert constraint.hostname == "WKS-FIN12"
 
 
 def test_add_constraint_stores_the_structured_effect_when_given(db_path: Path):
@@ -622,6 +636,48 @@ def test_a_database_created_before_ingest_format_existed_is_migrated(db_path: Pa
             agents=True, total_findings=9, contested_count=6, contested_total=9,
         )
         assert db.get_run(new_id).ingest_format == "defender"
+
+
+def test_a_database_created_before_hostname_existed_is_migrated(db_path: Path):
+    """The identical idempotent-ALTER pattern as ingest_format's own
+    migration test above, for constraints.hostname (CLAUDE.md's
+    machine-identity constraint scoping entry) -- a pre-existing
+    constraint row has no truthful hostname to backfill (None, read back
+    as "legacy" by constraint_apply.match_constraints), and a freshly
+    added row can carry a real one."""
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE constraints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset_id TEXT NOT NULL,
+            constraint_text TEXT NOT NULL,
+            effect_kind TEXT,
+            effect_value TEXT,
+            created_at TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1
+        );
+        INSERT INTO constraints (asset_id, constraint_text, effect_kind, effect_value, created_at, active)
+        VALUES ('A12', 'legacy constraint, predates hostname', 'patch_window', 'Sun 02:00-06:00',
+                '2026-09-01T00:00:00+00:00', 1);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with Memory(db_path) as db:
+        [old] = db.constraints_for_asset("A12")
+        assert old.constraint_text == "legacy constraint, predates hostname"  # history preserved
+        assert old.hostname is None  # nothing invented for it
+
+        new_id = db.add_constraint(
+            "A09", "a fresh constraint", effect_kind="patch_window", effect_value="Sun 02:00-06:00",
+            hostname="WKS-FIN12",
+        )
+        [new] = [c for c in db.constraints_for_asset("A09") if c.id == new_id]
+        assert new.hostname == "WKS-FIN12"
 
 
 def test_migration_is_idempotent_across_reopens(db_path: Path):

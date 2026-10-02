@@ -311,6 +311,134 @@ def test_deterministic_export_flags_a_constraint_on_an_asset_with_no_findings_in
     assert constraint["note"] is not None
 
 
+# --- deterministic path, --apply-constraints: the 1.3.0 constraint_application
+# block and the now-honest asset_scoped live flag/notes (CLAUDE.md's
+# machine-identity constraint scoping entry). F07/F14 are demo's real
+# A09/WKS-FIN12 contested findings -- see test_cli.py's own comment.
+
+
+def test_deterministic_export_constraint_application_block_when_a_constraint_applied(tmp_path):
+    from rhinosecure.export import write_run_export
+
+    memory = Memory(tmp_path / "mem.db")
+    memory.add_constraint(
+        "A09", "WKS-FIN12 can only patch on Sundays",
+        effect_kind="patch_window", effect_value="Sun 02:00-06:00", hostname="WKS-FIN12",
+    )
+    result = run_with_report(DEMO_DIR, seed=42, offline=True, memory=memory)
+    export_path = tmp_path / "export.json"
+
+    write_run_export(
+        export_path, fmt="native", data_dir=DEMO_DIR, seed=42, offline=True,
+        agents=False, result=result, memory=memory,
+    )
+    data = json.loads(export_path.read_text(encoding="utf-8"))
+
+    assert data["export_schema_version"] == "1.3.0"
+    capp = data["constraint_application"]
+    assert capp["applied"] is True
+    assert capp["digest"] == result.constraint_application.digest
+    assert capp["digest"].startswith("sha256:")
+    [constraint_id] = capp["applied_constraint_ids"]
+    assert capp["skipped"] == {"legacy": [], "identity_mismatch": []}
+
+    # No duplication: the applied entry's full detail (constraint_text,
+    # effect_kind/value, recorded hostname) lives only in the EXISTING
+    # constraints.asset_scoped section, joinable by this same id.
+    [asset_scoped] = [c for c in data["constraints"]["asset_scoped"] if c["constraint_id"] == constraint_id]
+    assert asset_scoped["hostname"] == "WKS-FIN12"
+    assert asset_scoped["asset_id"] == "A09"
+    assert asset_scoped["note"] is None  # applied, not skipped -- nothing to explain
+    deltas_by_finding = {d["finding_id"]: d for d in asset_scoped["deltas"]}
+    assert deltas_by_finding["F07"]["before_bucket"] == "contested"
+    assert deltas_by_finding["F07"]["after_bucket"] == "next_window"
+    assert deltas_by_finding["F07"]["before_risk_score"] == deltas_by_finding["F07"]["after_risk_score"]
+    assert deltas_by_finding["F14"]["before_bucket"] == "contested"
+    assert deltas_by_finding["F14"]["after_bucket"] == "next_window"
+
+
+def test_deterministic_export_legacy_and_mismatched_constraints_are_named_not_silently_empty(tmp_path):
+    from rhinosecure.export import write_run_export
+
+    memory = Memory(tmp_path / "mem.db")
+    memory.add_constraint(  # legacy -- no hostname
+        "A09", "predates hostname recording", effect_kind="patch_window", effect_value="Sun 02:00-06:00",
+    )
+    memory.add_constraint(  # identity_mismatch -- A09's real hostname is WKS-FIN12
+        "A09", "recorded against the wrong machine",
+        effect_kind="compensating_control", effect_value="WAF rule enabled", hostname="SOME-OTHER-HOST",
+    )
+    result = run_with_report(DEMO_DIR, seed=42, offline=True, memory=memory)
+    export_path = tmp_path / "export.json"
+
+    write_run_export(
+        export_path, fmt="native", data_dir=DEMO_DIR, seed=42, offline=True,
+        agents=False, result=result, memory=memory,
+    )
+    data = json.loads(export_path.read_text(encoding="utf-8"))
+
+    capp = data["constraint_application"]
+    assert capp["applied_constraint_ids"] == []
+    [legacy] = capp["skipped"]["legacy"]
+    assert legacy["asset_id"] == "A09"
+    [mismatch] = capp["skipped"]["identity_mismatch"]
+    assert mismatch["asset_id"] == "A09"
+    assert mismatch["current_hostname"] == "WKS-FIN12"  # the asset's real, current hostname
+
+    by_id = {c["constraint_id"]: c for c in data["constraints"]["asset_scoped"]}
+    legacy_entry = by_id[legacy["constraint_id"]]
+    assert legacy_entry["deltas"] == []
+    assert "no recorded hostname" in legacy_entry["note"]
+    mismatch_entry = by_id[mismatch["constraint_id"]]
+    assert mismatch_entry["deltas"] == []
+    assert "does not match this asset's current hostname" in mismatch_entry["note"]
+
+    # F14 (A09, KEV, no control, no window) stays contested -- nothing applied.
+    [f14] = [f for f in data["findings"] if f["finding_id"] == "F14"]
+    assert f14["bucket"] == "contested"
+
+
+def test_agents_export_constraint_application_block_is_the_fixed_not_applicable_shape(
+    monkeypatch, agents_data_dir, tmp_path
+):
+    """The ConstraintApplicator/digest mechanism is deterministic-path-only
+    (CLAUDE.md's machine-identity constraint scoping entry) -- the agents
+    path keeps applying constraints per finding via score_finding_tool
+    (already covered elsewhere in this file), but has no run-wide summary
+    to report here."""
+    from rhinosecure.agents import coordinator as coordinator_module
+    from rhinosecure.agents.coordinator import Coordinator
+    from rhinosecure.export import write_run_export
+    from rhinosecure.ingest import join_findings
+
+    monkeypatch.setattr(coordinator_module, "Crew", _QueuedFakeCrew)
+
+    findings = list(join_findings(agents_data_dir / "findings.csv", agents_data_dir / "assets.csv"))
+    _QueuedFakeCrew.queue = [
+        _research_json("F01", "CVE-2021-26855"),
+        _research_json("F02", "CVE-2018-8410"),
+        _research_json("F03", "CVE-2020-1472"),
+        _environment_json("F01", "CVE-2021-26855", "A01", "EXCH01"),
+        _environment_json("F02", "CVE-2018-8410", "A02", "WKS01"),
+        _environment_json("F03", "CVE-2020-1472", "A03", "WKS02"),
+        "F01", "F02", "F03",
+    ]
+    coordinator = Coordinator(agents_data_dir)
+    coordinator.run(findings)
+
+    export_path = tmp_path / "export.json"
+    write_run_export(
+        export_path, fmt="native", data_dir=agents_data_dir, seed=42, offline=False,
+        agents=True, coordinator=coordinator,
+    )
+    data = json.loads(export_path.read_text(encoding="utf-8"))
+
+    assert data["constraint_application"] == {
+        "applied": False, "digest": None, "applied_constraint_ids": [],
+        "skipped": {"legacy": [], "identity_mismatch": []},
+    }
+
+
 # --- deterministic path: capacity history is agents-independent ---------
 
 

@@ -451,6 +451,66 @@ def test_run_deterministic_against_the_real_demo_fixture_offline(client: TestCli
     assert len(export_data["findings"]) == body["result"]["total_findings"]
 
 
+def test_run_deterministic_job_always_applies_identity_matched_constraints_no_flag(
+    client: TestClient, tmp_path: Path, monkeypatch
+):
+    """CLAUDE.md's machine-identity constraint scoping entry: the web
+    run_deterministic job always applies stored constraints, no flag, no
+    opt-out -- the deliberate CLI/web asymmetry. Seeds the exact db_path
+    the client fixture's own JobConfig points at (tmp_path / "mem.db")."""
+    from rhinosecure.memory import Memory
+
+    monkeypatch.setattr(jobs_module, "REPO_ROOT", REPO_ROOT)
+    seed_memory = Memory(tmp_path / "mem.db")
+    seed_memory.add_constraint(
+        "A09", "WKS-FIN12 can only patch on Sundays",
+        effect_kind="patch_window", effect_value="Sun 02:00-06:00", hostname="WKS-FIN12",
+    )
+    seed_memory.close()
+
+    resp = client.post("/api/jobs", json={"kind": "run_deterministic", "input": {"source_ref": "demo"}})
+    body = _wait_for_terminal(client, resp.json()["job_id"])
+
+    assert body["status"] == "succeeded", body.get("error")
+    assert body["result"]["constraints_applied"] == 1
+    assert body["result"]["constraints_skipped_legacy"] == 0
+    assert body["result"]["constraints_skipped_identity_mismatch"] == 0
+    assert body["result"]["constraint_digest"] is not None
+
+    export_data = json.loads((tmp_path / "export.json").read_text(encoding="utf-8"))
+    by_id = {f["finding_id"]: f for f in export_data["findings"]}
+    assert by_id["F07"]["bucket"] == "next_window"  # was contested without the constraint
+    assert by_id["F14"]["bucket"] == "next_window"
+    assert export_data["constraint_application"]["applied"] is True
+
+
+def test_run_deterministic_job_skips_a_legacy_constraint_with_no_recorded_hostname(
+    client: TestClient, tmp_path: Path, monkeypatch
+):
+    """The same legacy-skip behavior as the deterministic CLI path
+    (test_cli.py's own test) -- unit-level, no LLM calls, confirming the
+    web job's always-on fold uses the identical matcher, not a looser one."""
+    from rhinosecure.memory import Memory
+
+    monkeypatch.setattr(jobs_module, "REPO_ROOT", REPO_ROOT)
+    seed_memory = Memory(tmp_path / "mem.db")
+    seed_memory.add_constraint(  # no hostname -- legacy
+        "A09", "predates hostname recording", effect_kind="patch_window", effect_value="Sun 02:00-06:00",
+    )
+    seed_memory.close()
+
+    resp = client.post("/api/jobs", json={"kind": "run_deterministic", "input": {"source_ref": "demo"}})
+    body = _wait_for_terminal(client, resp.json()["job_id"])
+
+    assert body["status"] == "succeeded", body.get("error")
+    assert body["result"]["constraints_applied"] == 0
+    assert body["result"]["constraints_skipped_legacy"] == 1
+
+    export_data = json.loads((tmp_path / "export.json").read_text(encoding="utf-8"))
+    by_id = {f["finding_id"]: f for f in export_data["findings"]}
+    assert by_id["F14"]["bucket"] == "contested"  # unchanged -- the legacy row never applied
+
+
 def test_run_deterministic_never_touches_plan_state_coordinator(client: TestClient, monkeypatch):
     """run_deterministic is a throwaway, Coordinator-free view -- it must
     not become "the current plan" constraint_submit would replan against."""
