@@ -755,7 +755,13 @@ def _build_deterministic_export(
     *, fmt: str, data_dir: Path, seed: int, offline: bool, result: RunResult, memory: Memory | None
 ) -> dict[str, Any]:
     scored = result.scored
-    cache = SnapshotCache()
+    # memoize=True: this instance lives only for this one export build (one
+    # pass over `scored`, never reused afterward), so it is exactly the
+    # short-lived case SnapshotCache.memoize's own docstring describes as
+    # safe -- fixes _sources_for_cve's measured per-finding re-reads of the
+    # same CVE/KEV-catalog/ATT&CK-bundle bytes (CLAUDE.md's "Fleet-scale
+    # audit, part 1").
+    cache = SnapshotCache(memoize=True)
     contested_ids: set[str] = set()  # the deterministic path never dispatches ToT
     contract = result.contract
     run_label = _current_run_label(fmt, contract)

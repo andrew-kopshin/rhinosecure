@@ -121,3 +121,80 @@ def test_default_snapshot_dir_matches_repo_layout():
 
     assert DEFAULT_SNAPSHOT_DIR.name == "snapshots"
     assert DEFAULT_SNAPSHOT_DIR.parent.name == "data"
+
+
+# ---- memoize (CLAUDE.md's "Fleet-scale audit, part 1", 2026-09-25) ---------
+
+
+def test_memoize_defaults_to_false(tmp_path: Path):
+    assert SnapshotCache(tmp_path).memoize is False
+
+
+def test_without_memoize_a_repeat_read_sees_a_later_write(tmp_path: Path):
+    # Pins today's behavior unchanged for every caller that never opts in.
+    cache = SnapshotCache(tmp_path)
+    cache.write("nvd", "CVE-2021-26855", {"n": 1})
+    first = cache.read("nvd", "CVE-2021-26855")
+    cache.write("nvd", "CVE-2021-26855", {"n": 2})
+    second = cache.read("nvd", "CVE-2021-26855")
+    assert first.payload == {"n": 1}
+    assert second.payload == {"n": 2}
+
+
+def test_with_memoize_a_repeat_read_is_served_from_memory_not_the_file(tmp_path: Path):
+    cache = SnapshotCache(tmp_path, memoize=True)
+    cache.write("nvd", "CVE-2021-26855", {"n": 1})
+    first = cache.read("nvd", "CVE-2021-26855")
+
+    # Mutate the file directly, bypassing cache.write() entirely -- the only
+    # way a disagreement between the file and a real re-read could show up.
+    path = tmp_path / "nvd" / "CVE-2021-26855.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["payload"] = {"n": 999}
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    second = cache.read("nvd", "CVE-2021-26855")
+    assert first.payload == {"n": 1}
+    assert second.payload == {"n": 1}  # served from memory, the file on disk was never reopened
+
+
+def test_with_memoize_actual_file_opens_collapse_to_one_per_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # Files written up front, through a SEPARATE (non-memoizing) instance --
+    # the point is to count opens from read() alone, not have write()'s own
+    # disk access (and its own internal read()) show up in the count.
+    SnapshotCache(tmp_path).write("kev", None, {"n": 1})
+    SnapshotCache(tmp_path).write("nvd", "CVE-2021-26855", {"n": 1})
+    cache = SnapshotCache(tmp_path, memoize=True)
+
+    opens: list[Path] = []
+    real_open = Path.open
+
+    def counting_open(self, *args, **kwargs):
+        opens.append(self)
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+
+    for _ in range(50):
+        cache.read("kev", None)
+        cache.read("nvd", "CVE-2021-26855")
+
+    assert len(opens) == 2  # exactly one real open per distinct (source, key), not 100
+
+
+def test_with_memoize_a_miss_is_not_cached_forever(tmp_path: Path):
+    cache = SnapshotCache(tmp_path, memoize=True)
+    assert cache.read("nvd", "CVE-9999-0001") is None  # miss, not memoized
+
+    cache.write("nvd", "CVE-9999-0001", {"n": 1})  # a later write for the same key...
+    assert cache.read("nvd", "CVE-9999-0001").payload == {"n": 1}  # ...must be visible, not shadowed by the old miss
+
+
+def test_with_memoize_a_second_write_still_bumps_version_through_the_memoized_read(tmp_path: Path):
+    cache = SnapshotCache(tmp_path, memoize=True)
+    first = cache.write("kev", None, {"n": 1})
+    second = cache.write("kev", None, {"n": 2})  # write()'s own internal read() must see `first` via memory, not disk
+
+    assert first.version == 1
+    assert second.version == 2
+    assert cache.read("kev", None).payload == {"n": 2}

@@ -302,7 +302,13 @@ def run_with_report(
         def enrich(e: EnrichedFinding) -> EnrichedFinding:
             return attach_source_enrichment(e)
     else:
-        cache = SnapshotCache(offline=offline)
+        # memoize=True: this instance lives only for this one call's single
+        # enrichment pass (never reused across separate `rhino run`
+        # invocations), so it is exactly the short-lived case
+        # SnapshotCache.memoize's own docstring describes as safe -- fixes
+        # the measured per-finding NVD/EPSS re-reads for a CVE this pass
+        # already read (CLAUDE.md's "Fleet-scale audit, part 1").
+        cache = SnapshotCache(offline=offline, memoize=True)
         kev_catalog = load_kev_catalog(cache)  # one bulk feed, loaded once for the whole run
         attack_index = load_attack_index(cache)  # same shape: one filtered bundle, loaded once
 

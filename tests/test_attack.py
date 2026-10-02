@@ -194,6 +194,33 @@ def test_semantic_fallback_ranks_product_specific_technique_higher(tmp_path: Pat
     assert "semantic similarity=" in matches[0].reason
 
 
+def test_semantic_fallback_is_memoized_by_text_and_limit(tmp_path: Path, monkeypatch):
+    # CLAUDE.md's "Fleet-scale audit, part 1" (2026-09-25): a real fleet's
+    # findings commonly share templated product/evidence text per CVE, so
+    # the expensive vector search + MMR rerank behind this should run once
+    # per distinct (text, limit), not once per finding.
+    index = _index(tmp_path)
+    monkeypatch.setattr(attack, "MIN_CANDIDATE_SIMILARITY", 0.0)
+    calls = []
+    original = index._compute_semantic_candidates
+
+    def counting(text, limit):
+        calls.append((text, limit))
+        return original(text, limit)
+
+    monkeypatch.setattr(index, "_compute_semantic_candidates", counting)
+
+    first = index.lookup("CVE-AAAA-00001", product="Windows Print Spooler", evidence="port monitor persistence")
+    assert len(calls) == 1  # first call for this (text, limit): a real compute
+
+    second = index.lookup("CVE-BBBB-00002", product="Windows Print Spooler", evidence="port monitor persistence")
+    assert first == second  # identical text -> identical result
+    assert len(calls) == 1  # ...served from the memo, no second real compute
+
+    index.lookup("CVE-AAAA-00001", product="Windows Print Spooler", evidence="port monitor persistence", limit=1)
+    assert len(calls) == 2  # a different `limit` is a genuinely different question -> a real, second compute
+
+
 def test_no_match_in_either_tier_returns_empty(tmp_path: Path, monkeypatch):
     index = _index(tmp_path)
     monkeypatch.setattr(attack, "MIN_CANDIDATE_SIMILARITY", 0.0)

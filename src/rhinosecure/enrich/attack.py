@@ -198,6 +198,16 @@ class TechniqueIndex:
     CVE/product lookups. See module docstring for the two-tier match."""
 
     def __init__(self, payload: dict[str, Any]):
+        # Per-instance memo for the semantic fallback below, keyed by its own
+        # (text, limit) inputs -- see _semantic_candidates' own note. Safe
+        # because this whole object is already rebuilt fresh for every
+        # top-level dispatch, on both the deterministic path (`load_attack_
+        # index` inside `cli.py`'s `run_with_report`) and the agents path
+        # (`_dispatch_research`'s own "a one-time bulk fetch" comment) --
+        # never kept across separate runs the way `agents/coordinator.py`'s
+        # `Coordinator.cache` is, so there is nothing for this memo to go
+        # stale against within one instance's lifetime.
+        self._semantic_memo: dict[tuple[str, int], list[TechniqueMatch]] = {}
         self._techniques: dict[str, Technique] = {
             r["technique_id"]: Technique(
                 technique_id=r["technique_id"],
@@ -218,6 +228,23 @@ class TechniqueIndex:
         )
 
     def _semantic_candidates(self, text: str, limit: int) -> list[TechniqueMatch]:
+        """Memoized by (text, limit) -- the only two inputs this ever reads
+        (`MIN_CANDIDATE_SIMILARITY` is a module constant, not an argument,
+        and no caller mutates it mid-instance outside a test that never
+        reuses the instance across the mutation). This is the cost CLAUDE.md's
+        "Fleet-scale audit, part 1" measured (3,547 MMR-reranked vector
+        searches for 28 distinct CVEs, 21s of a profiled run) -- real scanner
+        exports commonly template `product`/`evidence` per CVE the same way
+        this project's own generated fixture does, so most findings for one
+        CVE ask this exact question again."""
+        memo_key = (text, limit)
+        if memo_key in self._semantic_memo:
+            return self._semantic_memo[memo_key]
+        result = self._compute_semantic_candidates(text, limit)
+        self._semantic_memo[memo_key] = result
+        return result
+
+    def _compute_semantic_candidates(self, text: str, limit: int) -> list[TechniqueMatch]:
         pool = [
             (technique_id, score)
             for technique_id, score in self._vector_index.search(text, top_k=CANDIDATE_POOL_SIZE)

@@ -3342,3 +3342,92 @@ and a `rhino-web-scale-5000` entry in `.claude/launch.json`.
   still ships 11+ MiB to the browser).
 - **CLI (6):** `--top N`, and the summary line first.
 - **Agents on a subset (7)** -- a scoping decision, not a fix.
+
+---
+
+## Fleet-scale audit, part 2: items 1 and 4 fixed, measured 16-17x (2026-10-02)
+
+Closes the two items the prior entry named as having "no design fork" -- the acceptance test
+was exact (byte-identical, now content-identical since `generated_at` always differs): export
+re-reads (item 1) and per-finding-but-really-per-CVE enrichment work (item 4), on the
+deterministic `rhino run` path that was actually measured. The agents path's share of these same
+defects is explicitly addressed below, not silently left ambiguous.
+
+**Root cause, both items: no caller ever remembered a read it had just made.**
+`export._sources_for_cve` and `cli.py`'s enrichment loop both call `SnapshotCache.read()` once
+per *finding* for data that is actually keyed per *CVE* (NVD, EPSS) or per *run* (the KEV
+catalog, the ATT&CK bundle -- one file, re-opened and re-parsed for every finding regardless).
+Separately, `enrich/attack.py`'s semantic fallback re-ran its MMR-reranked vector search from
+scratch for every finding too, even when two findings asked the identical question (the same
+`product`/`evidence` text -- which real scanner exports commonly template per CVE, exactly as
+this project's own generated fixture does).
+
+**Built: `SnapshotCache.memoize` (`enrich/cache.py`), opt-in, default `False`.** An in-process
+dict on top of the existing file-backed `read()`/`write()` -- a repeat `(source, key)` is served
+from memory instead of reopening and re-parsing the file; `write()` keeps that memory fresh so a
+write is never followed by a stale memoized read; a miss is never memoized, so a key that
+genuinely doesn't exist yet and is later written through the same instance is seen correctly, not
+shadowed by an old `None`. Default `False` means every existing caller is behavior-identical
+unless it opts in.
+
+**Why opt-in, not the new default everywhere -- asked of the measurement itself, not assumed.**
+A `SnapshotCache` instance that is *kept* across separate top-level operations would silently stop
+noticing a snapshot someone else bumped the version on in the meantime (Section 8 rule 4) --
+exactly the kind of regression this project's own discipline flags rather than absorbs. Checked,
+not guessed: `cli.py run_with_report`'s own enrichment cache and `export.py`'s
+`_build_deterministic_export`'s own cache are BOTH constructed fresh, used for exactly one pass,
+and discarded -- grepped every `SnapshotCache(` construction site to confirm it, not assumed from
+the two call sites that happened to be slow. `memoize=True` is set at exactly those two,
+documented in `SnapshotCache`'s own docstring as the shape that's safe. `agents/coordinator.py`'s
+`Coordinator.cache` is the one `SnapshotCache` instance that genuinely is kept across separate
+operations (a later `replan()`, in `rhino web --enable-jobs`, reuses the same instance a `run()`
+built) -- left at `memoize=False`, unchanged, and `_build_agents_export`'s own `_sources_for_cve`
+calls (which read through `coordinator.cache`) are therefore still exactly as slow as before. Not
+an oversight: this is item 7's own boundary ("not measured, only extrapolated: the agents path"),
+and turning memoization on there would need a real decision about *when* to invalidate it
+(`run()`, each `replan()`, never) that this fix was not asked to make.
+
+**Built: `enrich/attack.py`'s `TechniqueIndex` memoizes its own semantic fallback, unconditionally
+-- a different case from `SnapshotCache.memoize` and correctly treated differently.** Checked
+before building: `TechniqueIndex` (unlike `SnapshotCache`) is NEVER the long-lived case --
+`load_attack_index(cache)` is called fresh at the top of every top-level dispatch on BOTH paths
+(`cli.py run_with_report` for the deterministic path; `agents/coordinator.py`'s
+`_dispatch_research`, whose own comment already says "a one-time bulk fetch," for every `run()`
+AND every `replan()`). So there is no instance for a memo to go stale against, in either path, and
+this fix benefits the agents path too, unlike the `SnapshotCache` one. Memoized by `(text, limit)`
+-- its own actual inputs, never collapsed to `cve_id` alone, since two findings sharing one CVE
+could still legitimately carry different `product`/`evidence` text; caching by CVE alone would
+silently return one finding's answer for a different finding's real question, exactly the
+wrong-but-plausible shortcut this project's discipline argues against elsewhere.
+
+**Measured** (same machine/pool as part 1, `--offline --seed 42`, run + `--export`):
+
+| findings | before | after | factor |
+|---|---|---|---|
+| 24 (demo) | 1.1 s | 2.1 s* | -- |
+| 500 | 5.5 s | 2.3 s | 2.4x |
+| 5,000 | 54-59 s | 3.4 s | ~16-17x |
+| 20,000 (3% KEV) | not measured (part 1 only ran this size without `--export`) | 8.7 s | -- |
+
+\* The demo fixture's 24 findings are too few for the fix to show a win against ordinary process
+startup noise; the point was never this size. Peak memory stayed non-issue throughout (42-147 MB
+across all four sizes) -- these items were always a CPU/IO-redundancy defect, not a memory one.
+
+**Verified content-identical, not just visually similar.** The 5,000-finding export produced after
+both fixes diffs against the ORIGINAL (pre-fix) export from part 1 with every key equal except
+`generated_at` (`findings`, `contested`, `summary`, `pipeline` all compared equal directly, not
+eyeballed). `rhino run --data demo --seed 42 --offline` still reads `Contested: 3/24 (12.5%)`;
+`data/demo` untouched. 7 new tests (`tests/test_cache.py` x6, `tests/test_attack.py` x1), every
+existing test in both files passes unmodified (proving `memoize`'s default-off path and
+`TechniqueIndex`'s unconditional memoization are each behavior-preserving for every caller that
+doesn't specifically exercise the new path). Each new test confirmed to fail when its own fix is
+reverted (checked by reverting each independently and re-running, then restoring byte-for-byte).
+Full suite: 1,707 passed (was 1,700 at the start of this entry's work).
+
+**Still open, unchanged from part 1's own list, and now one item narrower.** Item 4's ATT&CK-
+semantic-search component is fixed on BOTH paths (above); its snapshot-read component remains
+open for the agents path specifically (`_build_agents_export`'s `_sources_for_cve`, and
+`Coordinator.run()`'s own per-finding NVD/EPSS reads via the long-lived `self.cache`) -- real,
+same shape, deliberately not fixed here, for the staleness reason stated above. Chat context
+strategy, Findings/Contested/Recommended pagination, and CLI `--top N` remain exactly as part 1
+left them: real design forks, not touched by this entry.

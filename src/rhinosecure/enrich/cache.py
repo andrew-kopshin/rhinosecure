@@ -85,11 +85,45 @@ class SnapshotEntry:
 
 
 class SnapshotCache:
-    """Read-through cache backed by JSON files under a snapshot directory."""
+    """Read-through cache backed by JSON files under a snapshot directory.
 
-    def __init__(self, snapshot_dir: Path | None = None, *, offline: bool = False):
+    `memoize=True` adds an in-process dict on top of the file-backed reads
+    below -- `read()` serves a repeat (source, key) from memory instead of
+    re-opening and re-parsing the file, and `write()` keeps that memory
+    fresh so a write is never followed by a stale memoized read. This
+    closes a real, measured defect (CLAUDE.md's "Fleet-scale audit, part 1,"
+    2026-09-25): `export.py`'s `_sources_for_cve` and the enrichment loops
+    in `cli.py`/`agents/coordinator.py` all call `read()` once per FINDING
+    for data that is actually keyed per CVE (or, for the KEV catalog and the
+    ATT&CK bundle, per *run* -- one file, read again for every finding) --
+    at 5,000 findings drawn from 28 distinct CVEs this measured as 45 of a
+    54-second export (profiled), almost entirely redundant disk I/O and
+    JSON parsing of bytes already read.
+
+    Default is `False` -- every existing caller is unaffected. A caller
+    that turns it on is making a claim this class cannot verify on its
+    own: that this *particular* `SnapshotCache` instance will not outlive
+    the one pass of reads it is backing, and that nothing else will have
+    bumped a snapshot's version on disk by the time a later read in that
+    same pass asks for it again. A freshly-constructed, short-lived
+    instance used for exactly one `rhino run` invocation or one export
+    build satisfies that trivially. A `SnapshotCache` instance that is
+    *kept* across separate top-level operations -- `agents/coordinator.py`'s
+    `Coordinator.cache`, reused across a later `replan()` once a plan is
+    already established in `rhino web --enable-jobs` -- does **not**: a
+    human could run a separate `rhino run` in the meantime that bumps
+    `kev.json`'s version (Section 8 rule 4), and a memoized `Coordinator`
+    would never notice. `memoize` therefore stays off for that case,
+    flagged rather than silently fixed -- CLAUDE.md's "Fleet-scale audit"
+    entry lists it as measured-but-not-yet-fixed (item 7, the agents path)
+    for exactly this reason, not an oversight here.
+    """
+
+    def __init__(self, snapshot_dir: Path | None = None, *, offline: bool = False, memoize: bool = False):
         self.snapshot_dir = snapshot_dir or DEFAULT_SNAPSHOT_DIR
         self.offline = offline
+        self.memoize = memoize
+        self._memory: dict[tuple[str, str | None], SnapshotEntry] = {}
 
     def _path(self, source: str, key: str | None) -> Path:
         if key is None:
@@ -98,12 +132,18 @@ class SnapshotCache:
         return self.snapshot_dir / source / f"{key}.json"
 
     def read(self, source: str, key: str | None = None) -> SnapshotEntry | None:
+        cache_key = (source, key)
+        if self.memoize and cache_key in self._memory:
+            return self._memory[cache_key]
         path = self._path(source, key)
         if not path.exists():
-            return None
+            return None  # a miss is never memoized -- see write()'s own note on why
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        return SnapshotEntry.from_json(data)
+        entry = SnapshotEntry.from_json(data)
+        if self.memoize:
+            self._memory[cache_key] = entry
+        return entry
 
     def write(self, source: str, key: str | None, payload: Any) -> SnapshotEntry:
         """Persist `payload`, bumping the version if a snapshot already
@@ -124,6 +164,13 @@ class SnapshotCache:
             json.dump(entry.to_json(), f, indent=2, sort_keys=True)
             f.write("\n")
         tmp_path.replace(path)
+        if self.memoize:
+            # Keeps a later read() in the same pass from either re-reading
+            # the file it was never asked to invalidate, or -- worse, since
+            # a miss is never memoized above -- re-deriving `existing` as
+            # None and re-using version 1 for what is now the SECOND write
+            # to this key within one memoized instance's lifetime.
+            self._memory[(source, key)] = entry
         return entry
 
     def get_or_fetch(
