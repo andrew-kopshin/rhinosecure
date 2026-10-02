@@ -338,6 +338,9 @@ Two gaps, neither with a fix yet, both direct consequences of the scale rule abo
   bullet above already states, now concrete for a consumer that didn't exist when that bullet
   was written.
 
+  *Superseded in part (2026-09-25):* the Scenarios tab's Selection mode already filters and pages;
+  only the Findings/Contested tabs and Recommended mode do not. See "Fleet-scale audit, part 1".
+
 ---
 
 ## 2. Environment: the synthetic Windows fleet
@@ -1741,6 +1744,7 @@ rhinosecure/
   tests/
   scripts/
     smoke_test.py            # standalone LLM connectivity check, not wired into the pipeline
+    generate_fleet.py        # seeded fleet-scale dataset generator (Fleet-scale audit, 2026-09-25)
   out/                       # generated plans, gitignored
 ```
 
@@ -3220,3 +3224,121 @@ remain genuinely unbuilt. Either is a real, separate piece of future work if a s
 use the existing CSV-shaped tooling" -- `probe.py`'s column profiler is hard-coded to `.csv` files
 today (`profile_source` raises `ProbeError` outright on an xlsx-only directory) and would need a
 genuine new xlsx-reading path to support that, not a small extension.
+
+---
+
+## Fleet-scale audit, part 1: a generator, and what measuring found (2026-09-25)
+
+Opens the two gaps Section 1 names ("UI pagination and filtering", "chat context strategy at
+fleet scale") the way that section itself demands: find the defect by running at scale, not by
+reasoning about it. The order was decided (asked, not assumed): **generator, then measure, then fix
+what is measured, bringing each real design fork back before building.** This entry is the first two
+steps. Nothing below changes scoring, ingest, export, or the UI; no defect is fixed yet.
+
+**Correction to Section 1's "left open" note.** It says the Findings/Contested tables *and any
+scenario view* render every finding with no pagination or filtering. That is only true of the
+Findings and Contested tabs. The Scenarios tab already has a filter bar (bucket, KEV, exposure,
+role, blast radius, search) and pages Selection mode at `SCENARIO_PAGE_SIZE = 50`. Its default
+**Recommended** mode (every `patch_now` + `contested` finding) has neither. The note is left as
+written (history) and this entry supersedes it.
+
+**Built: `scripts/generate_fleet.py`** -- standalone, not in the CLI, not imported by `src/` (the
+`scripts/smoke_test.py` convention). `--assets N --findings M --seed 42 --out DIR`, native format,
+default output `data/full` (gitignored via `data/full*/`, as Section 9's layout already said:
+"generated, seed 42"). Decided (asked): **the CVE pool is the snapshotted CVEs** (28 today), so a
+generated fleet runs `--offline`, uses real NVD/EPSS/KEV data, and leaves `data/snapshots/`
+untouched. The pool is *discovered* at runtime -- a CVE qualifies only if it has an NVD record with
+CVSS *and* an EPSS record, so no CVE id appears in the generator. What that costs, stated so it is
+not mistaken for coverage: only 28 unique CVEs, so this measures rows, assets, export size, UI and
+chat at scale but **not per-CVE enrichment fan-out** (NVD is 5 req/30s unauthenticated -- about 50
+minutes for 500 unique CVEs, about 5 with a key). That stays a separate, live-network measurement.
+Properties, each pinned by a test: byte-identical output for the same arguments (seeded RNG, a fixed
+`--as-of` date, never "today", `\n` endings); it refuses to write into any directory it did not
+itself generate (a `GENERATED.json` marker with parameters, the CVE pool, and file hashes is the
+only thing it will overwrite), which is what keeps `data/demo` (Section 8 rule 1) unreachable without
+the generator knowing its name; findings are spread with a long tail across a realistic role mix
+(70% workstations, servers carrying more findings each), no asset repeats a CVE, and 12.5% of
+scanner severities are one tier off NVD's (Section 3's own defensible rate). `--kev-share` sets the
+target KEV-listed fraction and *also* bounds findings per asset to the smaller of the KEV/non-KEV
+sides -- found by measurement: asking for 3% first realized 11.3%, because 72 heavy servers needed
+more non-KEV CVEs than the pool holds and were forced onto KEV ones. An unattainable request is now
+refused, not quietly missed, and the realized share is printed and recorded on every run. Building
+the tests also caught a real latent hazard: `_allocate_findings` looped forever if capacity ran out
+(only the up-front check prevented it) -- it now raises.
+
+**Measured** (Windows 11, Python 3.12, `--offline --seed 42`; one machine, one pool -- read the
+shape, not the digits):
+
+| findings | run only | run + `--export` | peak memory | export on disk |
+|---|---|---|---|---|
+| 24 (demo) | ~1 s | 1.1 s | 51 MB | 0.07 MB |
+| 500 | -- | 5.5 s | 54 MB | 1.5 MB |
+| 5,000 | 5 s | **54-59 s** | 78 MB | 15.4 MB (11.1 MiB compact) |
+| 20,000 (3% KEV) | 24.5 s | not run | 97 MB | -- |
+
+The compute path is linear (about 1 ms/finding) and memory is a non-issue to 20,000. Everything
+that goes wrong is downstream of it.
+
+**Defects measured, ranked by how badly they fail (none fixed):**
+
+1. **`export._sources_for_cve` re-reads and re-parses six snapshot files per finding** --
+   30,002 reads for 5,000 findings, including the 1.5 MB bulk KEV catalog and the ATT&CK bundle
+   every time. It is 45 s of the 54 s export run (profiled), i.e. the export costs ten times the
+   plan it describes, growing as findings x bulk-file size. A web `run_deterministic` job at 5,000
+   findings takes about a minute for this alone. Pure performance: the output must stay
+   byte-identical, which makes the acceptance test exact.
+2. **Chat cannot answer at scale.** An un-named question puts the whole export in the prompt:
+   about 11 MiB, roughly 2.9M tokens at 5,000 findings (4 chars/token, a floor). Full detail fits
+   about **344 findings in a 200K window** and about 1,700 in 1M; at 581 tokens/finding a 32K local
+   model holds about 55 -- and Section 8's "self-hosted is a first-class target" makes that the case
+   that matters. A question that names one finding is narrowed (0.76 MiB), but the all-compact
+   projection alone is 0.78 MiB (~0.2M tokens) at 5,000, so **the existing pre-filter does not
+   scale either**. This is a real design fork (see below), not a tuning problem.
+3. **The Findings tab renders every finding**: 10,001 table rows, 79K DOM nodes, a 195,000 px page;
+   switching to it takes 316 ms and each row click 116-178 ms (it scans every detail row). No
+   filter, search, sort, or pagination -- at 5,000 nothing is findable, which is a usability defect
+   before it is a latency one. The Scenarios tab's **Recommended** mode is unpaginated too (1,608
+   rows in the run measured). Fetch (151 ms) and parse (11 ms) are not the problem; paint was not
+   measured (the browser pane was hidden, so `requestAnimationFrame` never fired).
+4. **Enrichment does per-finding work that is per-CVE**: 3,547 ATT&CK semantic searches and 10,002
+   NVD/EPSS snapshot reads for 28 distinct CVEs. Real fleets repeat CVEs far more than this pool
+   does. Cheap at 5,000 (5 s total), so lower priority, but it is the same defect as (1).
+5. **The export is 42.6% `rationale`, 21.4% `decomposition`, 15.8% `sources`**; `sources` is
+   byte-identical for every finding of one CVE (28 distinct lists across 5,000 findings). Relevant
+   to (2) and (3): a summary export plus per-finding detail is the shape both want.
+6. **The CLI prints every row** (5,000 lines; the `Contested:` summary is the last line).
+   `--explain` is worse. Section 1 lists "CLI output" among interfaces that may not assume demo
+   scale.
+7. **Not measured, only extrapolated: the agents path.** At Section 8's measured $6.48 per 24
+   findings, that is about $135 for 500 and about $1,350 for 5,000 (plus Tree-of-Thought). The UI
+   has a cost confirm; nothing lets an operator run agents on a subset (by bucket, by top-N).
+
+**A measurement result about Section 6's "~1%" contested target.** The 28-CVE pool is mostly
+famous KEV anchors, so a uniform draw is 56-58% KEV and reads **31.6%** contested at 5,000
+findings -- a number about the pool, not about scale. With a stated KEV share: **2.0%** contested
+at 3.3% KEV (5,000 findings / 1,000 assets), **1.6%** at 3.1% KEV (20,000 / 4,000). Contested
+tracks (KEV share) x (share of assets with neither a control nor a window), here about 60% of KEV
+findings because most workstations declare neither; it does not track fleet size. So the target is
+neither verified nor falsified: it is reachable only at low KEV prevalence or a fleet that
+declares windows/controls, and that dependence is now quantified. Separately, the Overview note
+("a small fixture-sized run is expected to read higher than that") is untrue at 5,000 findings.
+
+**Verification.** 26 tests (`tests/test_generate_fleet.py`), each snapshot fixture written through
+the real `SnapshotCache`, none touching `data/`. Every behavior was mutated one at a time (23
+mutations: pool filters, discovery, seeding, the overwrite guard, the marker check, the KEV cap and
+picker, both disagreement paths, `as_of`, sampling with replacement, allocation, the capacity check,
+hashes, parameter validation, exit codes) and each turned a specific test red; none survived. Full
+suite 1,700 passed (was 1,674). `rhino run --data demo --seed 42 --offline` still reads
+`Contested: 3/24 (12.5%)`; `data/demo` is byte-untouched. Also added: `data/full*/` in `.gitignore`
+and a `rhino-web-scale-5000` entry in `.claude/launch.json`.
+
+**Open -- needs a decision before anything is built.**
+- **Fix (1) and (4)?** No design fork; byte-identical export is the acceptance test.
+- **Chat at scale (2)** is the real fork: retrieve-then-answer (a code-owned top-K plus aggregates
+  in the prompt), tool-based querying (breaks the deliberately toolless chat agent), or an honest
+  refusal past a measured size. Each has a different answer for a 32K local model.
+- **Findings/Contested/Recommended (3):** server-side paging and filtering (needs an API, and a
+  summary/detail export split per (5)) versus client-side paging over the same export (small, but
+  still ships 11+ MiB to the browser).
+- **CLI (6):** `--top N`, and the summary line first.
+- **Agents on a subset (7)** -- a scoping decision, not a fix.

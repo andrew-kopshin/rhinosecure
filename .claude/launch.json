@@ -126,6 +126,20 @@
       "port": 8428
     },
     {
+      "name": "rhino-web-scale-5000",
+      "runtimeExecutable": ".venv312/Scripts/python.exe",
+      "runtimeArgs": [
+        "-m",
+        "rhinosecure.cli",
+        "web",
+        "--export",
+        "out/scale/export_5000.json",
+        "--port",
+        "8429"
+      ],
+      "port": 8429
+    },
+    {
       "name": "rhino-js-tests",
       "runtimeExecutable": ".venv312/Scripts/python.exe",
       "runtimeArgs": [

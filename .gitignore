@@ -15,3 +15,6 @@ data/verify-ctrlflow-a/
 data/adapters/*verify*.json
 data/adapters/upload-*.json
 !data/adapters/upload-6f1bbcfe799046ff864be03e.json
+
+# Generated scale datasets (scripts/generate_fleet.py) -- reproducible from a seed, never committed
+data/full*/
