@@ -1188,6 +1188,16 @@ def _run_run_deterministic(job: Job, plan_state: PlanState, on_stage: Callable[[
         provisional_adapter = None
         resolved = resolve_source_ref(source_ref)
 
+    # Constructed BEFORE scoring, unlike the CLI's own plain `rhino run`
+    # (which never constructs one at all unless --apply-constraints is
+    # passed): this job ALWAYS applies stored, machine-identity-matched
+    # constraints, no flag, no opt-out -- CLAUDE.md's machine-identity
+    # constraint scoping entry's own deliberate CLI/web asymmetry. Passed
+    # into run_with_report itself now (not just to the export afterward,
+    # as this used to), so the fold actually reaches `result.scored`, not
+    # only the export's separate, display-only constraints section.
+    job_memory = plan_state.memory if plan_state.memory is not None else Memory(plan_state.config.db_path)
+
     on_stage("scoring")
     from rhinosecure.cli import run_with_report
 
@@ -1198,9 +1208,8 @@ def _run_run_deterministic(job: Job, plan_state: PlanState, on_stage: Callable[[
         fmt=resolved.fmt,
         adapter_config=resolved.adapter_config,
         adapter=provisional_adapter,
+        memory=job_memory,
     )
-
-    job_memory = plan_state.memory if plan_state.memory is not None else Memory(plan_state.config.db_path)
 
     # Deliberately BEFORE the export write, and deliberately not wrapped in
     # a try/except: this is the last point before result.scored's
@@ -1231,6 +1240,7 @@ def _run_run_deterministic(job: Job, plan_state: PlanState, on_stage: Callable[[
     )
 
     bucket_counts = Counter(sf.bucket.value for sf in result.scored)
+    capp = result.constraint_application
     return JobOutcome(
         result={
             "source_ref": source_ref,
@@ -1238,6 +1248,14 @@ def _run_run_deterministic(job: Job, plan_state: PlanState, on_stage: Callable[[
             "total_findings": len(result.scored),
             "bucket_distribution": dict(bucket_counts),
             "provisional": provisional_adapter is not None,
+            # Always real here (never None) -- this job always applies
+            # constraints, no flag. Mirrors cli.py's own printed summary.
+            "constraints_applied": capp.applied_count if capp is not None else 0,
+            "constraints_skipped_legacy": capp.skipped_legacy_count if capp is not None else 0,
+            "constraints_skipped_identity_mismatch": (
+                capp.skipped_identity_mismatch_count if capp is not None else 0
+            ),
+            "constraint_digest": capp.digest if capp is not None else None,
         },
         export_written=True,
     )

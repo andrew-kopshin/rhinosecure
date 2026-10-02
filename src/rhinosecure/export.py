@@ -135,9 +135,18 @@ from rhinosecure.scoring import Bucket, contested_rate, score_finding
 
 if TYPE_CHECKING:
     from rhinosecure.agents.coordinator import Coordinator
-    from rhinosecure.cli import RunResult
+    from rhinosecure.cli import ConstraintApplicationSummary, RunResult
 
-EXPORT_SCHEMA_VERSION = "1.2.0"
+#: 1.3.0: a top-level `constraint_application` key (CLAUDE.md's
+#: machine-identity constraint scoping entry, 2026-10-02) -- what
+#: `--apply-constraints` (or the web run_deterministic job, which always
+#: applies) actually did this run: the digest, which constraints applied,
+#: and which were skipped and why. Additive, matching this module's own
+#: precedent for the last two bumps (1.0.0->1.1.0: is_kev/asset added per
+#: finding; 1.1.0->1.2.0: a new top-level provenance key) -- both were
+#: triggered by a previously-absent field becoming exported, never a
+#: breaking change to an existing one. See _constraint_application_dict.
+EXPORT_SCHEMA_VERSION = "1.3.0"
 
 # memory.list_runs()/Memory has no list_capacity_constraints()/all_runs()
 # without a run_id -- reconstructing constraints.capacity (always
@@ -615,6 +624,21 @@ _PROVISIONAL_NO_MEMORY_NOTE = (
     "confirm the contract, then re-run --agents to see live effect"
 )
 _NO_FINDINGS_NOTE = "no findings for this asset in the current dataset"
+#: Per-constraint notes for the deterministic path's own `live=True` case
+#: (CLAUDE.md's machine-identity constraint scoping entry) -- a constraint
+#: whose asset_id IS in this run but that was skipped as legacy/
+#: identity_mismatch must say so, not silently show `deltas: []` with
+#: `note: None`, which would read as "applies, had no effect" rather than
+#: "never applied, and here is why." Mirrors `cli.ConstraintApplicator`'s
+#: own two reasons exactly -- see that class's docstring.
+_DET_SKIPPED_LEGACY_NOTE = (
+    "this constraint has no recorded hostname (predates machine-identity constraint scoping, or was "
+    "recorded without one) -- never applied this run; see the top-level constraint_application.skipped.legacy block"
+)
+_DET_SKIPPED_MISMATCH_NOTE = (
+    "this constraint's recorded hostname does not match this asset's current hostname -- never applied "
+    "this run; see the top-level constraint_application.skipped.identity_mismatch block"
+)
 
 
 def _asset_scoped_constraints(
@@ -624,6 +648,8 @@ def _asset_scoped_constraints(
     not_live_note: str,
     coordinator: Coordinator | None,
     current_asset_ids: set[str],
+    deterministic_deltas_by_asset: dict[str, list[dict[str, Any]]] | None = None,
+    deterministic_skip_reason_by_id: dict[int, str] | None = None,
 ) -> list[dict[str, Any]]:
     """`live` replaces the old blanket `agents: bool` -- a confirmed
     agents run and a PROVISIONAL agents run both have `agents=True` in
@@ -632,7 +658,17 @@ def _asset_scoped_constraints(
     (`coordinator.memory is not None`). `not_live_note` lets each caller
     supply the honest reason ("deterministic path never touches memory.py
     at all" vs. "this run's Coordinator was never given one") instead of
-    this function guessing which applies."""
+    this function guessing which applies.
+
+    `coordinator=None` with `live=True` is the new, third case (CLAUDE.md's
+    machine-identity constraint scoping entry): a deterministic run that
+    actually applied `--apply-constraints`. There is no `Coordinator` to
+    recompute a delta from on this path -- `deterministic_deltas_by_asset`
+    (real before/after `ScoredFinding` comparisons, computed once in
+    `cli.run_with_report` while scoring, never recomputed here) and
+    `deterministic_skip_reason_by_id` (which of THIS run's legacy/
+    identity_mismatch skips this specific constraint_id was, if any) carry
+    what the agents-path branch instead gets from a live `Coordinator`."""
     entries = []
     for c in memory.all_active_constraints():
         applies = c.asset_id in current_asset_ids
@@ -642,9 +678,18 @@ def _asset_scoped_constraints(
             note = not_live_note
         elif not applies:
             note = _NO_FINDINGS_NOTE
-        else:
+        elif coordinator is not None:
             note = None
             deltas = _asset_constraint_deltas(coordinator, c.asset_id)
+        else:
+            reason = (deterministic_skip_reason_by_id or {}).get(c.id)
+            if reason == "legacy":
+                note = _DET_SKIPPED_LEGACY_NOTE
+            elif reason == "identity_mismatch":
+                note = _DET_SKIPPED_MISMATCH_NOTE
+            else:
+                note = None
+                deltas = (deterministic_deltas_by_asset or {}).get(c.asset_id, [])
         entries.append(
             {
                 "constraint_id": c.id,
@@ -654,6 +699,7 @@ def _asset_scoped_constraints(
                 "effect_value": c.effect_value,
                 "created_at": c.created_at,
                 "active": c.active,
+                "hostname": c.hostname,
                 "applies_to_current_run": applies,
                 "deltas": deltas,
                 "note": note,
@@ -731,6 +777,8 @@ def _constraints_section(
     not_live_note: str,
     coordinator: Coordinator | None,
     current_asset_ids: set[str],
+    deterministic_deltas_by_asset: dict[str, list[dict[str, Any]]] | None = None,
+    deterministic_skip_reason_by_id: dict[int, str] | None = None,
 ) -> dict[str, Any]:
     if memory is None:
         return {"asset_scoped": [], "capacity": []}
@@ -741,6 +789,8 @@ def _constraints_section(
             not_live_note=not_live_note,
             coordinator=coordinator,
             current_asset_ids=current_asset_ids,
+            deterministic_deltas_by_asset=deterministic_deltas_by_asset,
+            deterministic_skip_reason_by_id=deterministic_skip_reason_by_id,
         ),
         "capacity": _capacity_history(memory, data_dir=data_dir, run_label=run_label),
     }
@@ -755,6 +805,45 @@ def _pipeline_common(fmt: str, report: IngestReport, offline: bool, contract: Co
                 f"KEV/EPSS/NVD/ATT&CK attached via SnapshotCache for {report.findings_total} finding(s)"
                 + (", offline mode" if offline else "")
             ),
+        },
+    }
+
+
+def _constraint_application_dict(summary: ConstraintApplicationSummary | None) -> dict[str, Any]:
+    """The new 1.3.0 top-level block -- CLAUDE.md's machine-identity
+    constraint scoping entry. `summary is None` means constraints were
+    not applied this run at all (plain `rhino run`, no --apply-constraints)
+    -- a fixed, DB-independent shape, since computing anything real here
+    would require the very Memory this run never constructed. Deliberately
+    minimal to avoid duplicating the existing `constraints.asset_scoped`
+    section (CLAUDE.md's own "no duplicated data" instruction): each
+    applied/skipped entry carries only `constraint_id` plus the one or two
+    NEW facts this run discovered (which bucket it fell in; for a
+    mismatch, what the asset's hostname actually is now) -- everything
+    else about the row (constraint_text, effect_kind, effect_value,
+    created_at, its recorded hostname) is already in `constraints
+    .asset_scoped[]`, joinable by that same `constraint_id`."""
+    if summary is None:
+        return {
+            "applied": False,
+            "digest": None,
+            "applied_constraint_ids": [],
+            "skipped": {"legacy": [], "identity_mismatch": []},
+        }
+    return {
+        "applied": True,
+        "digest": summary.digest,
+        "applied_constraint_ids": [r.constraint_id for r in summary.applied],
+        "skipped": {
+            "legacy": [{"constraint_id": r.constraint_id, "asset_id": r.asset_id} for r in summary.skipped_legacy],
+            "identity_mismatch": [
+                {
+                    "constraint_id": r.constraint_id,
+                    "asset_id": r.asset_id,
+                    "current_hostname": r.current_hostname,
+                }
+                for r in summary.skipped_identity_mismatch
+            ],
         },
     }
 
@@ -790,14 +879,35 @@ def _build_deterministic_export(
     pipeline["agents"] = {"status": "not_run", "detail": "run without --agents; deterministic pipeline only"}
     pipeline["tot"] = {"status": "not_run", "detail": "agents not dispatched"}
 
+    # CLAUDE.md's machine-identity constraint scoping entry: `live` is
+    # honest here now -- True only when this run actually constructed a
+    # Memory and folded identity-matched constraints into scoring
+    # (`result.constraint_application is not None`), never a blanket
+    # False regardless of what --apply-constraints did. The deterministic-
+    # path-specific deltas/skip-reasons (no Coordinator to recompute from,
+    # unlike the agents path) come from the SAME ConstraintApplicator that
+    # already did the real work during scoring -- never recomputed here.
+    capp = result.constraint_application
+    deterministic_deltas_by_asset: dict[str, list[dict[str, Any]]] = {}
+    deterministic_skip_reason_by_id: dict[int, str] = {}
+    if capp is not None:
+        for d in capp.deltas:
+            deterministic_deltas_by_asset.setdefault(d["asset_id"], []).append(d)
+        for r in capp.skipped_legacy:
+            deterministic_skip_reason_by_id[r.constraint_id] = "legacy"
+        for r in capp.skipped_identity_mismatch:
+            deterministic_skip_reason_by_id[r.constraint_id] = "identity_mismatch"
+
     constraints = _constraints_section(
         memory=memory,
         data_dir=data_dir,
         run_label=run_label,
-        live=False,
+        live=capp is not None,
         not_live_note=_DETERMINISTIC_NOTE,
         coordinator=None,
         current_asset_ids={s.asset_id for s in scored},
+        deterministic_deltas_by_asset=deterministic_deltas_by_asset,
+        deterministic_skip_reason_by_id=deterministic_skip_reason_by_id,
     )
 
     return {
@@ -826,6 +936,7 @@ def _build_deterministic_export(
         "findings": findings,
         "contested": [],
         "constraints": constraints,
+        "constraint_application": _constraint_application_dict(capp),
         "usage": {"research": None, "environment": None, "risk": None, "tot": None},
     }
 
@@ -943,6 +1054,19 @@ def _build_agents_export(
         "findings": findings,
         "contested": contested,
         "constraints": constraints,
+        # Always the fixed "not applied" shape on this path -- the
+        # ConstraintApplicator/digest mechanism (cli.py, CLAUDE.md's
+        # machine-identity constraint scoping entry) is specific to the
+        # deterministic path's own --apply-constraints flag; it has no
+        # agents-path analog to report here. This does NOT mean the
+        # agents path never applies a constraint -- it does, per finding,
+        # via agents/risk.py's score_finding_tool -- that effect is
+        # already visible in `constraints.asset_scoped[].deltas` above
+        # (live=coordinator.memory is not None) and in each finding's own
+        # `constraints_applied`/`decomposition`; this key specifically
+        # means "no run-wide digest/summary exists for this path," never
+        # fabricated to claim otherwise.
+        "constraint_application": _constraint_application_dict(None),
         "usage": {
             "research": _usage_dict(state.research_usage),
             "environment": _usage_dict(state.environment_usage),

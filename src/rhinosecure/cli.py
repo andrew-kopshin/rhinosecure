@@ -145,7 +145,9 @@ full design reasoning.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import random
 import sys
 import textwrap
@@ -157,6 +159,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from rhinosecure.agents.coordinator import Coordinator, RunState
     from rhinosecure.agents.schema_inference import ProposeResult
+    from rhinosecure.memory import Constraint, Memory
 
 from rhinosecure.adapters import (
     DEFAULT_FORMAT,
@@ -169,6 +172,7 @@ from rhinosecure.adapters import (
 from rhinosecure.adapters.config_model import Contract
 from rhinosecure.adapters.probe import ColumnProfile, FileProfile, ProbeError, profile_source
 from rhinosecure.adapters.review import Measurement, ReviewError, ReviewOutcome, is_provisional, review_contract
+from rhinosecure.constraint_apply import apply_constraints, match_constraints
 from rhinosecure.enrich.attack import load_index as load_attack_index
 from rhinosecure.enrich.cache import OfflineCacheMissError, SnapshotCache
 from rhinosecure.enrich.kev import load_catalog as load_kev_catalog
@@ -211,6 +215,212 @@ def _resolve_data_dir(data_arg: str) -> Path:
 
 
 @dataclass(frozen=True)
+class AppliedConstraintRecord:
+    """One constraint that was actually identity-matched (asset_id AND
+    hostname) and folded into scoring this run -- the facts a human or
+    the export needs to know WHAT applied, joinable back to the existing
+    `constraints.asset_scoped[]` export section by `constraint_id` for
+    everything else about the row (created_at, active, free-text
+    constraint_text already live there)."""
+
+    constraint_id: int
+    asset_id: str
+    hostname: str
+    effect_kind: str | None
+    effect_value: str | None
+
+
+@dataclass(frozen=True)
+class SkippedConstraintRecord:
+    """One constraint that matched by asset_id but was never applied this
+    run, and why -- `reason` is exactly `"legacy"` (no hostname was ever
+    recorded for it) or `"identity_mismatch"` (a hostname was recorded,
+    but it disagrees with this asset's current hostname -- a rename, or
+    two different real machines sharing one asset_id). `current_hostname`
+    is this run's own, real answer for what the asset is actually called
+    now -- not derivable from the old constraints section, which has no
+    notion of "the asset's current hostname" at all."""
+
+    constraint_id: int
+    asset_id: str
+    current_hostname: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class ConstraintApplicationSummary:
+    """What `--apply-constraints` (or the web run_deterministic job,
+    which always applies) actually did this run -- CLAUDE.md's
+    machine-identity constraint scoping entry. `digest` is a sha256 over
+    the sorted, canonical-JSON `(asset_id, hostname, effect_kind,
+    effect_value)` tuples of every entry in `applied` -- row ids and
+    timestamps deliberately excluded, so an unrelated edit to a
+    constraint's free text, or a retract-then-identical-resubmit, does
+    not churn it; only a change to what scoring actually reads does.
+    `deltas` is a before/after comparison per finding whose asset had at
+    least one applied constraint -- the deterministic-path analog of
+    `agents/coordinator.py`'s `FindingDelta`, computed the same way
+    (score the ground-truth finding, score the overlaid one, diff) but
+    without needing a `Coordinator` or Research-merged enrichment, since
+    the deterministic path has nothing to merge."""
+
+    digest: str
+    applied: tuple[AppliedConstraintRecord, ...] = ()
+    skipped_legacy: tuple[SkippedConstraintRecord, ...] = ()
+    skipped_identity_mismatch: tuple[SkippedConstraintRecord, ...] = ()
+    deltas: tuple[dict, ...] = ()
+
+    @property
+    def applied_count(self) -> int:
+        return len(self.applied)
+
+    @property
+    def skipped_legacy_count(self) -> int:
+        return len(self.skipped_legacy)
+
+    @property
+    def skipped_identity_mismatch_count(self) -> int:
+        return len(self.skipped_identity_mismatch)
+
+
+def _compute_constraint_digest(applied: tuple[AppliedConstraintRecord, ...]) -> str:
+    """sha256 of the sorted (asset_id, hostname, effect_kind, effect_value)
+    tuples actually applied, as canonical JSON -- reuses the identical
+    sha256-over-canonical-JSON convention `adapters/config_model.py`'s
+    `compute_content_digest` already established in this codebase
+    (`json.dumps(..., sort_keys=True, separators=(",", ":"),
+    ensure_ascii=True)`), extended with an explicit list-order rule that
+    module never needed (it hashes dicts, never an independently-orderable
+    list of records): sorted here by the tuple itself, with None treated
+    as sorting before any string so a legacy/incomplete record (should one
+    ever reach this function -- in practice every genuinely `applied`
+    record has both fields) never raises comparing None to str."""
+    tuples = [(r.asset_id, r.hostname, r.effect_kind, r.effect_value) for r in applied]
+    tuples.sort(key=lambda t: tuple((x is None, x) for x in t))
+    blob = json.dumps(
+        [list(t) for t in tuples], sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(blob).hexdigest()
+
+
+def _scored_finding_changed(before: ScoredFinding, after: ScoredFinding) -> bool:
+    return before.bucket != after.bucket or not math.isclose(
+        before.risk_score, after.risk_score, abs_tol=1e-9
+    )
+
+
+def _build_deterministic_delta(before: ScoredFinding, after: ScoredFinding) -> dict:
+    """The deterministic-path analog of `agents/coordinator.py`'s
+    `_build_finding_delta` -- identical comparison (bucket changed? risk
+    score changed past a tight float tolerance? which rationale lines
+    were added/removed?), but between two plain `ScoredFinding` objects
+    (no agent narrative to carry, so `after_verdict_summary` is always
+    `None` here, matching this module's "never fabricated" convention for
+    a field that genuinely doesn't exist on this path)."""
+    before_rationale = set(before.rationale)
+    after_rationale = set(after.rationale)
+    return {
+        "finding_id": after.finding_id,
+        "cve_id": after.cve_id,
+        "asset_id": after.asset_id,
+        "hostname": after.hostname,
+        "before_bucket": before.bucket.value,
+        "after_bucket": after.bucket.value,
+        "before_risk_score": before.risk_score,
+        "after_risk_score": after.risk_score,
+        "rationale_added": sorted(after_rationale - before_rationale),
+        "rationale_removed": sorted(before_rationale - after_rationale),
+        "after_verdict_summary": None,
+        "changed": _scored_finding_changed(before, after),
+    }
+
+
+class ConstraintApplicator:
+    """One instance per `rhino run` invocation (constructed only when
+    `--apply-constraints`/the web job's always-on equivalent is in
+    effect): looks up and caches each distinct asset's stored constraints
+    (one DB read per asset actually touched by this run, not per
+    finding), matches by `(asset_id, hostname)` via
+    `constraint_apply.match_constraints` -- the SAME matcher
+    `agents/risk.py`/`agents/environment.py`/`agents/coordinator.py`/
+    `export.py` use, CLAUDE.md's "no second rule" -- folds matched ones
+    into the finding via `constraint_apply.apply_constraints`, and
+    accumulates the distinct applied/skipped-by-reason records plus
+    per-finding deltas for the run-wide summary `run_with_report` returns
+    on `RunResult.constraint_application`.
+
+    Skip counting follows CLAUDE.md's own scope rule exactly: a
+    constraint is only ever looked at here because `apply` was called for
+    one of ITS asset's own findings in THIS run, so every constraint this
+    class ever sees already has its asset_id present in this run --
+    "constraints for assets that aren't in this run are another fleet's
+    business and are not counted" is true by construction, not by an
+    extra filter."""
+
+    def __init__(self, memory: Memory):
+        self._memory = memory
+        self._cache: dict[str, list[Constraint]] = {}
+        self._applied: dict[int, AppliedConstraintRecord] = {}
+        self._skipped_legacy: dict[int, SkippedConstraintRecord] = {}
+        self._skipped_mismatch: dict[int, SkippedConstraintRecord] = {}
+        self._deltas: dict[str, dict] = {}  # finding_id -> delta dict
+
+    def apply(self, enriched: EnrichedFinding) -> EnrichedFinding:
+        asset = enriched.asset
+        candidates = self._cache.get(asset.asset_id)
+        if candidates is None:
+            candidates = self._memory.constraints_for_asset(asset.asset_id)
+            self._cache[asset.asset_id] = candidates
+        match = match_constraints(candidates, asset.asset_id, asset.hostname)
+        for c in match.skipped_legacy:
+            self._skipped_legacy.setdefault(
+                c.id,
+                SkippedConstraintRecord(
+                    constraint_id=c.id, asset_id=c.asset_id, current_hostname=asset.hostname, reason="legacy"
+                ),
+            )
+        for c in match.skipped_identity_mismatch:
+            self._skipped_mismatch.setdefault(
+                c.id,
+                SkippedConstraintRecord(
+                    constraint_id=c.id,
+                    asset_id=c.asset_id,
+                    current_hostname=asset.hostname,
+                    reason="identity_mismatch",
+                ),
+            )
+        if not match.applied:
+            return enriched
+        for c in match.applied:
+            self._applied.setdefault(
+                c.id,
+                AppliedConstraintRecord(
+                    constraint_id=c.id,
+                    asset_id=c.asset_id,
+                    hostname=c.hostname,
+                    effect_kind=c.effect_kind,
+                    effect_value=c.effect_value,
+                ),
+            )
+        return enriched.model_copy(update={"asset": apply_constraints(asset, list(match.applied))})
+
+    def record_delta(self, before: ScoredFinding, after: ScoredFinding) -> None:
+        self._deltas[after.finding_id] = _build_deterministic_delta(before, after)
+
+    def summary(self) -> ConstraintApplicationSummary:
+        applied = tuple(sorted(self._applied.values(), key=lambda r: r.constraint_id))
+        return ConstraintApplicationSummary(
+            digest=_compute_constraint_digest(applied),
+            applied=applied,
+            skipped_legacy=tuple(sorted(self._skipped_legacy.values(), key=lambda r: r.constraint_id)),
+            skipped_identity_mismatch=tuple(
+                sorted(self._skipped_mismatch.values(), key=lambda r: r.constraint_id)
+            ),
+            deltas=tuple(self._deltas.values()),
+        )
+
+
+@dataclass(frozen=True)
 class RunResult:
     """The deterministic path's output plus the inventory it was scored
     against and the ingest report -- `main` needs the last two to print
@@ -236,7 +446,16 @@ class RunResult:
     `kev_due_date_by_finding` is the same shape, same reasoning, for
     `remediation.py`'s overdue check: `EnrichedFinding.kev_due_date` is
     another fact the same discarded per-iteration object carries and
-    `ScoredFinding` doesn't."""
+    `ScoredFinding` doesn't.
+
+    `constraint_application` is `None` whenever constraints were not
+    applied this run (the default, plain `rhino run` -- CLAUDE.md's
+    machine-identity constraint scoping entry) and a real
+    `ConstraintApplicationSummary` whenever a `memory` was passed to
+    `run_with_report`, even if it happened to match nothing -- "a
+    `Memory` was consulted this run" and "something applied" are
+    different facts, and `None` is reserved for the former being false,
+    not the latter."""
 
     scored: list[ScoredFinding]
     assets: dict[str, Asset]
@@ -245,6 +464,7 @@ class RunResult:
     kev_due_date_by_finding: dict[str, str | None]
     report: IngestReport
     contract: Contract | None = None
+    constraint_application: ConstraintApplicationSummary | None = None
 
 
 def run(
@@ -264,7 +484,18 @@ def run_with_report(
     fmt: str = DEFAULT_FORMAT,
     adapter_config: str | None = None,
     adapter: IngestAdapter | None = None,
+    memory: Memory | None = None,
 ) -> RunResult:
+    """`memory`, when given, is the one thing that makes this run honor
+    stored, identity-matched constraints (CLAUDE.md's machine-identity
+    constraint scoping entry) -- `None` (the default) reproduces every
+    byte of this function's prior behavior exactly, since nothing below
+    does anything differently when `memory is None`. The plain `rhino
+    run` CLI dispatch never passes one unless `--apply-constraints` was
+    given, and never even imports `Memory` otherwise -- see `main`'s own
+    dispatch and its docstring's "must never open the database at all"
+    rule. The web `run_deterministic` job always passes a real one
+    (CLAUDE.md Section 10's web/CLI asymmetry, decided deliberately)."""
     # Scoring is fully deterministic (no sampling); the seed is accepted
     # now so the CLI contract does not change once Slice 4's ToT beam
     # search introduces anything seed-sensitive.
@@ -320,6 +551,7 @@ def run_with_report(
     not_collected_by_finding: dict[str, frozenset[str]] = {}
     is_kev_by_finding: dict[str, bool] = {}
     kev_due_date_by_finding: dict[str, str | None] = {}
+    applicator = ConstraintApplicator(memory) if memory is not None else None
     for e in enriched:  # still one lazy pass over the findings stream
         tally.observe(e.finding)
         if e.finding.not_collected:
@@ -327,7 +559,14 @@ def run_with_report(
         enriched_finding = enrich(e)  # bound once: is_kev/kev_due_date read off it below, then it's scored
         is_kev_by_finding[e.finding.finding_id] = enriched_finding.is_kev
         kev_due_date_by_finding[e.finding.finding_id] = enriched_finding.kev_due_date
-        scored.append(score_finding(enriched_finding))
+        if applicator is not None:
+            overlaid_finding = applicator.apply(enriched_finding)
+            after_scored = score_finding(overlaid_finding)
+            if overlaid_finding is not enriched_finding:  # a constraint actually matched this asset
+                applicator.record_delta(score_finding(enriched_finding), after_scored)
+            scored.append(after_scored)
+        else:
+            scored.append(score_finding(enriched_finding))
     return RunResult(
         scored=rank(scored),
         assets=assets,
@@ -336,6 +575,7 @@ def run_with_report(
         kev_due_date_by_finding=kev_due_date_by_finding,
         report=tally.report(fmt, assets, adapter.stats),
         contract=contract,
+        constraint_application=applicator.summary() if applicator is not None else None,
     )
 
 
@@ -529,6 +769,25 @@ def _print_failures(coordinator: Coordinator, *, verbose: bool = False) -> None:
 
 def _print_contested_rate(rate: ContestedRate) -> None:
     print(f"\nContested: {rate.contested}/{rate.total} ({rate.pct:.1f}%) of scored findings")
+
+
+def _print_constraint_application_summary(summary: ConstraintApplicationSummary) -> None:
+    """One line, right after Contested: -- CLAUDE.md's machine-identity
+    constraint scoping entry, decided display shape: applied count,
+    skipped counts by reason, and a digest prefix. Printed only when the
+    caller actually applied constraints this run (`--apply-constraints`,
+    or the web `run_deterministic` job, which always does) -- the plain
+    path that never constructed a `Memory` has no `ConstraintApplicationSummary`
+    to print at all (`RunResult.constraint_application is None`), so this
+    function is simply never called there; it does not itself decide
+    whether to print, the same split `_print_usage_summary` draws against
+    its own caller."""
+    print(
+        f"Constraints applied: {summary.applied_count} "
+        f"(skipped: {summary.skipped_legacy_count} legacy, "
+        f"{summary.skipped_identity_mismatch_count} identity_mismatch) "
+        f"-- digest {summary.digest[:19]}..."
+    )
 
 
 def _print_usage_summary(state: "RunState") -> None:
@@ -1528,7 +1787,23 @@ def main(argv: list[str] | None = None) -> int:
             "read memory.py's remediation history and print what's still open, what reappeared "
             "after being marked remediated, what's past its KEV due date, and what was accepted "
             "without a note. Opt-in: the plain deterministic path never touches memory.py "
-            "otherwise. With --agents, reuses the Memory that flag already constructs"
+            "otherwise, unless --apply-constraints is also given. With --agents, reuses the "
+            "Memory that flag already constructs"
+        ),
+    )
+    run_parser.add_argument(
+        "--apply-constraints",
+        action="store_true",
+        help=(
+            "fold stored, machine-identity-matched constraints (memory.py's constraints table) "
+            "into the deterministic pipeline before scoring -- the same LLM-free overlay "
+            "'rhino run --agents'/'rhino constraint add' already apply, keyed to the resolved "
+            "asset's own (asset_id, hostname) pair, not the file or run a constraint was "
+            "originally submitted against. Opt-in: without this flag, the deterministic path "
+            "never touches memory.py at all, exactly as before this flag existed -- 'rhino run "
+            "--data demo' reads identically regardless of what's in your database. Prints an "
+            "applied/skipped-by-reason summary and a digest after the Contested: line, and "
+            "writes the same detail into --export's output"
         ),
     )
     run_format_group = run_parser.add_mutually_exclusive_group()
@@ -1938,9 +2213,27 @@ def main(argv: list[str] | None = None) -> int:
 
             return 0
 
+        # Memory is constructed here, and ONLY here, iff --apply-constraints
+        # was actually given -- this is the one gate that makes "the plain
+        # deterministic path must never open the database at all" true: no
+        # other branch below constructs its OWN Memory unless this one is
+        # still None (meaning the flag was never passed), in which case each
+        # keeps its exact prior behavior (its own fallback construction),
+        # unchanged byte-for-byte from before this flag existed.
+        memory_for_run = None
+        if args.apply_constraints:
+            from rhinosecure.memory import Memory
+
+            memory_for_run = Memory(args.db) if args.db else Memory()
+
         try:
             result = run_with_report(
-                data_dir, args.seed, offline=args.offline, fmt=args.format, adapter_config=args.adapter_config
+                data_dir,
+                args.seed,
+                offline=args.offline,
+                fmt=args.format,
+                adapter_config=args.adapter_config,
+                memory=memory_for_run,
             )
         except IngestError as exc:
             print(f"ingest error: {exc}", file=sys.stderr)
@@ -1954,6 +2247,8 @@ def main(argv: list[str] | None = None) -> int:
         _print_exclusions(result.report, result.contract)
         _print_table(scored)
         _print_contested_rate(contested_rate(s.bucket.value for s in scored))
+        if result.constraint_application is not None:
+            _print_constraint_application_summary(result.constraint_application)
         _print_ingest_report(result.report, result.contract)
 
         if args.track_remediation:
@@ -1967,7 +2262,9 @@ def main(argv: list[str] | None = None) -> int:
                 from rhinosecure import remediation
                 from rhinosecure.memory import Memory
 
-                track_memory = Memory(args.db) if args.db else Memory()
+                track_memory = memory_for_run if memory_for_run is not None else (
+                    Memory(args.db) if args.db else Memory()
+                )
                 tracked = _tracked_findings_from_scored(result)
                 summary = remediation.classify_remediation(tracked, track_memory.latest_remediation_events())
                 _print_remediation_summary(summary, db_path=str(track_memory.db_path))
@@ -1986,7 +2283,9 @@ def main(argv: list[str] | None = None) -> int:
             from rhinosecure.export import write_run_export
             from rhinosecure.memory import Memory
 
-            export_memory = Memory(args.db) if args.db else Memory()
+            export_memory = memory_for_run if memory_for_run is not None else (
+                Memory(args.db) if args.db else Memory()
+            )
             try:
                 write_run_export(
                     Path(args.export),

@@ -63,8 +63,15 @@ def test_deterministic_export_matches_schema_shape(tmp_path):
 
     data = json.loads(export_path.read_text(encoding="utf-8"))
 
-    assert data["export_schema_version"] == "1.2.0"
+    assert data["export_schema_version"] == "1.3.0"
     assert data["generated_at"]  # non-empty ISO 8601 string
+    # memory=None above -- constraints were never applied this run (CLAUDE.md's
+    # machine-identity constraint scoping entry), so this is the fixed,
+    # DB-independent "not applied" shape, not computed from anything.
+    assert data["constraint_application"] == {
+        "applied": False, "digest": None, "applied_constraint_ids": [],
+        "skipped": {"legacy": [], "identity_mismatch": []},
+    }
     assert data["run"] == {
         "data_dir": str(DEMO_DIR), "format": "native", "seed": 42, "offline": True, "agents": False,
     }
