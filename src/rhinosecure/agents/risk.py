@@ -80,7 +80,6 @@ from crewai.llms.base_llm import BaseLLM
 from crewai.tools import BaseTool, tool
 from pydantic import BaseModel
 
-from rhinosecure.agents.constraint_intake import apply_constraints
 from rhinosecure.agents.entity_consistency import (
     find_neutralized_axis_assertions,
     find_wrong_cve_mentions,
@@ -90,6 +89,7 @@ from rhinosecure.agents.environment import EnvironmentAssessment
 from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.prompt_safety import UNTRUSTED_TEXT_NOTICE, fence
 from rhinosecure.agents.research import ResearchFinding
+from rhinosecure.constraint_apply import apply_constraints, match_constraints
 from rhinosecure.llm import get_llm
 from rhinosecure.memory import Memory
 from rhinosecure.schema import AttackTechniqueRef, EnrichedFinding
@@ -207,10 +207,13 @@ def build_risk_tools(
         )
         constraints_applied: list[str] = []
         if memory is not None:
-            active = memory.constraints_for_asset(enriched.asset.asset_id)
-            if active:
-                enriched = enriched.model_copy(update={"asset": apply_constraints(enriched.asset, active)})
-                constraints_applied = [c.constraint_text for c in active]
+            candidates = memory.constraints_for_asset(enriched.asset.asset_id)
+            match = match_constraints(candidates, enriched.asset.asset_id, enriched.asset.hostname)
+            if match.applied:
+                enriched = enriched.model_copy(
+                    update={"asset": apply_constraints(enriched.asset, list(match.applied))}
+                )
+                constraints_applied = [c.constraint_text for c in match.applied]
         scored = score_finding(enriched)
         result = {
             "finding_id": scored.finding_id,

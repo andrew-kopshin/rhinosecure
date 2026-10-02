@@ -403,10 +403,17 @@ def _agents_decomposition(coordinator: Coordinator, enriched: Any, research: Any
     """Live recompute of one agents-path finding's `ScoreDecomposition` --
     mirrors `agents/risk.py`'s `score_finding_tool` EXACTLY: merge
     Research's enrichment signals into the ground-truth `EnrichedFinding`
-    (`merge_research_into_enriched`), fold in any active constraint via
-    `coordinator.memory` (identical `constraints_for_asset`/
-    `apply_constraints` calls, same condition -- `if coordinator.memory is
-    not None`), then `scoring.score_finding`.
+    (`merge_research_into_enriched`), fold in any active, IDENTITY-MATCHED
+    constraint via `coordinator.memory` (identical `constraints_for_asset`
+    + `constraint_apply.match_constraints` + `apply_constraints` calls,
+    same condition -- `if coordinator.memory is not None`), then
+    `scoring.score_finding`. Updated alongside CLAUDE.md's machine-identity
+    constraint scoping entry (2026-10-02): this is a fourth site reading
+    stored constraints that the scoping survey's Q2 didn't separately name,
+    but it must use the identical matcher as the other three -- otherwise
+    this display would show a legacy or hostname-mismatched constraint as
+    if it had been applied, disagreeing with what `score_finding_tool`
+    actually used for the real `risk_score`/`bucket` this finding reports.
 
     Deliberately NOT `_asset_constraint_deltas`'s constraint-free "before"
     pattern -- that pattern exists specifically to isolate a constraint's
@@ -425,14 +432,15 @@ def _agents_decomposition(coordinator: Coordinator, enriched: Any, research: Any
     path-conditional field."""
     if research is None:
         return None
-    from rhinosecure.agents.constraint_intake import apply_constraints
     from rhinosecure.agents.risk import merge_research_into_enriched
+    from rhinosecure.constraint_apply import apply_constraints, match_constraints
 
     merged = merge_research_into_enriched(enriched, research)
     if coordinator.memory is not None:
-        active = coordinator.memory.constraints_for_asset(merged.asset.asset_id)
-        if active:
-            merged = merged.model_copy(update={"asset": apply_constraints(merged.asset, active)})
+        candidates = coordinator.memory.constraints_for_asset(merged.asset.asset_id)
+        match = match_constraints(candidates, merged.asset.asset_id, merged.asset.hostname)
+        if match.applied:
+            merged = merged.model_copy(update={"asset": apply_constraints(merged.asset, list(match.applied))})
     return _decomposition_dict(score_finding(merged).decomposition)
 
 

@@ -97,18 +97,29 @@ from pydantic import BaseModel
 
 from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.prompt_safety import fence
+from rhinosecure.constraint_apply import ConstraintEffectKind, apply_constraints
 from rhinosecure.llm import get_llm
-from rhinosecure.memory import Constraint
 from rhinosecure.schema import Asset
 from rhinosecure.scoring import ScoredFinding
 
 ROLE = "Constraint Interpreter"
 
-
-class ConstraintEffectKind(str, Enum):
-    PATCH_WINDOW = "patch_window"
-    COMPENSATING_CONTROL = "compensating_control"
-    PATCH_RESTRICTION = "patch_restriction"
+# `ConstraintEffectKind`/`apply_constraints` moved to `rhinosecure.constraint_apply`
+# (2026-10-02, machine-identity constraint scoping) -- a crewai-free module so the
+# deterministic path can reuse the identical overlay without importing crewai.
+# Re-exported here, unchanged, for every existing importer of this module.
+__all__ = [
+    "ConstraintEffectKind",
+    "ConstraintInterpretation",
+    "ConstraintInterpretationError",
+    "ConstraintKind",
+    "ConstraintMismatchError",
+    "apply_constraints",
+    "build_constraint_agent",
+    "build_constraint_task",
+    "build_constraint_tools",
+    "verify_constraint_matches_tool",
+]
 
 
 class ConstraintKind(str, Enum):
@@ -174,66 +185,6 @@ class ConstraintInterpretation(BaseModel):
     affected_finding_ids: list[str]
     rationale: str
     sources: list[str]
-
-
-def apply_constraints(asset: Asset, constraints: list[Constraint]) -> Asset:
-    """Overlay `constraints`' effects onto a COPY of `asset` -- `asset`
-    itself is never modified, and nothing this returns is written back
-    anywhere (see module docstring). `constraints` should already be
-    filtered to active ones for this asset (`Memory.constraints_for_asset`'s
-    default). Later constraints in the list win over earlier ones of the
-    same effect_kind -- `constraints_for_asset` returns oldest-first, so
-    the most recently stated version of a fact supersedes an older one,
-    same as a human correcting an earlier statement. compensating_control
-    is the one additive kind: multiple controls accumulate rather than
-    replacing each other, matching how `Asset.compensating_control_list`
-    already treats its own comma/semicolon-separated field as a set, not
-    a single value.
-
-    **A supplied field stops being not-collected.** Any field a
-    constraint actually writes is removed from `Asset.not_collected`
-    (adapters/base.py) on the returned copy. This is the whole point of
-    the constraint path for a record ingested from a source that exports
-    no operational context: before, a Defender asset's blank
-    `patch_window` meant "unknown" and everything downstream said so;
-    after a human states the window, it is known, and continuing to flag
-    it as a data gap would be false. Fields no constraint touched keep
-    their marker, so one constraint never launders an asset's other gaps.
-    """
-    patch_window = asset.patch_window
-    patch_restrictions = asset.patch_restrictions
-    added_controls: list[str] = []
-    supplied: set[str] = set()
-    for c in constraints:
-        if not c.effect_value:
-            continue
-        if c.effect_kind == ConstraintEffectKind.PATCH_WINDOW.value:
-            patch_window = c.effect_value
-            supplied.add("patch_window")
-        elif c.effect_kind == ConstraintEffectKind.PATCH_RESTRICTION.value:
-            patch_restrictions = c.effect_value
-            supplied.add("patch_restrictions")
-        elif c.effect_kind == ConstraintEffectKind.COMPENSATING_CONTROL.value:
-            added_controls.append(c.effect_value)
-            supplied.add("compensating_controls")
-
-    if added_controls:
-        compensating_controls = (
-            f"{asset.compensating_controls}, {', '.join(added_controls)}"
-            if asset.compensating_controls
-            else ", ".join(added_controls)
-        )
-    else:
-        compensating_controls = asset.compensating_controls
-
-    return asset.model_copy(
-        update={
-            "patch_window": patch_window,
-            "patch_restrictions": patch_restrictions,
-            "compensating_controls": compensating_controls,
-            "not_collected": asset.not_collected - supplied,
-        }
-    )
 
 
 class ConstraintInterpretationError(RuntimeError):

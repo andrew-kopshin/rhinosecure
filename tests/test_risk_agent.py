@@ -187,6 +187,7 @@ def test_an_active_compensating_control_constraint_changes_the_score_and_is_repo
     memory.add_constraint(
         "A02", "now sits behind the new WAF rule",
         effect_kind="compensating_control", effect_value="WAF rule enabled",
+        hostname="EXCH01",  # ASSET.hostname -- must match for the identity-scoped matcher to apply this
     )
     call_log: list[dict] = []
     tools = {

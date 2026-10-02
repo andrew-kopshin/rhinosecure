@@ -229,6 +229,7 @@ def test_lookup_asset_context_surfaces_active_constraints_separately_from_asset_
     memory.add_constraint(
         "A02", "the mail server only reboots on Sundays",
         effect_kind="patch_window", effect_value="Sun 00:00-06:00",
+        hostname="EXCH02",  # ASSET_A02.hostname -- must match for the identity-scoped matcher to apply this
     )
     call_log: list[dict] = []
     tools = {t.name: t for t in build_environment_tools(_asset_index(), call_log, memory)}

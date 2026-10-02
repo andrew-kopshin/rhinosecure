@@ -1142,7 +1142,9 @@ def test_submit_capacity_constraint_applies_an_active_asset_constraint_before_ra
 
     memory = Memory(tmp_path / "mem.db")
     memory.add_constraint("A08", "A08 now sits behind a new WAF rule", effect_kind="compensating_control",
-                           effect_value="WAF rule enabled")
+                           effect_value="WAF rule enabled", hostname="H8")  # A08's real hostname -- the
+    # identity-scoped matcher (constraint_apply.match_constraints) requires both asset_id AND hostname
+    # to match before a constraint is applied; omitting hostname would make this row "legacy" and skipped.
     _QueuedFakeCrew.queue = [_capacity_interpretation_json(5)]
 
     coordinator = Coordinator(data_dir, memory=memory)

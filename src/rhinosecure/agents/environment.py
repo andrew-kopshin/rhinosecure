@@ -91,6 +91,7 @@ from rhinosecure.agents.entity_consistency import (
 from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.prompt_safety import UNTRUSTED_TEXT_NOTICE, fence
 from rhinosecure.agents.research import ResearchFinding
+from rhinosecure.constraint_apply import match_constraints
 from rhinosecure.llm import get_llm
 from rhinosecure.memory import Memory
 from rhinosecure.schema import Asset, EnrichedFinding
@@ -171,17 +172,25 @@ def build_environment_tools(
         build, role, criticality, environment, exposure, compensating
         controls, and patch window/restrictions, as declared in the fleet
         inventory -- plus, separately, any active human-supplied
-        constraint on file for this asset (see human_constraints in the
-        result), which is never merged into the asset's own fields. Any
-        field named in the result's not_collected list holds a default
-        rather than a value this asset's source supplied: a blank
+        constraint whose recorded asset_id AND hostname both match this
+        asset (see human_constraints in the result; constraint_apply
+        .match_constraints is the matcher, same one every other reader of
+        stored constraints uses), which is never merged into the asset's
+        own fields. A constraint recorded against this asset_id under a
+        different (or no) hostname is never surfaced here -- it did not
+        apply. Any field named in the result's not_collected list holds a
+        default rather than a value this asset's source supplied: a blank
         patch_window listed there means nobody recorded one, not that
         patching is unrestricted."""
         asset = asset_index.get(asset_id)
         if asset is None:
             result: dict[str, Any] = {"asset_id": asset_id, "found": False}
         else:
-            human_constraints = memory.constraints_for_asset(asset_id) if memory is not None else []
+            if memory is not None:
+                candidates = memory.constraints_for_asset(asset_id)
+                human_constraints = match_constraints(candidates, asset_id, asset.hostname).applied
+            else:
+                human_constraints = []
             # NOT fenced here, deliberately: patch_window/patch_restrictions/
             # compensating_controls/human_constraints are the fields the task
             # below instructs the model to copy VERBATIM into its own

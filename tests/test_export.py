@@ -652,6 +652,8 @@ def test_agents_export_full_shape_with_contested_finding_and_constraint(monkeypa
     memory.add_constraint(
         "A02", "the finance workstation now sits behind a WAF",
         effect_kind="compensating_control", effect_value="WAF rule enabled",
+        hostname="WKS01",  # A02's real hostname (ASSETS_CSV above) -- the identity-scoped matcher
+        # (constraint_apply.match_constraints) requires both asset_id AND hostname to match.
     )
 
     findings = list(join_findings(agents_data_dir / "findings.csv", agents_data_dir / "assets.csv"))

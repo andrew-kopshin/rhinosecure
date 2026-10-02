@@ -131,7 +131,6 @@ from rhinosecure.agents.constraint_intake import (
     ConstraintInterpretationError,
     ConstraintKind,
     ConstraintMismatchError,
-    apply_constraints,
     build_constraint_agent,
     build_constraint_task,
     build_constraint_tools,
@@ -163,6 +162,7 @@ from rhinosecure.agents.risk import (
     merge_research_into_enriched,
     verify_scoring_matches_tool,
 )
+from rhinosecure.constraint_apply import apply_constraints, match_constraints
 from rhinosecure.adapters import DEFAULT_FORMAT
 from rhinosecure.adapters.config_model import Contract
 from rhinosecure.adapters.review import is_provisional
@@ -763,11 +763,19 @@ class Coordinator:
 
         if on_stage is not None:
             on_stage("persisting")
+        # `affected` is non-empty here (checked above) and every element's
+        # asset_id already equals interpretation.asset_id (the filter two
+        # lines up), so they all share one real, resolved Asset's hostname
+        # -- the one honest value to record (CLAUDE.md's machine-identity
+        # constraint scoping, 2026-10-02): a constraint applies later only
+        # when both asset_id AND hostname match (constraint_apply
+        # .match_constraints).
         constraint_id = self.memory.add_constraint(
             interpretation.asset_id,
             text,
             effect_kind=interpretation.effect_kind,
             effect_value=interpretation.effect_value,
+            hostname=affected[0].asset.hostname,
         )
 
         affected_ids = [e.finding.finding_id for e in affected]
@@ -917,9 +925,10 @@ class Coordinator:
         attack_index = load_attack_index(self.cache)
         scored = []
         for e in findings:
-            active = self.memory.constraints_for_asset(e.asset.asset_id)
-            if active:
-                e = e.model_copy(update={"asset": apply_constraints(e.asset, active)})
+            candidates = self.memory.constraints_for_asset(e.asset.asset_id)
+            match = match_constraints(candidates, e.asset.asset_id, e.asset.hostname)
+            if match.applied:
+                e = e.model_copy(update={"asset": apply_constraints(e.asset, list(match.applied))})
             scored.append(score_finding(attach_threat_signals(e, kev_catalog, attack_index, self.cache)))
         scored_by_id = {s.finding_id: s for s in scored}
         asset_id_by_finding_id = {e.finding.finding_id: e.asset.asset_id for e in findings}

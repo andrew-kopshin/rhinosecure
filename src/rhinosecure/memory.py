@@ -131,7 +131,16 @@ CREATE TABLE IF NOT EXISTS constraints (
     effect_kind TEXT,
     effect_value TEXT,
     created_at TEXT NOT NULL,
-    active INTEGER NOT NULL DEFAULT 1
+    active INTEGER NOT NULL DEFAULT 1,
+    -- The resolved asset's hostname at submit time (2026-10-02, machine-
+    -- identity constraint scoping -- CLAUDE.md's dated entry). Nullable:
+    -- a row written before this column existed has no truthful value to
+    -- backfill, and is treated as "legacy" everywhere this is read --
+    -- never applied, always reported, never silently dropped. Together
+    -- with asset_id, this is the one matcher every reader of this table
+    -- uses (constraint_apply.match_constraints): a constraint applies to
+    -- an asset only when BOTH match.
+    hostname TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_constraints_asset_id ON constraints (asset_id);
 
@@ -246,6 +255,11 @@ class Constraint:
     # applied.
     effect_kind: str | None = None
     effect_value: str | None = None
+    # The resolved asset's hostname at submit time -- None for a row
+    # written before this column existed ("legacy", constraint_apply
+    # .match_constraints' own vocabulary). Never read by this module;
+    # see constraint_apply.py for what it means and how it's matched.
+    hostname: str | None = None
 
 
 @dataclass(frozen=True)
@@ -370,6 +384,7 @@ def _constraint_from_row(row: sqlite3.Row) -> Constraint:
         active=bool(row["active"]),
         effect_kind=row["effect_kind"],
         effect_value=row["effect_value"],
+        hostname=row["hostname"],
     )
 
 
@@ -505,6 +520,7 @@ class Memory:
         """
         added: list[tuple[str, str, str]] = [
             ("runs", "ingest_format", "TEXT"),
+            ("constraints", "hostname", "TEXT"),
         ]
         for table, column, decl in added:
             existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
@@ -530,17 +546,26 @@ class Memory:
         *,
         effect_kind: str | None = None,
         effect_value: str | None = None,
+        hostname: str | None = None,
     ) -> int:
         """`effect_kind`/`effect_value` are optional and independent of
         each other's presence -- this module doesn't validate them
-        against anything (no dependency on agents/constraint_intake.py's
+        against anything (no dependency on constraint_apply.py's
         ConstraintEffectKind enum). Omit both to record a constraint
-        that hasn't been interpreted into a structured effect yet."""
+        that hasn't been interpreted into a structured effect yet.
+
+        `hostname` should be the resolved asset's own `Asset.hostname` at
+        the moment of submission -- the caller (`agents/coordinator.py`'s
+        `submit_constraint`, the single call site) already has the
+        resolved `Asset` in hand and is the only place that can supply an
+        honest value. Omitting it (the default) records a row with no
+        recorded identity -- `constraint_apply.match_constraints` treats
+        that as "legacy": never applied, always reported."""
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO constraints (asset_id, constraint_text, effect_kind, effect_value, "
-                "created_at, active) VALUES (?, ?, ?, ?, ?, 1)",
-                (asset_id, constraint_text, effect_kind, effect_value, _now()),
+                "created_at, active, hostname) VALUES (?, ?, ?, ?, ?, 1, ?)",
+                (asset_id, constraint_text, effect_kind, effect_value, _now(), hostname),
             )
             self._conn.commit()
             return cur.lastrowid
