@@ -93,13 +93,13 @@ from typing import Any, Literal
 from crewai import Agent, Task
 from crewai.llms.base_llm import BaseLLM
 from crewai.tools import BaseTool, tool
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.prompt_safety import fence
 from rhinosecure.constraint_apply import ConstraintEffectKind, apply_constraints
 from rhinosecure.llm import get_llm
-from rhinosecure.schema import Asset
+from rhinosecure.schema import Asset, AssetRole
 from rhinosecure.scoring import ScoredFinding
 
 ROLE = "Constraint Interpreter"
@@ -123,68 +123,114 @@ __all__ = [
 
 
 class ConstraintKind(str, Enum):
-    """The two shapes a constraint can honestly resolve to -- mirrors
+    """The three shapes a constraint can honestly resolve to -- mirrors
     ConstraintEffectKind's own reasoning: a fixed, bounded menu is what
     makes the result mechanically usable downstream (which table it
     belongs in, which re-ranking mechanism reads it) rather than more
     prose a later stage has to re-interpret. `constraint_kind` is None
-    (not a third member here) when neither shape fits -- see
-    ConstraintInterpretation."""
+    (not a fourth member here) when no shape fits -- see
+    ConstraintInterpretation.
+
+    `GROUP` (docs/group-constraints-design.md Section 6) added 2026-10-03,
+    mirroring exactly how `CAPACITY` was added as the second member: the
+    Interpreter only extracts a field+value; code, never the model,
+    always computes which real assets that resolves to, every time it's
+    applied (`constraint_apply.match_group_constraints`)."""
 
     ASSET = "asset"
     CAPACITY = "capacity"
+    GROUP = "group"
 
 
 class ConstraintInterpretation(BaseModel):
-    """This agent's structured output, one of three shapes selected by
+    """This agent's structured output, one of four shapes selected by
     `constraint_kind`:
 
     - `constraint_kind="asset"` -- an asset-scoped operational constraint,
       matching CLAUDE.md Section 7's worked example ("the payroll server
       only reboots on Sundays"). `asset_id`, `effect_kind`, `effect_value`,
-      and `affected_finding_ids` are populated as before; `patch_limit` is
-      None.
+      and `affected_finding_ids` are populated as before; `patch_limit`,
+      `group_field`, `group_value` are None.
     - `constraint_kind="capacity"` -- a fleet-wide capacity statement
       naming no single asset (CLAUDE.md Section 10's "only five patches
       fit this window"). ONLY `patch_limit` is populated (the integer
       limit extracted from the statement); `asset_id`, `effect_kind`,
-      `effect_value` are None and `affected_finding_ids` is empty. Which
-      finding_ids a capacity limit actually constrains is computed
-      deterministically elsewhere in this codebase, from every finding
-      currently in the `next_window` bucket -- a separate, already-planned
-      piece this agent does not build and must not attempt: it never
-      populates `affected_finding_ids` for a capacity constraint, even if
-      list_findings_for_asset was called for some other reason first.
+      `effect_value`, `group_field`, `group_value` are None and
+      `affected_finding_ids` is empty. Which finding_ids a capacity limit
+      actually constrains is computed deterministically elsewhere in this
+      codebase, from every finding currently in the `next_window` bucket.
+    - `constraint_kind="group"` -- a statement naming a CATEGORY of
+      machines by one shared field and value, not one specific machine
+      and not a fleet-wide count (docs/group-constraints-design.md
+      Section 6, e.g. "all workstations only reboot outside business
+      hours"). `group_field`/`group_value` are populated;
+      `effect_kind`/`effect_value` are reused UNCHANGED from the asset
+      case, populated the identical way. `asset_id`/`patch_limit` are
+      None and `affected_finding_ids` is empty -- which real assets a
+      group predicate resolves to, now and on every future run, is always
+      computed by code (`constraint_apply.match_group_constraints`),
+      never by this agent; it never calls `search_assets` or
+      `list_findings_for_asset` for a group-shaped statement.
     - `constraint_kind=None` -- a refusal: the statement could not be
-      honestly resolved to EITHER an asset-scoped effect or a capacity
-      limit (e.g. it gestures at fleet-wide capacity but gives no
-      extractable number, or it names no asset and isn't a capacity
-      statement either, or it names an asset but no clear effect).
-      `asset_id`, `effect_kind`, `effect_value`, and `patch_limit` are all
-      None and `affected_finding_ids` is empty; only `rationale` explains
-      why.
+      honestly resolved to any of the three shapes above (e.g. it
+      gestures at fleet-wide capacity but gives no extractable number, it
+      names no asset and isn't a capacity or group statement either, it
+      names an asset but no clear effect, it names a category this fleet
+      doesn't track, or it combines a specific asset reference with a
+      separately-scoped category in one statement). `asset_id`,
+      `effect_kind`, `effect_value`, `patch_limit`, `group_field`,
+      `group_value` are all None and `affected_finding_ids` is empty;
+      only `rationale` explains why.
 
     In every case exactly one shape applies -- never a partial mix across
-    shapes.
+    shapes. This was previously enforced only by prompt wording; the
+    `model_validator` below makes it a real, code-enforced check.
 
-    `constraint_kind`/`effect_kind` are `Literal` types, not plain `str` --
-    the two closed vocabularies `ConstraintKind`/`ConstraintEffectKind`
-    document were previously enforced only by prompt wording and by
-    `apply_constraints`'s own branching (an unrecognized value matched no
-    branch and was silently inert downstream, never rejected). A value
-    outside either vocabulary now fails `parse_structured_output`'s
-    ordinary `pydantic.ValidationError` handling -- the exact same
+    `constraint_kind`/`effect_kind`/`group_field` are `Literal` types, not
+    plain `str` -- the closed vocabularies they document were previously
+    enforced only by prompt wording and by `apply_constraints`'s own
+    branching (an unrecognized value matched no branch and was silently
+    inert downstream, never rejected). A value outside any of these
+    vocabularies now fails `parse_structured_output`'s ordinary
+    `pydantic.ValidationError` handling -- the exact same
     retry-then-give-up path a malformed JSON blob already takes
-    (`agents/parsing.py`), not a new failure mode to handle."""
+    (`agents/parsing.py`), not a new failure mode to handle. `group_value`
+    is typed as `schema.AssetRole`, imported directly rather than
+    hand-copied, so this vocabulary has exactly one source -- a future
+    16th role (CLAUDE.md Section 3 already names a still-open `server`
+    role as a candidate) is picked up here automatically."""
 
-    constraint_kind: Literal["asset", "capacity"] | None
+    constraint_kind: Literal["asset", "capacity", "group"] | None
     asset_id: str | None
     effect_kind: Literal["patch_window", "compensating_control", "patch_restriction"] | None
     effect_value: str | None
     patch_limit: int | None
+    group_field: Literal["role"] | None = None
+    group_value: AssetRole | None = None
     affected_finding_ids: list[str]
     rationale: str
     sources: list[str]
+
+    @model_validator(mode="after")
+    def _exactly_one_shape(self) -> ConstraintInterpretation:
+        """Code-enforced form of "never guess a partial answer across
+        shapes" (the task prompt's own long-standing rule, now checked
+        rather than only asked for). Refuses a response naming an
+        `asset_id` together with `group_field`/`group_value` -- the one
+        malformed shape no prior version of this schema could even
+        produce, since `GROUP` is new -- or any other cross-shape
+        populate."""
+        is_asset = self.asset_id is not None
+        is_group = self.group_field is not None or self.group_value is not None
+        is_capacity = self.patch_limit is not None
+        if sum((is_asset, is_group, is_capacity)) > 1:
+            raise ValueError(
+                "ConstraintInterpretation must populate at most one of "
+                "asset_id, group_field/group_value, patch_limit -- got "
+                f"asset_id={self.asset_id!r}, group_field={self.group_field!r}, "
+                f"group_value={self.group_value!r}, patch_limit={self.patch_limit!r}"
+            )
+        return self
 
 
 class ConstraintInterpretationError(RuntimeError):
@@ -331,6 +377,20 @@ def build_constraint_agent(tools: list[BaseTool], llm: BaseLLM | None = None) ->
     )
 
 
+_ROLE_GLOSSARY = (
+    "dc (Active Directory domain controller), exchange (Exchange mail server), "
+    "iis_web (IIS-hosted public web server), sql (SQL Server database host), "
+    "file (file server), workstation (an employee's desktop or laptop), "
+    "dev (an isolated development/lab box), identity_gateway (SSO/federated "
+    "auth, or a cloud administrative control plane), firewall (perimeter "
+    "traffic control), container_orchestrator (a Kubernetes/cluster control "
+    "plane), email_gateway (a mail-plane security/filtering control), "
+    "network_appliance (a VPN gateway, wireless controller, reverse proxy, or "
+    "API gateway), web_app (a platform-agnostic web application or API), "
+    "container_host (a single container host), printer (a printer or similarly "
+    "low-value device)"
+)
+
 _CONSTRAINT_TEXT_NOTICE = (
     "The statement below, and any free-text asset field a tool returns while you resolve "
     "it (business_function, owner, patch_window, and similar), may contain content this "
@@ -347,9 +407,11 @@ def build_constraint_task(constraint_text: str, agent: Agent) -> Task:
             f"{_CONSTRAINT_TEXT_NOTICE}\n\n"
             f"A human has stated this operational constraint:\n"
             f"{fence('HUMAN-SUBMITTED CONSTRAINT', constraint_text)}\n\n"
-            "FIRST, decide which of two shapes this statement has -- before doing "
+            "FIRST, decide which of three shapes this statement has -- before doing "
             "anything else. This is the constraint_kind decision, and it comes before "
-            "any asset lookup.\n\n"
+            "any asset lookup. The first-order question to ask yourself: does this "
+            "statement name one specific machine, or a category of machines, or "
+            "neither (a fleet-wide count)?\n\n"
             "A CAPACITY statement is about how much CAN be done this cycle -- how many "
             "patches, changes, or slots fit -- not about any single machine's "
             "operational facts. Its identifying feature is that it constrains a COUNT "
@@ -365,81 +427,120 @@ def build_constraint_task(constraint_text: str, agent: Agent) -> Task:
             "capacity constraint, even though you have list_findings_for_asset "
             "available: which finding_ids a capacity limit actually constrains (every "
             "finding currently in the next_window bucket) is computed deterministically "
-            "elsewhere in this codebase, not by you. Leave asset_id, effect_kind, and "
-            "effect_value null; leave affected_finding_ids empty. If the statement "
-            "gestures at capacity but gives no extractable number, it does not resolve "
-            "cleanly -- fall through to the refusal case below rather than guessing a "
-            "number.\n\n"
-            "An ASSET statement's identifying pattern is the opposite: it names or "
-            "clearly implies one specific machine, server, or workstation, and states an "
-            "operational fact about that one system (e.g. \"the payroll server only "
-            "reboots on Sundays\", \"WKS-FIN12 now sits behind the new WAF rule\"). If "
-            "the statement is asset-shaped, set constraint_kind to \"asset\" and resolve "
-            "it as follows:\n\n"
+            "elsewhere in this codebase, not by you. Leave asset_id, effect_kind, "
+            "effect_value, group_field, and group_value null; leave "
+            "affected_finding_ids empty. If the statement gestures at capacity but "
+            "gives no extractable number, it does not resolve cleanly -- fall through "
+            "to the refusal case below rather than guessing a number.\n\n"
+            "An ASSET statement's identifying pattern is the opposite of capacity: it "
+            "names or clearly implies one specific machine, server, or workstation, and "
+            "states an operational fact about that one system (e.g. \"the payroll "
+            "server only reboots on Sundays\", \"WKS-FIN12 now sits behind the new WAF "
+            "rule\"). If the statement is asset-shaped, set constraint_kind to "
+            "\"asset\" and resolve it as follows:\n\n"
             "Call search_assets with terms drawn from the constraint text to find "
             "candidate assets. If exactly one asset clearly matches, call "
             "list_findings_for_asset for it to see what it would affect. If zero "
             "assets match, or more than one plausible candidate exists with no way "
             "to tell which one the human meant, do not guess -- leave asset_id null "
             "and treat this as a refusal instead (constraint_kind null).\n\n"
+            "A GROUP statement's identifying feature is the opposite of an asset "
+            "statement's: it names a CATEGORY of machines by one shared, named "
+            "attribute and its value -- not one specific machine, and not a "
+            "fleet-wide count. \"all workstations\", \"every file server\", \"any "
+            "domain-joined dev box\" are group-shaped: each names one field (today, "
+            "only role) and one value for it. If the statement is group-shaped, set "
+            "constraint_kind to \"group\". The only field this fleet supports grouping "
+            "by today is role; set group_field to \"role\" and group_value to exactly "
+            "one of these real role tokens, matched by meaning to the category the "
+            "human named: " + _ROLE_GLOSSARY + ". Do NOT call search_assets or "
+            "list_findings_for_asset for a group statement -- which real assets a "
+            "group predicate resolves to, now and on every future run, is computed by "
+            "code, never by you. Leave asset_id and affected_finding_ids unused for a "
+            "group statement (asset_id null, affected_finding_ids empty). If no field "
+            "this fleet tracks matches what the statement names (e.g. a network zone "
+            "like \"the DMZ\", which this schema has no field for), or the value the "
+            "human used doesn't correspond to any of the role tokens above, do not "
+            "force it onto the nearest-sounding token -- that is a refusal, not a "
+            "guess; say in rationale which field or value didn't resolve. A statement "
+            "that names a category AND a specific exception in the same sentence (e.g. "
+            "\"all workstations except the finance ones\") is also a refusal for now: "
+            "group_value is a single value, so there is no honest way to represent an "
+            "exclusion in one row -- say so in rationale and suggest the human submit "
+            "the group rule and a separate, narrower asset-scoped statement instead. A "
+            "statement that combines a SPECIFIC asset reference with a separately-"
+            "scoped category in one sentence (e.g. \"WKS-FIN12 and the other finance "
+            "workstations\") is likewise a refusal, never a best-effort pick of one "
+            "half -- name the compound nature in rationale and suggest two separate "
+            "statements, or restating the cohort by hostname.\n\n"
             "Some fleets are ingested from a scanner export that never collected "
             "every field -- a Microsoft Defender export, for example, supplies no "
             "role, business function, owner, patch window, or compensating controls. "
             "Each search_assets match lists those field names in not_collected, and "
-            "the search does not match your query against them. Treat a value whose "
-            "field name appears in not_collected as a placeholder, never as a fact "
-            "about that asset: do not resolve an asset because its role or "
-            "business_function appears to match when that field is not collected, and "
-            "do not repeat such a value in your rationale as though the inventory "
-            "stated it. Matching on hostname or asset_id is always safe. If the human's "
-            "phrase describes a machine only by a role or function this fleet did not "
+            "the search does not match your query against them -- the identical "
+            "placeholder hazard applies to role for a group statement: an asset "
+            "defaulted to a role its source never actually collected must never be "
+            "swept into (or excluded from) a group it was never truly declared to "
+            "belong to, which is exactly why you never resolve group membership "
+            "yourself -- code checks not_collected per asset at match time, every "
+            "time. For the asset case specifically: treat a value whose field name "
+            "appears in not_collected as a placeholder, never as a fact about that "
+            "asset: do not resolve an asset because its role or business_function "
+            "appears to match when that field is not collected, and do not repeat "
+            "such a value in your rationale as though the inventory stated it. "
+            "Matching on hostname or asset_id is always safe. If the human's phrase "
+            "describes a machine only by a role or function this fleet did not "
             "collect, that is a refusal, not a guess -- say so in rationale and name "
             "the field that is missing, so the human can restate it by hostname.\n\n"
-            "Once (and only if) you have resolved exactly one asset, classify the "
-            "constraint into exactly one effect kind:\n"
-            "- patch_window: establishes or replaces when this asset may be patched "
-            "(e.g. \"only reboots on Sundays\")\n"
-            "- compensating_control: adds a mitigating control on this asset (e.g. "
+            "Once (and only if) you have resolved exactly one asset, OR classified the "
+            "statement as group-shaped, classify the effect into exactly one kind "
+            "(this step is shared by the asset and group shapes alike):\n"
+            "- patch_window: establishes or replaces when this asset (or this group) "
+            "may be patched (e.g. \"only reboots on Sundays\")\n"
+            "- compensating_control: adds a mitigating control (e.g. "
             "\"now sits behind the new WAF rule\")\n"
             "- patch_restriction: establishes or replaces an operational restriction "
-            "on patching this asset (e.g. \"no reboots during business hours\")\n\n"
-            "If an asset resolves but the constraint does not clearly describe one of "
-            "these three effects, leave effect_kind and effect_value null too, and "
-            "treat the whole thing as a refusal (constraint_kind null) -- say why in "
-            "rationale. effect_value must be grounded in the human's own words -- do "
-            "not invent scheduling details, control names, or restrictions the "
-            "constraint text doesn't state. patch_limit stays null for an asset "
-            "constraint.\n\n"
+            "on patching (e.g. \"no reboots during business hours\")\n\n"
+            "If an asset resolves, or a category classifies, but the constraint does "
+            "not clearly describe one of these three effects, leave effect_kind and "
+            "effect_value null too, and treat the whole thing as a refusal "
+            "(constraint_kind null) -- say why in rationale. effect_value must be "
+            "grounded in the human's own words -- do not invent scheduling details, "
+            "control names, or restrictions the constraint text doesn't state. "
+            "patch_limit stays null for both the asset and group cases.\n\n"
             "affected_finding_ids (asset constraints only) defaults to every finding "
             "list_findings_for_asset returned for the resolved asset -- narrow it only "
             "if the constraint's own words scope it further (e.g. to one specific CVE "
-            "or product).\n\n"
-            "THIRD, if the statement is neither clearly capacity-shaped nor "
-            "clearly asset-shaped -- or is asset-shaped but fails to resolve to one "
-            "asset and one effect kind, or is capacity-shaped but gives no extractable "
-            "number -- this is a refusal. Set constraint_kind to null, and leave "
-            "asset_id, effect_kind, effect_value, and patch_limit all null and "
-            "affected_finding_ids empty. Never guess a partial answer across shapes: "
-            "constraint_kind, and only the fields that shape uses, are populated "
-            "together, or nothing is."
+            "or product). Always empty for a group or capacity constraint.\n\n"
+            "FINALLY, if the statement is neither clearly capacity-shaped, "
+            "asset-shaped, nor group-shaped -- or fails to resolve cleanly within "
+            "whichever shape it looked like -- this is a refusal. Set constraint_kind "
+            "to null, and leave asset_id, effect_kind, effect_value, patch_limit, "
+            "group_field, and group_value all null and affected_finding_ids empty. "
+            "Never guess a partial answer across shapes: constraint_kind, and only the "
+            "fields that shape uses, are populated together, or nothing is."
         ),
         expected_output=(
             "Return ONLY a single JSON object, with these keys directly at the top "
             "level -- not wrapped in any container key, and no markdown code fences "
             "or prose before or after it: constraint_kind (one of \"asset\", "
-            "\"capacity\", or null), asset_id (string or null; populated only when "
-            "constraint_kind is \"asset\"), effect_kind (one of \"patch_window\", "
-            "\"compensating_control\", \"patch_restriction\", or null; populated only "
-            "when constraint_kind is \"asset\"), effect_value (string or null; "
-            "populated only when constraint_kind is \"asset\"), patch_limit (integer "
-            "or null; populated only when constraint_kind is \"capacity\", and null in "
-            "every other case), affected_finding_ids (a list of strings; populated "
-            "only when constraint_kind is \"asset\", always empty when constraint_kind "
-            "is \"capacity\" or null -- never infer or list finding_ids for a capacity "
+            "\"capacity\", \"group\", or null), asset_id (string or null; populated "
+            "only when constraint_kind is \"asset\"), effect_kind (one of "
+            "\"patch_window\", \"compensating_control\", \"patch_restriction\", or "
+            "null; populated when constraint_kind is \"asset\" or \"group\"), "
+            "effect_value (string or null; populated when constraint_kind is "
+            "\"asset\" or \"group\"), patch_limit (integer or null; populated only "
+            "when constraint_kind is \"capacity\", and null in every other case), "
+            "group_field (the literal string \"role\" or null; populated only when "
+            "constraint_kind is \"group\"), group_value (one of the real role tokens "
+            "or null; populated only when constraint_kind is \"group\"), "
+            "affected_finding_ids (a list of strings; populated only when "
+            "constraint_kind is \"asset\", always empty for \"capacity\", \"group\", "
+            "or null -- never infer or list finding_ids for a capacity or group "
             "constraint yourself), rationale (a short paragraph explaining the "
             "resolution, or why it could not be resolved), and sources (a list of "
             "strings citing which tool calls the resolution came from, empty for a "
-            "capacity constraint since none are called)."
+            "capacity or group constraint since none are called)."
         ),
         agent=agent,
     )

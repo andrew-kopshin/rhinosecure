@@ -78,6 +78,8 @@ def _constraint_interpretation_json(
     rationale: str = "fake rationale",
     constraint_kind: str | None = "asset",
     patch_limit: int | None = None,
+    group_field: str | None = None,
+    group_value: str | None = None,
 ) -> str:
     return json.dumps(
         {
@@ -86,10 +88,23 @@ def _constraint_interpretation_json(
             "effect_kind": effect_kind,
             "effect_value": effect_value,
             "patch_limit": patch_limit,
+            "group_field": group_field,
+            "group_value": group_value,
             "affected_finding_ids": affected_finding_ids or [],
             "rationale": rationale,
             "sources": ["fake"],
         }
+    )
+
+
+def _group_constraint_interpretation_json(
+    *, group_field: str = "role", group_value: str = "workstation",
+    effect_kind: str = "patch_window", effect_value: str = "Sat-Sun",
+    rationale: str = "all workstations only patch weekends",
+) -> str:
+    return _constraint_interpretation_json(
+        constraint_kind="group", asset_id=None, effect_kind=effect_kind, effect_value=effect_value,
+        group_field=group_field, group_value=group_value, rationale=rationale,
     )
 
 
@@ -1154,6 +1169,34 @@ def test_submit_capacity_constraint_applies_an_active_asset_constraint_before_ra
     assert result.deltas == ()  # F08 is mitigate_monitor once overlaid -- never enters the pool
 
 
+def test_submit_capacity_constraint_applies_an_active_group_constraint_before_ranking(tmp_path):
+    """A70. The group-constraint sibling of
+    test_submit_capacity_constraint_applies_an_active_asset_constraint_
+    before_ranking -- a group-level compensating control (role=workstation)
+    changes A08/F08's real, current bucket before the capacity rank/cutoff
+    is computed, exactly as an asset-level one already does."""
+    from rhinosecure.memory import Memory
+
+    data_dir = tmp_path / "overlay"
+    data_dir.mkdir()
+    (data_dir / "assets.csv").write_text(CAPACITY_OVERLAY_ASSETS_CSV, encoding="utf-8")
+    (data_dir / "findings.csv").write_text(CAPACITY_OVERLAY_FINDINGS_CSV, encoding="utf-8")
+    findings = list(join_findings(data_dir / "findings.csv", data_dir / "assets.csv"))
+
+    memory = Memory(tmp_path / "mem.db")
+    memory.add_group_constraint(
+        "role", "workstation", "all workstations now sit behind a WAF",
+        effect_kind="compensating_control", effect_value="WAF rule enabled",
+    )
+    _QueuedFakeCrew.queue = [_capacity_interpretation_json(5)]
+
+    coordinator = Coordinator(data_dir, memory=memory)
+    result = coordinator.submit_constraint("five patches fit this window", findings)
+
+    assert result.persisted is True
+    assert result.deltas == ()  # F08 is mitigate_monitor once overlaid -- never enters the pool
+
+
 def test_submit_capacity_constraint_limit_zero_is_a_real_limit_not_a_decline(
     capacity_data_dir, capacity_findings, tmp_path
 ):
@@ -1329,3 +1372,295 @@ def test_ingest_format_is_recorded_on_the_runs_row(tmp_path: Path, monkeypatch):
 
     assert memory.get_run(result.run_id).ingest_format == "defender"
     memory.close()
+
+
+# --- group-constraint preview/confirm: zero agent dispatch, provisional guard,
+# no expiry (docs/group-constraints-design.md Slice A, Section 11.7) ---------
+
+
+def _workstation_asset(asset_id: str, hostname: str, **overrides) -> "Asset":
+    from rhinosecure.schema import Asset
+
+    fields = dict(
+        asset_id=asset_id, hostname=hostname, os="Windows 10", os_build="19045", role="workstation",
+        business_function="Finance analyst workstation", criticality=2, internet_exposed=False,
+        environment="prod", data_sensitivity="confidential", patch_window="", patch_restrictions="",
+        compensating_controls="", owner="it-helpdesk",
+    )
+    fields.update(overrides)
+    return Asset(**fields)
+
+
+@pytest.fixture
+def large_fleet_assets():
+    """50 workstations plus 2 non-workstations -- large enough that a
+    fallback to a full agents pass (run(affected)) would be an obvious,
+    measurable cost, not incidental (A46/A47's own stated intent)."""
+    assets = {f"WS{i:02d}": _workstation_asset(f"WS{i:02d}", f"WKS-{i:02d}") for i in range(50)}
+    assets["SQL01"] = _workstation_asset("SQL01", "SQL01", role="sql")
+    assets["DC01"] = _workstation_asset("DC01", "DC01", role="dc")
+    return assets
+
+
+def test_preview_group_constraint_calls_interpret_constraint_exactly_once(data_dir, findings, tmp_path):
+    """A45."""
+    from rhinosecure.memory import Memory
+
+    _QueuedFakeCrew.queue = [_group_constraint_interpretation_json()]
+    memory = Memory(tmp_path / "mem.db")
+    coordinator = Coordinator(data_dir, memory=memory)
+    coordinator.submit_constraint("all workstations only patch weekends", findings)
+    assert _QueuedFakeCrew.instantiations == 1  # the one Interpreter dispatch, nothing more
+    memory.close()
+
+
+def test_preview_group_constraint_never_calls_run_or_replan(large_fleet_assets, tmp_path, monkeypatch):
+    """A46. Against a fleet constructed so the group statement matches
+    50+ assets -- large enough that a full agents pass would be an
+    obvious, not incidental, cost."""
+    from rhinosecure.memory import Memory
+
+    _QueuedFakeCrew.queue = [_group_constraint_interpretation_json()]
+    memory = Memory(tmp_path / "mem.db")
+    coordinator = Coordinator(tmp_path, memory=memory, assets=large_fleet_assets)
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("run()/replan() must never be called for a group preview")
+
+    monkeypatch.setattr(coordinator, "run", _fail_if_called)
+    monkeypatch.setattr(coordinator, "replan", _fail_if_called)
+
+    result = coordinator.submit_constraint("all workstations only patch weekends", [])
+
+    assert result.persisted is False  # a GroupConstraintPreview, never persisted
+    assert len(result.matched_asset_ids) == 50
+    memory.close()
+
+
+def test_confirm_group_constraint_never_calls_run_or_replan(large_fleet_assets, tmp_path, monkeypatch):
+    """A47. Same instrumentation, across a full confirm_group_constraint
+    invocation against the same 50+-asset match."""
+    from rhinosecure.memory import Memory
+
+    _QueuedFakeCrew.queue = [_group_constraint_interpretation_json()]
+    memory = Memory(tmp_path / "mem.db")
+    coordinator = Coordinator(tmp_path, memory=memory, assets=large_fleet_assets)
+    preview = coordinator.submit_constraint("all workstations only patch weekends", [])
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("run()/replan() must never be called for a group confirm")
+
+    monkeypatch.setattr(coordinator, "run", _fail_if_called)
+    monkeypatch.setattr(coordinator, "replan", _fail_if_called)
+
+    result = coordinator.confirm_group_constraint(preview.token, [])
+
+    assert result.persisted is True
+    memory.close()
+
+
+def test_preview_group_constraint_works_without_any_prior_run_ever_being_called(data_dir, findings, tmp_path):
+    """A48. A fresh Coordinator (self.state is None, confirmed) previews
+    correctly using self._asset_index, never self.state."""
+    from rhinosecure.memory import Memory
+
+    _QueuedFakeCrew.queue = [_group_constraint_interpretation_json()]
+    memory = Memory(tmp_path / "mem.db")
+    coordinator = Coordinator(data_dir, memory=memory)
+    assert coordinator.state is None  # never run() before this call
+
+    result = coordinator.submit_constraint("all workstations only patch weekends", findings)
+
+    assert coordinator.state is None  # still never run -- preview doesn't dispatch anything
+    assert result.matched_asset_ids == ("A02",)  # the one workstation in data_dir's fixture
+    memory.close()
+
+
+def test_a_provisional_coordinator_refuses_preview_group_constraint(data_dir, findings):
+    """A49. Mirrors the existing provisional-refuses-asset-constraint
+    guard -- fires inside submit_constraint, before interpret_constraint
+    is even reached, identically for the group branch."""
+    coordinator = Coordinator(data_dir)  # no memory= given -- provisional/memory-less
+    with pytest.raises(CoordinatorError, match="requires a Memory instance"):
+        coordinator.submit_constraint("all workstations only patch weekends", findings)
+    assert _QueuedFakeCrew.instantiations == 0  # refused before interpret_constraint ever dispatched
+
+
+def test_group_constraint_preview_never_writes_to_the_group_constraints_table(data_dir, findings, tmp_path):
+    """A50."""
+    from rhinosecure.memory import Memory
+
+    _QueuedFakeCrew.queue = [_group_constraint_interpretation_json()]
+    memory = Memory(tmp_path / "mem.db")
+    coordinator = Coordinator(data_dir, memory=memory)
+
+    result = coordinator.submit_constraint("all workstations only patch weekends", findings)
+
+    assert result.persisted is False
+    assert memory.all_active_group_constraints() == []  # group_constraints table untouched
+    assert memory.load_pending_group_constraint(result.token) is not None  # pending table gained a row
+    memory.close()
+
+
+def test_confirm_group_constraint_with_a_valid_unconsumed_token_writes_rescores_deterministically_and_returns_deltas(
+    data_dir, findings, tmp_path
+):
+    """A51. Writes the group_constraints row, re-scores via attach_
+    threat_signals/score_finding (never .run()/.replan()), and honors an
+    already-active asset-scoped constraint on one of the matched assets
+    in both the before and after picture."""
+    from rhinosecure.memory import Memory
+
+    memory = Memory(tmp_path / "mem.db")
+    # An asset-scoped constraint already active on A02 (the one matched
+    # workstation) -- the "before" picture must already reflect it.
+    memory.add_constraint(
+        "A02", "already active", effect_kind="compensating_control", effect_value="EDR agent deployed",
+        hostname="WKS01",
+    )
+    _QueuedFakeCrew.queue = [_group_constraint_interpretation_json()]
+    coordinator = Coordinator(data_dir, memory=memory)
+    preview = coordinator.submit_constraint("all workstations only patch weekends", findings)
+    assert preview.matched_asset_ids == ("A02",)
+
+    result = coordinator.confirm_group_constraint(preview.token, findings)
+
+    assert result.persisted is True
+    assert result.group_constraint_id is not None
+    [gc] = memory.all_active_group_constraints()
+    assert gc.id == result.group_constraint_id
+    assert gc.group_field == "role" and gc.group_value == "workstation"
+    [delta] = result.deltas
+    assert delta.finding_id == "F02"
+    assert delta.before_risk_score == pytest.approx(delta.after_risk_score)  # bucket may move, score doesn't
+    memory.close()
+
+
+def test_confirm_group_constraint_commits_nothing_when_kev_catalog_load_fails(
+    data_dir, findings, tmp_path, monkeypatch
+):
+    """Adversarial-review finding, fixed: load_kev_catalog/load_attack_
+    index (both can raise OfflineCacheMissError on a real, reachable
+    missing-snapshot case) used to run AFTER the token-consume and
+    group-constraint-write commits -- a failure there left the token
+    permanently burned with nothing persisted, or worse, left the group
+    constraint already active while the caller saw only a generic error.
+    Reordered so this failure happens before either commit; this test
+    confirms neither commit happened when it's triggered."""
+    from rhinosecure.memory import Memory
+
+    _QueuedFakeCrew.queue = [_group_constraint_interpretation_json()]
+    memory = Memory(tmp_path / "mem.db")
+    coordinator = Coordinator(data_dir, memory=memory)
+    preview = coordinator.submit_constraint("all workstations only patch weekends", findings)
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("simulated snapshot-cache failure")
+
+    monkeypatch.setattr(coordinator_module, "load_kev_catalog", _raise)
+
+    with pytest.raises(RuntimeError, match="simulated snapshot-cache failure"):
+        coordinator.confirm_group_constraint(preview.token, findings)
+
+    assert memory.all_active_group_constraints() == []  # nothing written
+    pending = memory.load_pending_group_constraint(preview.token)
+    assert pending.consumed_at is None  # token not burned
+    memory.close()
+
+
+def test_confirm_group_constraint_refuses_when_the_fleet_changed_since_preview(data_dir, findings, tmp_path):
+    """A52. A token whose stored matched_asset_ids no longer match
+    current data (simulated by adding a new matching asset to the DB
+    between preview and confirm) is refused with no write."""
+    from rhinosecure.memory import Memory
+
+    _QueuedFakeCrew.queue = [_group_constraint_interpretation_json()]
+    memory = Memory(tmp_path / "mem.db")
+    coordinator = Coordinator(data_dir, memory=memory)
+    preview = coordinator.submit_constraint("all workstations only patch weekends", findings)
+
+    # Mutate the live asset index after preview -- a new workstation joins
+    # the fleet, changing what a fresh match would compute.
+    coordinator._asset_index["A99"] = _workstation_asset("A99", "WKS99")
+
+    result = coordinator.confirm_group_constraint(preview.token, findings)
+
+    assert result.persisted is False
+    assert result.refusal_reason is not None
+    assert "changed since this preview" in result.refusal_reason
+    assert memory.all_active_group_constraints() == []  # no write
+    memory.close()
+
+
+def test_confirm_group_constraint_refuses_a_second_confirm_of_the_same_token(data_dir, findings, tmp_path):
+    """A53."""
+    from rhinosecure.memory import Memory
+
+    _QueuedFakeCrew.queue = [_group_constraint_interpretation_json()]
+    memory = Memory(tmp_path / "mem.db")
+    coordinator = Coordinator(data_dir, memory=memory)
+    preview = coordinator.submit_constraint("all workstations only patch weekends", findings)
+
+    first = coordinator.confirm_group_constraint(preview.token, findings)
+    assert first.persisted is True
+
+    second = coordinator.confirm_group_constraint(preview.token, findings)
+    assert second.persisted is False
+    assert second.refusal_reason is not None
+    assert "already confirmed" in second.refusal_reason
+    assert len(memory.all_active_group_constraints()) == 1  # not double-applied
+    memory.close()
+
+
+def test_confirm_group_constraint_succeeds_on_an_old_unchanged_preview_and_reports_its_age(
+    data_dir, findings, tmp_path
+):
+    """A54. Previews don't expire -- a preview whose created_at is hours
+    old, against an otherwise-unchanged fleet, still confirms
+    successfully and reports its real age, never a gate."""
+    from rhinosecure.memory import Memory
+
+    _QueuedFakeCrew.queue = [_group_constraint_interpretation_json()]
+    memory = Memory(tmp_path / "mem.db")
+    coordinator = Coordinator(data_dir, memory=memory)
+    preview = coordinator.submit_constraint("all workstations only patch weekends", findings)
+
+    # Simulate an old preview: rewrite created_at directly, far in the past.
+    with memory._lock:
+        memory._conn.execute(
+            "UPDATE pending_group_constraints SET created_at = ? WHERE token = ?",
+            ("2020-01-01T00:00:00+00:00", preview.token),
+        )
+        memory._conn.commit()
+
+    result = coordinator.confirm_group_constraint(preview.token, findings)
+
+    assert result.persisted is True  # still succeeds -- age is not a gate
+    assert result.preview_age_seconds is not None
+    assert result.preview_age_seconds > 3600  # hours old, reported honestly
+    memory.close()
+
+
+def test_group_constraints_are_invisible_when_memory_is_none_structurally_not_by_a_new_check(
+    data_dir, findings, monkeypatch
+):
+    """A55. score_finding_tool/lookup_asset_context never call
+    all_active_group_constraints() when memory is None -- this falls out
+    of the existing `if memory is not None:` gate, not a dedicated new
+    check."""
+    from rhinosecure.memory import Memory
+
+    calls = []
+    original = Memory.all_active_group_constraints
+
+    def _spy(self):
+        calls.append(1)
+        return original(self)
+
+    monkeypatch.setattr(Memory, "all_active_group_constraints", _spy)
+
+    coordinator = Coordinator(data_dir)  # memory=None
+    _queue_happy_path(["F01", "F02"])
+    coordinator.run(findings)  # dispatches Environment/Risk with memory=None throughout
+
+    assert calls == []  # never called -- memory is None, structurally unreachable

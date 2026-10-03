@@ -241,6 +241,61 @@ def test_score_finding_ignores_environment_analysis_asset_data_uses_ground_truth
     assert list(sig.parameters) == ["enriched_by_id", "research_by_id", "call_log", "memory"]
 
 
+# --- group constraints (docs/group-constraints-design.md Slice A) ---------
+
+
+def test_score_finding_tool_folds_a_matching_group_constraint_into_the_real_score(tmp_path):
+    """A67. Seeds a group-level compensating-control constraint matching
+    ENRICHED.asset's role (exchange), calls score_finding_tool, and
+    asserts the score/rationale reflects it and the new
+    group_constraints_applied field names it."""
+    from rhinosecure.memory import Memory
+
+    memory = Memory(tmp_path / "mem.db")
+    memory.add_group_constraint(
+        "role", "exchange", "all exchange servers now sit behind a WAF",
+        effect_kind="compensating_control", effect_value="WAF rule enabled",
+    )
+    tools = {
+        t.name: t
+        for t in build_risk_tools({"F01": ENRICHED}, {"F01": RESEARCH}, [], memory)
+    }
+
+    without_constraint = json.loads(_tools()[0]["score_finding"].run(finding_id="F01"))
+    with_group_constraint = json.loads(tools["score_finding"].run(finding_id="F01"))
+
+    assert with_group_constraint["group_constraints_applied"] == ["all exchange servers now sit behind a WAF"]
+    assert with_group_constraint["risk_score"] < without_constraint["risk_score"]
+
+
+def test_score_finding_tool_fetches_group_constraints_once_per_tool_build_not_per_finding(tmp_path, monkeypatch):
+    """A68. A call-count mock on all_active_group_constraints asserts
+    exactly one call across a multi-finding dispatch -- the fleet-scale
+    requirement at the agents-path tool-build boundary."""
+    from rhinosecure.memory import Memory
+
+    memory = Memory(tmp_path / "mem.db")
+    calls = []
+    original = Memory.all_active_group_constraints
+
+    def _spy(self):
+        calls.append(1)
+        return original(self)
+
+    monkeypatch.setattr(Memory, "all_active_group_constraints", _spy)
+
+    tools = {
+        t.name: t
+        for t in build_risk_tools(
+            {"F01": ENRICHED, "F02": ENRICHED}, {"F01": RESEARCH, "F02": RESEARCH}, [], memory
+        )
+    }
+    tools["score_finding"].run(finding_id="F01")
+    tools["score_finding"].run(finding_id="F02")
+
+    assert len(calls) == 1
+
+
 # --- agent/task construction (no network, no LLM call) ----------------------
 
 

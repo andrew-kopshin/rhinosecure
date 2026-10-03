@@ -723,7 +723,8 @@ def test_run_deterministic_never_applies_a_constraint_against_a_provisional_mapp
     assert f01["bucket"] == "contested"  # the constraint is on file but never consulted
     assert export_data["constraint_application"] == {
         "applied": False, "reason": "provisional_mapping", "digest": None,
-        "applied_constraint_ids": [], "skipped": {"legacy": [], "identity_mismatch": []},
+        "applied_constraint_ids": [], "applied_group_constraint_ids": [], "overridden_group_effects": [],
+        "skipped": {"legacy": [], "identity_mismatch": [], "not_collected": []},
     }
 
     # --- confirm the identical contract, re-run the identical upload -----
@@ -744,6 +745,121 @@ def test_run_deterministic_never_applies_a_constraint_against_a_provisional_mapp
     assert f01_confirmed["bucket"] == "next_window"
     assert export_data2["constraint_application"]["applied"] is True
     assert export_data2["constraint_application"]["reason"] is None
+
+
+def test_run_deterministic_job_reports_group_constraint_application_in_its_result_and_export(
+    client: TestClient, tmp_path: Path, monkeypatch
+):
+    """A61 (docs/group-constraints-design.md Slice A). Seeds a matching
+    group constraint (role=dc -- the real mapped role for A01 in this
+    file's own mystery.csv fixture, via Col="srv" -> "dc"), dispatches
+    run_deterministic against a CONFIRMED contract, and asserts
+    applied_group_constraint_ids is non-empty in both the job result
+    (the gap this test closes -- web/jobs.py's result dict omitted this
+    field entirely before this fix, even though export.py already
+    carried it) and the export."""
+    from rhinosecure.adapters.config_io import confirm_contract, overwrite_contract, write_contract
+    from rhinosecure.memory import Memory
+
+    monkeypatch.setattr(jobs_module, "REPO_ROOT", REPO_ROOT)
+
+    upload_id = "8" * 32
+    upload_dir = uploads_module.DEFAULT_UPLOADS_DIR / upload_id
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "mystery.csv").write_text(
+        "Asset_ID,Hostname,Finding_ID,Cve,Col\nA01,EXCH01,F01,CVE-2021-26855,srv\n",
+        encoding="utf-8",
+    )
+    adapters_dir = tmp_path / "adapters"
+    monkeypatch.setattr(jobs_module, "resolve_config_path", lambda name: adapters_dir / f"{name}.json")
+    name = jobs_module._default_propose_name(upload_id)
+
+    contract = _build_contract_for_upload(upload_dir, name, confirm=True)
+    write_contract(adapters_dir / f"{contract.format}.json", contract)
+
+    seed_memory = Memory(tmp_path / "mem.db")
+    seed_memory.add_group_constraint(
+        "role", "dc", "all domain controllers only patch on Sundays",
+        effect_kind="patch_window", effect_value="Sun 02:00-06:00",
+    )
+    seed_memory.close()
+
+    resp = client.post("/api/jobs", json={"kind": "run_deterministic", "input": {"source_ref": upload_id}})
+    body = _wait_for_terminal(client, resp.json()["job_id"])
+
+    assert body["status"] == "succeeded", body.get("error")
+    assert body["result"]["applied_group_constraint_ids"] != []
+    assert body["result"]["constraints_applied_group"] == 1
+
+    export_data = json.loads((tmp_path / "export.json").read_text(encoding="utf-8"))
+    assert export_data["constraint_application"]["applied_group_constraint_ids"] != []
+
+
+def test_run_deterministic_job_never_applies_a_group_constraint_against_a_provisional_mapping(
+    client: TestClient, tmp_path: Path, monkeypatch
+):
+    """A62. Mirrors
+    test_run_deterministic_never_applies_a_constraint_against_a_
+    provisional_mapping_but_does_once_confirmed exactly, substituting a
+    seeded group constraint (role=dc) for the asset-scoped one: against
+    the unconfirmed contract, the finding stays unconstrained and
+    applied_group_constraint_ids == []; after confirming the identical
+    contract, the identical constraint now applies."""
+    from rhinosecure.adapters.config_io import confirm_contract, overwrite_contract, write_contract
+    from rhinosecure.memory import Memory
+
+    monkeypatch.setattr(jobs_module, "REPO_ROOT", REPO_ROOT)
+
+    upload_id = "9" * 32
+    upload_dir = uploads_module.DEFAULT_UPLOADS_DIR / upload_id
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "mystery.csv").write_text(
+        "Asset_ID,Hostname,Finding_ID,Cve,Col\nA01,EXCH01,F01,CVE-2021-26855,srv\n",
+        encoding="utf-8",
+    )
+    adapters_dir = tmp_path / "adapters"
+    monkeypatch.setattr(jobs_module, "resolve_config_path", lambda name: adapters_dir / f"{name}.json")
+    name = jobs_module._default_propose_name(upload_id)
+
+    contract = _build_contract_for_upload(upload_dir, name)  # review.state == "proposed", never confirmed yet
+    contract_path = adapters_dir / f"{contract.format}.json"
+    write_contract(contract_path, contract)
+
+    seed_memory = Memory(tmp_path / "mem.db")
+    seed_memory.add_group_constraint(
+        "role", "dc", "all domain controllers only patch on Sundays",
+        effect_kind="patch_window", effect_value="Sun 02:00-06:00",
+    )
+    seed_memory.close()
+
+    # --- while unconfirmed: the group matcher is never even consulted ---
+    resp = client.post("/api/jobs", json={"kind": "run_deterministic", "input": {"source_ref": upload_id}})
+    body = _wait_for_terminal(client, resp.json()["job_id"])
+
+    assert body["status"] == "succeeded", body.get("error")
+    assert body["result"]["provisional"] is True
+    assert body["result"]["applied_group_constraint_ids"] == []
+
+    export_data = json.loads((tmp_path / "export.json").read_text(encoding="utf-8"))
+    [f01] = [f for f in export_data["findings"] if f["finding_id"] == "F01"]
+    assert f01["bucket"] == "contested"  # the constraint is on file but never consulted
+    assert export_data["constraint_application"]["applied_group_constraint_ids"] == []
+
+    # --- confirm the identical contract, re-run the identical upload ----
+    confirmed = confirm_contract(contract, at="2026-01-01T01:00:00Z", by="test-suite")
+    overwrite_contract(contract_path, confirmed)
+
+    resp2 = client.post("/api/jobs", json={"kind": "run_deterministic", "input": {"source_ref": upload_id}})
+    body2 = _wait_for_terminal(client, resp2.json()["job_id"])
+
+    assert body2["status"] == "succeeded", body2.get("error")
+    assert body2["result"]["provisional"] is False
+    assert body2["result"]["applied_group_constraint_ids"] != []
+
+    export_data2 = json.loads((tmp_path / "export.json").read_text(encoding="utf-8"))
+    [f01_confirmed] = [f for f in export_data2["findings"] if f["finding_id"] == "F01"]
+    assert f01_confirmed["bucket"] == "next_window"
+    assert export_data2["constraint_application"]["applied_group_constraint_ids"] != []
 
 
 def test_run_agents_scores_provisionally_against_an_unconfirmed_upload_contract(

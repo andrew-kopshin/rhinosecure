@@ -864,3 +864,235 @@ def test_provisional_provenance_survives_a_new_session(db_path: Path):
 
     with Memory(db_path) as session_two:
         assert session_two.provisional_provenance_formats("F14") == ["northgate-gen"]
+
+
+# --- group constraints (docs/group-constraints-design.md Slice A) ---------
+
+
+def test_a_fresh_database_gets_the_group_constraints_table(db_path: Path):
+    """A1."""
+    with Memory(db_path) as db:
+        columns = {row["name"] for row in db._conn.execute("PRAGMA table_info(group_constraints)")}
+    assert columns == {
+        "id", "group_field", "group_value", "constraint_text",
+        "effect_kind", "effect_value", "created_at", "active",
+    }
+
+
+def test_a_fresh_database_gets_the_pending_group_constraints_table(db_path: Path):
+    """A2."""
+    with Memory(db_path) as db:
+        columns = {row["name"] for row in db._conn.execute("PRAGMA table_info(pending_group_constraints)")}
+    assert columns == {
+        "token", "group_field", "group_value", "constraint_text", "effect_kind", "effect_value",
+        "matched_asset_ids", "excluded_asset_ids", "preview_digest", "created_at", "consumed_at",
+    }
+
+
+def test_a_database_created_before_group_constraints_existed_gets_the_tables_idempotently(db_path: Path):
+    """A3. Mirrors test_a_database_created_before_hostname_existed_is_migrated
+    line-for-line: hand-build the pre-feature schema (just `constraints` and
+    `runs`), insert one row in each, reopen with the new Memory, and confirm
+    the old rows survive untouched while the two new tables now exist, empty.
+    This is CREATE TABLE IF NOT EXISTS, not an ALTER TABLE on an existing
+    table -- A4 is the companion check that _migrate() itself never fires
+    for this."""
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE constraints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset_id TEXT NOT NULL,
+            constraint_text TEXT NOT NULL,
+            effect_kind TEXT,
+            effect_value TEXT,
+            created_at TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at TEXT NOT NULL,
+            data_dir TEXT NOT NULL,
+            seed INTEGER NOT NULL,
+            offline INTEGER NOT NULL,
+            agents INTEGER NOT NULL,
+            total_findings INTEGER NOT NULL,
+            contested_count INTEGER NOT NULL,
+            contested_total INTEGER NOT NULL
+        );
+        INSERT INTO constraints (asset_id, constraint_text, created_at, active)
+        VALUES ('A12', 'a pre-existing constraint', '2026-09-01T00:00:00+00:00', 1);
+        INSERT INTO runs (started_at, data_dir, seed, offline, agents, total_findings,
+                          contested_count, contested_total)
+        VALUES ('2026-09-01T00:00:00+00:00', 'demo', 42, 1, 0, 24, 3, 24);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with Memory(db_path) as db:
+        [old] = db.constraints_for_asset("A12")
+        assert old.constraint_text == "a pre-existing constraint"  # untouched
+        assert db.all_active_group_constraints() == []  # new table exists, empty
+        assert db.load_pending_group_constraint("nonexistent-token") is None  # new table exists, empty
+
+
+def test_group_constraints_table_addition_adds_no_migrate_entries(db_path: Path):
+    """A4. Distinguishes this from the hostname/ingest_format cases, which
+    genuinely are ALTER TABLE column migrations on tables that already
+    existed -- group_constraints/pending_group_constraints are brand-new
+    tables, reached via plain CREATE TABLE IF NOT EXISTS in _SCHEMA_SQL,
+    never via _migrate(). Read directly out of _migrate's own source
+    rather than its runtime side effects, since a brand-new table has no
+    column to inspect for "was this ALTER'd in" -- if a future implementer
+    mistakenly routes this through _migrate() instead, its hardcoded
+    (table, column, decl) list would name one of these two tables."""
+    import inspect
+
+    source = inspect.getsource(Memory._migrate)
+    assert "group_constraints" not in source
+    assert "pending_group_constraints" not in source
+
+    with Memory(db_path):
+        pass  # construction alone must not raise
+
+
+def test_migration_is_idempotent_across_reopens_for_group_constraints(db_path: Path):
+    """A5. Open/close the same db 3 times, adding one group constraint each
+    time -- all 3 rows survive, no duplicate-table error (CREATE TABLE IF
+    NOT EXISTS, not plain CREATE TABLE)."""
+    for i in range(3):
+        with Memory(db_path) as db:
+            db.add_group_constraint("role", "workstation", f"constraint {i}")
+
+    with Memory(db_path) as db:
+        assert len(db.all_active_group_constraints()) == 3
+
+
+def test_add_group_constraint_returns_an_id_and_is_retrievable(db_path: Path):
+    """A6."""
+    with Memory(db_path) as db:
+        group_constraint_id = db.add_group_constraint(
+            "role", "workstation", "all workstations only patch weekends",
+            effect_kind="patch_window", effect_value="Sat-Sun",
+        )
+        [gc] = db.all_active_group_constraints()
+        assert gc.id == group_constraint_id
+        assert gc.group_field == "role"
+        assert gc.group_value == "workstation"
+        assert gc.constraint_text == "all workstations only patch weekends"
+        assert gc.active is True
+        assert gc.created_at
+
+
+def test_add_group_constraint_rejects_a_group_field_outside_group_field_choices(db_path: Path):
+    """Adversarial-review finding, fixed: docs/group-constraints-design.md
+    Section 1.1 specifies add_group_constraint validates group_field
+    against constraint_apply.GROUP_FIELD_CHOICES defensively -- the real
+    implementation did not. Every real caller already goes through a
+    Literal-typed model that can't produce an illegal value, so this is
+    belt-and-suspenders, not a live scoring bug, but a confirmed gap
+    against the written design."""
+    with Memory(db_path) as db:
+        with pytest.raises(ValueError, match="group_field"):
+            db.add_group_constraint("owner", "it-helpdesk", "x")
+
+
+def test_add_group_constraint_with_no_effect_defaults_both_to_none(db_path: Path):
+    """A7. Mirrors add_constraint's own precedent -- an uninterpreted group
+    constraint is a legitimate row shape."""
+    with Memory(db_path) as db:
+        db.add_group_constraint("role", "workstation", "not yet interpreted")
+        [gc] = db.all_active_group_constraints()
+        assert gc.effect_kind is None
+        assert gc.effect_value is None
+
+
+def test_deactivate_group_constraint_is_a_soft_delete(db_path: Path):
+    """A8."""
+    with Memory(db_path) as db:
+        group_constraint_id = db.add_group_constraint("role", "workstation", "text")
+        db.deactivate_group_constraint(group_constraint_id)
+
+        with db._lock:
+            row = db._conn.execute(
+                "SELECT * FROM group_constraints WHERE id = ?", (group_constraint_id,)
+            ).fetchone()
+        assert row is not None  # still on file
+        assert row["active"] == 0
+        assert row["constraint_text"] == "text"
+
+
+def test_all_active_group_constraints_excludes_deactivated_rows_by_default(db_path: Path):
+    """A9."""
+    with Memory(db_path) as db:
+        keep = db.add_group_constraint("role", "workstation", "keep")
+        drop = db.add_group_constraint("role", "sql", "drop")
+        db.deactivate_group_constraint(drop)
+
+        active = db.all_active_group_constraints()
+        assert [gc.id for gc in active] == [keep]
+
+
+def test_deactivating_an_already_inactive_group_constraint_a_second_time_is_refused(tmp_path: Path):
+    """A10. The refusal lives at the CLI layer (mirroring the asset table's
+    own `rhino constraint retract` refusal exactly -- cli.py checks
+    membership in `all_active_group_constraints()` before calling
+    `deactivate_group_constraint`, rather than memory.py itself raising),
+    so this is exercised through `rhino constraint group retract` end to
+    end, the same way tests/test_cli.py's own
+    test_constraint_retract_refuses_an_unknown_or_already_retracted_id
+    exercises the asset-table case."""
+    from rhinosecure.cli import main
+
+    db = tmp_path / "c.db"
+    group_constraint_id = Memory(db).add_group_constraint("role", "workstation", "x")
+
+    assert main(["constraint", "group", "retract", str(group_constraint_id), "--db", str(db)]) == 0
+    assert main(["constraint", "group", "retract", str(group_constraint_id), "--db", str(db)]) == 1
+
+
+def test_group_constraints_survive_across_sessions(db_path: Path):
+    """A11."""
+    with Memory(db_path) as session_one:
+        group_constraint_id = session_one.add_group_constraint(
+            "role", "workstation", "text", effect_kind="patch_window", effect_value="Sat-Sun"
+        )
+
+    with Memory(db_path) as session_two:
+        [gc] = session_two.all_active_group_constraints()
+        assert gc.id == group_constraint_id
+        assert gc.group_field == "role"
+        assert gc.effect_value == "Sat-Sun"
+
+
+def test_pending_group_constraint_save_load_and_one_shot_consume(db_path: Path):
+    """A12. Pins the storage layer's own round-trip only -- the confirm
+    path's own "already consumed" refusal is A53, against
+    Coordinator.confirm_group_constraint, not this storage-level check."""
+    with Memory(db_path) as db:
+        db.save_pending_group_constraint(
+            "tok-1", "role", "workstation", "all workstations only patch weekends",
+            effect_kind="patch_window", effect_value="Sat-Sun",
+            matched_asset_ids=["A09", "A10"], excluded_asset_ids=["A99"],
+            preview_digest="sha256:deadbeef",
+        )
+
+        pending = db.load_pending_group_constraint("tok-1")
+        assert pending is not None
+        assert pending.group_field == "role"
+        assert pending.group_value == "workstation"
+        assert pending.matched_asset_ids == ("A09", "A10")
+        assert pending.excluded_asset_ids == ("A99",)
+        assert pending.preview_digest == "sha256:deadbeef"
+        assert pending.consumed_at is None
+
+        db.consume_pending_group_constraint("tok-1")
+        reloaded = db.load_pending_group_constraint("tok-1")
+        assert reloaded is not None
+        assert reloaded.consumed_at is not None  # still readable, for age/audit display
+
+
+def test_load_pending_group_constraint_returns_none_for_an_unknown_token(db_path: Path):
+    with Memory(db_path) as db:
+        assert db.load_pending_group_constraint("never-issued") is None

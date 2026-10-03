@@ -116,9 +116,13 @@ module itself never constructs a provider client or calls `get_llm`.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
@@ -162,7 +166,12 @@ from rhinosecure.agents.risk import (
     merge_research_into_enriched,
     verify_scoring_matches_tool,
 )
-from rhinosecure.constraint_apply import apply_constraints, match_constraints
+from rhinosecure.constraint_apply import (
+    fold_constraints,
+    has_usable_effect,
+    match_constraints,
+    match_group_constraints,
+)
 from rhinosecure.adapters import DEFAULT_FORMAT
 from rhinosecure.adapters.config_model import Contract
 from rhinosecure.adapters.review import is_provisional
@@ -170,7 +179,7 @@ from rhinosecure.enrich.attack import load_index as load_attack_index
 from rhinosecure.enrich.cache import SnapshotCache
 from rhinosecure.enrich.kev import load_catalog as load_kev_catalog
 from rhinosecure.ingest import attach_threat_signals, load_asset_index
-from rhinosecure.memory import Memory
+from rhinosecure.memory import GroupConstraint, Memory
 from rhinosecure.schema import Asset, EnrichedFinding
 from rhinosecure.scoring import (
     Bucket,
@@ -362,6 +371,122 @@ def _summarize_deltas(constraint_id: int, deltas: tuple[FindingDelta, ...]) -> s
 
 def _usage_dict(usage: UsageMetrics | None) -> dict[str, Any] | None:
     return None if usage is None else usage.model_dump()
+
+
+def _build_group_finding_delta(
+    before: ScoredFinding, after: ScoredFinding, group_constraints_applied: tuple[str, ...]
+) -> FindingDelta:
+    """The group-constraint sibling of `_build_finding_delta`, for
+    `confirm_group_constraint`'s own fully-deterministic re-score --
+    there is no `RiskRecommendation` here (no agent dispatch at all), so
+    `after` is a plain `ScoredFinding` like `before`, the identical
+    "no agent narrative to borrow" situation `_capacity_verdict_summary`/
+    `_capacity_rationale_line` already solve for the capacity path.
+    `after_verdict_summary` is a short, code-generated sentence rather
+    than an agent's own narrative."""
+    before_rationale = set(before.rationale)
+    after_rationale = set(after.rationale)
+    if group_constraints_applied:
+        verdict_summary = (
+            f"{after.bucket.value} ({after.risk_score:.1f}) -- group constraint(s) applied: "
+            + "; ".join(group_constraints_applied)
+        )
+    else:
+        verdict_summary = f"{after.bucket.value} ({after.risk_score:.1f})"
+    return FindingDelta(
+        finding_id=after.finding_id,
+        cve_id=after.cve_id,
+        hostname=after.hostname,
+        before_bucket=before.bucket.value,
+        after_bucket=after.bucket.value,
+        after_verdict_summary=verdict_summary,
+        after_constraints_applied=group_constraints_applied,
+        before_risk_score=before.risk_score,
+        after_risk_score=after.risk_score,
+        rationale_added=tuple(sorted(after_rationale - before_rationale)),
+        rationale_removed=tuple(sorted(before_rationale - after_rationale)),
+    )
+
+
+def _compute_group_preview_digest(
+    group_field: str,
+    group_value: str,
+    effect_kind: str | None,
+    effect_value: str | None,
+    matched_asset_ids: list[str],
+    excluded_asset_ids: list[str],
+) -> str:
+    """sha256 of the sorted, canonical-JSON preview content -- the same
+    `sha256:` + canonical-JSON convention `constraint_apply
+    .compute_constraint_digest`/`adapters/config_model.compute_content_
+    digest` already establish (docs/group-constraints-design.md Section
+    7.1, step 4). Recomputed identically at confirm time (Section 7.3)
+    against CURRENT data; a mismatch means the fleet changed since the
+    preview was generated and confirm must refuse rather than guess."""
+    payload = {
+        "group_field": group_field,
+        "group_value": group_value,
+        "effect_kind": effect_kind,
+        "effect_value": effect_value,
+        "matched": sorted(matched_asset_ids),
+        "excluded": sorted(excluded_asset_ids),
+    }
+    blob = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(blob).hexdigest()
+
+
+@dataclass(frozen=True)
+class GroupConstraintPreview:
+    """The outcome of a group-shaped `submit_constraint` call -- never
+    persisted (`persisted` is always `False` by construction). Everything
+    a human needs to review before confirming: field, value, the
+    resolved effect, and the matched/excluded asset lists (full,
+    untruncated -- display-side capping is a rendering concern, Section
+    7.2, not this dataclass's). `token` is what `confirm_group_constraint`
+    needs to act on this specific, reviewed preview."""
+
+    interpretation: ConstraintInterpretation
+    token: str
+    group_field: str
+    group_value: str
+    effect_kind: str | None
+    effect_value: str | None
+    matched_asset_ids: tuple[str, ...]
+    excluded_not_collected_asset_ids: tuple[str, ...]
+
+    @property
+    def persisted(self) -> bool:
+        return False
+
+
+@dataclass(frozen=True)
+class GroupConstraintSubmissionResult:
+    """The end-to-end outcome of `confirm_group_constraint`.
+    `group_constraint_id`/`run_id` are `None` together when confirm
+    refused (an unknown/already-consumed token, or the fleet changed
+    since the preview was generated -- `refusal_reason` names which).
+    `preview_age_seconds` is purely informational (Section 7.3: previews
+    never expire; this is reported, never a gate)."""
+
+    group_constraint_id: int | None
+    run_id: int | None
+    deltas: tuple[FindingDelta, ...]
+    group_field: str | None = None
+    group_value: str | None = None
+    matched_asset_ids: tuple[str, ...] = ()
+    excluded_not_collected_asset_ids: tuple[str, ...] = ()
+    preview_age_seconds: float | None = None
+    refusal_reason: str | None = None
+
+    @property
+    def persisted(self) -> bool:
+        return self.group_constraint_id is not None
+
+    @property
+    def changed_deltas(self) -> tuple[FindingDelta, ...]:
+        return tuple(d for d in self.deltas if d.changed)
 
 
 @dataclass(frozen=True)
@@ -700,17 +825,22 @@ class Coordinator:
         *,
         seed: int = 42,
         on_stage: Callable[[str], None] | None = None,
-    ) -> ConstraintSubmissionResult | CapacitySubmissionResult:
+    ) -> ConstraintSubmissionResult | CapacitySubmissionResult | GroupConstraintPreview:
         """The full "Human submits a constraint" flow (Section 5's Flow,
         Section 7's worked example): interpret, then dispatch to one of
-        two entirely different mechanisms depending on
+        three entirely different mechanisms depending on
         `interpretation.constraint_kind`. Requires `self.memory` --
         construct `Coordinator(..., memory=Memory(...))`. See the module
         docstring for the asset-scoped mechanics; `_submit_capacity_constraint`
         below has the fleet-wide capacity mechanics
-        (CLAUDE.md Section 10's "only five patches fit this window").
-        `seed` is recorded on the resulting `runs` row only (scoring has
-        no sampling to seed -- same no-op `cli.run` itself documents).
+        (CLAUDE.md Section 10's "only five patches fit this window");
+        `_preview_group_constraint` (docs/group-constraints-design.md
+        Section 7) has the group-constraint preview mechanics -- LLM-free
+        past the one `interpret_constraint` call just above, same as
+        capacity, never persisting anything itself (a separate
+        `confirm_group_constraint` call does that). `seed` is recorded on
+        the resulting `runs` row only (scoring has no sampling to seed --
+        same no-op `cli.run` itself documents).
 
         `on_stage`, if given, is called with `"interpreting"` right before
         the one Constraint Interpreter dispatch, `"persisting"` right
@@ -735,6 +865,9 @@ class Coordinator:
             return self._submit_capacity_constraint(
                 text, findings, interpretation, seed=seed, on_stage=on_stage
             )
+
+        if interpretation.constraint_kind == ConstraintKind.GROUP.value:
+            return self._preview_group_constraint(text, interpretation)
 
         if interpretation.constraint_kind != ConstraintKind.ASSET.value or interpretation.asset_id is None:
             # A refusal (constraint_kind=None), or -- defensively -- any
@@ -863,6 +996,285 @@ class Coordinator:
             unresolved_finding_ids=unresolved,
         )
 
+    def _match_group_candidate(
+        self, group_field: str, group_value: str
+    ) -> tuple[list[str], list[str]]:
+        """Matches `(group_field, group_value)` against `self._asset_index`
+        -- the FULL fleet inventory, not just assets with findings in the
+        current dispatch, since a human reviewing "how many assets match"
+        should see the real fleet-wide count (`search_assets` already
+        searches this same full inventory, for the identical reason).
+        Reuses a throwaway `GroupConstraint(id=-1, ...)` run through the
+        real `match_group_constraints`, so there is exactly one
+        implementation of the match predicate, never two. Returns
+        `(matched_asset_ids, excluded_not_collected_asset_ids)`, both
+        sorted for a deterministic preview/confirm digest."""
+        probe = GroupConstraint(
+            id=-1,
+            group_field=group_field,
+            group_value=group_value,
+            constraint_text="",
+            created_at="",
+            active=True,
+        )
+        matched: list[str] = []
+        excluded: list[str] = []
+        for asset in self._asset_index.values():
+            match = match_group_constraints([probe], asset)
+            if match.applied:
+                matched.append(asset.asset_id)
+            elif match.skipped_not_collected:
+                excluded.append(asset.asset_id)
+        return sorted(matched), sorted(excluded)
+
+    def _preview_group_constraint(
+        self, text: str, interpretation: ConstraintInterpretation
+    ) -> GroupConstraintPreview | ConstraintSubmissionResult:
+        """docs/group-constraints-design.md Section 7.1 -- interpret once
+        (already done, by the caller, `submit_constraint`), then match
+        against `self._asset_index` directly. Needs no seeded or
+        agents-run `Coordinator`: `self._asset_index` is populated at
+        `__init__` time (via `assets=` or `load_asset_index`), before any
+        agent has ever been dispatched -- there is no `self.run()`/
+        `self.replan()` call anywhere in this method, by construction,
+        and none is needed. Never writes to `group_constraints` -- only
+        to `pending_group_constraints`, the review gate's own durable
+        state (Section 1.2)."""
+        if interpretation.group_field is None or interpretation.group_value is None:
+            # Recognized as group-shaped, but the Interpreter couldn't
+            # ground a field/value -- the group analogue of "an asset
+            # resolves but the effect doesn't." Nothing persisted.
+            return ConstraintSubmissionResult(
+                interpretation=interpretation, constraint_id=None, run_id=None, deltas=()
+            )
+        if interpretation.effect_kind is None or interpretation.effect_value is None:
+            return ConstraintSubmissionResult(
+                interpretation=interpretation, constraint_id=None, run_id=None, deltas=()
+            )
+
+        matched, excluded = self._match_group_candidate(
+            interpretation.group_field, interpretation.group_value
+        )
+        preview_digest = _compute_group_preview_digest(
+            interpretation.group_field,
+            interpretation.group_value,
+            interpretation.effect_kind,
+            interpretation.effect_value,
+            matched,
+            excluded,
+        )
+        token = uuid.uuid4().hex
+        self.memory.save_pending_group_constraint(
+            token,
+            interpretation.group_field,
+            interpretation.group_value,
+            text,
+            effect_kind=interpretation.effect_kind,
+            effect_value=interpretation.effect_value,
+            matched_asset_ids=matched,
+            excluded_asset_ids=excluded,
+            preview_digest=preview_digest,
+        )
+        return GroupConstraintPreview(
+            interpretation=interpretation,
+            token=token,
+            group_field=interpretation.group_field,
+            group_value=interpretation.group_value,
+            effect_kind=interpretation.effect_kind,
+            effect_value=interpretation.effect_value,
+            matched_asset_ids=tuple(matched),
+            excluded_not_collected_asset_ids=tuple(excluded),
+        )
+
+    def confirm_group_constraint(
+        self,
+        token: str,
+        findings: list[EnrichedFinding],
+        *,
+        seed: int = 42,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> GroupConstraintSubmissionResult:
+        """docs/group-constraints-design.md Section 7.3. Re-validates the
+        preview against CURRENT data, then writes the row and computes
+        deltas through the deterministic pipeline -- the exact one
+        `_submit_capacity_constraint` already uses (`ingest
+        .attach_threat_signals` + `scoring.score_finding`) and
+        `cli.ConstraintApplicator` already uses to fold a constraint and
+        recompute a before/after score. No `self.run()`/`self.replan()`
+        call anywhere in this method -- no agent dispatch of any kind,
+        and no LLM call at all (the one Interpreter dispatch already
+        happened, at preview time, in a separate, earlier call).
+        Requires `self.memory` -- the identical guard `submit_constraint`
+        already has."""
+        if self.memory is None:
+            raise CoordinatorError(
+                "confirm_group_constraint requires a Memory instance -- construct "
+                "Coordinator(..., memory=Memory(...))"
+            )
+
+        pending = self.memory.load_pending_group_constraint(token)
+        if pending is None:
+            return GroupConstraintSubmissionResult(
+                group_constraint_id=None,
+                run_id=None,
+                deltas=(),
+                refusal_reason=f"no pending group constraint found for token {token!r}",
+            )
+        if pending.consumed_at is not None:
+            return GroupConstraintSubmissionResult(
+                group_constraint_id=None,
+                run_id=None,
+                deltas=(),
+                refusal_reason=(
+                    f"token {token!r} was already confirmed or discarded at "
+                    f"{pending.consumed_at} -- propose again"
+                ),
+            )
+
+        # Re-run the match against CURRENT data (never cached from the
+        # preview call) and recompute the digest the identical way.
+        matched, excluded = self._match_group_candidate(pending.group_field, pending.group_value)
+        fresh_digest = _compute_group_preview_digest(
+            pending.group_field, pending.group_value, pending.effect_kind, pending.effect_value,
+            matched, excluded,
+        )
+        if fresh_digest != pending.preview_digest:
+            return GroupConstraintSubmissionResult(
+                group_constraint_id=None,
+                run_id=None,
+                deltas=(),
+                group_field=pending.group_field,
+                group_value=pending.group_value,
+                refusal_reason=(
+                    "the fleet changed since this preview was generated -- the "
+                    "matched/excluded set you reviewed no longer reflects current "
+                    "data. Propose again to review the current set before confirming."
+                ),
+            )
+
+        preview_age_seconds = (
+            datetime.now(timezone.utc) - datetime.fromisoformat(pending.created_at)
+        ).total_seconds()
+
+        # Adversarial-review finding, fixed: load_kev_catalog/load_attack_
+        # index (both can raise OfflineCacheMissError on a missing
+        # snapshot -- a real, documented, far-from-rare failure mode, not
+        # a contrived one) used to run AFTER consume_pending_group_
+        # constraint/add_group_constraint's own commits. A failure there
+        # left the token permanently burned and/or the group constraint
+        # already silently active fleet-wide, while the CLI/web caller
+        # only ever sees "offline error", indistinguishable from total
+        # failure. Moved here, before either commit, closes the single
+        # most likely failure mode outright -- this is not a full
+        # multi-statement transaction (sqlite3 here commits per call, and
+        # `record_run`/`record_decision`/`record_feedback` below still
+        # have no rollback of their own, the identical accepted tradeoff
+        # `ConstraintReplanFailedError`'s own docstring already documents
+        # for the asset-scoped path), just moving the one well-known,
+        # reachable risk ahead of the point of no return.
+        if on_stage is not None:
+            on_stage("computing")
+        kev_catalog = load_kev_catalog(self.cache)
+        attack_index = load_attack_index(self.cache)
+
+        self.memory.consume_pending_group_constraint(token)
+        group_constraint_id = self.memory.add_group_constraint(
+            pending.group_field,
+            pending.group_value,
+            pending.constraint_text,
+            effect_kind=pending.effect_kind,
+            effect_value=pending.effect_value,
+        )
+        # Includes the just-written row (ORDER BY created_at, id puts it
+        # last) -- the "after" fold; excluding it by id gives the honest
+        # "before" baseline (whatever was already active, group-vs-group
+        # precedence respected via the same oldest-first list order).
+        all_group_constraints_after = self.memory.all_active_group_constraints()
+        all_group_constraints_before = [
+            g for g in all_group_constraints_after if g.id != group_constraint_id
+        ]
+        matched_set = set(pending.matched_asset_ids)
+        affected = [e for e in findings if e.asset.asset_id in matched_set]
+        asset_id_by_finding_id = {e.finding.finding_id: e.asset.asset_id for e in affected}
+
+        deltas = []
+        for e in affected:
+            enriched = attach_threat_signals(e, kev_catalog, attack_index, self.cache)
+
+            asset_candidates = self.memory.constraints_for_asset(e.asset.asset_id)
+            asset_match = match_constraints(asset_candidates, e.asset.asset_id, e.asset.hostname)
+            asset_effective = tuple(c for c in asset_match.applied if has_usable_effect(c))
+
+            group_match_before = match_group_constraints(all_group_constraints_before, e.asset)
+            group_effective_before = tuple(
+                g for g in group_match_before.applied if has_usable_effect(g)
+            )
+            before_fold = fold_constraints(
+                e.asset, constraints=list(asset_effective), group_constraints=list(group_effective_before)
+            )
+            before = score_finding(enriched.model_copy(update={"asset": before_fold.asset}))
+
+            group_match_after = match_group_constraints(all_group_constraints_after, e.asset)
+            group_effective_after = tuple(
+                g for g in group_match_after.applied if has_usable_effect(g)
+            )
+            after_fold = fold_constraints(
+                e.asset, constraints=list(asset_effective), group_constraints=list(group_effective_after)
+            )
+            after = score_finding(enriched.model_copy(update={"asset": after_fold.asset}))
+
+            group_texts = tuple(g.constraint_text for g in group_effective_after)
+            deltas.append(_build_group_finding_delta(before, after, group_texts))
+        deltas = tuple(deltas)
+
+        if on_stage is not None:
+            on_stage("persisting")
+        run_id = self.memory.record_run(
+            data_dir=str(self.data_dir),
+            ingest_format=self.ingest_format,
+            seed=seed,
+            offline=self.cache.offline,
+            # agents=False: this confirm made no LLM calls beyond the one
+            # Interpreter call already dispatched at preview time -- the
+            # re-score itself is the deterministic pipeline, the same
+            # shape as `rhino run` without --agents.
+            agents=False,
+            total_findings=len(affected),
+            contested_count=sum(1 for d in deltas if d.after_bucket == Bucket.CONTESTED.value),
+            contested_total=len(deltas),
+        )
+        for delta in deltas:
+            self.memory.record_decision(
+                run_id=run_id,
+                finding_id=delta.finding_id,
+                cve_id=delta.cve_id,
+                asset_id=asset_id_by_finding_id[delta.finding_id],
+                hostname=delta.hostname,
+                risk_score=delta.after_risk_score,
+                bucket=delta.after_bucket,
+                rationale=[*delta.rationale_added],
+                verdict_summary=delta.after_verdict_summary,
+                narrative=delta.after_verdict_summary,
+            )
+        self.memory.record_feedback(
+            pending.constraint_text,
+            f"group constraint #{group_constraint_id} ({pending.group_field}="
+            f"{pending.group_value}): re-evaluated {len(deltas)} finding(s), "
+            f"{sum(1 for d in deltas if d.changed)} changed",
+            run_id=run_id,
+        )
+
+        return GroupConstraintSubmissionResult(
+            group_constraint_id=group_constraint_id,
+            run_id=run_id,
+            deltas=deltas,
+            group_field=pending.group_field,
+            group_value=pending.group_value,
+            matched_asset_ids=tuple(pending.matched_asset_ids),
+            excluded_not_collected_asset_ids=tuple(pending.excluded_asset_ids),
+            preview_age_seconds=preview_age_seconds,
+        )
+
     def _submit_capacity_constraint(
         self,
         text: str,
@@ -923,12 +1335,27 @@ class Coordinator:
             on_stage("computing")
         kev_catalog = load_kev_catalog(self.cache)
         attack_index = load_attack_index(self.cache)
+        # Fetched once, before the loop -- never per finding/asset (Section
+        # 3's fleet-scale reading rule). Group-scoped constraints are
+        # folded in alongside any active asset-scoped one, for the
+        # identical reason the asset-scoped fold already exists here:
+        # otherwise "the real, current bucket" below would be a lie
+        # whenever a group constraint (e.g. "all workstations need a
+        # compensating control") is affecting has_patch_window/
+        # has_compensating_controls for dozens of assets at once.
+        group_candidates = self.memory.all_active_group_constraints()
         scored = []
         for e in findings:
             candidates = self.memory.constraints_for_asset(e.asset.asset_id)
             match = match_constraints(candidates, e.asset.asset_id, e.asset.hostname)
-            if match.applied:
-                e = e.model_copy(update={"asset": apply_constraints(e.asset, list(match.applied))})
+            group_match = match_group_constraints(group_candidates, e.asset)
+            asset_effective = tuple(c for c in match.applied if has_usable_effect(c))
+            group_effective = tuple(g for g in group_match.applied if has_usable_effect(g))
+            if asset_effective or group_effective:
+                fold_result = fold_constraints(
+                    e.asset, constraints=list(asset_effective), group_constraints=list(group_effective)
+                )
+                e = e.model_copy(update={"asset": fold_result.asset})
             scored.append(score_finding(attach_threat_signals(e, kev_catalog, attack_index, self.cache)))
         scored_by_id = {s.finding_id: s for s in scored}
         asset_id_by_finding_id = {e.finding.finding_id: e.asset.asset_id for e in findings}

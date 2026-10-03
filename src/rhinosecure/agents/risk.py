@@ -89,7 +89,7 @@ from rhinosecure.agents.environment import EnvironmentAssessment
 from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.prompt_safety import UNTRUSTED_TEXT_NOTICE, fence
 from rhinosecure.agents.research import ResearchFinding
-from rhinosecure.constraint_apply import apply_constraints, match_constraints
+from rhinosecure.constraint_apply import fold_constraints, has_usable_effect, match_constraints, match_group_constraints
 from rhinosecure.llm import get_llm
 from rhinosecure.memory import Memory
 from rhinosecure.schema import AttackTechniqueRef, EnrichedFinding
@@ -123,6 +123,12 @@ class RiskRecommendation(BaseModel):
     # when no memory was configured or none were active. See module
     # docstring: this is separate from scoring_rationale on purpose.
     constraints_applied: list[str] = []
+    # The group-constraint sibling of constraints_applied (docs/group-
+    # constraints-design.md Section 8.6) -- kept as its own, separate
+    # field rather than merged into constraints_applied, so a reader can
+    # tell an asset-scoped constraint's text apart from a group-scoped
+    # one's without guessing which table either came from.
+    group_constraints_applied: list[str] = []
     # Which of criticality/environment/data_sensitivity/role/internet_exposed
     # this finding's asset SOURCE never determined at all
     # (scoring.neutralized_axes_for), copied verbatim from score_finding's
@@ -186,7 +192,14 @@ def build_risk_tools(
     optional and defaults to None -- omitting it (as every call site did
     before constraints existed) reproduces the exact prior behavior,
     constraints_applied always empty and scoring always against the
-    asset exactly as `assets.csv` declares it."""
+    asset exactly as `assets.csv` declares it.
+
+    `group_constraints` is fetched ONCE here, at tool-build time -- never
+    per finding -- the identical fleet-scale discipline the asset-scoped
+    read never needed to state explicitly (it's already indexed per
+    asset_id) but a whole-table read genuinely does (docs/group-
+    constraints-design.md Section 3)."""
+    group_constraints = memory.all_active_group_constraints() if memory is not None else []
 
     @tool("score_finding")
     def score_finding_tool(finding_id: str) -> str:
@@ -194,9 +207,10 @@ def build_risk_tools(
         bucket. This is the ONLY way to get either -- never estimate them
         yourself. Returns risk_score, bucket, a fully cited rationale
         (severity source, exposure, EPSS/KEV, ATT&CK, impact factors,
-        compensating controls, patch window), constraints_applied
-        (any active human-supplied constraints that were folded into the
-        asset used for this computation, separate from rationale), and
+        compensating controls, patch window), constraints_applied and
+        group_constraints_applied (any active human-supplied asset- or
+        group-scoped constraints that were folded into the asset used for
+        this computation, separate from rationale), and
         neutralized_axes -- any of role/environment/data_sensitivity/
         criticality/internet_exposed this asset's SOURCE never determined
         at all. A value returned for an axis named in neutralized_axes is
@@ -206,14 +220,22 @@ def build_risk_tools(
             enriched_by_id[finding_id], research_by_id[finding_id]
         )
         constraints_applied: list[str] = []
+        group_constraints_applied: list[str] = []
         if memory is not None:
             candidates = memory.constraints_for_asset(enriched.asset.asset_id)
             match = match_constraints(candidates, enriched.asset.asset_id, enriched.asset.hostname)
-            if match.applied:
-                enriched = enriched.model_copy(
-                    update={"asset": apply_constraints(enriched.asset, list(match.applied))}
+            asset_effective = tuple(c for c in match.applied if has_usable_effect(c))
+            group_match = match_group_constraints(group_constraints, enriched.asset)
+            group_effective = tuple(g for g in group_match.applied if has_usable_effect(g))
+            if asset_effective or group_effective:
+                fold_result = fold_constraints(
+                    enriched.asset,
+                    constraints=list(asset_effective),
+                    group_constraints=list(group_effective),
                 )
-                constraints_applied = [c.constraint_text for c in match.applied]
+                enriched = enriched.model_copy(update={"asset": fold_result.asset})
+                constraints_applied = [c.constraint_text for c in asset_effective]
+                group_constraints_applied = [g.constraint_text for g in group_effective]
         scored = score_finding(enriched)
         result = {
             "finding_id": scored.finding_id,
@@ -224,6 +246,7 @@ def build_risk_tools(
             "bucket": scored.bucket.value,
             "rationale": list(scored.rationale),
             "constraints_applied": constraints_applied,
+            "group_constraints_applied": group_constraints_applied,
             # Which axes are neutralized (scoring.neutralized_axes_for) plus
             # the raw values in effect for all five -- needed so
             # verify_scoring_matches_tool's find_neutralized_axis_assertions
@@ -315,14 +338,16 @@ def build_risk_task(
             f"{fence('ENVIRONMENT APPLICABILITY_SUMMARY', environment.applicability_summary)}\n\n"
             f"{neutralized_instruction}\n\n"
             f"Call score_finding with finding_id={finding.finding_id!r} exactly once "
-            "and copy its risk_score, bucket, rationale, and constraints_applied "
-            "into your output verbatim -- do not adjust, round, or reinterpret "
-            "them. If constraints_applied is non-empty, this score was computed "
-            "against an asset with one or more human-supplied constraints folded "
-            "in -- state this explicitly in narrative, naming the constraint text "
-            "and distinguishing it clearly from facts the asset inventory itself "
-            "declares (Environment's own patch_window/compensating_controls above "
-            "are the inventory's facts, unaffected by any constraint). Then write "
+            "and copy its risk_score, bucket, rationale, constraints_applied, and "
+            "group_constraints_applied into your output verbatim -- do not adjust, "
+            "round, or reinterpret them. If constraints_applied or "
+            "group_constraints_applied is non-empty, this score was computed "
+            "against an asset with one or more human-supplied asset- or "
+            "group-scoped constraints folded in -- state this explicitly in "
+            "narrative, naming the constraint text and distinguishing it clearly "
+            "from facts the asset inventory itself declares (Environment's own "
+            "patch_window/compensating_controls above are the inventory's facts, "
+            "unaffected by any constraint). Then write "
             "verdict_summary: exactly two sentences stating the bucket and the "
             "single biggest reason for it, written so it stands alone -- a "
             "reader skimming a plan with dozens of findings should get the gist "
@@ -341,6 +366,8 @@ def build_risk_task(
             "exactly from score_finding), scoring_rationale (its rationale "
             "list, copied verbatim as an array of strings), constraints_applied "
             "(its constraints_applied list, copied verbatim -- empty list if "
+            "the tool returned none), group_constraints_applied (its "
+            "group_constraints_applied list, copied verbatim -- empty list if "
             "the tool returned none), neutralized_axes (its neutralized_axes "
             "list, copied verbatim -- empty list if the tool returned none; "
             "REQUIRED even when empty, never omitted), verdict_summary "
@@ -401,6 +428,13 @@ def verify_scoring_matches_tool(
         raise ScoringMismatchError(
             f"{recommendation.finding_id}: constraints_applied does not match the "
             "tool's constraints_applied verbatim"
+        )
+    if list(recommendation.group_constraints_applied) != list(
+        tool_result.get("group_constraints_applied", [])
+    ):
+        raise ScoringMismatchError(
+            f"{recommendation.finding_id}: group_constraints_applied does not match "
+            "the tool's group_constraints_applied verbatim"
         )
     if sorted(recommendation.neutralized_axes) != sorted(tool_result.get("neutralized_axes", [])):
         raise ScoringMismatchError(

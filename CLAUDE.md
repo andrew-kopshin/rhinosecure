@@ -3805,3 +3805,296 @@ and the `_run_run_agents` job-result mirroring fix.
 active constraints exist in it at all, so there is nothing to report as legacy -- unchanged from
 the prior entry's own identical check.
 before it was ever committed.
+
+---
+
+## Group-scoped constraints, Slice A (2026-10-03)
+
+**Built, against `docs/group-constraints-design.md` (the spec of record, moved here from
+`out/` in its own commit before any code was written).** Storage (`group_constraints`,
+`pending_group_constraints`, both in `memory.py`'s `_SCHEMA_SQL`, never `_migrate()` -- brand-new
+tables, not a column added to an existing one); `constraint_apply.py`'s `match_group_constraints`,
+`fold_constraints` (two-pass precedence: group constraints set a baseline for
+`patch_window`/`patch_restrictions`, an active asset constraint unconditionally overrides and the
+override is reported via `OverriddenGroupEffect`; `compensating_control` is additive from both
+origins, never a single winner), the Option C digest (`compute_constraint_digest`'s per-record
+tuple shape depends only on that record's own origin -- an asset-origin record is always the
+pre-feature 4-tuple, a group-origin record is always a 5-tuple with `"group:<id>"` injected --
+byte-identical to the pre-feature formula whenever no group record exists, by construction);
+`agents/constraint_intake.py`'s third `ConstraintKind` (`GROUP`), `ConstraintInterpretation`'s
+`group_field`/`group_value` (the latter typed `schema.AssetRole`, imported directly, never a
+hand-copied duplicate), and the new `_exactly_one_shape` cross-shape validator; `rhino constraint
+group add|confirm|list|retract`, a sibling CLI subcommand tree, never sharing `constraint
+{list,retract}`'s bare integer argument (`constraints.id` and `group_constraints.id` are
+independent `AUTOINCREMENT` sequences and will collide); the deterministic path's
+`--apply-constraints` flag and `ConstraintApplicator`'s group-aware fold, now shared via
+`constraint_apply.ConstraintAccumulator`/`summarize_for_assets` with the agents path; the four
+agents-path read sites (`agents/risk.py`'s `score_finding_tool`, `agents/environment.py`'s
+`lookup_asset_context`, `agents/coordinator.py`'s `_submit_capacity_constraint`, `export.py`'s
+`_agents_decomposition`) plus capacity's own fold; the export's `group_scoped` constraints-section
+key and `constraint_application` block's `applied_group_constraint_ids`/
+`overridden_group_effects`/`skipped.not_collected`; and both provisional guards (a provisional,
+unconfirmed mapping never even consults the group matcher, on either the CLI or the web job path
+-- the identical `memory=None` mechanism the prior "Two fixes" entry already established for the
+asset-only case).
+
+**The preview/confirm review gate (design Section 7), rebuilt LLM-free except the one Interpreter
+call, per the user's explicit revision of the first design draft.** `Coordinator.submit_constraint`
+interprets once, then for a group-shaped result dispatches to `_preview_group_constraint`, which
+matches `self._asset_index` directly (no `self.run()`/`self.replan()`, needs no prior agents run at
+all) and writes only to `pending_group_constraints`, never the real `group_constraints` table.
+`confirm_group_constraint` (public) re-validates the match against CURRENT data via a fresh digest
+recompute, refuses on disagreement or on an already-consumed token, and -- only once valid --
+writes the real row and re-scores exactly the matched assets' findings through the deterministic
+`attach_threat_signals`/`score_finding` pair (never an agent dispatch). Previews never expire;
+confirm reports the previous preview's age purely informationally, never as a gate. **One design
+ambiguity resolved, not left open:** the design's Section 7.1 prose could be read either way on
+whether `_preview_group_constraint` re-interprets internally; it does not -- `submit_constraint`'s
+own single `interpret_constraint` call is reused, matching the tested "called exactly once per
+preview" property and the identical shape the capacity path already uses.
+
+**A real, pre-existing defect found by writing this slice's own test suite, not filed and left for
+later: `ConstraintAccumulator.record_group`'s `_applied_group` dict was keyed by
+`group_constraint_id` alone, via `setdefault`.** One group constraint matching a SECOND asset was
+silently dropped from `_applied_group` -- the first asset encountered "won" the dict slot and every
+later one vanished -- so the digest, `applied_group_constraint_ids`, and the `rhino constraint group
+list`-adjacent reporting were all blind to a role-based rule's real blast radius: a constraint
+matching 50 workstations would report, hash, and count as if it had applied to exactly one. Caught
+while writing test A29 (`test_digest_changes_when_a_second_asset_joins_an_existing_group`) against
+the real mechanism rather than the raw digest function alone, confirmed live with a direct
+before/after probe (digest unchanged across 1-asset vs. 2-asset populations before the fix;
+correctly differing after). Fixed by keying `(group_constraint_id, asset_id)` instead --
+`AppliedGroupConstraintRecord`'s own docstring already said "one group constraint that matched ONE
+asset," the dict just didn't enforce it. `ConstraintAccumulator.summary()`'s sort key extended to
+`(group_constraint_id, asset_id)` for the same reason. Zero other tests broke (nothing pre-existing
+exercised two assets sharing one group constraint), and the fix is covered by A29/A30 plus A71's
+real-demo-fixture parity check.
+
+**A second real gap found and fixed the same way: `web/jobs.py`'s two job result dicts.**
+`_run_run_deterministic`'s result never carried `applied_group_constraint_ids` (or the group/
+not_collected counts) at all, even though `export.py` already did -- exactly the CLI/web
+result-dict asymmetry the prior "Two fixes" entry had already found and fixed once, for a
+different field pair, and exactly what test A61 was written to catch. Fixed by adding the three
+fields, mirrored into `_run_run_agents`'s own result dict too (not explicitly named by A61, but the
+identical asymmetry risk the earlier entry's own reasoning argues both handlers should never
+diverge on). **A third, independent gap in the same area:** `_run_run_agents`'s `agents_capp`
+computation had its own inline copy of the "reached Risk this run" filter
+(`(e.asset for e in coordinator.state.enriched_by_id.values() if e.finding.finding_id in
+coordinator.state.risk_by_id)`) instead of calling the shared `constraint_apply.scored_assets`
+helper `export.py`/`cli.py` both already use -- precisely the single-sourcing gap Section 8.8's
+housekeeping item (test A72) was written to close, found not yet done. Fixed by importing and
+calling `scored_assets` there too; confirmed behavior-preserving by the existing web-jobs suite
+passing unmodified.
+
+**Two deviations from the design doc, each because the doc contradicted itself or its own
+suggested mechanism didn't work, not because a decision was relitigated.**
+1. **Section 8.2 vs. test A57's own description disagreed on whether `rhino constraint list`
+   should show group rows.** Section 8.2, bolded: `"rhino constraint list" -- **Unchanged** --
+   continues to operate only on constraints (asset-scoped), exactly as today`. Test A57's own
+   description: output should visibly separate group rows from asset rows "in a distinct section."
+   Honored Section 8.2 (the deliberate, explicit architectural line) and rewrote A57 to verify
+   separation BY COMMAND instead -- `rhino constraint list` shows asset rows only, byte-identical
+   to before this feature; `rhino constraint group list` (already a separate command, decision 7 in
+   Section 12) shows group rows only; neither ever interleaves the other's rows.
+2. **Test A34's own suggested mechanism (identity/equality against `schema.AssetRole`) cannot
+   distinguish an import from a hand-copied duplicate.** `typing.Literal.__class_getitem__` is
+   `@_tp_cache`-memoized, so a hand-copied `Literal[...]` with today's same 15 role values IN THE
+   SAME ORDER resolves to the exact same cached singleton object as `schema.AssetRole` -- confirmed
+   directly (`is` and `==` both returned `True` against a deliberately-reintroduced hand-copied
+   duplicate during this slice's own break/fix cycle). Rewritten as an AST check on the source
+   (`ConstraintInterpretation`'s `group_value` field's annotation expression must contain a `Name`
+   node reading `AssetRole`) -- the only mechanism that actually tells "imports the name" apart from
+   "redeclares an identical value," confirmed to go red against the hand-copied version and green
+   against the real import.
+
+**One test placed differently than the design doc's own section header implied, not a deviation in
+behavior.** A10 (deactivating an already-inactive group constraint twice) lives in
+`tests/test_cli.py`, not `tests/test_memory.py` as Section 11.2's header suggested -- the refusal
+mechanism (checking membership in `all_active_group_constraints()` before calling
+`deactivate_group_constraint`) lives in `cli.py`, identically to how the existing asset-constraint
+retract refusal already does and is already tested there
+(`test_constraint_retract_refuses_an_unknown_or_already_retracted_id`); `memory.py`'s own
+`deactivate_group_constraint` has no refusal of its own to test, by design, matching
+`deactivate_constraint`'s existing shape exactly.
+
+**`web/jobs.py` was in scope and needed real changes, not a free pass.** The design's own Section
+11.8 framing ("the deterministic path (including its existing web entry point)") made this
+explicit, but it was easy to assume the existing `--apply-constraints`/`memory=` plumbing already
+covered it "for free" through `run_with_report`. It covered SCORING correctly (confirmed: a
+provisional run's matcher is never even consulted, machine-identity-scoping's own pre-existing
+guard holds unchanged) but not REPORTING -- the result-dict gaps above were real and found only by
+writing A61/A62 against the actual job handler, not by reasoning about what `run_with_report`
+already does.
+
+**Found, not fixed, per the task's own scope instruction: a pre-existing, order-dependent test
+failure unrelated to this slice.** `tests/test_adapters_review.py
+::test_measure_reports_the_unmapped_profile_problem_separately_from_halted_by` and
+`tests/test_cli_adapt.py::test_confirm_against_an_undecodable_source_reports_cleanly_not_a_traceback`
+fail when run as a small subset (just those two files, or either alone) in the presence of a stray,
+untracked `data/adapters/corpwide.json` left over from an earlier, unrelated session -- confirmed by
+temporarily moving that one file aside and back (both tests pass with it absent, both fail with it
+present, in that narrower run), and confirmed unrelated to this slice by reverting every Slice A
+change and reproducing the identical failure. Both pass when the FULL suite runs in its normal,
+unfiltered order -- apparently order-/state-dependent on what else has touched `data/adapters/`'s
+shared scratch directory by the time they run, not a hard failure. Neither test, nor
+`adapters/review.py`/`schema_inference.py`/`cli_adapt`-adjacent code, was touched by this slice.
+Left exactly as found, including the stray file itself (not this session's to delete).
+
+**Verified.**
+- `rhino run --data demo --seed 42 --offline` with zero group constraints: byte-identical to HEAD
+  `975e30f`'s own output (diffed, not eyeballed), confirmed both before any Slice A code existed and
+  again after every fix above landed.
+- `--apply-constraints` against a scratch DB holding only asset constraints (a real A09/WKS-FIN12
+  patch-window row, one legacy row, one wrong-hostname row): the printed digest
+  (`sha256:ecc45625714c...`) is identical before and after every Slice A change -- the exact-hash
+  target the task specification named could not be reproduced from the scratch DB as literally
+  described and the user, asked directly, chose stability-of-one's-own-value over chasing the
+  original figure; this is that chosen verification, confirmed twice.
+- Group preview and confirm make zero `Coordinator.run`/`.replan` calls (monkeypatched to raise if
+  called, across a 50-asset fleet specifically so a silent fallback would be an obvious cost, not
+  incidental) and dispatch `interpret_constraint` exactly once per preview; confirm makes no LLM call
+  at all -- A45-A50.
+- A real demo run with one confirmed group constraint (`role=workstation`, `patch_window`): F07,
+  F11, and F14 (the fixture's three real workstation-asset findings, two of them the fixture's own
+  designated `contested` cases) move `contested -> next_window` with `risk_score` numerically
+  unchanged (18.7, 25.9, 25.5 respectively, before and after); every other finding's bucket and
+  score is untouched -- confirmed via a real diff between two full CLI runs, not inspection of one.
+- Precedence: asset-wins (A19, with a group constraint given a strictly LATER `created_at` than the
+  overriding asset constraint, so a timestamp-based regression would flip the result), group-vs-
+  group last-writer-wins (A23, with the chronologically-older constraint given a deliberately
+  HIGHER id -- the retract-and-reinsert scenario -- so an id-based regression would also flip the
+  result), and compensating controls accumulating from both origins (A21) -- all three tested, all
+  three confirmed to fail when their respective mechanism is broken and pass when restored.
+- Provisional plans never apply a group constraint, on both the CLI preview/confirm path (A49, the
+  pre-existing `memory is None` guard in `submit_constraint`, confirmed to fire before
+  `interpret_constraint` is ever dispatched) and the web job path (A62, mirroring the existing
+  asset-constraint provisional test exactly).
+- Every one of the 73 new tests (Section 11 names 72; A1-A12 gained one extra storage-layer
+  round-trip check, and A72's two distinct claims -- the filter's own correctness and its
+  single-sourcing across three call sites -- were written as two tests rather than conflated into
+  one) was confirmed to fail when its own fix was reverted, then restored with the suite green
+  again, via actual revert-run-restore cycles, not asserted. Full suite before the adversarial
+  review round below: **1,815 passed** (was 1,742 before this slice; net +73, zero regressions,
+  zero modifications to a pre-existing test's assertions beyond the two documented, additive
+  exceptions above: A44 extending an existing refusal-validation test with two new field
+  assertions, and the pre-existing `test_cli.py` print-format tests needing no change at all once
+  the new group/not_collected clause was made conditional on actually having something to report).
+
+**Adversarial review (3 independent parallel reviewers, each covering a distinct area, each
+instructed to construct a concrete failure scenario before reporting) found and this entry fixes 7
+further real, confirmed defects, plus one deliberately left as a documented, pre-existing,
+out-of-scope tradeoff.**
+
+1. **`ConstraintAccumulator._skipped_not_collected_assets` had no per-(group_constraint,asset)
+   dedup -- a plain list, appended to unconditionally.** Every real caller invokes `record_group`
+   once per FINDING, not once per asset (the same calling shape that caused the `_applied_group`
+   bug above), so an asset with N findings, skipped as `not_collected` for one active group
+   constraint, inflated that constraint's reported `skipped_asset_count` by N and duplicated its
+   own asset_id N times in the capped `sample_asset_ids` -- directly undermining the Section 7.2
+   fleet-scale-safe reporting guarantee that field exists to satisfy. Fixed by the identical
+   pattern as `_applied_group`'s own earlier fix: the backing dict's values are now themselves
+   `dict[str, None]` (an ordered set), not a plain list.
+2. **`ConstraintAccumulator._overridden` had no dedup at all.** `record_fold_result` is called once
+   per finding by every real caller (`cli.ConstraintApplicator`, `agents/risk.py`'s
+   `score_finding_tool`, `_submit_capacity_constraint`'s fold, `export.py`'s
+   `_agents_decomposition`), so one real override fact on a multi-finding asset was reported once
+   PER FINDING in `overridden_group_effects` -- a 3-finding asset with one override produced the
+   byte-identical record three times in the exported JSON. Fixed by making `_overridden` a
+   `dict[OverriddenGroupEffect, None]` (the dataclass is frozen and hashable) instead of a list --
+   `record_fold_result` now `setdefault`s each effect in, and `tuple(self._overridden)` already
+   gives the deduped, first-seen-order result with no further change needed at the read site.
+3. **`rhino constraint group add`'s dispatch claimed "Nothing persisted" for every non-group
+   result, which was simply false whenever the Interpreter actually resolved the statement as
+   asset-scoped or capacity-shaped** (both of which `submit_constraint` persists immediately and,
+   for the asset case, runs a real re-plan). A human typing an asset- or capacity-shaped statement
+   into the group-specific subcommand by mistake was told nothing happened while a row was written
+   and money was spent on a re-plan. Fixed by mirroring the shared `constraint add` dispatch's own
+   correct three-way branch (`CapacitySubmissionResult` / `GroupConstraintPreview` / else, `return 0
+   if result.persisted else 1`) instead of a blanket non-group refusal.
+4. **`rhino constraint group list` had no exception handling around its `load_batch` call**, unlike
+   its `add`/`confirm` siblings -- a bad `--data`/`--format` combination raised a raw `IngestError`
+   traceback instead of the identical clean message every other group subcommand gives. Fixed by
+   wrapping it in the same `try/except IngestError` (not `OfflineCacheMissError` too: `list` does no
+   enrichment, so that one can never actually fire here, confirmed by reading `load_batch`'s own
+   docstring -- added only where it's reachable, not copied reflexively).
+5. **`Memory.add_group_constraint` never validated `group_field` against
+   `constraint_apply.GROUP_FIELD_CHOICES`**, contradicting this design's own Section 1.1, which
+   explicitly specifies that defensive check ("the same belt-and-suspenders posture
+   `Asset._validate_not_collected` already takes"). Inert today (every real caller already goes
+   through a `Literal`-typed model that can't produce an illegal value) but a confirmed gap against
+   the written spec, found independently by two of the three reviewers. Fixed with a local import
+   (avoids a module-level dependency between these two crewai-free, core-only modules) and a clear
+   `ValueError`.
+6. **The deterministic path's `constraints.group_scoped[].deltas` were ALWAYS empty, regardless of
+   what a group constraint genuinely changed.** `_build_deterministic_export` never computed or
+   passed a `deterministic_group_deltas_by_id` to `_constraints_section` -- the parameter existed on
+   `_group_scoped_constraints` and was read there, but no caller on the deterministic path ever
+   populated it, so it silently stayed at its own default, `None`, on every real run. Confirmed
+   empirically by one of the reviewers against the real demo fixture: a genuine group constraint
+   with 3 real per-finding before/after records in `capp.deltas` still exported `deltas: []` for its
+   own `group_scoped` row. Fixed by changing `_group_scoped_constraints`'s deterministic-path branch
+   to read from `deterministic_deltas_by_asset` (the SAME asset-keyed dict the asset-scoped section
+   already receives and that already has every real delta, since `ConstraintApplicator.apply()`
+   folds asset- and group-origin effects together and `record_delta` fires whenever either changed
+   the asset) -- for each group constraint, the union of every matched asset's own deltas is its
+   real, complete delta list. The now-unused `deterministic_group_deltas_by_id` parameter and its
+   plumbing through `_constraints_section`/`_build_deterministic_export`'s call site were removed
+   rather than left as dead code.
+7. **`Coordinator.confirm_group_constraint` ran `load_kev_catalog`/`load_attack_index` (both can
+   raise `OfflineCacheMissError` on a real, reachable missing-snapshot case, not a contrived one)
+   AFTER its two commits** (`consume_pending_group_constraint`, `add_group_constraint`). A failure
+   there left the one-shot token permanently burned with nothing persisted, or -- the more likely
+   order in practice -- left a group constraint already silently active fleet-wide while `rhino
+   constraint group confirm`'s own exception handler printed an indistinguishable "offline error"
+   exit 1, with no mention that something had, in fact, just changed. Fixed by moving both loads
+   ahead of either commit -- not a full multi-statement transaction (sqlite3 here still commits
+   per call, and `record_run`/`record_decision`/`record_feedback` later in the same method still
+   have no rollback of their own, the identical accepted tradeoff `ConstraintReplanFailedError`'s
+   own docstring already documents for the asset-scoped path), just moving the one well-known,
+   reachable risk ahead of the point of no return, which is what actually closes the failure mode a
+   reviewer could concretely construct.
+
+**One further finding, deliberately left as a documented, pre-existing, out-of-scope tradeoff, not
+fixed:** `export.py`'s `_agents_decomposition` fetches `all_active_group_constraints()` once per
+FINDING (via `_agents_finding_entry`, called once per recommendation), not once per run --
+contradicting this design's own Section 3 "once per run, never per finding" rule taken literally.
+Investigated before deciding: this is not a new regression the group-constraint addition
+introduced in isolation -- the IDENTICAL call site already re-fetches `constraints_for_asset`
+(asset-scoped) per finding too, with an existing, pre-this-slice comment explicitly naming a
+per-export-build cache as "a real fleet-scale win but out of this fix's scope, matching Section
+8.8's own housekeeping boundary (named, not silently expanded)". The group fetch mirrors that
+exact, already-accepted pattern at the exact same call site; fixing only the group half while
+leaving the asset half as-is would be inconsistent, and fixing both is a real refactor of
+pre-existing, already-deferred code, not a defect Slice A was asked to introduce or close. Named
+here, matching this project's own repeated "named, not silently expanded" discipline (the
+identical shape the Fleet-scale audit entries already use for the agents path's own snapshot-read
+redundancy), rather than silently left unmentioned.
+
+**Also checked and found NOT to be bugs, across all three reviews** (so the next reader doesn't
+re-investigate the same ground): a token from a mismatched fleet is caught by confirm's own
+content-based digest re-check, not by instance identity, and a genuine mismatch almost always
+changes the hashed matched/excluded sets; `fold_constraints`'s within-call override attribution
+(which asset/group constraint's id gets cited) is correct for both single- and multiple-constraint
+cases; no mutable-default-argument leakage in `fold_constraints`; `compute_constraint_digest`'s
+mixed-tuple-length sort cannot raise `TypeError`; the exact "Two fixes" unfiltered-population bug
+class does not recur for groups anywhere (`scored_assets`/`risk_by_id` gating is correct at every
+read site); a forward-incompatible `group_field`/`group_value` degrades to "doesn't match," never
+crashes; `environment.py`'s `group_human_constraints` is not filtered by `has_usable_effect` the
+way `risk.py`'s `group_constraints_applied` is -- plausibly intentional (environment.py's field
+feeds model narrative context, not a scoring claim, unlike risk.py's, which specifically asserts
+"this changed the score") rather than an oversight, and not reachable through the documented group
+flow today regardless (`_preview_group_constraint` already refuses a no-effect interpretation
+before it can reach the table) -- noted, not changed, to avoid a speculative fix built on an
+uncertain reading of intent.
+
+**Full suite after every fix above: 1,820 passed** (net +5 over the 1,815 reported before this
+round: one new test each for findings 3, 4, 5, 6, 7 above; findings 1 and 2 are covered by the
+already-existing A29/A30/A71 tests, which is how they were caught in the first place). Every new
+test confirmed to fail when its own fix was reverted, then restored, exactly as the rest of this
+slice's own tests were. `rhino run --data demo --seed 42 --offline` re-confirmed byte-identical and
+the `--apply-constraints` scratch-DB digest re-confirmed unchanged (`sha256:ecc45625714c...`) both
+immediately before and immediately after this entire adversarial-review round.
+
+**Slice B** (the web Constraints tab's new section, its retract route, and the preview card with a
+Confirm button) is unbuilt, per the design's own split -- Slice A is fully usable CLI-only on its
+own, exactly as intended.

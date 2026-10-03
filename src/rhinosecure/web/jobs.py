@@ -139,7 +139,7 @@ from rhinosecure.adapters.config_model import SCORING_ENUM_TARGETS, Attestation,
 from rhinosecure.adapters.configured import ConfiguredAdapter
 from rhinosecure.agents.constraint_intake import ConstraintInterpretationError
 from rhinosecure.agents.coordinator import Coordinator, CoordinatorError, ConstraintReplanFailedError
-from rhinosecure.constraint_apply import summarize_for_assets
+from rhinosecure.constraint_apply import scored_assets, summarize_for_assets
 from rhinosecure.agents.schema_inference import (
     DEFAULT_MAX_ATTEMPTS as PROPOSE_DEFAULT_MAX_ATTEMPTS,
     DEFAULT_SAMPLE_ROWS,
@@ -1271,6 +1271,19 @@ def _run_run_deterministic(job: Job, plan_state: PlanState, on_stage: Callable[[
             "constraints_skipped_identity_mismatch": (
                 capp.skipped_identity_mismatch_count if capp is not None else 0
             ),
+            # docs/group-constraints-design.md Slice A, test A61: these were
+            # missing from this job's own result dict even though the export
+            # already carried them (export.py's _constraint_application_dict)
+            # -- the exact CLI/web result-dict asymmetry CLAUDE.md's "Two
+            # fixes" entry already found and fixed once, for a different
+            # field pair.
+            "applied_group_constraint_ids": (
+                [r.group_constraint_id for r in capp.applied_group] if capp is not None else []
+            ),
+            "constraints_applied_group": capp.applied_group_count if capp is not None else 0,
+            "constraints_skipped_not_collected": (
+                sum(s.skipped_asset_count for s in capp.skipped_not_collected) if capp is not None else 0
+            ),
             "constraint_digest": capp.digest if capp is not None else None,
             # None whenever capp is real (something was actually
             # consulted). Otherwise "provisional_mapping" -- the only
@@ -1439,7 +1452,7 @@ def _run_run_agents(job: Job, plan_state: PlanState, on_stage: Callable[[str], N
     agents_capp = (
         summarize_for_assets(
             coordinator.memory,
-            (e.asset for e in coordinator.state.enriched_by_id.values() if e.finding.finding_id in coordinator.state.risk_by_id),
+            scored_assets(coordinator.state.enriched_by_id, coordinator.state.risk_by_id),
         )
         if coordinator.memory is not None
         else None
@@ -1455,6 +1468,19 @@ def _run_run_agents(job: Job, plan_state: PlanState, on_stage: Callable[[str], N
             "constraints_skipped_legacy": agents_capp.skipped_legacy_count if agents_capp is not None else 0,
             "constraints_skipped_identity_mismatch": (
                 agents_capp.skipped_identity_mismatch_count if agents_capp is not None else 0
+            ),
+            # Mirrors _run_run_deterministic's own group fields -- the
+            # identical CLI/web asymmetry risk, closed for both jobs
+            # together rather than only the one test A61 names, matching
+            # CLAUDE.md's "Two fixes" entry's own stated reasoning for why
+            # these two handlers should never drift again.
+            "applied_group_constraint_ids": (
+                [r.group_constraint_id for r in agents_capp.applied_group] if agents_capp is not None else []
+            ),
+            "constraints_applied_group": agents_capp.applied_group_count if agents_capp is not None else 0,
+            "constraints_skipped_not_collected": (
+                sum(s.skipped_asset_count for s in agents_capp.skipped_not_collected)
+                if agents_capp is not None else 0
             ),
             "constraint_digest": agents_capp.digest if agents_capp is not None else None,
             # provisional is the only reason this job's own capp is ever

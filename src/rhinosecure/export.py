@@ -128,7 +128,15 @@ from typing import TYPE_CHECKING, Any
 
 from rhinosecure.adapters.config_model import Contract
 from rhinosecure.adapters.review import is_provisional
-from rhinosecure.constraint_apply import apply_constraints, match_constraints, summarize_for_assets
+from rhinosecure.constraint_apply import (
+    DISPLAY_CAP,
+    fold_constraints,
+    has_usable_effect,
+    match_constraints,
+    match_group_constraints,
+    scored_assets,
+    summarize_for_assets,
+)
 from rhinosecure.enrich.cache import SnapshotCache
 from rhinosecure.ingest import GapTally, IngestReport, IngestStats
 from rhinosecure.memory import Memory
@@ -469,8 +477,21 @@ def _agents_decomposition(coordinator: Coordinator, enriched: Any, research: Any
     if coordinator.memory is not None:
         candidates = coordinator.memory.constraints_for_asset(merged.asset.asset_id)
         match = match_constraints(candidates, merged.asset.asset_id, merged.asset.hostname)
-        if match.applied:
-            merged = merged.model_copy(update={"asset": apply_constraints(merged.asset, list(match.applied))})
+        asset_effective = tuple(c for c in match.applied if has_usable_effect(c))
+        # Fetched fresh each call, not cached on `coordinator` -- this
+        # function already re-reads constraints_for_asset per call for
+        # the identical reason (a live recompute, not a cached one); a
+        # per-export-build cache would be a real fleet-scale win but is
+        # out of this fix's scope, matching Section 8.8's own housekeeping
+        # boundary (named, not silently expanded).
+        group_candidates = coordinator.memory.all_active_group_constraints()
+        group_match = match_group_constraints(group_candidates, merged.asset)
+        group_effective = tuple(g for g in group_match.applied if has_usable_effect(g))
+        if asset_effective or group_effective:
+            fold_result = fold_constraints(
+                merged.asset, constraints=list(asset_effective), group_constraints=list(group_effective)
+            )
+            merged = merged.model_copy(update={"asset": fold_result.asset})
     return _decomposition_dict(score_finding(merged).decomposition)
 
 
@@ -601,6 +622,49 @@ def _asset_constraint_deltas(coordinator: Coordinator, asset_id: str) -> list[di
     deltas: list[dict[str, Any]] = []
     for fid, enriched in state.enriched_by_id.items():
         if enriched.asset.asset_id != asset_id:
+            continue
+        after = state.risk_by_id.get(fid)
+        research = state.research_by_id.get(fid)
+        if after is None or research is None:
+            continue  # this finding failed upstream in the current run -- nothing to diff
+        before = score_finding(merge_research_into_enriched(enriched, research))
+        delta = _build_finding_delta(before, after)
+        deltas.append(
+            {
+                "finding_id": delta.finding_id,
+                "cve_id": delta.cve_id,
+                "hostname": delta.hostname,
+                "before_bucket": delta.before_bucket,
+                "after_bucket": delta.after_bucket,
+                "before_risk_score": delta.before_risk_score,
+                "after_risk_score": delta.after_risk_score,
+                "rationale_added": list(delta.rationale_added),
+                "rationale_removed": list(delta.rationale_removed),
+                "after_verdict_summary": delta.after_verdict_summary,
+                "changed": delta.changed,
+            }
+        )
+    return deltas
+
+
+def _group_constraint_deltas(coordinator: Coordinator, gc: Any) -> list[dict[str, Any]]:
+    """The group-constraint sibling of `_asset_constraint_deltas` -- same
+    pattern exactly (a clean, constraint-free "before" recompute against
+    the real, already-scored agents-path "after"), over every asset that
+    currently matches `gc` rather than one fixed asset_id. `after` is the
+    real `RiskRecommendation` `agents/risk.py`'s `score_finding_tool`
+    already produced -- which already folds in whatever was actually
+    active (asset- AND group-scoped) -- so this reuses
+    `_build_finding_delta` unchanged, exactly like the asset-scoped
+    version, rather than a second, isolated recompute."""
+    from rhinosecure.agents.coordinator import _build_finding_delta
+    from rhinosecure.agents.risk import merge_research_into_enriched
+
+    state = coordinator.state
+    deltas: list[dict[str, Any]] = []
+    for fid, enriched in state.enriched_by_id.items():
+        match = match_group_constraints([gc], enriched.asset)
+        if not match.applied:
             continue
         after = state.risk_by_id.get(fid)
         research = state.research_by_id.get(fid)
@@ -827,6 +891,79 @@ def _capacity_history(memory: Memory, *, data_dir: Path, run_label: str) -> list
     return entries
 
 
+def _group_scoped_constraints(
+    memory: Memory,
+    *,
+    live: bool,
+    not_live_note: str,
+    coordinator: Coordinator | None,
+    asset_index: dict[str, Any],
+    deterministic_deltas_by_asset: dict[str, list[dict[str, Any]]] | None = None,
+) -> list[dict[str, Any]]:
+    """The group-constraint sibling of `_asset_scoped_constraints`
+    (docs/group-constraints-design.md Section 8.3). Unlike an asset
+    constraint (which belongs to exactly one asset), a group constraint
+    can match many assets, so `matched_asset_count`/
+    `excluded_not_collected_asset_count` are counts, not a bool, and the
+    id lists are capped for display (`constraint_apply.DISPLAY_CAP`),
+    with the real total always shown honestly alongside -- the identical
+    fleet-scale-safe convention Section 7.2 already establishes for the
+    preview/confirm gate."""
+    entries = []
+    for gc in memory.all_active_group_constraints():
+        matched: list[str] = []
+        excluded: list[str] = []
+        for asset in asset_index.values():
+            match = match_group_constraints([gc], asset)
+            if match.applied:
+                matched.append(asset.asset_id)
+            elif match.skipped_not_collected:
+                excluded.append(asset.asset_id)
+        matched.sort()
+        excluded.sort()
+        if not live:
+            note = not_live_note
+            deltas: list[dict[str, Any]] = []
+        elif coordinator is not None:
+            deltas = _group_constraint_deltas(coordinator, gc)
+            note = None if matched else _NO_FINDINGS_NOTE
+        else:
+            # Adversarial-review finding, fixed: this used to read a
+            # `deterministic_group_deltas_by_id` parameter that
+            # `_build_deterministic_export` never actually computed or
+            # passed (it stayed at its own default, None), so a group
+            # constraint's deltas were ALWAYS empty on the deterministic
+            # path regardless of what it genuinely changed.
+            # `deterministic_deltas_by_asset` (keyed by asset_id) already
+            # has every real delta -- ConstraintApplicator.apply() folds
+            # asset- and group-origin effects together and
+            # record_delta fires whenever EITHER changed the asset, so
+            # the union of per-matched-asset deltas is this group
+            # constraint's own real, complete delta list.
+            by_asset = deterministic_deltas_by_asset or {}
+            deltas = [d for asset_id in matched for d in by_asset.get(asset_id, [])]
+            note = None if matched else _NO_FINDINGS_NOTE
+        entries.append(
+            {
+                "group_constraint_id": gc.id,
+                "group_field": gc.group_field,
+                "group_value": gc.group_value,
+                "constraint_text": gc.constraint_text,
+                "effect_kind": gc.effect_kind,
+                "effect_value": gc.effect_value,
+                "created_at": gc.created_at,
+                "active": gc.active,
+                "matched_asset_count": len(matched),
+                "matched_asset_ids": matched[:DISPLAY_CAP],
+                "excluded_not_collected_asset_count": len(excluded),
+                "excluded_not_collected_asset_ids": excluded[:DISPLAY_CAP],
+                "deltas": deltas,
+                "note": note,
+            }
+        )
+    return entries
+
+
 def _constraints_section(
     *,
     memory: Memory | None,
@@ -836,11 +973,12 @@ def _constraints_section(
     not_live_note: str,
     coordinator: Coordinator | None,
     current_asset_ids: set[str],
+    asset_index: dict[str, Any] | None = None,
     deterministic_deltas_by_asset: dict[str, list[dict[str, Any]]] | None = None,
     deterministic_skip_reason_by_id: dict[int, str] | None = None,
 ) -> dict[str, Any]:
     if memory is None:
-        return {"asset_scoped": [], "capacity": []}
+        return {"asset_scoped": [], "capacity": [], "group_scoped": []}
     return {
         "asset_scoped": _asset_scoped_constraints(
             memory,
@@ -852,6 +990,18 @@ def _constraints_section(
             deterministic_skip_reason_by_id=deterministic_skip_reason_by_id,
         ),
         "capacity": _capacity_history(memory, data_dir=data_dir, run_label=run_label),
+        "group_scoped": _group_scoped_constraints(
+            memory,
+            live=live,
+            not_live_note=not_live_note,
+            coordinator=coordinator,
+            asset_index=(
+                asset_index
+                if asset_index is not None
+                else (coordinator._asset_index if coordinator is not None else {})
+            ),
+            deterministic_deltas_by_asset=deterministic_deltas_by_asset,
+        ),
     }
 
 
@@ -925,13 +1075,26 @@ def _constraint_application_dict(
             "reason": _constraint_application_reason(contract),
             "digest": None,
             "applied_constraint_ids": [],
-            "skipped": {"legacy": [], "identity_mismatch": []},
+            "applied_group_constraint_ids": [],
+            "overridden_group_effects": [],
+            "skipped": {"legacy": [], "identity_mismatch": [], "not_collected": []},
         }
     return {
         "applied": True,
         "reason": None,
         "digest": summary.digest,
         "applied_constraint_ids": [r.constraint_id for r in summary.applied],
+        "applied_group_constraint_ids": [r.group_constraint_id for r in summary.applied_group],
+        "overridden_group_effects": [
+            {
+                "asset_id": o.asset_id,
+                "field": o.field,
+                "overriding_constraint_id": o.overriding_constraint_id,
+                "group_constraint_id": o.group_constraint_id,
+                "group_value_would_have_set": o.group_value_would_have_set,
+            }
+            for o in summary.overridden_group_effects
+        ],
         "skipped": {
             "legacy": [{"constraint_id": r.constraint_id, "asset_id": r.asset_id} for r in summary.skipped_legacy],
             "identity_mismatch": [
@@ -941,6 +1104,16 @@ def _constraint_application_dict(
                     "current_hostname": r.current_hostname,
                 }
                 for r in summary.skipped_identity_mismatch
+            ],
+            "not_collected": [
+                {
+                    "group_constraint_id": s.group_constraint_id,
+                    "group_field": s.group_field,
+                    "group_value": s.group_value,
+                    "skipped_asset_count": s.skipped_asset_count,
+                    "sample_asset_ids": list(s.sample_asset_ids),
+                }
+                for s in summary.skipped_not_collected
             ],
         },
     }
@@ -1004,6 +1177,7 @@ def _build_deterministic_export(
         not_live_note=(_PROVISIONAL_MAPPING_NOTE if is_provisional(contract) else _DETERMINISTIC_NOTE),
         coordinator=None,
         current_asset_ids={s.asset_id for s in scored},
+        asset_index=result.assets,
         deterministic_deltas_by_asset=deterministic_deltas_by_asset,
         deterministic_skip_reason_by_id=deterministic_skip_reason_by_id,
     )
@@ -1148,10 +1322,7 @@ def _build_agents_export(
     # mirrors the identical guard `_asset_constraint_deltas` (above) already
     # uses for the per-constraint delta view.
     agents_capp = (
-        summarize_for_assets(
-            coordinator.memory,
-            (e.asset for e in state.enriched_by_id.values() if e.finding.finding_id in state.risk_by_id),
-        )
+        summarize_for_assets(coordinator.memory, scored_assets(state.enriched_by_id, state.risk_by_id))
         if coordinator.memory is not None
         else None
     )

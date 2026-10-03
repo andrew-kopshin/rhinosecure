@@ -900,14 +900,14 @@ def test_quiet_flag_without_agents_is_a_harmless_no_op():
 def _fake_interpretation(
     *, asset_id="A02", effect_kind="compensating_control", effect_value="WAF rule enabled",
     affected_finding_ids=None, rationale="matched A02 via business_function",
-    constraint_kind="asset", patch_limit=None,
+    constraint_kind="asset", patch_limit=None, group_field=None, group_value=None,
 ):
     from rhinosecure.agents.constraint_intake import ConstraintInterpretation
 
     return ConstraintInterpretation(
         constraint_kind=constraint_kind,
         asset_id=asset_id, effect_kind=effect_kind, effect_value=effect_value,
-        patch_limit=patch_limit,
+        patch_limit=patch_limit, group_field=group_field, group_value=group_value,
         affected_finding_ids=affected_finding_ids if affected_finding_ids is not None else ["F02"],
         rationale=rationale, sources=["fake"],
     )
@@ -1292,6 +1292,189 @@ def test_constraint_add_capacity_decline_when_limit_not_extracted_exits_1(monkey
     assert exit_code == 1
     assert "capacity constraint -- patch_limit=None" in captured.out
     assert "Nothing computed or persisted." in captured.err
+
+
+# --- rhino constraint group (docs/group-constraints-design.md Slice A) ------
+
+
+def test_constraint_group_add_reports_an_asset_shaped_result_honestly_not_as_nothing_persisted(
+    monkeypatch, capsys
+):
+    """Adversarial-review finding, fixed: a statement typed into `rhino
+    constraint group add` by mistake (asset-shaped, not group-shaped) was
+    unconditionally reported as "Nothing persisted" regardless of what
+    submit_constraint actually did -- false whenever the asset branch (or
+    the capacity branch) genuinely persisted a row and ran a real re-plan.
+    Mirrors the shared `constraint add` dispatch's own correct branching."""
+    monkeypatch.setattr("rhinosecure.cli.submit_constraint", lambda *a, **k: _fake_submission_result())
+
+    exit_code = main(["constraint", "group", "add", "the finance workstation now sits behind a WAF"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0  # genuinely persisted -- must not report failure
+    assert "Nothing persisted" not in out
+    assert "Constraint #7 persisted" in out  # the real asset-constraint result, printed honestly
+
+
+def test_constraint_group_add_loads_the_inventory_via_load_batch_with_data_format_adapter_config(
+    monkeypatch, capsys
+):
+    """A56. Confirms load_batch is called the identical way `rhino run`/
+    `rhino constraint add` already do, and that no Coordinator.run() is
+    ever triggered by the group preview path."""
+    from rhinosecure.agents.coordinator import Coordinator
+
+    calls = {}
+    import rhinosecure.cli as cli_module
+
+    real_load_batch = cli_module.load_batch
+
+    def spy_load_batch(data_dir, adapter):
+        calls["data_dir"] = data_dir
+        calls["format"] = adapter.format
+        return real_load_batch(data_dir, adapter)
+
+    monkeypatch.setattr(cli_module, "load_batch", spy_load_batch)
+    monkeypatch.setattr(
+        Coordinator, "interpret_constraint",
+        lambda self, text, findings: _fake_interpretation(
+            asset_id=None, effect_kind="patch_window", effect_value="Sat-Sun",
+            constraint_kind="group", group_field="role", group_value="workstation",
+        ),
+    )
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("Coordinator.run must never be called for a group preview")
+
+    monkeypatch.setattr(Coordinator, "run", _fail_if_called)
+    monkeypatch.setattr(Coordinator, "replan", _fail_if_called)
+
+    exit_code = main(["constraint", "group", "add", "all workstations only patch weekends", "--offline"])
+
+    assert exit_code == 0
+    assert calls["data_dir"] == DEMO_DIR
+    assert calls["format"] == "native"
+    assert "matched" in capsys.readouterr().out.lower() or "workstation" in capsys.readouterr().out.lower()
+
+
+def test_constraint_list_shows_group_constraints_in_a_distinct_section_from_asset_constraints(capsys, tmp_path):
+    """A57, reconciled against a genuine self-contradiction between this
+    design's own Section 8.2 ("`rhino constraint list` -- Unchanged --
+    continues to operate only on constraints (asset-scoped), exactly as
+    today") and this test's own original description (implying `rhino
+    constraint list` itself should show both in one combined, sectioned
+    display). Section 8.2 is the deliberate, bolded architectural
+    decision -- honored here -- so this verifies separation BY COMMAND:
+    `rhino constraint list` shows asset rows only (byte-identical to
+    before this feature), `rhino constraint group list` shows group rows
+    only, and neither ever interleaves the other's rows into its own
+    output. Flagged as a reconciled design self-contradiction in the
+    Slice A report, not silently resolved."""
+    from rhinosecure.memory import Memory
+
+    db = tmp_path / "c.db"
+    Memory(db).add_constraint("A09", "an asset-scoped constraint text")
+    Memory(db).add_group_constraint("role", "workstation", "a group-scoped constraint text")
+
+    asset_exit = main(["constraint", "list", "--db", str(db)])
+    asset_out = capsys.readouterr().out
+    assert asset_exit == 0
+    assert "an asset-scoped constraint text" in asset_out
+    assert "a group-scoped constraint text" not in asset_out  # never interleaved
+
+    group_exit = main(["constraint", "group", "list", "--db", str(db), "--data", "demo"])
+    group_out = capsys.readouterr().out
+    assert group_exit == 0
+    assert "a group-scoped constraint text" in group_out
+    assert "an asset-scoped constraint text" not in group_out  # never interleaved
+
+
+def test_constraint_group_list_reports_a_bad_data_dir_cleanly_not_a_traceback(tmp_path, capsys):
+    """Adversarial-review finding, fixed: `constraint group list` had no
+    exception handling around its load_batch call, unlike its `add`/
+    `confirm` siblings -- an existing but empty/wrong-shaped --data
+    directory (missing assets.csv/findings.csv for the native format)
+    raised a raw IngestError traceback instead of a clean message."""
+    db = tmp_path / "c.db"
+    empty_dir = tmp_path / "empty-data"
+    empty_dir.mkdir()
+    exit_code = main(["constraint", "group", "list", "--data", str(empty_dir), "--db", str(db)])
+    assert exit_code == 1
+    assert "ingest error" in capsys.readouterr().err
+
+
+def test_constraint_group_retract_removes_the_named_group_constraint_only(tmp_path, capsys):
+    """A58. The decisive id-collision test: a same-numbered ASSET
+    constraint must be untouched by a group retract of the same numeric id."""
+    from rhinosecure.memory import Memory
+
+    db = tmp_path / "c.db"
+    memory = Memory(db)
+    asset_id = memory.add_constraint("A09", "asset constraint")
+    group_id = memory.add_group_constraint("role", "workstation", "group constraint")
+    assert asset_id == group_id  # deliberately constructed id collision
+
+    exit_code = main(["constraint", "group", "retract", str(group_id), "--db", str(db)])
+    assert exit_code == 0
+
+    # The group constraint is now inactive; the asset constraint (same
+    # numeric id, different table) is untouched.
+    assert memory.all_active_group_constraints() == []
+    assert len(memory.all_active_constraints()) == 1
+    assert memory.all_active_constraints()[0].id == asset_id
+
+
+def test_apply_constraints_flag_on_folds_a_matching_group_constraint_into_the_deterministic_score(tmp_path):
+    """A59. Seeds a group constraint (role=workstation, patch_window)
+    matching a currently-contested demo finding's asset (A09/WKS-FIN12,
+    F07 and F14) -- with --apply-constraints, the finding moves bucket
+    with risk_score unchanged."""
+    from rhinosecure.memory import Memory
+
+    db = tmp_path / "mem.db"
+    memory = Memory(db)
+    memory.add_group_constraint(
+        "role", "workstation", "all workstations only patch weekends",
+        effect_kind="patch_window", effect_value="Sat-Sun",
+    )
+    memory.close()
+
+    before = run_with_report(DEMO_DIR, 42, offline=True)
+    before_f14 = next(r for r in before.scored if r.finding_id == "F14")
+    assert before_f14.bucket.value == "contested"
+
+    after = run_with_report(DEMO_DIR, 42, offline=True, memory=Memory(db))
+    after_f14 = next(r for r in after.scored if r.finding_id == "F14")
+
+    assert after_f14.bucket.value == "next_window"
+    assert after_f14.risk_score == pytest.approx(before_f14.risk_score)
+
+
+def test_constraint_applicator_fetches_group_constraints_exactly_once_per_invocation_not_per_finding(
+    monkeypatch, tmp_path
+):
+    """A60. A call-count mock on all_active_group_constraints asserts
+    exactly one call across a whole --apply-constraints run over the
+    24-finding demo fixture -- the fleet-scale requirement made concrete."""
+    from rhinosecure.memory import Memory
+
+    db = tmp_path / "mem.db"
+    memory = Memory(db)
+    memory.add_group_constraint("role", "workstation", "x", effect_kind="patch_window", effect_value="Sat-Sun")
+    memory.close()
+
+    calls = []
+    original = Memory.all_active_group_constraints
+
+    def _spy(self):
+        calls.append(1)
+        return original(self)
+
+    monkeypatch.setattr(Memory, "all_active_group_constraints", _spy)
+
+    run_with_report(DEMO_DIR, 42, offline=True, memory=Memory(db))
+
+    assert len(calls) == 1
 
 
 # --- rhino web ---------------------------------------------------------------

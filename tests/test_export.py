@@ -72,7 +72,8 @@ def test_deterministic_export_matches_schema_shape(tmp_path):
     # consulted -- the plain `rhino run` without --apply-constraints.
     assert data["constraint_application"] == {
         "applied": False, "reason": "flag_not_set", "digest": None, "applied_constraint_ids": [],
-        "skipped": {"legacy": [], "identity_mismatch": []},
+        "applied_group_constraint_ids": [], "overridden_group_effects": [],
+        "skipped": {"legacy": [], "identity_mismatch": [], "not_collected": []},
     }
     assert data["run"] == {
         "data_dir": str(DEMO_DIR), "format": "native", "seed": 42, "offline": True, "agents": False,
@@ -144,7 +145,7 @@ def test_deterministic_export_matches_schema_shape(tmp_path):
     assert nvd_source["key"] == "CVE-2023-23397"
 
     assert data["contested"] == []
-    assert data["constraints"] == {"asset_scoped": [], "capacity": []}
+    assert data["constraints"] == {"asset_scoped": [], "capacity": [], "group_scoped": []}
     assert data["usage"] == {"research": None, "environment": None, "risk": None, "tot": None}
 
 
@@ -343,7 +344,7 @@ def test_deterministic_export_constraint_application_block_when_a_constraint_app
     assert capp["digest"] == result.constraint_application.digest
     assert capp["digest"].startswith("sha256:")
     [constraint_id] = capp["applied_constraint_ids"]
-    assert capp["skipped"] == {"legacy": [], "identity_mismatch": []}
+    assert capp["skipped"] == {"legacy": [], "identity_mismatch": [], "not_collected": []}
 
     # No duplication: the applied entry's full detail (constraint_text,
     # effect_kind/value, recorded hostname) lives only in the EXISTING
@@ -399,6 +400,144 @@ def test_deterministic_export_legacy_and_mismatched_constraints_are_named_not_si
     # F14 (A09, KEV, no control, no window) stays contested -- nothing applied.
     [f14] = [f for f in data["findings"] if f["finding_id"] == "F14"]
     assert f14["bucket"] == "contested"
+
+
+# --- group constraints (docs/group-constraints-design.md Slice A) ---------
+
+
+def test_constraints_section_gains_a_group_scoped_key_alongside_asset_scoped_and_capacity(tmp_path):
+    """A63. The third top-level key is always present, even with zero
+    group constraints on file (so a consumer reading
+    data.constraints.group_scoped unconditionally never gets a missing-
+    key error) -- and populated with the documented per-row shape once a
+    group constraint actually exists."""
+    from rhinosecure.export import write_run_export
+
+    memory = Memory(tmp_path / "mem.db")
+    result = run_with_report(DEMO_DIR, seed=42, offline=True)
+    export_path = tmp_path / "export.json"
+    write_run_export(
+        export_path, fmt="native", data_dir=DEMO_DIR, seed=42, offline=True,
+        agents=False, result=result, memory=memory,
+    )
+    data = json.loads(export_path.read_text(encoding="utf-8"))
+    assert data["constraints"]["group_scoped"] == []  # key always present, even when empty
+
+    memory.add_group_constraint(
+        "role", "workstation", "all workstations only patch weekends",
+        effect_kind="patch_window", effect_value="Sat-Sun",
+    )
+    write_run_export(
+        export_path, fmt="native", data_dir=DEMO_DIR, seed=42, offline=True,
+        agents=False, result=result, memory=memory,
+    )
+    data2 = json.loads(export_path.read_text(encoding="utf-8"))
+    [group_row] = data2["constraints"]["group_scoped"]
+    assert group_row["group_field"] == "role"
+    assert group_row["group_value"] == "workstation"
+    assert group_row["matched_asset_count"] >= 1  # demo's real workstations (A09/A10)
+
+
+def test_constraint_application_block_reports_applied_group_constraint_ids_separately_from_asset_ids(tmp_path):
+    """A64. applied_constraint_ids (asset-origin) and
+    applied_group_constraint_ids (group-origin) never share one combined
+    list, even when the two tables' numeric id spaces collide."""
+    from rhinosecure.export import write_run_export
+
+    memory = Memory(tmp_path / "mem.db")
+    asset_id = memory.add_constraint(
+        "A09", "WKS-FIN12 can only patch on Sundays",
+        effect_kind="patch_window", effect_value="Sun 02:00-06:00", hostname="WKS-FIN12",
+    )
+    group_id = memory.add_group_constraint(
+        "role", "sql", "all sql servers only patch weekends",
+        effect_kind="patch_restriction", effect_value="no reboot during business hours",
+    )
+    assert asset_id == group_id  # deliberately constructed id collision
+
+    result = run_with_report(DEMO_DIR, seed=42, offline=True, memory=memory)
+    export_path = tmp_path / "export.json"
+    write_run_export(
+        export_path, fmt="native", data_dir=DEMO_DIR, seed=42, offline=True,
+        agents=False, result=result, memory=memory,
+    )
+    data = json.loads(export_path.read_text(encoding="utf-8"))
+
+    capp = data["constraint_application"]
+    # The demo fixture has two real sql-role assets (A06/A12), so the group
+    # constraint genuinely applies to both -- the decisive check is that the
+    # two numerically-identical ids stay in their own separate lists (never
+    # merged into one combined list with no origin tag), not that either
+    # list is empty.
+    assert capp["applied_constraint_ids"] == [asset_id]
+    assert capp["applied_group_constraint_ids"] == [group_id, group_id]
+    assert all(entry == asset_id for entry in capp["applied_constraint_ids"])  # never contaminated by group ids
+    assert all(entry == group_id for entry in capp["applied_group_constraint_ids"])  # never contaminated by asset ids
+
+
+def test_deterministic_export_group_scoped_deltas_reflect_what_was_actually_scored(tmp_path):
+    """Adversarial-review finding, fixed: the deterministic path's
+    constraints.group_scoped[].deltas were ALWAYS empty regardless of
+    what a group constraint genuinely changed -- _build_deterministic_
+    export never computed or passed a deterministic_group_deltas_by_id
+    (the old parameter stayed at its own default, None, on every call).
+    Seeds a group constraint (role=sql, compensating_control) matching
+    demo's two real sql-role assets (A06/A12) and confirms real,
+    non-empty deltas appear, matching what was genuinely scored."""
+    from rhinosecure.export import write_run_export
+
+    memory = Memory(tmp_path / "mem.db")
+    memory.add_group_constraint(
+        "role", "sql", "all sql servers now sit behind enhanced monitoring",
+        effect_kind="compensating_control", effect_value="enhanced monitoring enabled",
+    )
+    result = run_with_report(DEMO_DIR, seed=42, offline=True, memory=memory)
+    export_path = tmp_path / "export.json"
+    write_run_export(
+        export_path, fmt="native", data_dir=DEMO_DIR, seed=42, offline=True,
+        agents=False, result=result, memory=memory,
+    )
+    data = json.loads(export_path.read_text(encoding="utf-8"))
+
+    [group_row] = data["constraints"]["group_scoped"]
+    assert group_row["group_field"] == "role" and group_row["group_value"] == "sql"
+    assert group_row["deltas"] != []  # the real bug: this was always []
+    delta_asset_ids = {d["asset_id"] for d in group_row["deltas"]}
+    assert delta_asset_ids <= set(group_row["matched_asset_ids"])  # only matched assets' deltas appear
+    assert group_row["note"] is None  # findings exist, nothing to explain
+
+
+def test_zero_group_constraints_leaves_export_byte_identical_in_shape_to_pre_feature_except_the_new_empty_keys(
+    tmp_path,
+):
+    """A66. The export-level sibling of the Section 10 acceptance test:
+    with zero rows in group_constraints, every existing export key/value
+    is unchanged; the only diff from a pre-feature export is the presence
+    of the new, empty keys."""
+    from rhinosecure.export import write_run_export
+
+    memory = Memory(tmp_path / "mem.db")
+    memory.add_constraint(
+        "A09", "WKS-FIN12 can only patch on Sundays",
+        effect_kind="patch_window", effect_value="Sun 02:00-06:00", hostname="WKS-FIN12",
+    )
+    result = run_with_report(DEMO_DIR, seed=42, offline=True, memory=memory)
+    export_path = tmp_path / "export.json"
+    write_run_export(
+        export_path, fmt="native", data_dir=DEMO_DIR, seed=42, offline=True,
+        agents=False, result=result, memory=memory,
+    )
+    data = json.loads(export_path.read_text(encoding="utf-8"))
+
+    assert data["constraints"]["group_scoped"] == []
+    assert data["constraint_application"]["applied_group_constraint_ids"] == []
+    assert data["constraint_application"]["overridden_group_effects"] == []
+    assert data["constraint_application"]["skipped"]["not_collected"] == []
+    # Every pre-existing key/value this scenario already exercises
+    # (asset_scoped application) is unaffected by group_constraints being empty.
+    assert data["constraint_application"]["applied"] is True
+    [asset_scoped] = data["constraints"]["asset_scoped"]
+    assert asset_scoped["asset_id"] == "A09"
 
 
 def test_agents_export_asset_scoped_constraints_are_honest_about_legacy_and_mismatched_rows(
@@ -524,7 +663,8 @@ def test_agents_export_constraint_application_block_is_not_applicable_with_no_me
     # caller produces.
     assert data["constraint_application"] == {
         "applied": False, "reason": "flag_not_set", "digest": None, "applied_constraint_ids": [],
-        "skipped": {"legacy": [], "identity_mismatch": []},
+        "applied_group_constraint_ids": [], "overridden_group_effects": [],
+        "skipped": {"legacy": [], "identity_mismatch": [], "not_collected": []},
     }
 
 
@@ -583,7 +723,7 @@ def test_agents_export_constraint_application_block_reports_what_actually_applie
     assert capp["reason"] is None
     assert capp["digest"].startswith("sha256:")
     [constraint_id] = capp["applied_constraint_ids"]
-    assert capp["skipped"] == {"legacy": [], "identity_mismatch": []}
+    assert capp["skipped"] == {"legacy": [], "identity_mismatch": [], "not_collected": []}
 
     [f02] = [f for f in data["findings"] if f["finding_id"] == "F02"]
     assert f02["bucket"] == "next_window"  # was contested without the constraint
@@ -657,7 +797,7 @@ def test_agents_export_constraint_application_block_excludes_a_constraint_whose_
     capp = data["constraint_application"]
     assert capp["applied"] is True  # a real Memory WAS consulted this run (coordinator.memory is not None)
     assert capp["applied_constraint_ids"] == []
-    assert capp["skipped"] == {"legacy": [], "identity_mismatch": []}  # not skipped by reason either -- just never reached
+    assert capp["skipped"] == {"legacy": [], "identity_mismatch": [], "not_collected": []}  # not skipped by reason either -- just never reached
 
 
 # --- deterministic path: capacity history is agents-independent ---------
@@ -931,6 +1071,7 @@ class _QueuedFakeCrew:
                     "risk_score": tool_result["risk_score"], "bucket": tool_result["bucket"],
                     "scoring_rationale": tool_result["rationale"],
                     "constraints_applied": tool_result["constraints_applied"],
+                    "group_constraints_applied": tool_result.get("group_constraints_applied", []),
                     "neutralized_axes": tool_result.get("neutralized_axes", []),
                     "verdict_summary": "fake verdict summary.", "narrative": "fake narrative",
                     "sources": ["risk-source"],
@@ -1149,6 +1290,58 @@ def test_agents_export_full_shape_with_contested_finding_and_constraint(monkeypa
     assert "WAF rule enabled" in delta["rationale_added"][0]
 
 
+def test_agents_decomposition_reflects_a_live_group_constraint_identically_to_score_finding_tool(
+    monkeypatch, agents_data_dir, tmp_path
+):
+    """A65. Seeds a group constraint (role=exchange, compensating_control)
+    matching F01's asset (A01/EXCH01), runs the real agents pipeline (fake
+    Crew), and confirms the export's recomputed decomposition agrees with
+    what score_finding_tool actually produced -- the identical bug class
+    CLAUDE.md's "Two fixes" entry already found once for the asset-only
+    case at this exact call site (_agents_decomposition), now checked for
+    the group-origin case too."""
+    from rhinosecure.agents import coordinator as coordinator_module
+    from rhinosecure.agents.coordinator import Coordinator
+    from rhinosecure.ingest import join_findings
+    from rhinosecure.export import write_run_export
+
+    monkeypatch.setattr(coordinator_module, "Crew", _QueuedFakeCrew)
+
+    memory = Memory(tmp_path / "mem.db")
+    memory.add_group_constraint(
+        "role", "exchange", "all exchange servers now sit behind a WAF",
+        effect_kind="compensating_control", effect_value="WAF rule enabled",
+    )
+
+    findings = list(join_findings(agents_data_dir / "findings.csv", agents_data_dir / "assets.csv"))
+
+    _QueuedFakeCrew.queue = [
+        _research_json("F01", "CVE-2021-26855"),
+        _research_json("F02", "CVE-2018-8410"),
+        _research_json("F03", "CVE-2020-1472"),
+        _environment_json("F01", "CVE-2021-26855", "A01", "EXCH01"),
+        _environment_json("F02", "CVE-2018-8410", "A02", "WKS01"),
+        _environment_json("F03", "CVE-2020-1472", "A03", "WKS02"),
+        "F01", "F02", "F03",
+    ]
+
+    coordinator = Coordinator(agents_data_dir, memory=memory)
+    coordinator.run(findings)
+
+    export_path = tmp_path / "export.json"
+    write_run_export(
+        export_path, fmt="native", data_dir=agents_data_dir, seed=42, offline=False,
+        agents=True, coordinator=coordinator, memory=memory,
+    )
+    data = json.loads(export_path.read_text(encoding="utf-8"))
+
+    [f01] = [f for f in data["findings"] if f["finding_id"] == "F01"]
+    f01_decomposition = f01["decomposition"]
+    assert f01_decomposition["impact"]["compensating_controls"] == ["WAF rule enabled"]
+    assert f01["risk_score"] == coordinator.state.risk_by_id["F01"].risk_score
+    assert "all exchange servers now sit behind a WAF" in coordinator.state.risk_by_id["F01"].group_constraints_applied
+
+
 # --- agents path: memory-less (provisional-shaped) coordinator ----------
 
 
@@ -1225,7 +1418,8 @@ def test_agents_export_constraints_section_notes_a_memory_less_coordinator(monke
     # Coordinator never touched it) would have passed the full suite.
     assert data["constraint_application"] == {
         "applied": False, "reason": "flag_not_set", "digest": None, "applied_constraint_ids": [],
-        "skipped": {"legacy": [], "identity_mismatch": []},
+        "applied_group_constraint_ids": [], "overridden_group_effects": [],
+        "skipped": {"legacy": [], "identity_mismatch": [], "not_collected": []},
     }
 
 

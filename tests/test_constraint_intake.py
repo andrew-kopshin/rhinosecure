@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 from crewai import Task
@@ -257,15 +258,24 @@ def test_verify_does_not_check_effect_value_or_patch_limit():
     statement's own worked example spells its number as a word ('only
     five patches'), so a mechanical equality check would reject valid
     output. Any effect_value/patch_limit passes regardless of the real
-    tool results on file."""
+    tool results on file. Two separate, single-shape constructions (not
+    one combined asset_id+patch_limit object, which the group-constraints
+    era's cross-shape model_validator now correctly refuses) -- the point
+    is unchanged: the function reads neither field at all."""
     from rhinosecure.agents.constraint_intake import verify_constraint_matches_tool
 
     tools, call_log = _tools()
     tools["search_assets"].run(query="payroll")
     tools["list_findings_for_asset"].run(asset_id="A12")
 
-    weird = _interpretation(effect_value="something nobody said", patch_limit=999)
-    verify_constraint_matches_tool(weird, call_log)  # must not raise
+    weird_effect_value = _interpretation(effect_value="something nobody said")
+    verify_constraint_matches_tool(weird_effect_value, call_log)  # must not raise
+
+    weird_patch_limit = _interpretation(
+        constraint_kind="capacity", asset_id=None, effect_kind=None,
+        effect_value=None, patch_limit=999, affected_finding_ids=[],
+    )
+    verify_constraint_matches_tool(weird_patch_limit, call_log)  # must not raise
 
 
 def test_verify_is_inert_for_capacity_and_refusal_shapes():
@@ -381,6 +391,9 @@ def test_asset_interpretation_still_validates_with_the_existing_fields_populated
 
 
 def test_refusal_interpretation_still_validates_with_everything_null_or_empty():
+    """A44 (extended): also asserts group_field/group_value are None on a
+    refusal-shaped interpretation -- genuine refusal validation must not
+    require the new group fields to be populated."""
     interpretation = ConstraintInterpretation(
         constraint_kind=None,
         asset_id=None,
@@ -395,6 +408,8 @@ def test_refusal_interpretation_still_validates_with_everything_null_or_empty():
     assert interpretation.asset_id is None
     assert interpretation.patch_limit is None
     assert interpretation.affected_finding_ids == []
+    assert interpretation.group_field is None
+    assert interpretation.group_value is None
 
 
 def test_an_unrecognized_constraint_kind_is_rejected_at_parse_time_not_silently_inert():
@@ -559,3 +574,176 @@ def test_task_prompt_tells_the_interpreter_not_to_resolve_on_a_placeholder():
     description = build_constraint_task("the file server reboots on Sundays", agent).description
     assert "not_collected" in description
     assert "placeholder" in description
+
+
+# --- group-shaped intake (docs/group-constraints-design.md Slice A) -------
+
+
+def test_a_group_shaped_interpretation_parses_with_asset_id_and_patch_limit_null():
+    """A33."""
+    interpretation = ConstraintInterpretation(
+        constraint_kind="group",
+        asset_id=None,
+        effect_kind="patch_window",
+        effect_value="Sat-Sun",
+        patch_limit=None,
+        group_field="role",
+        group_value="workstation",
+        affected_finding_ids=[],
+        rationale="all workstations only patch weekends",
+        sources=[],
+    )
+    assert interpretation.constraint_kind == "group"
+    assert interpretation.group_field == "role"
+    assert interpretation.group_value == "workstation"
+    assert interpretation.asset_id is None
+    assert interpretation.patch_limit is None
+
+
+def test_group_value_type_is_imported_from_schema_assetrole_not_a_second_declaration():
+    """A34. Checked by AST inspection of the SOURCE, not by runtime
+    identity or equality on the resolved annotation object -- both of
+    those turn out not to work here: `typing.Literal.__class_getitem__`
+    is `@_tp_cache`-memoized, so a hand-copied `Literal[...]` with today's
+    same 15 values IN THE SAME ORDER resolves to the exact same cached
+    singleton as `schema.AssetRole` itself, making `is` and `==` both
+    useless for telling "imports AssetRole" apart from "redeclares an
+    identical Literal" (confirmed directly: both returned True against a
+    hand-copied duplicate before this test was rewritten). The only
+    mechanism that genuinely distinguishes the two is whether the source
+    actually imports the name -- a future 16th AssetRole value is picked
+    up automatically only if this module never had its own copy to begin
+    with."""
+    import ast
+    import inspect
+
+    import rhinosecure.agents.constraint_intake as constraint_intake_module
+
+    tree = ast.parse(Path(inspect.getfile(constraint_intake_module)).read_text(encoding="utf-8"))
+    [class_def] = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == "ConstraintInterpretation"
+    ]
+    [group_value_field] = [
+        node for node in class_def.body
+        if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", None) == "group_value"
+    ]
+    annotation_names = {n.id for n in ast.walk(group_value_field.annotation) if isinstance(n, ast.Name)}
+    assert "AssetRole" in annotation_names
+
+
+def test_an_out_of_vocabulary_group_field_is_rejected_at_parse_time():
+    """A35. Mirrors the existing unrecognized-effect_kind rejection exactly
+    -- group_field="owner" is a real Asset field, just not in v1's
+    Literal["role"] scope."""
+    with pytest.raises(Exception):
+        ConstraintInterpretation(
+            constraint_kind="group",
+            asset_id=None,
+            effect_kind="patch_window",
+            effect_value="Sat-Sun",
+            patch_limit=None,
+            group_field="owner",
+            group_value="workstation",
+            affected_finding_ids=[],
+            rationale="x",
+            sources=[],
+        )
+
+
+def test_an_out_of_vocabulary_group_value_is_rejected_at_parse_time():
+    """A36."""
+    with pytest.raises(Exception):
+        ConstraintInterpretation(
+            constraint_kind="group",
+            asset_id=None,
+            effect_kind="patch_window",
+            effect_value="Sat-Sun",
+            patch_limit=None,
+            group_field="role",
+            group_value="not-a-real-role",
+            affected_finding_ids=[],
+            rationale="x",
+            sources=[],
+        )
+
+
+def test_a_response_with_both_asset_id_and_group_field_populated_is_rejected():
+    """A37. The new cross-shape model_validator("exactly one shape
+    populates") rejects a malformed response naming both."""
+    with pytest.raises(Exception):
+        ConstraintInterpretation(
+            constraint_kind="asset",
+            asset_id="A12",
+            effect_kind="patch_window",
+            effect_value="Sat-Sun",
+            patch_limit=None,
+            group_field="role",
+            group_value="workstation",
+            affected_finding_ids=[],
+            rationale="x",
+            sources=[],
+        )
+
+
+def test_a_response_with_group_field_but_no_effect_is_a_legitimate_uninterpreted_row_shape():
+    """A38. Mirrors memory.py's own documented allowance: group_field/
+    group_value populated, effect_kind=None/effect_value=None still
+    validates -- a real, legal partial shape, not a refusal."""
+    interpretation = ConstraintInterpretation(
+        constraint_kind="group",
+        asset_id=None,
+        effect_kind=None,
+        effect_value=None,
+        patch_limit=None,
+        group_field="role",
+        group_value="workstation",
+        affected_finding_ids=[],
+        rationale="resolved the group, but no clear effect was stated",
+        sources=[],
+    )
+    assert interpretation.group_field == "role"
+    assert interpretation.effect_kind is None
+
+
+def test_build_constraint_task_includes_the_full_role_glossary():
+    """A39. The task description's only way to map "domain controllers" ->
+    "dc" without a tool call."""
+    agent = build_constraint_agent([], llm=get_llm(LLMConfig(api_key="test-key-not-used")))
+    description = build_constraint_task("all domain controllers only patch weekends", agent).description
+    assert "dc (Active Directory domain controller)" in description
+    assert "workstation (an employee's desktop or laptop)" in description
+    assert "printer (a printer or similarly" in description
+
+
+def test_build_constraint_task_instructs_not_to_call_tools_for_a_group_statement():
+    """A40. Mirrors the existing capacity-case instruction."""
+    agent = build_constraint_agent([], llm=get_llm(LLMConfig(api_key="test-key-not-used")))
+    description = build_constraint_task("all workstations only patch weekends", agent).description
+    assert "Do NOT call search_assets or list_findings_for_asset for a group statement" in description
+
+
+def test_build_constraint_task_states_the_singular_vs_categorical_distinction():
+    """A41. The only lever this codebase has for steering model behavior
+    on "one machine vs. a category" at all."""
+    agent = build_constraint_agent([], llm=get_llm(LLMConfig(api_key="test-key-not-used")))
+    description = build_constraint_task("all workstations only patch weekends", agent).description
+    assert "does this statement name one specific machine, or a category of machines" in description
+
+
+def test_build_constraint_task_instructs_refusal_on_a_category_plus_exception_statement():
+    """A42. Pins the "all workstations except the finance ones" refusal
+    instruction text."""
+    agent = build_constraint_agent([], llm=get_llm(LLMConfig(api_key="test-key-not-used")))
+    description = build_constraint_task("all workstations except the finance ones", agent).description
+    assert "all workstations except the finance ones" in description
+    assert "is also a refusal for now" in description
+
+
+def test_build_constraint_task_instructs_refusal_on_a_compound_asset_plus_group_statement():
+    """A43. A statement combining an asset reference and a group
+    predicate is a refusal, never a best-effort pick of one half."""
+    agent = build_constraint_agent([], llm=get_llm(LLMConfig(api_key="test-key-not-used")))
+    description = build_constraint_task("WKS-FIN12 and the other finance workstations", agent).description
+    assert "WKS-FIN12 and the other finance" in description
+    assert "is likewise a refusal, never a best-effort pick of one half" in description

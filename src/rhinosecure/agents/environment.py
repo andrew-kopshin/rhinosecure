@@ -91,7 +91,7 @@ from rhinosecure.agents.entity_consistency import (
 from rhinosecure.agents.limits import MAX_AGENT_EXECUTION_SECONDS
 from rhinosecure.agents.prompt_safety import UNTRUSTED_TEXT_NOTICE, fence
 from rhinosecure.agents.research import ResearchFinding
-from rhinosecure.constraint_apply import match_constraints
+from rhinosecure.constraint_apply import match_constraints, match_group_constraints
 from rhinosecure.llm import get_llm
 from rhinosecure.memory import Memory
 from rhinosecure.schema import Asset, EnrichedFinding
@@ -140,6 +140,11 @@ class EnvironmentAssessment(BaseModel):
     # Active memory.Constraint text for this asset, if any -- informational
     # only, never merged into the three fields above. See module docstring.
     human_constraints: list[str] = []
+    # The group-constraint sibling of human_constraints (docs/group-
+    # constraints-design.md Section 8.6) -- a separate field, never
+    # folded into human_constraints, so a reader can tell an asset-scoped
+    # constraint's text apart from a group-scoped one's.
+    group_human_constraints: list[str] = []
     # Which of criticality/environment/data_sensitivity/role/internet_exposed
     # this asset's SOURCE never determined at all (scoring.neutralized_axes_for)
     # -- copied verbatim from lookup_asset_context's own result, the same
@@ -164,7 +169,12 @@ def build_environment_tools(
     CrewAI tool, logging every call the same way research.py's tools do.
     `memory` is optional and defaults to None -- omitting it (as every
     call site did before constraints existed) reproduces the exact prior
-    behavior, `human_constraints` always empty."""
+    behavior, `human_constraints`/`group_human_constraints` always empty.
+
+    `group_constraints` is fetched ONCE here, at tool-build time -- never
+    per asset (docs/group-constraints-design.md Section 3's fleet-scale
+    reading rule)."""
+    group_constraints = memory.all_active_group_constraints() if memory is not None else []
 
     @tool("lookup_asset_context")
     def lookup_asset_context(asset_id: str) -> str:
@@ -189,8 +199,10 @@ def build_environment_tools(
             if memory is not None:
                 candidates = memory.constraints_for_asset(asset_id)
                 human_constraints = match_constraints(candidates, asset_id, asset.hostname).applied
+                group_human_constraints = match_group_constraints(group_constraints, asset).applied
             else:
                 human_constraints = []
+                group_human_constraints = []
             # NOT fenced here, deliberately: patch_window/patch_restrictions/
             # compensating_controls/human_constraints are the fields the task
             # below instructs the model to copy VERBATIM into its own
@@ -221,6 +233,7 @@ def build_environment_tools(
                 "compensating_controls": list(asset.compensating_control_list),
                 "owner": asset.owner,
                 "human_constraints": [c.constraint_text for c in human_constraints],
+                "group_human_constraints": [g.constraint_text for g in group_human_constraints],
                 # Field names above whose value is a documented default,
                 # because this asset's source never collected them
                 # (adapters/base.py). A blank patch_window listed here
@@ -298,13 +311,14 @@ def build_environment_task(
             "os_build_consistent_provenance at its default value "
             "\"model_judgment\"; every other field must come from "
             "lookup_asset_context or the finding text above. If the tool's "
-            "human_constraints is non-empty, copy it verbatim into your own "
-            "human_constraints field and mention it explicitly in "
-            "applicability_summary as a fact distinct from the asset's own "
+            "human_constraints or group_human_constraints is non-empty, copy "
+            "each verbatim into your own human_constraints/"
+            "group_human_constraints fields and mention them explicitly in "
+            "applicability_summary as facts distinct from the asset's own "
             "declared patch_window/compensating_controls/patch_restrictions "
-            "-- never blend a human constraint into those three fields, "
-            "which must always report only what the asset record itself "
-            "declares. Copy the tool's neutralized_axes list verbatim into "
+            "-- never blend a human or group constraint into those three "
+            "fields, which must always report only what the asset record "
+            "itself declares. Copy the tool's neutralized_axes list verbatim into "
             "your own neutralized_axes field. For every axis named there "
             "(role, environment, data_sensitivity, criticality, "
             "internet_exposed), the value the tool returned for it is a "
@@ -326,7 +340,10 @@ def build_environment_task(
             "compensating_controls (a list of strings), has_patch_window "
             "(bool), patch_window, patch_restrictions, human_constraints "
             "(a list of strings, copied verbatim from the tool result -- "
-            "empty list if the tool returned none), neutralized_axes (a "
+            "empty list if the tool returned none), group_human_constraints "
+            "(a list of strings, copied verbatim from the tool result's own "
+            "group_human_constraints -- empty list if the tool returned "
+            "none), neutralized_axes (a "
             "list of strings, copied verbatim from the tool result's own "
             "neutralized_axes -- empty list if the tool returned none; "
             "REQUIRED even when empty, never omitted), applicability_summary "
@@ -420,6 +437,13 @@ def verify_environment_matches_tool(
     if list(assessment.human_constraints) != list(tool_result.get("human_constraints", [])):
         raise EnvironmentMismatchError(
             f"{assessment.asset_id}: human_constraints does not match the tool's result verbatim"
+        )
+    if list(assessment.group_human_constraints) != list(
+        tool_result.get("group_human_constraints", [])
+    ):
+        raise EnvironmentMismatchError(
+            f"{assessment.asset_id}: group_human_constraints does not match the tool's "
+            "result verbatim"
         )
 
     neutralized = tool_result.get("neutralized_axes") or []

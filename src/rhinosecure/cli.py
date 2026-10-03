@@ -194,7 +194,8 @@ from rhinosecure.constraint_apply import (
     ConstraintAccumulator,
     ConstraintApplicationSummary,
     SkippedConstraintRecord,
-    apply_constraints,
+    fold_constraints,
+    scored_assets,
     summarize_for_assets,
 )
 from rhinosecure.enrich.attack import load_index as load_attack_index
@@ -300,10 +301,15 @@ class ConstraintApplicator:
 
     def apply(self, enriched: EnrichedFinding) -> EnrichedFinding:
         asset = enriched.asset
-        effective = self._engine.record(asset.asset_id, asset.hostname)
-        if not effective:
+        asset_effective = self._engine.record(asset.asset_id, asset.hostname)
+        group_effective = self._engine.record_group(asset)
+        if not asset_effective and not group_effective:
             return enriched
-        return enriched.model_copy(update={"asset": apply_constraints(asset, effective)})
+        fold_result = fold_constraints(
+            asset, constraints=list(asset_effective), group_constraints=list(group_effective)
+        )
+        self._engine.record_fold_result(fold_result)
+        return enriched.model_copy(update={"asset": fold_result.asset})
 
     def record_delta(self, before: ScoredFinding, after: ScoredFinding) -> None:
         self._deltas[after.finding_id] = _build_deterministic_delta(before, after)
@@ -543,11 +549,18 @@ def submit_constraint(
     db_path: Path | str | None = None,
     fmt: str = DEFAULT_FORMAT,
     adapter_config: str | None = None,
-) -> ConstraintSubmissionResult | CapacitySubmissionResult:
-    """CLI entry point for `rhino constraint add` -- the agent equivalent
-    of `run`/`run_agents`, dispatching `agents/coordinator.py`'s
-    `submit_constraint` against every finding in `data_dir`. Imports
-    agents.*/memory lazily, same reason as `run_agents`.
+) -> ConstraintSubmissionResult | CapacitySubmissionResult | GroupConstraintPreview:
+    """CLI entry point for `rhino constraint add` (and, when `text`
+    resolves to a group-shaped statement, `rhino constraint group add` --
+    the identical function, Section 7.4's "no new job kind" decision
+    applied to the CLI) -- the agent equivalent of `run`/`run_agents`,
+    dispatching `agents/coordinator.py`'s `submit_constraint` against
+    every finding in `data_dir`. Imports agents.*/memory lazily, same
+    reason as `run_agents`.
+
+    A group-shaped statement returns a `GroupConstraintPreview` --
+    nothing is persisted here; `confirm_group_constraint` below is the
+    separate call that writes.
 
     `fmt` selects the ingest adapter exactly as it does for `run`. This is
     the path that most needs a non-native format to work: a real scanner
@@ -575,6 +588,52 @@ def submit_constraint(
         contract=contract,
     )
     return coordinator.submit_constraint(text, findings, seed=seed)
+
+
+def confirm_group_constraint(
+    token: str,
+    data_dir: Path,
+    seed: int,
+    *,
+    offline: bool = False,
+    db_path: Path | str | None = None,
+    fmt: str = DEFAULT_FORMAT,
+    adapter_config: str | None = None,
+) -> GroupConstraintSubmissionResult:
+    """CLI entry point for `rhino constraint group confirm` -- re-loads
+    the inventory the identical deterministic way `submit_constraint`
+    above does (no `coordinator.run()` call anywhere in this function or
+    in `Coordinator.confirm_group_constraint` itself), then dispatches to
+    `agents/coordinator.py`'s `confirm_group_constraint`. No LLM call at
+    all: the one Interpreter dispatch already happened at preview time,
+    in whatever earlier `rhino constraint group add` invocation produced
+    `token`.
+
+    `--data`/`--format`/`--adapter-config` must match what `add` used --
+    confirm re-validates the match against CURRENT data at this path and
+    refuses on disagreement (Section 7.3), so pointing this at a
+    different fleet than the preview reviewed fails safely rather than
+    silently confirming something nobody reviewed."""
+    from rhinosecure.agents.coordinator import Coordinator
+    from rhinosecure.memory import DEFAULT_DB_PATH, Memory
+
+    random.seed(seed)
+    adapter = load_config_adapter(adapter_config) if adapter_config else get_adapter(fmt)
+    fmt = adapter.format
+    contract = getattr(adapter, "contract", None)
+    assets, enriched = load_batch(data_dir, adapter)
+    findings = list(enriched)
+    _warn_of_exclusions(adapter.stats, fmt, contract)
+    memory = Memory(db_path if db_path is not None else DEFAULT_DB_PATH)
+    coordinator = Coordinator(
+        data_dir,
+        cache=SnapshotCache(offline=offline),
+        memory=memory,
+        assets=assets,
+        ingest_format=adapter.run_label,
+        contract=contract,
+    )
+    return coordinator.confirm_group_constraint(token, findings, seed=seed)
 
 
 def _print_rows(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> None:
@@ -682,12 +741,27 @@ def _print_constraint_application_summary(summary: ConstraintApplicationSummary)
     -- so this function is simply never called in either case; it does
     not itself decide whether to print, the same split
     `_print_usage_summary` draws against its own caller."""
-    print(
-        f"Constraints applied: {summary.applied_count} "
-        f"(skipped: {summary.skipped_legacy_count} legacy, "
-        f"{summary.skipped_identity_mismatch_count} identity_mismatch) "
-        f"-- digest {summary.digest[:19]}..."
-    )
+    # Group-aware clauses only appear when group constraints are actually
+    # in play this run (applied, or skipped as not_collected) -- keeps the
+    # printed line byte-identical to its pre-group-constraints shape for
+    # every asset-only run, rather than a permanent ", 0 group"/
+    # ", 0 not_collected" suffix no one asked to see.
+    if summary.applied_group or summary.skipped_not_collected:
+        not_collected_count = sum(s.skipped_asset_count for s in summary.skipped_not_collected)
+        print(
+            f"Constraints applied: {summary.applied_count} asset, {summary.applied_group_count} group "
+            f"(skipped: {summary.skipped_legacy_count} legacy, "
+            f"{summary.skipped_identity_mismatch_count} identity_mismatch, "
+            f"{not_collected_count} not_collected) "
+            f"-- digest {summary.digest[:19]}..."
+        )
+    else:
+        print(
+            f"Constraints applied: {summary.applied_count} "
+            f"(skipped: {summary.skipped_legacy_count} legacy, "
+            f"{summary.skipped_identity_mismatch_count} identity_mismatch) "
+            f"-- digest {summary.digest[:19]}..."
+        )
 
 
 def _agents_constraint_application_summary(coordinator: "Coordinator") -> ConstraintApplicationSummary | None:
@@ -725,10 +799,9 @@ def _agents_constraint_application_summary(coordinator: "Coordinator") -> Constr
     always agree."""
     if coordinator.memory is None:
         return None
-    scored_ids = coordinator.state.risk_by_id
     return summarize_for_assets(
         coordinator.memory,
-        (e.asset for e in coordinator.state.enriched_by_id.values() if e.finding.finding_id in scored_ids),
+        scored_assets(coordinator.state.enriched_by_id, coordinator.state.risk_by_id),
     )
 
 
@@ -832,8 +905,13 @@ def _print_constraint_interpretation(interpretation: ConstraintInterpretation) -
         print(f"  capacity constraint -- patch_limit={interpretation.patch_limit}")
         print(_wrap(interpretation.rationale, indent="  rationale: ", continuation_indent="    "))
         return
+    if interpretation.constraint_kind == "group":
+        print(f"  group constraint -- {interpretation.group_field}={interpretation.group_value!r}")
+        print(f"  effect: {interpretation.effect_kind} = {interpretation.effect_value!r}")
+        print(_wrap(interpretation.rationale, indent="  rationale: ", continuation_indent="    "))
+        return
     if interpretation.constraint_kind != "asset" or interpretation.asset_id is None:
-        print(f"  could not resolve to a single asset or a capacity limit -- {interpretation.rationale}")
+        print(f"  could not resolve to a single asset, a group, or a capacity limit -- {interpretation.rationale}")
         return
     print(f"  asset: {interpretation.asset_id}")
     print(f"  effect: {interpretation.effect_kind} = {interpretation.effect_value!r}")
@@ -921,6 +999,67 @@ def _print_capacity_result(result: CapacitySubmissionResult) -> None:
                 continuation_indent="    ",
             )
         )
+
+
+def _print_group_preview_result(result: GroupConstraintPreview) -> None:
+    """docs/group-constraints-design.md Section 7.4: prints the preview
+    (field, value, counts, a capped sample) and a ready-to-run next
+    command with the real token -- the identical "prints the exact next
+    command" convention `rhino adapt propose`'s own output already uses.
+    Matched/excluded lists are capped for display
+    (`constraint_apply.DISPLAY_CAP`) with the real total always shown."""
+    from rhinosecure.constraint_apply import DISPLAY_CAP
+
+    print(
+        f"\nGroup constraint preview: {result.group_field}={result.group_value!r}, "
+        f"effect: {result.effect_kind}={result.effect_value!r}"
+    )
+    matched = result.matched_asset_ids
+    excluded = result.excluded_not_collected_asset_ids
+    print(
+        f"  matched: {len(matched)} asset(s)"
+        + (f" (showing {min(len(matched), DISPLAY_CAP)}): {', '.join(matched[:DISPLAY_CAP])}" if matched else "")
+    )
+    if excluded:
+        print(
+            f"  excluded as not_collected: {len(excluded)} asset(s) "
+            f"(showing {min(len(excluded), DISPLAY_CAP)}): {', '.join(excluded[:DISPLAY_CAP])}"
+        )
+    print(f"\nNothing persisted yet. To apply this, run:\n  rhino constraint group confirm {result.token}")
+
+
+def _print_group_confirm_result(result: GroupConstraintSubmissionResult) -> None:
+    """The group-constraint sibling of `_print_constraint_result` --
+    same diff framing (before/after bucket and risk_score per finding),
+    since a group constraint, like an asset one, changes `bucket_for`'s
+    real inputs, not a cross-finding allocation (unlike capacity)."""
+    if not result.persisted:
+        print(f"\nNothing persisted: {result.refusal_reason}", file=sys.stderr)
+        return
+
+    age_note = f" (preview generated {result.preview_age_seconds:.0f}s ago)" if result.preview_age_seconds is not None else ""
+    print(
+        f"\nGroup constraint #{result.group_constraint_id} persisted{age_note}. "
+        f"Re-scored {len(result.deltas)} finding(s) across "
+        f"{len(result.matched_asset_ids)} matched asset(s)."
+    )
+    changed = result.changed_deltas
+    if not changed:
+        print("\nNo findings changed bucket or risk score.")
+        return
+
+    print(f"\nDiff ({len(changed)}/{len(result.deltas)} finding(s) changed):")
+    for d in changed:
+        print(
+            f"\n  {d.finding_id} ({d.cve_id} on {d.hostname}): "
+            f"{d.before_bucket} ({d.before_risk_score:.1f}) -> "
+            f"{d.after_bucket} ({d.after_risk_score:.1f})"
+        )
+        for line in d.rationale_added:
+            print(_wrap(line, indent="    + ", continuation_indent="      "))
+        for line in d.rationale_removed:
+            print(_wrap(line, indent="    - ", continuation_indent="      "))
+        print(_wrap(f"why: {d.after_verdict_summary}", indent="    ", continuation_indent="    "))
 
 
 def _print_adapter_config_banner(contract: Contract | None, report: IngestReport | None = None) -> None:
@@ -1842,6 +1981,130 @@ def main(argv: list[str] | None = None) -> int:
         "--db", default=None, help="path to the memory.py SQLite file (default: memory.DEFAULT_DB_PATH)"
     )
 
+    # Group-scoped constraints (docs/group-constraints-design.md) -- a
+    # sibling subcommand tree, deliberately never sharing `constraint
+    # {list,retract}`'s bare integer argument: `constraints.id` and
+    # `group_constraints.id` are independent AUTOINCREMENT sequences and
+    # WILL collide (Section 8.2).
+    constraint_group_parser = constraint_subparsers.add_parser(
+        "group", help="submit (preview), confirm, list, or retract a group-scoped constraint (e.g. role=workstation)"
+    )
+    constraint_group_subparsers = constraint_group_parser.add_subparsers(
+        dest="constraint_group_command", required=True
+    )
+
+    constraint_group_add_parser = constraint_group_subparsers.add_parser(
+        "add",
+        help=(
+            "preview a free-form group-scoped constraint -- interprets once, matches the current "
+            "inventory, never writes until `constraint group confirm`"
+        ),
+    )
+    constraint_group_add_parser.add_argument(
+        "text", help='the constraint, in plain English, e.g. "all workstations only patch weekends"'
+    )
+    constraint_group_add_parser.add_argument("--data", default="demo", help="dataset name under data/, or a path")
+    constraint_group_add_parser.add_argument("--seed", type=int, default=42)
+    constraint_group_add_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="forbid network fetches; fail loudly on any snapshot cache miss instead of fetching",
+    )
+    constraint_group_add_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show CrewAI's own console logging -- suppressed by default, unlike rhino run --agents",
+    )
+    constraint_group_add_parser.add_argument(
+        "--db", default=None, help="path to the memory.py SQLite file (default: memory.DEFAULT_DB_PATH)"
+    )
+    constraint_group_add_format_group = constraint_group_add_parser.add_mutually_exclusive_group()
+    constraint_group_add_format_group.add_argument(
+        "--format",
+        default=DEFAULT_FORMAT,
+        choices=sorted(FORMATS),
+        help="ingest adapter for --data's files, same as `rhino run --format`",
+    )
+    constraint_group_add_format_group.add_argument(
+        "--adapter-config",
+        default=None,
+        metavar="NAME_OR_PATH",
+        help="use a declarative ingest contract instead of a built-in --format, same as `rhino run --adapter-config`",
+    )
+
+    constraint_group_confirm_parser = constraint_group_subparsers.add_parser(
+        "confirm",
+        help=(
+            "confirm a previously-shown group-constraint preview by token -- writes the row, "
+            "re-scores deterministically, no LLM call at all"
+        ),
+    )
+    constraint_group_confirm_parser.add_argument("token", help="the token printed by `constraint group add`")
+    constraint_group_confirm_parser.add_argument(
+        "--data", default="demo", help="dataset name under data/, or a path -- must match what `add` used"
+    )
+    constraint_group_confirm_parser.add_argument("--seed", type=int, default=42)
+    constraint_group_confirm_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="forbid network fetches; fail loudly on any snapshot cache miss instead of fetching",
+    )
+    constraint_group_confirm_parser.add_argument(
+        "--db", default=None, help="path to the memory.py SQLite file (default: memory.DEFAULT_DB_PATH)"
+    )
+    constraint_group_confirm_format_group = constraint_group_confirm_parser.add_mutually_exclusive_group()
+    constraint_group_confirm_format_group.add_argument(
+        "--format",
+        default=DEFAULT_FORMAT,
+        choices=sorted(FORMATS),
+        help="ingest adapter for --data's files -- must match what `add` used",
+    )
+    constraint_group_confirm_format_group.add_argument(
+        "--adapter-config",
+        default=None,
+        metavar="NAME_OR_PATH",
+        help="use a declarative ingest contract instead of a built-in --format -- must match what `add` used",
+    )
+
+    constraint_group_list_parser = constraint_group_subparsers.add_parser(
+        "list",
+        help="print every active group constraint on file, with live matched-asset counts against --data",
+    )
+    constraint_group_list_parser.add_argument("--data", default="demo", help="dataset name under data/, or a path")
+    constraint_group_list_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="forbid network fetches; fail loudly on any snapshot cache miss instead of fetching",
+    )
+    constraint_group_list_parser.add_argument(
+        "--db", default=None, help="path to the memory.py SQLite file (default: memory.DEFAULT_DB_PATH)"
+    )
+    constraint_group_list_format_group = constraint_group_list_parser.add_mutually_exclusive_group()
+    constraint_group_list_format_group.add_argument(
+        "--format",
+        default=DEFAULT_FORMAT,
+        choices=sorted(FORMATS),
+        help="ingest adapter for --data's files, same as `rhino run --format`",
+    )
+    constraint_group_list_format_group.add_argument(
+        "--adapter-config",
+        default=None,
+        metavar="NAME_OR_PATH",
+        help="use a declarative ingest contract instead of a built-in --format, same as `rhino run --adapter-config`",
+    )
+
+    constraint_group_retract_parser = constraint_group_subparsers.add_parser(
+        "retract",
+        help=(
+            "retract one group constraint by id (from `constraint group list`) -- soft-delete: the row "
+            "stays on file, inactive; no LLM, no ingest. Takes effect on the next run."
+        ),
+    )
+    constraint_group_retract_parser.add_argument("group_constraint_id", type=int)
+    constraint_group_retract_parser.add_argument(
+        "--db", default=None, help="path to the memory.py SQLite file (default: memory.DEFAULT_DB_PATH)"
+    )
+
     remediation_parser = subparsers.add_parser(
         "remediation", help="record and inspect what actually happened to a finding (memory.py's remediation_events)"
     )
@@ -2298,7 +2561,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "constraint" and args.constraint_command == "add":
-        from rhinosecure.agents.coordinator import CapacitySubmissionResult, ConstraintInterpretationError
+        from rhinosecure.agents.coordinator import (
+            CapacitySubmissionResult,
+            ConstraintInterpretationError,
+            GroupConstraintPreview,
+        )
         from rhinosecure.llm import LLMConfigError
 
         data_dir = _resolve_data_dir(args.data)
@@ -2337,9 +2604,153 @@ def main(argv: list[str] | None = None) -> int:
         _print_constraint_interpretation(result.interpretation)
         if isinstance(result, CapacitySubmissionResult):
             _print_capacity_result(result)
+        elif isinstance(result, GroupConstraintPreview):
+            # A group-shaped statement -- `rhino constraint add` (and
+            # `rhino constraint group add`, the identical function)
+            # resolve to the same preview; nothing persisted here, see
+            # `rhino constraint group confirm`.
+            _print_group_preview_result(result)
         else:
             _print_constraint_result(result)
         return 0 if result.persisted else 1
+
+    if args.command == "constraint" and args.constraint_command == "group":
+        from rhinosecure.agents.coordinator import (
+            CapacitySubmissionResult,
+            ConstraintInterpretationError,
+            GroupConstraintPreview,
+        )
+        from rhinosecure.llm import LLMConfigError
+        from rhinosecure.memory import Memory
+
+        if args.constraint_group_command == "add":
+            data_dir = _resolve_data_dir(args.data)
+            if not args.verbose:
+                from crewai.events.utils.console_formatter import set_suppress_console_output
+
+                set_suppress_console_output(True)
+            try:
+                result = submit_constraint(
+                    args.text,
+                    data_dir,
+                    args.seed,
+                    offline=args.offline,
+                    db_path=args.db,
+                    fmt=args.format,
+                    adapter_config=args.adapter_config,
+                )
+            except IngestError as exc:
+                print(f"ingest error: {exc}", file=sys.stderr)
+                return 1
+            except OfflineCacheMissError as exc:
+                print(f"offline error: {exc}", file=sys.stderr)
+                return 1
+            except LLMConfigError as exc:
+                print(f"LLM config error: {exc}", file=sys.stderr)
+                return 1
+            except ConstraintInterpretationError as exc:
+                print(f"could not interpret constraint: {exc}. Nothing was persisted.", file=sys.stderr)
+                if args.verbose:
+                    raw = getattr(exc.__cause__, "raw", None)
+                    if raw is not None:
+                        _print_raw_output(raw, indent="  ", file=sys.stderr)
+                return 1
+
+            _print_constraint_interpretation(result.interpretation)
+            if isinstance(result, GroupConstraintPreview):
+                _print_group_preview_result(result)
+                return 0
+            # Adversarial-review finding, fixed: a statement typed into
+            # `constraint group add` by mistake can still resolve to an
+            # asset-scoped or capacity-shaped interpretation (both of which
+            # `submit_constraint` persists immediately, unlike a group
+            # preview) -- the old code here claimed "Nothing persisted"
+            # unconditionally for every non-group result, which was simply
+            # false whenever the asset or capacity branch actually wrote a
+            # row and ran a real re-plan. Mirrors `constraint add`'s own
+            # correct branching (CapacitySubmissionResult / else) instead
+            # of asserting a blanket non-group refusal.
+            if isinstance(result, CapacitySubmissionResult):
+                _print_capacity_result(result)
+            else:
+                _print_constraint_result(result)
+            return 0 if result.persisted else 1
+
+        if args.constraint_group_command == "confirm":
+            data_dir = _resolve_data_dir(args.data)
+            try:
+                result = confirm_group_constraint(
+                    args.token,
+                    data_dir,
+                    args.seed,
+                    offline=args.offline,
+                    db_path=args.db,
+                    fmt=args.format,
+                    adapter_config=args.adapter_config,
+                )
+            except IngestError as exc:
+                print(f"ingest error: {exc}", file=sys.stderr)
+                return 1
+            except OfflineCacheMissError as exc:
+                print(f"offline error: {exc}", file=sys.stderr)
+                return 1
+            _print_group_confirm_result(result)
+            return 0 if result.persisted else 1
+
+        if args.constraint_group_command == "list":
+            data_dir = _resolve_data_dir(args.data)
+            adapter = load_config_adapter(args.adapter_config) if args.adapter_config else get_adapter(args.format)
+            # Adversarial-review finding, fixed: unlike its `add`/`confirm`
+            # siblings, `list` had no exception handling at all -- a bad
+            # --data/--format combination raised a raw traceback instead
+            # of the same clean error message every other group
+            # subcommand gives. load_batch (no enrichment here, unlike
+            # add/confirm) only ever raises IngestError, never
+            # OfflineCacheMissError -- that one's enrichment-only.
+            try:
+                assets, _enriched = load_batch(data_dir, adapter)
+            except IngestError as exc:
+                print(f"ingest error: {exc}", file=sys.stderr)
+                return 1
+            group_memory = Memory(args.db) if args.db else Memory()
+            active = group_memory.all_active_group_constraints()
+            if not active:
+                print("no active group constraints on file")
+                return 0
+            from rhinosecure.constraint_apply import match_group_constraints
+
+            rows = []
+            for gc in active:
+                matched_count = sum(1 for a in assets.values() if match_group_constraints([gc], a).applied)
+                rows.append(
+                    (
+                        str(gc.id),
+                        f"{gc.group_field}={gc.group_value}",
+                        f"{gc.effect_kind}={gc.effect_value!r}" if gc.effect_kind else "(not interpreted)",
+                        str(matched_count),
+                        gc.constraint_text,
+                    )
+                )
+            _print_rows(("id", "group", "effect", "matched", "constraint"), rows)
+            return 0
+
+        if args.constraint_group_command == "retract":
+            group_retract_memory = Memory(args.db) if args.db else Memory()
+            active_ids = {gc.id for gc in group_retract_memory.all_active_group_constraints()}
+            if args.group_constraint_id not in active_ids:
+                print(
+                    f"constraint group retract: no active group constraint with id "
+                    f"{args.group_constraint_id} (see `rhino constraint group list`; an "
+                    "already-retracted one cannot be retracted again)",
+                    file=sys.stderr,
+                )
+                return 1
+            group_retract_memory.deactivate_group_constraint(args.group_constraint_id)
+            print(
+                f"Retracted group constraint #{args.group_constraint_id} (kept on file, inactive). "
+                "It stops applying on the next run; plans already exported are unchanged until re-run."
+            )
+            return 0
 
     if args.command == "remediation" and args.remediation_command == "mark":
         from rhinosecure import remediation

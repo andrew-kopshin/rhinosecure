@@ -100,6 +100,23 @@ a human confirms that format, with nothing here needing to change. A
 provisional run is known to have produced it -- the same "absence means
 no signal, never guessed" reading `Asset.not_collected` already relies on.
 
+**An eighth and ninth table (2026-10-03, group-scoped constraints --
+`docs/group-constraints-design.md` Section 1, Slice A):** `group_constraints` --
+a stored predicate (`group_field`, `group_value`), matched at read time against
+whichever asset is currently being scored, never a one-time fan-out into N
+asset-scoped rows -- with the same soft-delete `active` lifecycle `constraints`
+already has (a group rule is a standing fact, unlike a capacity constraint).
+No `asset_id` column, for the identical reason `capacity_constraints` has none:
+a group constraint is not about one asset. `pending_group_constraints` -- the
+preview/confirm review gate's own durable state (needed because the CLI runs
+propose and confirm as two separate process invocations): one row per preview,
+keyed by a one-shot `token`, holding the matched/excluded asset lists and a
+digest of what was reviewed, so confirm can refuse rather than guess the moment
+current data disagrees with what a human actually saw. Previews never expire
+on their own -- the digest re-check at confirm time is the real safety net, not
+a clock (`created_at` is kept only so confirm can report how old the preview
+was, purely informationally).
+
 Timestamps are UTC ISO 8601 strings (`datetime.now(timezone.utc)
 .isoformat()`), the same format `enrich/cache.py`'s `SnapshotEntry
 .retrieved_at` already uses, for the same reason: sortable as plain text,
@@ -232,6 +249,37 @@ CREATE TABLE IF NOT EXISTS provisional_provenance (
     recorded_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_provisional_provenance_finding_id ON provisional_provenance (finding_id);
+
+-- Group-scoped constraints (docs/group-constraints-design.md Section 1.1).
+-- No asset_id -- a group constraint is a predicate, matched fresh every
+-- read against whichever asset is being scored, never an asset-keyed row.
+CREATE TABLE IF NOT EXISTS group_constraints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_field TEXT NOT NULL,
+    group_value TEXT NOT NULL,
+    constraint_text TEXT NOT NULL,
+    effect_kind TEXT,
+    effect_value TEXT,
+    created_at TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1
+);
+
+-- The group-constraint review gate's own durable state (docs/group-
+-- constraints-design.md Section 1.2) -- a preview's reviewed content,
+-- re-validated (never re-derived) at confirm time via preview_digest.
+CREATE TABLE IF NOT EXISTS pending_group_constraints (
+    token TEXT PRIMARY KEY,
+    group_field TEXT NOT NULL,
+    group_value TEXT NOT NULL,
+    constraint_text TEXT NOT NULL,
+    effect_kind TEXT,
+    effect_value TEXT,
+    matched_asset_ids TEXT NOT NULL,
+    excluded_asset_ids TEXT NOT NULL,
+    preview_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    consumed_at TEXT
+);
 """
 
 
@@ -363,6 +411,46 @@ class CapacityConstraint:
     created_at: str
 
 
+@dataclass(frozen=True)
+class GroupConstraint:
+    """One stored predicate -- `docs/group-constraints-design.md` Section 1.1.
+    `effect_kind`/`effect_value` are nullable for the identical reason
+    `Constraint`'s are: a group statement can be recorded (an asset
+    resolved, in this case a real field+value matched something) before,
+    or without ever, being interpreted into a structured effect."""
+
+    id: int
+    group_field: str
+    group_value: str
+    constraint_text: str
+    created_at: str
+    active: bool
+    effect_kind: str | None = None
+    effect_value: str | None = None
+
+
+@dataclass(frozen=True)
+class PendingGroupConstraint:
+    """One preview's own reviewed content, durable across the CLI's two
+    separate process invocations (propose, then confirm) -- Section 1.2.
+    `matched_asset_ids`/`excluded_asset_ids` are the FULL, untruncated
+    lists reviewed at preview time (display-side capping, Section 7.2, is
+    a rendering concern only); `consumed_at` is `None` until confirmed (or
+    explicitly discarded), at which point a second confirm is refused."""
+
+    token: str
+    group_field: str
+    group_value: str
+    constraint_text: str
+    matched_asset_ids: tuple[str, ...]
+    excluded_asset_ids: tuple[str, ...]
+    preview_digest: str
+    created_at: str
+    consumed_at: str | None
+    effect_kind: str | None = None
+    effect_value: str | None = None
+
+
 def _json_or_none(value: str | None) -> Any:
     return None if value is None else json.loads(value)
 
@@ -463,6 +551,35 @@ def _capacity_constraint_from_row(row: sqlite3.Row) -> CapacityConstraint:
         pool_size=row["pool_size"],
         deferred_count=row["deferred_count"],
         created_at=row["created_at"],
+    )
+
+
+def _group_constraint_from_row(row: sqlite3.Row) -> GroupConstraint:
+    return GroupConstraint(
+        id=row["id"],
+        group_field=row["group_field"],
+        group_value=row["group_value"],
+        constraint_text=row["constraint_text"],
+        created_at=row["created_at"],
+        active=bool(row["active"]),
+        effect_kind=row["effect_kind"],
+        effect_value=row["effect_value"],
+    )
+
+
+def _pending_group_constraint_from_row(row: sqlite3.Row) -> PendingGroupConstraint:
+    return PendingGroupConstraint(
+        token=row["token"],
+        group_field=row["group_field"],
+        group_value=row["group_value"],
+        constraint_text=row["constraint_text"],
+        matched_asset_ids=tuple(json.loads(row["matched_asset_ids"])),
+        excluded_asset_ids=tuple(json.loads(row["excluded_asset_ids"])),
+        preview_digest=row["preview_digest"],
+        created_at=row["created_at"],
+        consumed_at=row["consumed_at"],
+        effect_kind=row["effect_kind"],
+        effect_value=row["effect_value"],
     )
 
 
@@ -907,3 +1024,129 @@ class Memory:
                 (finding_id,),
             ).fetchall()
         return [row["format"] for row in rows]
+
+    # --- group constraints (docs/group-constraints-design.md Section 1.1) -----
+
+    def add_group_constraint(
+        self,
+        group_field: str,
+        group_value: str,
+        constraint_text: str,
+        *,
+        effect_kind: str | None = None,
+        effect_value: str | None = None,
+    ) -> int:
+        """Mirrors `add_constraint`'s own "an uninterpreted constraint is a
+        legitimate row shape" allowance -- `effect_kind`/`effect_value` are
+        optional and independent of each other's presence.
+
+        Validates `group_field` against `constraint_apply.GROUP_FIELD_CHOICES`
+        defensively (docs/group-constraints-design.md Section 1.1) -- an
+        adversarial-review finding, fixed: every real caller already goes
+        through a `Literal`-typed model that can't produce an illegal
+        value, but this is the same belt-and-suspenders posture
+        `Asset._validate_not_collected` already takes for a field that
+        can't legally appear in `not_collected` either. Imported locally
+        to avoid a module-level dependency from this crewai-free,
+        core-only module onto another one (both are core-only; the import
+        itself is safe either way, but this module's own convention is to
+        keep its import graph minimal)."""
+        from rhinosecure.constraint_apply import GROUP_FIELD_CHOICES
+
+        if group_field not in GROUP_FIELD_CHOICES:
+            raise ValueError(
+                f"add_group_constraint: group_field={group_field!r} is not one of the "
+                f"supported fields {sorted(GROUP_FIELD_CHOICES)!r}"
+            )
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO group_constraints (group_field, group_value, constraint_text, "
+                "effect_kind, effect_value, created_at, active) VALUES (?, ?, ?, ?, ?, ?, 1)",
+                (group_field, group_value, constraint_text, effect_kind, effect_value, _now()),
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
+    def deactivate_group_constraint(self, group_constraint_id: int) -> None:
+        """Soft-delete, identical shape to `deactivate_constraint`."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE group_constraints SET active = 0 WHERE id = ?", (group_constraint_id,)
+            )
+            self._conn.commit()
+
+    def all_active_group_constraints(self) -> list[GroupConstraint]:
+        """The whole table, active rows only -- there is no `asset_id` to
+        filter a `WHERE` clause on (a group constraint is a fact about a
+        FIELD/VALUE pair, not one asset), so this is read in full and
+        matched in application code, the same shape `capacity_constraints`
+        is already read in (a small, fleet-wide table)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM group_constraints WHERE active = 1 ORDER BY created_at, id"
+            ).fetchall()
+        return [_group_constraint_from_row(r) for r in rows]
+
+    # --- the group-constraint review gate (Section 1.2) ------------------
+
+    def save_pending_group_constraint(
+        self,
+        token: str,
+        group_field: str,
+        group_value: str,
+        constraint_text: str,
+        *,
+        effect_kind: str | None,
+        effect_value: str | None,
+        matched_asset_ids: Iterable[str],
+        excluded_asset_ids: Iterable[str],
+        preview_digest: str,
+    ) -> None:
+        """One row per preview, keyed by a one-shot `token`
+        (`uuid.uuid4().hex`, the caller's job) -- never updated in place;
+        `consume_pending_group_constraint` is the only mutation this row
+        ever gets."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO pending_group_constraints (token, group_field, group_value, "
+                "constraint_text, effect_kind, effect_value, matched_asset_ids, "
+                "excluded_asset_ids, preview_digest, created_at, consumed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    token,
+                    group_field,
+                    group_value,
+                    constraint_text,
+                    effect_kind,
+                    effect_value,
+                    json.dumps(list(matched_asset_ids)),
+                    json.dumps(list(excluded_asset_ids)),
+                    preview_digest,
+                    _now(),
+                ),
+            )
+            self._conn.commit()
+
+    def load_pending_group_constraint(self, token: str) -> PendingGroupConstraint | None:
+        """`None` when the token was never issued -- a real confirm-time
+        possibility (a typo, or a token from a different database), kept
+        distinct from "already consumed" so a caller can give an honest,
+        differently-worded refusal for each."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM pending_group_constraints WHERE token = ?", (token,)
+            ).fetchone()
+        return None if row is None else _pending_group_constraint_from_row(row)
+
+    def consume_pending_group_constraint(self, token: str) -> None:
+        """Marks the token one-shot -- a second confirm against the same
+        token reads `consumed_at` already set and is refused by the
+        caller (`Coordinator.confirm_group_constraint`), never a second
+        write here. Never deletes the row: it stays in the historical
+        record, matching every other table in this module."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE pending_group_constraints SET consumed_at = ? WHERE token = ?",
+                (_now(), token),
+            )
+            self._conn.commit()
