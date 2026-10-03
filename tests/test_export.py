@@ -63,13 +63,15 @@ def test_deterministic_export_matches_schema_shape(tmp_path):
 
     data = json.loads(export_path.read_text(encoding="utf-8"))
 
-    assert data["export_schema_version"] == "1.3.0"
+    assert data["export_schema_version"] == "1.4.0"
     assert data["generated_at"]  # non-empty ISO 8601 string
     # memory=None above -- constraints were never applied this run (CLAUDE.md's
     # machine-identity constraint scoping entry), so this is the fixed,
-    # DB-independent "not applied" shape, not computed from anything.
+    # DB-independent "not applied" shape, not computed from anything. reason
+    # is "flag_not_set": a native (non-provisional) run with no Memory
+    # consulted -- the plain `rhino run` without --apply-constraints.
     assert data["constraint_application"] == {
-        "applied": False, "digest": None, "applied_constraint_ids": [],
+        "applied": False, "reason": "flag_not_set", "digest": None, "applied_constraint_ids": [],
         "skipped": {"legacy": [], "identity_mismatch": []},
     }
     assert data["run"] == {
@@ -334,9 +336,10 @@ def test_deterministic_export_constraint_application_block_when_a_constraint_app
     )
     data = json.loads(export_path.read_text(encoding="utf-8"))
 
-    assert data["export_schema_version"] == "1.3.0"
+    assert data["export_schema_version"] == "1.4.0"
     capp = data["constraint_application"]
     assert capp["applied"] is True
+    assert capp["reason"] is None
     assert capp["digest"] == result.constraint_application.digest
     assert capp["digest"].startswith("sha256:")
     [constraint_id] = capp["applied_constraint_ids"]
@@ -458,15 +461,35 @@ def test_agents_export_asset_scoped_constraints_are_honest_about_legacy_and_mism
         else:
             assert "does not match this asset's current hostname" in entry["note"]
 
+    # The top-level summary (CLAUDE.md's "agents path reports constraint
+    # application honestly" fix) must agree with the per-constraint notes
+    # above: a real Memory WAS consulted this run (applied: True, in the
+    # "a Memory was consulted" sense -- RunResult's own docstring draws
+    # this same distinction on the deterministic path), but nothing was
+    # actually applied, and both constraints surface by reason.
+    capp = data["constraint_application"]
+    assert capp["applied"] is True
+    assert capp["reason"] is None
+    assert capp["applied_constraint_ids"] == []
+    assert len(capp["skipped"]["legacy"]) == 1
+    assert len(capp["skipped"]["identity_mismatch"]) == 1
 
-def test_agents_export_constraint_application_block_is_the_fixed_not_applicable_shape(
+
+def test_agents_export_constraint_application_block_is_not_applicable_with_no_memory_at_all(
     monkeypatch, agents_data_dir, tmp_path
 ):
-    """The ConstraintApplicator/digest mechanism is deterministic-path-only
-    (CLAUDE.md's machine-identity constraint scoping entry) -- the agents
-    path keeps applying constraints per finding via score_finding_tool
-    (already covered elsewhere in this file), but has no run-wide summary
-    to report here."""
+    """A `Coordinator` built with no `Memory` and no contract at all (the
+    shape this test constructs directly -- not reachable via any real CLI
+    or web caller, which always either give a confirmed run a real
+    `Memory` or pair a memory-less one with a provisional contract) has
+    nothing to report: `coordinator.memory is None`, so
+    `_build_agents_export` never calls `summarize_for_assets` at all, and
+    the shape is the same fixed 'not applied' one the deterministic path
+    reports for its own `flag_not_set` case. Not the fixed ALWAYS-False
+    shape this test used to assert regardless of what `coordinator.memory`
+    held -- see the next test for the real, computed summary a run WITH
+    constraints and a real Memory now reports (CLAUDE.md's "agents path
+    reports constraint application honestly" fix)."""
     from rhinosecure.agents import coordinator as coordinator_module
     from rhinosecure.agents.coordinator import Coordinator
     from rhinosecure.export import write_run_export
@@ -494,10 +517,147 @@ def test_agents_export_constraint_application_block_is_the_fixed_not_applicable_
     )
     data = json.loads(export_path.read_text(encoding="utf-8"))
 
+    # contract is None (no --adapter-config here) -- is_provisional(None) is
+    # False, so this is "flag_not_set", not "provisional_mapping": a
+    # memory-less Coordinator paired with a non-provisional contract is a
+    # synthetic state (this test constructs it directly), not one any real
+    # caller produces.
     assert data["constraint_application"] == {
-        "applied": False, "digest": None, "applied_constraint_ids": [],
+        "applied": False, "reason": "flag_not_set", "digest": None, "applied_constraint_ids": [],
         "skipped": {"legacy": [], "identity_mismatch": []},
     }
+
+
+def test_agents_export_constraint_application_block_reports_what_actually_applied(
+    monkeypatch, agents_data_dir, tmp_path
+):
+    """The bug this closes: this top-level block used to be hard-coded to
+    the fixed 'not applied' shape on the agents path regardless of what
+    `coordinator.memory` actually held -- a reader of `applied: false`
+    would believe nothing applied even on a run that genuinely folded a
+    constraint into scoring (the effect was always visible elsewhere, in
+    `constraints.asset_scoped[].deltas` and each finding's own
+    `constraints_applied`/`decomposition`, but never summarized at the top
+    level the way the deterministic path's own `--apply-constraints` is).
+    Mirrors `test_deterministic_export_constraint_application_block_when_a_
+    constraint_applied` on the agents path instead -- A02/WKS01 is KEV
+    (forced via the fake Research JSON's own `is_kev` field) with no
+    compensating control or patch window declared, so it lands `contested`
+    without the constraint and `next_window` with it, the identical shape
+    the demo fixture's F07/F14 already exercise at the CLI level."""
+    from rhinosecure.agents import coordinator as coordinator_module
+    from rhinosecure.agents.coordinator import Coordinator
+    from rhinosecure.export import write_run_export
+    from rhinosecure.ingest import join_findings
+
+    monkeypatch.setattr(coordinator_module, "Crew", _QueuedFakeCrew)
+
+    memory = Memory(tmp_path / "mem.db")
+    memory.add_constraint(
+        "A02", "WKS01 can only patch on Sundays",
+        effect_kind="patch_window", effect_value="Sun 02:00-06:00", hostname="WKS01",
+    )
+
+    findings = list(join_findings(agents_data_dir / "findings.csv", agents_data_dir / "assets.csv"))
+    _QueuedFakeCrew.queue = [
+        _research_json("F01", "CVE-2021-26855"),
+        _research_json("F02", "CVE-2018-8410", is_kev=True),
+        _research_json("F03", "CVE-2020-1472"),
+        _environment_json("F01", "CVE-2021-26855", "A01", "EXCH01"),
+        _environment_json("F02", "CVE-2018-8410", "A02", "WKS01"),
+        _environment_json("F03", "CVE-2020-1472", "A03", "WKS02"),
+        "F01", "F02", "F03",
+    ]
+    coordinator = Coordinator(agents_data_dir, memory=memory)
+    coordinator.run(findings)
+
+    export_path = tmp_path / "export.json"
+    write_run_export(
+        export_path, fmt="native", data_dir=agents_data_dir, seed=42, offline=False,
+        agents=True, coordinator=coordinator, memory=memory,
+    )
+    data = json.loads(export_path.read_text(encoding="utf-8"))
+
+    capp = data["constraint_application"]
+    assert capp["applied"] is True
+    assert capp["reason"] is None
+    assert capp["digest"].startswith("sha256:")
+    [constraint_id] = capp["applied_constraint_ids"]
+    assert capp["skipped"] == {"legacy": [], "identity_mismatch": []}
+
+    [f02] = [f for f in data["findings"] if f["finding_id"] == "F02"]
+    assert f02["bucket"] == "next_window"  # was contested without the constraint
+
+
+def test_agents_export_constraint_application_block_excludes_a_constraint_whose_asset_never_scored(
+    monkeypatch, agents_data_dir, tmp_path
+):
+    """Adversarial-review finding, fixed: the first version of the fix above
+    sourced the agents-path summary from `state.enriched_by_id` unfiltered
+    -- the raw, pre-dispatch finding population, never pruned when a
+    finding fails Research/Environment/Risk (`agents/coordinator.py`'s own
+    documented 'record and skip' retry-cap behavior). That meant a
+    constraint on an asset whose only finding failed upstream was still
+    reported `applied: true`, with a real digest, even though
+    `agents/risk.py`'s `score_finding_tool` -- the only place a constraint
+    is genuinely folded into a real score on this path -- was never called
+    for it, and the finding never appears in the exported plan at all. The
+    exact inverse of what this fix exists to prevent. F02's Research
+    output is made permanently unparseable (`max_parse_attempts=1`, the
+    identical UNPARSEABLE-retry-exhaustion convention
+    test_coordinator.py's own `test_persistently_unparseable_finding_is_
+    recorded_and_skipped_not_blocking` uses to simulate a real, designed-
+    for LLM failure), so F02/A02 never reaches risk_by_id -- A02's stored
+    constraint must now report as NOT applied."""
+    from rhinosecure.agents import coordinator as coordinator_module
+    from rhinosecure.agents.coordinator import Coordinator
+    from rhinosecure.export import write_run_export
+    from rhinosecure.ingest import join_findings
+
+    monkeypatch.setattr(coordinator_module, "Crew", _QueuedFakeCrew)
+
+    unparseable = "this is not json and will never parse, no matter how many times you ask"
+
+    memory = Memory(tmp_path / "mem.db")
+    memory.add_constraint(
+        "A02", "WKS01 can only patch on Sundays",
+        effect_kind="patch_window", effect_value="Sun 02:00-06:00", hostname="WKS01",
+    )
+
+    findings = list(join_findings(agents_data_dir / "findings.csv", agents_data_dir / "assets.csv"))
+    _QueuedFakeCrew.queue = [
+        _research_json("F01", "CVE-2021-26855"),
+        unparseable,  # F02's research answer never parses -- max_parse_attempts=1 below gives up immediately
+        _research_json("F03", "CVE-2020-1472"),
+        # F02 never reaches Environment or Risk -- only F01/F03 do.
+        _environment_json("F01", "CVE-2021-26855", "A01", "EXCH01"),
+        _environment_json("F03", "CVE-2020-1472", "A03", "WKS02"),
+        "F01", "F03",
+    ]
+    coordinator = Coordinator(agents_data_dir, memory=memory, max_parse_attempts=1)
+    coordinator.run(findings)
+
+    # Sanity: the fixture above must actually exercise the failure.
+    assert "F02" in coordinator.state.research_failures
+    assert "F02" not in coordinator.state.risk_by_id
+    assert [r.finding_id for r in coordinator.ranked()] == ["F01", "F03"]
+
+    export_path = tmp_path / "export.json"
+    write_run_export(
+        export_path, fmt="native", data_dir=agents_data_dir, seed=42, offline=False,
+        agents=True, coordinator=coordinator, memory=memory,
+    )
+    data = json.loads(export_path.read_text(encoding="utf-8"))
+
+    # F02/A02 is genuinely absent from the exported plan.
+    assert [f["finding_id"] for f in data["findings"]] == ["F01", "F03"]
+
+    # The constraint on A02 must NOT be reported as applied -- nothing on
+    # this path ever scored a finding for A02 this run.
+    capp = data["constraint_application"]
+    assert capp["applied"] is True  # a real Memory WAS consulted this run (coordinator.memory is not None)
+    assert capp["applied_constraint_ids"] == []
+    assert capp["skipped"] == {"legacy": [], "identity_mismatch": []}  # not skipped by reason either -- just never reached
 
 
 # --- deterministic path: capacity history is agents-independent ---------
@@ -1053,6 +1213,20 @@ def test_agents_export_constraints_section_notes_a_memory_less_coordinator(monke
     assert constraint["note"] is not None
     assert "never given a Memory instance" in constraint["note"]
     assert "not applied on the deterministic path" not in constraint["note"]  # the WRONG (old, blanket) note
+
+    # Adversarial-review coverage gap, closed: this is the one scenario
+    # where `coordinator.memory` (None here) and the `memory` parameter
+    # (a real Memory, above) genuinely diverge -- the exact case a
+    # regression swapping which one `_build_agents_export` reads for the
+    # top-level `constraint_application` block would need to be caught by.
+    # Before this assertion existed, nothing checked this block at all in
+    # this scenario, so such a regression (reporting the real `memory`
+    # parameter's constraint as "applied" even though this run's own
+    # Coordinator never touched it) would have passed the full suite.
+    assert data["constraint_application"] == {
+        "applied": False, "reason": "flag_not_set", "digest": None, "applied_constraint_ids": [],
+        "skipped": {"legacy": [], "identity_mismatch": []},
+    }
 
 
 def test_agents_export_records_a_tot_failure_without_usage(monkeypatch, agents_data_dir, tmp_path):

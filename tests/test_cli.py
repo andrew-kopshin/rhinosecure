@@ -378,6 +378,14 @@ class _FakeCoordinator:
     environment_usage = None
     risk_usage = None
     tot_usage = None
+    # Empty by default -- summarize_for_assets(coordinator.memory, ...)
+    # then iterates zero assets, giving a real-but-empty summary (0
+    # applied/skipped, the empty-set digest) rather than erroring on a
+    # missing attribute. A test that wants a non-trivial constraint-
+    # application summary printed sets this to real EnrichedFinding-shaped
+    # stand-ins (needs only .asset.asset_id/.asset.hostname) before
+    # calling main()/run_agents().
+    enriched_by_id: dict = {}
 
     def __init__(
         self,
@@ -410,6 +418,17 @@ class _FakeCoordinator:
             environment_usage=_FakeCoordinator.environment_usage,
             risk_usage=_FakeCoordinator.risk_usage,
             tot_usage=_FakeCoordinator.tot_usage,
+            enriched_by_id=_FakeCoordinator.enriched_by_id,
+            # Every finding in `result` is, by construction, the thing
+            # ranked()/the real RunState.risk_by_id would also hold --
+            # _agents_constraint_application_summary (cli.py) now filters
+            # enriched_by_id down to this set (CLAUDE.md's "a constraint
+            # whose asset never scored must not read as applied" fix), so
+            # this fake needs a risk_by_id shaped the same way the real one
+            # is: {finding_id: RiskRecommendation}. Derived automatically
+            # from `result` rather than a separate attribute every test
+            # would otherwise have to remember to keep in sync.
+            risk_by_id={r.finding_id: r for r in _FakeCoordinator.result},
         )
 
     def run(self, findings):
@@ -437,6 +456,7 @@ def _reset_fake_coordinator():
     _FakeCoordinator.environment_usage = None
     _FakeCoordinator.risk_usage = None
     _FakeCoordinator.tot_usage = None
+    _FakeCoordinator.enriched_by_id = {}
 
 
 def _fake_recommendation(finding_id="F01", risk_score=42.0, bucket="next_window"):
@@ -475,6 +495,60 @@ def test_main_with_agents_flag_dispatches_coordinator_and_returns_0(monkeypatch)
     _FakeCoordinator.result = [_fake_recommendation()]
 
     assert main(["run", "--data", "demo", "--agents"]) == 0
+
+
+# --- --agents constraint-application reporting (CLAUDE.md's "agents path
+# reports constraint application honestly" fix) -------------------------
+
+
+def test_main_with_agents_flag_prints_no_constraints_line_when_nothing_is_on_file(monkeypatch, capsys):
+    """A real (empty) Memory is always constructed for `--agents` -- this
+    confirms the summary line still prints (coordinator.memory is not
+    None), just reporting zero applied/skipped, rather than never printing
+    at all the way the bug being fixed here looked from the outside."""
+    monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
+    _FakeCoordinator.result = [_fake_recommendation()]
+
+    assert main(["run", "--data", "demo", "--agents"]) == 0
+    out = capsys.readouterr().out
+    assert "Constraints applied: 0 (skipped: 0 legacy, 0 identity_mismatch) -- digest sha256:" in out
+
+
+def test_main_with_agents_flag_prints_a_real_summary_for_a_matching_constraint(monkeypatch, capsys, tmp_path):
+    """The bug this fix closes: `export.py` used to hard-code the agents
+    path's `constraint_application` block to the fixed 'not applied' shape
+    regardless of what actually happened, and `rhino run --agents` printed
+    no applied/skipped line at all. The `SimpleNamespace` stand-in for
+    `EnrichedFinding` carries only what the new code actually reads off it
+    -- `.asset.asset_id`/`.asset.hostname` and `.finding.finding_id` (the
+    latter needed to filter against `state.risk_by_id`, the adversarial-
+    review fix closing a separate bug: a constraint on an asset whose
+    finding never scored must not read as applied) -- so a full fixture
+    object isn't needed to exercise this path. F07 IS in `result`/
+    `risk_by_id` (set via the harness's own derivation below), so it
+    passes that filter."""
+    from rhinosecure.memory import Memory
+
+    monkeypatch.setattr("rhinosecure.agents.coordinator.Coordinator", _FakeCoordinator)
+    _FakeCoordinator.result = [_fake_recommendation(finding_id="F07", bucket="contested")]
+    _FakeCoordinator.enriched_by_id = {
+        "F07": SimpleNamespace(
+            asset=SimpleNamespace(asset_id="A09", hostname="WKS-FIN12"),
+            finding=SimpleNamespace(finding_id="F07"),
+        ),
+    }
+
+    db_path = tmp_path / "mem.db"
+    seed_memory = Memory(db_path)
+    seed_memory.add_constraint(
+        "A09", "WKS-FIN12 can only patch on Sundays",
+        effect_kind="patch_window", effect_value="Sun 02:00-06:00", hostname="WKS-FIN12",
+    )
+    seed_memory.close()
+
+    assert main(["run", "--data", "demo", "--agents", "--db", str(db_path)]) == 0
+    out = capsys.readouterr().out
+    assert "Constraints applied: 1 (skipped: 0 legacy, 0 identity_mismatch) -- digest sha256:" in out
 
 
 def test_main_with_agents_flag_and_explain_prints_narrative(monkeypatch, capsys):

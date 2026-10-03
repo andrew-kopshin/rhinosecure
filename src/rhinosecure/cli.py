@@ -163,7 +163,6 @@ full design reasoning.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import random
@@ -177,7 +176,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from rhinosecure.agents.coordinator import Coordinator, RunState
     from rhinosecure.agents.schema_inference import ProposeResult
-    from rhinosecure.memory import Constraint, Memory
+    from rhinosecure.memory import Memory
 
 from rhinosecure.adapters import (
     DEFAULT_FORMAT,
@@ -190,7 +189,14 @@ from rhinosecure.adapters import (
 from rhinosecure.adapters.config_model import Contract
 from rhinosecure.adapters.probe import ColumnProfile, FileProfile, ProbeError, profile_source
 from rhinosecure.adapters.review import Measurement, ReviewError, ReviewOutcome, is_provisional, review_contract
-from rhinosecure.constraint_apply import apply_constraints, has_usable_effect, match_constraints
+from rhinosecure.constraint_apply import (
+    AppliedConstraintRecord,
+    ConstraintAccumulator,
+    ConstraintApplicationSummary,
+    SkippedConstraintRecord,
+    apply_constraints,
+    summarize_for_assets,
+)
 from rhinosecure.enrich.attack import load_index as load_attack_index
 from rhinosecure.enrich.cache import OfflineCacheMissError, SnapshotCache
 from rhinosecure.enrich.kev import load_catalog as load_kev_catalog
@@ -232,95 +238,6 @@ def _resolve_data_dir(data_arg: str) -> Path:
     raise SystemExit(f"no such data set: {data_arg!r} (looked for {named} and {path})")
 
 
-@dataclass(frozen=True)
-class AppliedConstraintRecord:
-    """One constraint that was actually identity-matched (asset_id AND
-    hostname) and folded into scoring this run -- the facts a human or
-    the export needs to know WHAT applied, joinable back to the existing
-    `constraints.asset_scoped[]` export section by `constraint_id` for
-    everything else about the row (created_at, active, free-text
-    constraint_text already live there)."""
-
-    constraint_id: int
-    asset_id: str
-    hostname: str
-    effect_kind: str | None
-    effect_value: str | None
-
-
-@dataclass(frozen=True)
-class SkippedConstraintRecord:
-    """One constraint that matched by asset_id but was never applied this
-    run, and why -- `reason` is exactly `"legacy"` (no hostname was ever
-    recorded for it) or `"identity_mismatch"` (a hostname was recorded,
-    but it disagrees with this asset's current hostname -- a rename, or
-    two different real machines sharing one asset_id). `current_hostname`
-    is this run's own, real answer for what the asset is actually called
-    now -- not derivable from the old constraints section, which has no
-    notion of "the asset's current hostname" at all."""
-
-    constraint_id: int
-    asset_id: str
-    current_hostname: str
-    reason: str
-
-
-@dataclass(frozen=True)
-class ConstraintApplicationSummary:
-    """What `--apply-constraints` (or the web run_deterministic job,
-    which always applies) actually did this run -- CLAUDE.md's
-    machine-identity constraint scoping entry. `digest` is a sha256 over
-    the sorted, canonical-JSON `(asset_id, hostname, effect_kind,
-    effect_value)` tuples of every entry in `applied` -- row ids and
-    timestamps deliberately excluded, so an unrelated edit to a
-    constraint's free text, or a retract-then-identical-resubmit, does
-    not churn it; only a change to what scoring actually reads does.
-    `deltas` is a before/after comparison per finding whose asset had at
-    least one applied constraint -- the deterministic-path analog of
-    `agents/coordinator.py`'s `FindingDelta`, computed the same way
-    (score the ground-truth finding, score the overlaid one, diff) but
-    without needing a `Coordinator` or Research-merged enrichment, since
-    the deterministic path has nothing to merge."""
-
-    digest: str
-    applied: tuple[AppliedConstraintRecord, ...] = ()
-    skipped_legacy: tuple[SkippedConstraintRecord, ...] = ()
-    skipped_identity_mismatch: tuple[SkippedConstraintRecord, ...] = ()
-    deltas: tuple[dict, ...] = ()
-
-    @property
-    def applied_count(self) -> int:
-        return len(self.applied)
-
-    @property
-    def skipped_legacy_count(self) -> int:
-        return len(self.skipped_legacy)
-
-    @property
-    def skipped_identity_mismatch_count(self) -> int:
-        return len(self.skipped_identity_mismatch)
-
-
-def _compute_constraint_digest(applied: tuple[AppliedConstraintRecord, ...]) -> str:
-    """sha256 of the sorted (asset_id, hostname, effect_kind, effect_value)
-    tuples actually applied, as canonical JSON -- reuses the identical
-    sha256-over-canonical-JSON convention `adapters/config_model.py`'s
-    `compute_content_digest` already established in this codebase
-    (`json.dumps(..., sort_keys=True, separators=(",", ":"),
-    ensure_ascii=True)`), extended with an explicit list-order rule that
-    module never needed (it hashes dicts, never an independently-orderable
-    list of records): sorted here by the tuple itself, with None treated
-    as sorting before any string so a legacy/incomplete record (should one
-    ever reach this function -- in practice every genuinely `applied`
-    record has both fields) never raises comparing None to str."""
-    tuples = [(r.asset_id, r.hostname, r.effect_kind, r.effect_value) for r in applied]
-    tuples.sort(key=lambda t: tuple((x is None, x) for x in t))
-    blob = json.dumps(
-        [list(t) for t in tuples], sort_keys=True, separators=(",", ":"), ensure_ascii=True
-    ).encode("utf-8")
-    return "sha256:" + hashlib.sha256(blob).hexdigest()
-
-
 def _scored_finding_changed(before: ScoredFinding, after: ScoredFinding) -> bool:
     return before.bucket != after.bucket or not math.isclose(
         before.risk_score, after.risk_score, abs_tol=1e-9
@@ -356,16 +273,18 @@ def _build_deterministic_delta(before: ScoredFinding, after: ScoredFinding) -> d
 class ConstraintApplicator:
     """One instance per `rhino run` invocation (constructed only when
     `--apply-constraints`/the web job's always-on equivalent is in
-    effect): looks up and caches each distinct asset's stored constraints
-    (one DB read per asset actually touched by this run, not per
-    finding), matches by `(asset_id, hostname)` via
-    `constraint_apply.match_constraints` -- the SAME matcher
-    `agents/risk.py`/`agents/environment.py`/`agents/coordinator.py`/
-    `export.py` use, CLAUDE.md's "no second rule" -- folds matched ones
-    into the finding via `constraint_apply.apply_constraints`, and
-    accumulates the distinct applied/skipped-by-reason records plus
-    per-finding deltas for the run-wide summary `run_with_report` returns
-    on `RunResult.constraint_application`.
+    effect): the deterministic path's own thin wrapper around
+    `constraint_apply.ConstraintAccumulator` (the shared matching/
+    accounting engine both this path and the agents path's
+    `constraint_apply.summarize_for_assets` now use -- CLAUDE.md's "agents
+    path reports constraint application honestly" fix). This class adds
+    exactly the two things that engine deliberately knows nothing about:
+    folding a usable effect into a finding's `Asset`
+    (`constraint_apply.apply_constraints`) and recording a before/after
+    delta per finding whose asset had one applied -- both specific to
+    this path's own per-finding rescoring loop (`run_with_report`), which
+    the agents path doesn't have (it already folds a constraint's effect
+    into scoring per finding via `agents/risk.py`'s `score_finding_tool`).
 
     Skip counting follows CLAUDE.md's own scope rule exactly: a
     constraint is only ever looked at here because `apply` was called for
@@ -376,78 +295,21 @@ class ConstraintApplicator:
     extra filter."""
 
     def __init__(self, memory: Memory):
-        self._memory = memory
-        self._cache: dict[str, list[Constraint]] = {}
-        self._applied: dict[int, AppliedConstraintRecord] = {}
-        self._skipped_legacy: dict[int, SkippedConstraintRecord] = {}
-        self._skipped_mismatch: dict[int, SkippedConstraintRecord] = {}
+        self._engine = ConstraintAccumulator(memory)
         self._deltas: dict[str, dict] = {}  # finding_id -> delta dict
 
     def apply(self, enriched: EnrichedFinding) -> EnrichedFinding:
         asset = enriched.asset
-        candidates = self._cache.get(asset.asset_id)
-        if candidates is None:
-            candidates = self._memory.constraints_for_asset(asset.asset_id)
-            self._cache[asset.asset_id] = candidates
-        match = match_constraints(candidates, asset.asset_id, asset.hostname)
-        for c in match.skipped_legacy:
-            self._skipped_legacy.setdefault(
-                c.id,
-                SkippedConstraintRecord(
-                    constraint_id=c.id, asset_id=c.asset_id, current_hostname=asset.hostname, reason="legacy"
-                ),
-            )
-        for c in match.skipped_identity_mismatch:
-            self._skipped_mismatch.setdefault(
-                c.id,
-                SkippedConstraintRecord(
-                    constraint_id=c.id,
-                    asset_id=c.asset_id,
-                    current_hostname=asset.hostname,
-                    reason="identity_mismatch",
-                ),
-            )
-        # Identity-matched is not the same claim as "changed something" --
-        # an adversarial review caught that counting/digesting match.applied
-        # directly would report, hash, and print a constraint that resolved
-        # an asset but was never interpreted into a structured effect (a
-        # real, legitimate row shape -- memory.py's own add_constraint
-        # docstring anticipates it), contradicting this feature's own
-        # digest-stability contract. has_usable_effect is the same
-        # recognized-kind-and-truthy-value check apply_constraints' own
-        # loop already applies internally -- filtering here means an
-        # effect-less constraint is simply invisible to the overlay AND to
-        # this reporting, never counted as applied, legacy, or mismatch.
-        effective = [c for c in match.applied if has_usable_effect(c)]
+        effective = self._engine.record(asset.asset_id, asset.hostname)
         if not effective:
             return enriched
-        for c in effective:
-            self._applied.setdefault(
-                c.id,
-                AppliedConstraintRecord(
-                    constraint_id=c.id,
-                    asset_id=c.asset_id,
-                    hostname=c.hostname,
-                    effect_kind=c.effect_kind,
-                    effect_value=c.effect_value,
-                ),
-            )
         return enriched.model_copy(update={"asset": apply_constraints(asset, effective)})
 
     def record_delta(self, before: ScoredFinding, after: ScoredFinding) -> None:
         self._deltas[after.finding_id] = _build_deterministic_delta(before, after)
 
     def summary(self) -> ConstraintApplicationSummary:
-        applied = tuple(sorted(self._applied.values(), key=lambda r: r.constraint_id))
-        return ConstraintApplicationSummary(
-            digest=_compute_constraint_digest(applied),
-            applied=applied,
-            skipped_legacy=tuple(sorted(self._skipped_legacy.values(), key=lambda r: r.constraint_id)),
-            skipped_identity_mismatch=tuple(
-                sorted(self._skipped_mismatch.values(), key=lambda r: r.constraint_id)
-            ),
-            deltas=tuple(self._deltas.values()),
-        )
+        return self._engine.summary(deltas=tuple(self._deltas.values()))
 
 
 @dataclass(frozen=True)
@@ -813,18 +675,60 @@ def _print_constraint_application_summary(summary: ConstraintApplicationSummary)
     """One line, right after Contested: -- CLAUDE.md's machine-identity
     constraint scoping entry, decided display shape: applied count,
     skipped counts by reason, and a digest prefix. Printed only when the
-    caller actually applied constraints this run (`--apply-constraints`,
-    or the web `run_deterministic` job, which always does) -- the plain
-    path that never constructed a `Memory` has no `ConstraintApplicationSummary`
-    to print at all (`RunResult.constraint_application is None`), so this
-    function is simply never called there; it does not itself decide
-    whether to print, the same split `_print_usage_summary` draws against
-    its own caller."""
+    caller actually has a summary to report -- the plain deterministic
+    path without `--apply-constraints` has `RunResult.constraint_application
+    is None`, and a provisional `--agents` run (reachable only via the web
+    job substrate, never this CLI path) has `coordinator.memory is None`
+    -- so this function is simply never called in either case; it does
+    not itself decide whether to print, the same split
+    `_print_usage_summary` draws against its own caller."""
     print(
         f"Constraints applied: {summary.applied_count} "
         f"(skipped: {summary.skipped_legacy_count} legacy, "
         f"{summary.skipped_identity_mismatch_count} identity_mismatch) "
         f"-- digest {summary.digest[:19]}..."
+    )
+
+
+def _agents_constraint_application_summary(coordinator: "Coordinator") -> ConstraintApplicationSummary | None:
+    """The agents path's own run-wide constraint-application summary --
+    CLAUDE.md's "agents path reports constraint application honestly" fix.
+    `None` exactly when `coordinator.memory is None` (a provisional run,
+    CLAUDE.md's provisional-run entry -- the only way this is ever `None`
+    in practice, since every real caller that builds a CONFIRMED-contract
+    Coordinator always gives it a real `Memory`); otherwise a real summary
+    computed from `coordinator.memory` and every asset whose finding(s)
+    actually reached `risk_by_id` this run -- i.e. actually appear in
+    `coordinator.ranked()`/the exported plan.
+
+    Deliberately NOT `coordinator.state.enriched_by_id` unfiltered --
+    adversarial review of this fix's first version caught exactly that:
+    `enriched_by_id` is the raw, pre-dispatch ingest population
+    (`Coordinator.run()`'s very first line), never pruned when a finding
+    fails Research/Environment/Risk (`agents/risk.py`'s `score_finding_tool`
+    is the only place a constraint is genuinely folded into a real score on
+    this path, and it is only ever called during a successful Risk
+    dispatch) -- so an asset whose only finding(s) all failed upstream
+    would still be counted `applied`, with a real, non-null digest, even
+    though nothing in the actual scored/exported plan reflects it. That is
+    the exact inverse of the dishonesty this fix exists to close: `applied:
+    false` reads as "nothing applied" when something did; the unfiltered
+    version would make `applied: true` read as "this was genuinely scored"
+    when it wasn't. Filtering to `state.risk_by_id` membership mirrors the
+    identical, already-established guard `export.py`'s own
+    `_asset_constraint_deltas` uses for the per-constraint delta view
+    (`if after is None ...: continue  # this finding failed upstream`),
+    applied here to the run-wide summary instead. Shared with `export.py`'s
+    `_build_agents_export`, which computes the identical thing (same
+    filter) for the export file -- both are pure given the same
+    `(memory, assets)` inputs, so the printed digest and the exported one
+    always agree."""
+    if coordinator.memory is None:
+        return None
+    scored_ids = coordinator.state.risk_by_id
+    return summarize_for_assets(
+        coordinator.memory,
+        (e.asset for e in coordinator.state.enriched_by_id.values() if e.finding.finding_id in scored_ids),
     )
 
 
@@ -2208,6 +2112,16 @@ def main(argv: list[str] | None = None) -> int:
             _print_agent_table(recommendations)
             _print_failures(coordinator, verbose=args.verbose)
             _print_contested_rate(contested_rate(r.bucket for r in recommendations))
+            # coordinator.memory is None only for a provisional run (never on
+            # this CLI path -- run_agents() always constructs a real Memory,
+            # CLAUDE.md's machine-identity constraint scoping entry); real
+            # whenever a provisional web run_agents job dispatches this same
+            # Coordinator.run() path instead. Computed from coordinator.memory,
+            # not any display-only Memory a caller might hold separately --
+            # the same distinction export.py's _build_agents_export draws.
+            agents_capp = _agents_constraint_application_summary(coordinator)
+            if agents_capp is not None:
+                _print_constraint_application_summary(agents_capp)
             _print_usage_summary(coordinator.state)
 
             if args.track_remediation:

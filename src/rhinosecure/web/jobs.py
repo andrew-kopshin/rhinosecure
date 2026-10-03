@@ -139,6 +139,7 @@ from rhinosecure.adapters.config_model import SCORING_ENUM_TARGETS, Attestation,
 from rhinosecure.adapters.configured import ConfiguredAdapter
 from rhinosecure.agents.constraint_intake import ConstraintInterpretationError
 from rhinosecure.agents.coordinator import Coordinator, CoordinatorError, ConstraintReplanFailedError
+from rhinosecure.constraint_apply import summarize_for_assets
 from rhinosecure.agents.schema_inference import (
     DEFAULT_MAX_ATTEMPTS as PROPOSE_DEFAULT_MAX_ATTEMPTS,
     DEFAULT_SAMPLE_ROWS,
@@ -1188,14 +1189,13 @@ def _run_run_deterministic(job: Job, plan_state: PlanState, on_stage: Callable[[
         provisional_adapter = None
         resolved = resolve_source_ref(source_ref)
 
-    # Constructed BEFORE scoring, unlike the CLI's own plain `rhino run`
-    # (which never constructs one at all unless --apply-constraints is
-    # passed): this job ALWAYS applies stored, machine-identity-matched
-    # constraints, no flag, no opt-out -- CLAUDE.md's machine-identity
-    # constraint scoping entry's own deliberate CLI/web asymmetry. Passed
-    # into run_with_report itself now (not just to the export afterward,
-    # as this used to), so the fold actually reaches `result.scored`, not
-    # only the export's separate, display-only constraints section.
+    # Constructed unconditionally -- used below for the export's display-
+    # only constraints section and, for a provisional run, provisional-
+    # provenance recording, regardless of whether SCORING itself ever
+    # consults it (see the memory= argument below). A CONFIRMED upload
+    # applies stored, machine-identity-matched constraints always, no
+    # flag, no opt-out -- CLAUDE.md's machine-identity constraint scoping
+    # entry's own deliberate CLI/web asymmetry.
     job_memory = plan_state.memory if plan_state.memory is not None else Memory(plan_state.config.db_path)
 
     on_stage("scoring")
@@ -1208,7 +1208,19 @@ def _run_run_deterministic(job: Job, plan_state: PlanState, on_stage: Callable[[
         fmt=resolved.fmt,
         adapter_config=resolved.adapter_config,
         adapter=provisional_adapter,
-        memory=job_memory,
+        # CLAUDE.md's "provisional plans never apply constraints" fix: a
+        # provisional (unconfirmed) mapping must never consult stored
+        # constraints during scoring -- the matcher is never even called,
+        # not just "applies nothing because none matched" -- until a human
+        # actually confirms it, aligning this job with _run_run_agents's
+        # own provisional branch (`_build_and_run_coordinator(...,
+        # memory=None)`). Before this fix, job_memory was passed here
+        # unconditionally, so a provisional run's output could already
+        # reflect an operator's stored answer before anyone had reviewed
+        # the mapping that produced it. A CONFIRMED upload is unaffected:
+        # provisional_adapter is None for it, so this is exactly job_memory,
+        # same as before.
+        memory=None if provisional_adapter is not None else job_memory,
     )
 
     # Deliberately BEFORE the export write, and deliberately not wrapped in
@@ -1248,14 +1260,26 @@ def _run_run_deterministic(job: Job, plan_state: PlanState, on_stage: Callable[[
             "total_findings": len(result.scored),
             "bucket_distribution": dict(bucket_counts),
             "provisional": provisional_adapter is not None,
-            # Always real here (never None) -- this job always applies
-            # constraints, no flag. Mirrors cli.py's own printed summary.
+            # Real for a CONFIRMED upload (this job always applies
+            # constraints then, no flag) -- all zero/None, with
+            # constraint_application_reason="provisional_mapping", for a
+            # provisional one, since the matcher above was never even
+            # consulted (CLAUDE.md's "provisional plans never apply
+            # constraints" fix). Mirrors cli.py's own printed summary.
             "constraints_applied": capp.applied_count if capp is not None else 0,
             "constraints_skipped_legacy": capp.skipped_legacy_count if capp is not None else 0,
             "constraints_skipped_identity_mismatch": (
                 capp.skipped_identity_mismatch_count if capp is not None else 0
             ),
             "constraint_digest": capp.digest if capp is not None else None,
+            # None whenever capp is real (something was actually
+            # consulted). Otherwise "provisional_mapping" -- the only
+            # reason capp is ever None on THIS job: it always applies for
+            # a confirmed upload, so there is no "flag_not_set" case here
+            # the way the CLI's plain `rhino run` has.
+            "constraint_application_reason": (
+                None if capp is not None else "provisional_mapping"
+            ),
         },
         export_written=True,
     )
@@ -1403,6 +1427,23 @@ def _run_run_agents(job: Job, plan_state: PlanState, on_stage: Callable[[str], N
 
     recommendations = coordinator.ranked()
     bucket_counts = Counter(r.bucket for r in recommendations)
+
+    # Mirrors _run_run_deterministic's own result fields -- CLAUDE.md's
+    # "agents path reports constraint application honestly" fix. `None`
+    # (coordinator.memory is None) only for the provisional branch above;
+    # otherwise the same shared engine (constraint_apply.summarize_for_
+    # assets), filtered to state.risk_by_id membership -- a finding whose
+    # Research/Environment/Risk dispatch failed never reached a real score,
+    # so its asset must not read as "applied" here either (the identical
+    # fix applied to export.py's/cli.py's own copies of this computation).
+    agents_capp = (
+        summarize_for_assets(
+            coordinator.memory,
+            (e.asset for e in coordinator.state.enriched_by_id.values() if e.finding.finding_id in coordinator.state.risk_by_id),
+        )
+        if coordinator.memory is not None
+        else None
+    )
     return JobOutcome(
         result={
             "source_ref": source_ref,
@@ -1410,6 +1451,17 @@ def _run_run_agents(job: Job, plan_state: PlanState, on_stage: Callable[[str], N
             "total_findings": len(recommendations),
             "bucket_distribution": dict(bucket_counts),
             "provisional": provisional,
+            "constraints_applied": agents_capp.applied_count if agents_capp is not None else 0,
+            "constraints_skipped_legacy": agents_capp.skipped_legacy_count if agents_capp is not None else 0,
+            "constraints_skipped_identity_mismatch": (
+                agents_capp.skipped_identity_mismatch_count if agents_capp is not None else 0
+            ),
+            "constraint_digest": agents_capp.digest if agents_capp is not None else None,
+            # provisional is the only reason this job's own capp is ever
+            # None -- unlike _run_run_deterministic, this job has no
+            # "flag_not_set" case of its own (a confirmed run_agents always
+            # has coordinator.memory set, no flag, no opt-out).
+            "constraint_application_reason": None if agents_capp is not None else "provisional_mapping",
         },
         export_written=True,
     )

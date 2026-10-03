@@ -128,7 +128,7 @@ from typing import TYPE_CHECKING, Any
 
 from rhinosecure.adapters.config_model import Contract
 from rhinosecure.adapters.review import is_provisional
-from rhinosecure.constraint_apply import apply_constraints, match_constraints
+from rhinosecure.constraint_apply import apply_constraints, match_constraints, summarize_for_assets
 from rhinosecure.enrich.cache import SnapshotCache
 from rhinosecure.ingest import GapTally, IngestReport, IngestStats
 from rhinosecure.memory import Memory
@@ -147,7 +147,28 @@ if TYPE_CHECKING:
 #: finding; 1.1.0->1.2.0: a new top-level provenance key) -- both were
 #: triggered by a previously-absent field becoming exported, never a
 #: breaking change to an existing one. See _constraint_application_dict.
-EXPORT_SCHEMA_VERSION = "1.3.0"
+#:
+#: 1.4.0: a new `reason` field inside `constraint_application` (CLAUDE.md's
+#: dated follow-up to the entry above -- "the agents path reports
+#: constraint application honestly," plus "provisional plans never apply
+#: constraints"), and the agents path's own `constraint_application` block
+#: is no longer always the fixed `applied: false` shape: it now reports the
+#: SAME real digest/applied/skipped summary the deterministic path does
+#: whenever `coordinator.memory is not None`. The new field is additive
+#: (same precedent as the two bumps above -- a previously-absent field
+#: becoming exported); the agents-path behavior change is a correctness
+#: fix to what an EXISTING field (`applied`) reports, not a shape change,
+#: but is called out here because readers relying on the old "always
+#: false on this path" behavior (CLAUDE.md's own prior prose, now
+#: corrected) would otherwise be surprised by it silently. `reason` is one
+#: of `"flag_not_set"` (no Memory was consulted this run -- the plain
+#: deterministic path without `--apply-constraints`, or a memory-less
+#: agents-path Coordinator paired with a non-provisional contract, a
+#: synthetic state no real caller produces) or `"provisional_mapping"`
+#: (this run scored through an unconfirmed mapping -- the matcher is never
+#: consulted on either path until a human confirms it), `null` when
+#: `applied` is `true`. See `_constraint_application_reason`.
+EXPORT_SCHEMA_VERSION = "1.4.0"
 
 # memory.list_runs()/Memory has no list_capacity_constraints()/all_runs()
 # without a run_id -- reconstructing constraints.capacity (always
@@ -623,6 +644,19 @@ _PROVISIONAL_NO_MEMORY_NOTE = (
     "instance (CLAUDE.md's provisional-run entry) -- constraints are not applied on a provisional run; "
     "confirm the contract, then re-run --agents to see live effect"
 )
+#: The deterministic-path analog of _PROVISIONAL_NO_MEMORY_NOTE, for a
+#: provisional run on THAT path (CLAUDE.md's "provisional plans never
+#: apply constraints" fix) -- a provisional deterministic run skips the
+#: constraint matcher entirely (memory=None is passed to run_with_report),
+#: so _DETERMINISTIC_NOTE's "memory.py is never touched there -- run
+#: rhino run --agents" wording would be actively misleading here: the
+#: fix isn't switching to --agents, it's confirming the mapping. See the
+#: top-level constraint_application block's own reason="provisional_mapping".
+_PROVISIONAL_MAPPING_NOTE = (
+    "this run used a provisional (unconfirmed) mapping -- constraints are not applied on a provisional "
+    "run (see the top-level constraint_application block, reason=\"provisional_mapping\"); confirm the "
+    "mapping, then re-run to see live effect"
+)
 _NO_FINDINGS_NOTE = "no findings for this asset in the current dataset"
 #: Per-constraint notes for the deterministic path's own `live=True` case
 #: (CLAUDE.md's machine-identity constraint scoping entry) -- a constraint
@@ -834,36 +868,68 @@ def _pipeline_common(fmt: str, report: IngestReport, offline: bool, contract: Co
     }
 
 
-def _constraint_application_dict(summary: ConstraintApplicationSummary | None) -> dict[str, Any]:
-    """The new 1.3.0 top-level block -- CLAUDE.md's machine-identity
-    constraint scoping entry. `summary is None` means constraints were
-    not applied this run at all (plain `rhino run`, no --apply-constraints)
-    -- a fixed, DB-independent shape, since computing anything real here
-    would require the very Memory this run never constructed. Deliberately
-    minimal to avoid duplicating the existing `constraints.asset_scoped`
-    section (CLAUDE.md's own "no duplicated data" instruction): `applied`
-    is a bare list of constraint ids, and each `skipped` entry carries only
-    `constraint_id`/`asset_id` plus, for a mismatch, the one genuinely NEW
-    fact this run discovered -- what the asset's hostname actually is now.
-    No bucket/before-after information lives here; a finding's own
-    bucket transition from an applied constraint is in `constraints
-    .asset_scoped[].deltas`, not duplicated into this block. Everything
-    else about a constraint's own row (constraint_text, effect_kind,
-    effect_value, created_at, its recorded hostname) is already in
-    `constraints.asset_scoped[]` too, joinable by that same
-    `constraint_id` -- an adversarial review of this feature's first
-    version caught this docstring (and CLAUDE.md's matching prose)
-    claiming a bucket field that was never actually implemented; both were
-    corrected to describe the shape below, not the other way around."""
+def _constraint_application_reason(contract: Contract | None) -> str:
+    """Why `_constraint_application_dict` reports `applied: False` --
+    computed from `contract` alone, never passed in separately, so there
+    is exactly one place that decides it (CLAUDE.md's own "single-source
+    the rules" discipline). `is_provisional(contract)` already carries
+    the whole distinction this needs: a provisional (proposed-but-
+    unconfirmed) mapping is the ONLY way a web job's scoring ever omits
+    the constraint fold (CLAUDE.md's "provisional plans never apply
+    constraints" fix) -- `load_config_adapter` refuses to construct an
+    adapter over any other unconfirmed contract outright, so a plain CLI
+    `rhino run`/confirmed `--adapter-config` run can never reach this
+    function with `is_provisional(contract)` true. Everything else that
+    can make `applied: False` true (a plain `rhino run` with no
+    `--apply-constraints`; an agents-path `Coordinator` built with no
+    `Memory` at all, never pairing with a provisional contract -- reachable
+    only as a synthetic, test-only state, since every real caller gives a
+    memory-less Coordinator a provisional contract or a real Coordinator a
+    real Memory) reports `"flag_not_set"` -- a generic "no Memory was
+    consulted this run" reason, since neither case has a distinct root
+    cause of its own beyond that."""
+    return "provisional_mapping" if is_provisional(contract) else "flag_not_set"
+
+
+def _constraint_application_dict(
+    summary: ConstraintApplicationSummary | None, *, contract: Contract | None
+) -> dict[str, Any]:
+    """The 1.3.0 top-level block -- CLAUDE.md's machine-identity
+    constraint scoping entry, extended by the "agents path reports
+    constraint application honestly" fix. `summary is None` means no
+    `Memory` was consulted this run at all -- either a plain `rhino run`
+    with no `--apply-constraints`, or a provisional (unconfirmed) mapping
+    on either path (CLAUDE.md's "provisional plans never apply
+    constraints" fix) -- a fixed, DB-independent shape plus a `reason`
+    (`_constraint_application_reason`) naming which of those it was, since
+    computing anything real here would require the very Memory this run
+    never consulted. Deliberately minimal to avoid duplicating the
+    existing `constraints.asset_scoped` section (CLAUDE.md's own "no
+    duplicated data" instruction): `applied` is a bare list of constraint
+    ids, and each `skipped` entry carries only `constraint_id`/`asset_id`
+    plus, for a mismatch, the one genuinely NEW fact this run discovered
+    -- what the asset's hostname actually is now. No bucket/before-after
+    information lives here; a finding's own bucket transition from an
+    applied constraint is in `constraints.asset_scoped[].deltas`, not
+    duplicated into this block. Everything else about a constraint's own
+    row (constraint_text, effect_kind, effect_value, created_at, its
+    recorded hostname) is already in `constraints.asset_scoped[]` too,
+    joinable by that same `constraint_id` -- an adversarial review of this
+    feature's first version caught this docstring (and CLAUDE.md's
+    matching prose) claiming a bucket field that was never actually
+    implemented; both were corrected to describe the shape below, not the
+    other way around."""
     if summary is None:
         return {
             "applied": False,
+            "reason": _constraint_application_reason(contract),
             "digest": None,
             "applied_constraint_ids": [],
             "skipped": {"legacy": [], "identity_mismatch": []},
         }
     return {
         "applied": True,
+        "reason": None,
         "digest": summary.digest,
         "applied_constraint_ids": [r.constraint_id for r in summary.applied],
         "skipped": {
@@ -935,7 +1001,7 @@ def _build_deterministic_export(
         data_dir=data_dir,
         run_label=run_label,
         live=capp is not None,
-        not_live_note=_DETERMINISTIC_NOTE,
+        not_live_note=(_PROVISIONAL_MAPPING_NOTE if is_provisional(contract) else _DETERMINISTIC_NOTE),
         coordinator=None,
         current_asset_ids={s.asset_id for s in scored},
         deterministic_deltas_by_asset=deterministic_deltas_by_asset,
@@ -968,7 +1034,7 @@ def _build_deterministic_export(
         "findings": findings,
         "contested": [],
         "constraints": constraints,
-        "constraint_application": _constraint_application_dict(capp),
+        "constraint_application": _constraint_application_dict(capp, contract=contract),
         "usage": {"research": None, "environment": None, "risk": None, "tot": None},
     }
 
@@ -1055,6 +1121,41 @@ def _build_agents_export(
         current_asset_ids={e.asset.asset_id for e in state.enriched_by_id.values()},
     )
 
+    # CLAUDE.md's "agents path reports constraint application honestly"
+    # fix: computed from coordinator.memory specifically (never the
+    # `memory` parameter above, which can be a real, display-only Memory
+    # even for a PROVISIONAL run -- `_run_run_agents`'s own job_memory
+    # pattern) -- the same distinction `live=coordinator.memory is not
+    # None` just above already draws. `None` only for a provisional run;
+    # otherwise the real run-wide summary over every asset this run
+    # actually SCORED -- state.risk_by_id membership, not the raw,
+    # pre-dispatch state.enriched_by_id population -- via the SAME shared
+    # engine cli.ConstraintApplicator wraps for the deterministic path
+    # (constraint_apply.ConstraintAccumulator), so this path's digest/
+    # applied/skipped accounting is byte-identical to what the
+    # deterministic path would report for the same (memory, assets).
+    #
+    # Adversarial review of this fix's first version caught a real bug
+    # here: iterating state.enriched_by_id.values() unfiltered (the raw
+    # ingest-time population, never pruned when a finding fails Research/
+    # Environment/Risk) meant a constraint on an asset whose only
+    # finding(s) all failed upstream was still reported `applied: true`
+    # with a real digest -- even though `score_finding_tool` (the only
+    # place a constraint is genuinely folded into a real score on this
+    # path) was never called for it, and the finding never appears in
+    # `findings`/`contested` below. That is the exact inverse of the
+    # dishonesty this fix exists to close. Filtering to `state.risk_by_id`
+    # mirrors the identical guard `_asset_constraint_deltas` (above) already
+    # uses for the per-constraint delta view.
+    agents_capp = (
+        summarize_for_assets(
+            coordinator.memory,
+            (e.asset for e in state.enriched_by_id.values() if e.finding.finding_id in state.risk_by_id),
+        )
+        if coordinator.memory is not None
+        else None
+    )
+
     return {
         "export_schema_version": EXPORT_SCHEMA_VERSION,
         "generated_at": _now_iso(),
@@ -1086,19 +1187,19 @@ def _build_agents_export(
         "findings": findings,
         "contested": contested,
         "constraints": constraints,
-        # Always the fixed "not applied" shape on this path -- the
-        # ConstraintApplicator/digest mechanism (cli.py, CLAUDE.md's
-        # machine-identity constraint scoping entry) is specific to the
-        # deterministic path's own --apply-constraints flag; it has no
-        # agents-path analog to report here. This does NOT mean the
-        # agents path never applies a constraint -- it does, per finding,
-        # via agents/risk.py's score_finding_tool -- that effect is
-        # already visible in `constraints.asset_scoped[].deltas` above
-        # (live=coordinator.memory is not None) and in each finding's own
-        # `constraints_applied`/`decomposition`; this key specifically
-        # means "no run-wide digest/summary exists for this path," never
-        # fabricated to claim otherwise.
-        "constraint_application": _constraint_application_dict(None),
+        # Real whenever coordinator.memory is not None (CLAUDE.md's
+        # "agents path reports constraint application honestly" fix) --
+        # applied: False with reason="provisional_mapping" only for a
+        # provisional run. Superseded a prior version of this key that was
+        # ALWAYS the fixed "not applied" shape regardless of whether a
+        # confirmed run actually applied something -- absence encoded as a
+        # plausible value, the exact failure class CLAUDE.md's "structural
+        # problem underneath most of it" names. The per-finding effect was
+        # always visible elsewhere (`constraints.asset_scoped[].deltas`,
+        # each finding's own `constraints_applied`/`decomposition`); this
+        # key now also carries the run-wide digest/applied/skipped summary
+        # those per-finding views never did.
+        "constraint_application": _constraint_application_dict(agents_capp, contract=contract),
         "usage": {
             "research": _usage_dict(state.research_usage),
             "environment": _usage_dict(state.environment_usage),

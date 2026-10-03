@@ -3680,3 +3680,128 @@ package-attribute cache for the rest of the test session and broke 21 unrelated,
 `test_cli.py` tests the moment the full file ran (a 5-minute run where the first, narrower
 targeted run had shown nothing wrong) -- replaced with a genuinely isolated subprocess check
 before it was ever committed.
+
+---
+
+## Two fixes to machine-identity constraint scoping: the agents path reports honestly, and provisional plans never apply (2026-10-02)
+
+The entry above shipped the deterministic path's `--apply-constraints` flag and the web
+`run_deterministic` job's always-on fold. Two real gaps were found in that work afterward and are
+closed here.
+
+**Fix 1 -- the agents path reports constraint application honestly.** `export.py`'s
+`_build_agents_export` hard-coded the top-level `constraint_application` block to
+`{"applied": false, ...}` unconditionally, even on a confirmed `--agents` run whose `Coordinator`
+genuinely had a real `Memory` and folded identity-matched constraints into scoring per finding
+(`agents/risk.py`'s `score_finding_tool`, through the SAME `match_constraints`/`has_usable_effect`/
+`apply_constraints` chain `cli.ConstraintApplicator` wraps for the deterministic path). A reader of
+`applied: false` had no way to tell "nothing applied" from "this path doesn't report it" --
+absence encoded as a plausible value, Section 1's own named failure class. `rhino run --agents`
+also printed no applied/skipped line at all.
+
+Fixed by single-sourcing the summary/digest machinery: `AppliedConstraintRecord`,
+`SkippedConstraintRecord`, `ConstraintApplicationSummary`, and the digest function (renamed
+`compute_constraint_digest`, no longer private) moved out of `cli.py` into the crewai-free
+`constraint_apply.py`, alongside a new `ConstraintAccumulator` (the shared matching/accounting
+engine -- identity match, `has_usable_effect` filter, applied/skipped bookkeeping, with no
+knowledge of `Finding`/`EnrichedFinding`/scoring) and `summarize_for_assets(memory, assets)` (a
+run-wide summary over a population of assets, no per-finding rescoring step). `cli.ConstraintApplicator`
+is now a thin wrapper around `ConstraintAccumulator` that adds exactly the two things specific to
+the deterministic path's own per-finding rescoring loop: folding a usable effect into a finding's
+`Asset`, and recording a before/after delta. `cli._agents_constraint_application_summary` and
+`export._build_agents_export`'s `agents_capp` both call `summarize_for_assets` directly --
+`coordinator.memory is None` (a provisional run) is the only case either returns `None`; otherwise
+a real summary, printed by `cli.py` right after the `Contested:` line (`_print_constraint_application_summary`,
+reused verbatim -- the same function the deterministic path already had) and written into the
+export.
+
+A new `reason` field (`"flag_not_set"` | `"provisional_mapping"` | `null`) was added to the
+`constraint_application` block, computed by `export._constraint_application_reason(contract)` from
+`adapters.review.is_provisional(contract)` alone -- single-sourced rather than threaded through as a
+second parameter, since that one check is sufficient on every real caller: a plain CLI `rhino run`
+without `--apply-constraints` is never provisional (`load_config_adapter` refuses an unconfirmed
+contract outright, so the CLI can never even reach this state) and reports `"flag_not_set"`; a web
+job scoring through an unconfirmed mapping is always provisional and reports `"provisional_mapping"`.
+`EXPORT_SCHEMA_VERSION` bumped `1.3.0 -> 1.4.0` for the new field, matching this module's own
+precedent for the prior three bumps (a previously-absent field becoming exported, never a breaking
+change to an existing one).
+
+**Fix 2 -- provisional plans never apply constraints.** `web/jobs.py`'s `_run_run_deterministic`
+passed a real `Memory` into `run_with_report` unconditionally, even when scoring through a
+PROVISIONAL (proposed-but-unconfirmed) mapping (`ConfiguredAdapter.unconfirmed_preview()` via
+`_resolve_provisional`) -- so a stored, identity-matched constraint could silently change a
+provisional plan's output before a human ever confirmed the mapping producing it. This directly
+contradicted `_run_run_agents`'s own provisional branch, which already correctly builds its
+`Coordinator` with `memory=None` for exactly this reason. Fixed with one conditional: `memory=None
+if provisional_adapter is not None else job_memory` -- the matcher is never even consulted for a
+provisional run, not merely "applies nothing because nothing matched." `job_memory` itself is
+unchanged for the export's display-only constraints section and for `record_provisional_provenance`
+(both legitimately still use the real `Memory`, matching the CLI's own "a constraint exists on file
+but is not live" display convention) -- only the SCORING input changed. The job result dict gained
+the same `constraint_application_reason` field. A confirmed upload is unaffected: `provisional_adapter`
+is `None` for it, so this is exactly `job_memory`, byte-identical to before this fix.
+
+**Adversarial review before the final commit (4 independent reviewers, each dimension's findings
+re-verified by 3 independent skeptics) found and fixed one real, high-severity bug in Fix 1's own
+first version, plus two smaller gaps.**
+
+1. **High, confirmed by 6 independent skeptics across two dimensions that found it
+   separately: `summarize_for_assets` was being fed `coordinator.state.enriched_by_id` --
+   the raw, pre-dispatch finding population `Coordinator.run()` sets unconditionally from its
+   input, before any Research/Environment/Risk dispatch, and never pruned when a finding fails a
+   stage (the exact, already-documented "record and skip" retry-cap behavior, Safety and
+   guardrails above).** `agents/risk.py`'s `score_finding_tool` -- the only place a constraint is
+   genuinely folded into a real score on this path -- is only ever called during a successful Risk
+   dispatch; a finding that fails Research or Environment never reaches it. So a constraint on an
+   asset whose only finding(s) all failed upstream was still counted `applied`, with a real,
+   non-null digest and a populated `applied_constraint_ids`, even though that finding never
+   appears in `coordinator.ranked()`/the exported `findings` list at all -- the exact inverse of
+   the dishonesty this fix exists to close: `applied: false` misread as "nothing applied" is
+   replaced by `applied: true` misread as "this was genuinely scored." The deterministic path has
+   no equivalent failure mode (no LLM, every finding is unconditionally scored, so
+   `ConstraintApplicator`'s own accounting is structurally tied 1:1 to `RunResult.scored`) --
+   this was a new defect specific to the agents-path extraction, not a pre-existing one. Live-
+   reproduced by multiple reviewers independently (a finding made permanently unparseable via the
+   same `UNPARSEABLE`/`max_parse_attempts` convention `test_coordinator.py` already uses): the
+   constraint showed `applied: true` in a real export whose `findings` array contained nothing for
+   that asset. Fixed by filtering both call sites (`cli._agents_constraint_application_summary`,
+   `export._build_agents_export`) to only the assets of findings that actually reached
+   `state.risk_by_id` -- mirroring the identical, already-established guard `export._asset_constraint_deltas`
+   uses for the per-constraint delta view (`if after is None ...: continue`). `summarize_for_assets`'s
+   own docstring now states this requirement explicitly for future callers. A new regression test,
+   `test_agents_export_constraint_application_block_excludes_a_constraint_whose_asset_never_scored`,
+   reproduces the exact scenario and is confirmed to fail against the unfiltered version.
+2. **A test-coverage gap, closed:** no test constructed the one scenario where `coordinator.memory`
+   and the separate `memory` parameter to `write_run_export`/`_build_agents_export` genuinely
+   diverge (`coordinator.memory is None` -- a provisional run's Coordinator -- while `memory` is a
+   real, non-None, display-only Memory holding a genuinely-applicable constraint, exactly
+   `_run_run_agents`'s own provisional `job_memory` pattern) and then asserted on the
+   `constraint_application` block specifically. The one existing test building that exact
+   divergence (`test_agents_export_constraints_section_notes_a_memory_less_coordinator`) only
+   checked `constraints.asset_scoped`. A regression swapping which Memory `_build_agents_export`
+   reads would have passed the full suite undetected. Closed by extending that test with the
+   missing assertion; confirmed to fail when the swap is simulated.
+3. **Low severity, not in the original acceptance criteria, fixed anyway for consistency:**
+   `_run_run_agents`'s own `JobOutcome.result` never carried the `constraints_applied`/
+   `constraints_skipped_*`/`constraint_digest`/`constraint_application_reason` fields
+   `_run_run_deterministic`'s result dict already does, even though both jobs now compute the
+   identical summary. No current consumer (app.js reads neither block's constraint fields for
+   either job kind) was actually broken by the omission, but it was a real, needless asymmetry
+   between two sibling handlers sharing one engine -- closed the same way, filtered to
+   `state.risk_by_id` identically, with its own new dispatcher test.
+
+**Verified.** `rhino run --data demo --seed 42 --offline` confirmed byte-identical (via a
+`git worktree` checkout of `910f9e8`, the commit before any machine-identity constraint scoping
+work existed, not just asserted) both before and after every fix in this entry, including the
+adversarial-review round. Full suite: **1,742 passed** (was 1,735 at the start of this entry's
+work; net 7 new tests across both fixes and the review's own corrections). Every new test or
+assertion was confirmed to fail when its own fix was reverted, then restored with the suite green
+again -- done via actual revert-run-restore cycles for all of: the shared-engine extraction's
+digest-parity test, the two constraint-application fixes in `export.py`, the `risk_by_id` filter
+fix (both independently, via the dedicated regression test and the extended coverage-gap test),
+and the `_run_run_agents` job-result mirroring fix.
+
+**Read-only query against the real `rhinosecure.db`** (as requested, not a code change): zero
+active constraints exist in it at all, so there is nothing to report as legacy -- unchanged from
+the prior entry's own identical check.
+before it was ever committed.

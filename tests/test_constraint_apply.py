@@ -150,6 +150,77 @@ def test_has_usable_effect_is_false_for_an_empty_effect_value():
     assert has_usable_effect(c) is False
 
 
+# --- summarize_for_assets / ConstraintAccumulator -- the shared run-wide
+# summary engine both the deterministic (`cli.ConstraintApplicator`) and
+# agents (`export._build_agents_export`, `cli._agents_constraint_application
+# _summary`) paths now use (CLAUDE.md's "agents path reports constraint
+# application honestly" fix). The decisive property is digest/applied/
+# skipped PARITY between the two paths for the identical (memory, assets)
+# inputs -- checked here at unit level, against the real demo fixture,
+# with no LLM calls and no Coordinator at all.
+
+
+def test_summarize_for_assets_matches_cli_apply_constraints_on_the_real_demo_fixture(tmp_path):
+    """Acceptance test for the shared-engine extraction: one scratch DB (a
+    matching constraint on A09/WKS-FIN12, a legacy row, and a wrong-
+    hostname row, all on demo's real A09), scored against the real demo
+    fixture two different ways -- the deterministic `--apply-constraints`
+    path (`cli.run_with_report`, which drives `ConstraintApplicator` per
+    finding) and a bare call to `summarize_for_assets` over the SAME
+    fixture's real per-finding assets, with no Coordinator, no crew, no
+    LLM call anywhere -- and asserts the two summaries are identical:
+    same digest, same applied ids, same skip lists by reason. This is the
+    property that makes the agents path's own top-level
+    `constraint_application` block trustworthy: it is computed by this
+    SAME function over `coordinator.state.enriched_by_id`'s assets, never
+    a second, independently-written implementation that could drift."""
+    from rhinosecure.adapters import get_adapter
+    from rhinosecure.cli import run_with_report
+    from rhinosecure.constraint_apply import summarize_for_assets
+    from rhinosecure.ingest import load_batch
+    from rhinosecure.memory import Memory
+
+    demo_dir = Path(__file__).resolve().parents[1] / "data" / "demo"
+
+    db_path = tmp_path / "mem.db"
+    memory = Memory(db_path)
+    memory.add_constraint(  # matches -- demo's real A09 is WKS-FIN12
+        "A09", "WKS-FIN12 can only patch on Sundays",
+        effect_kind="patch_window", effect_value="Sun 02:00-06:00", hostname="WKS-FIN12",
+    )
+    memory.add_constraint(  # legacy -- no hostname recorded
+        "A01", "predates hostname recording", effect_kind="compensating_control", effect_value="WAF rule enabled",
+    )
+    memory.add_constraint(  # identity_mismatch -- A01's real hostname is not this
+        "A01", "recorded against the wrong machine",
+        effect_kind="compensating_control", effect_value="a different control", hostname="SOME-OTHER-MACHINE",
+    )
+    memory.close()
+
+    deterministic = run_with_report(demo_dir, 42, offline=True, memory=Memory(db_path)).constraint_application
+    assert deterministic is not None
+    assert deterministic.applied_count == 1  # sanity: the fixture above must actually exercise all three paths
+    assert deterministic.skipped_legacy_count == 1
+    assert deterministic.skipped_identity_mismatch_count == 1
+
+    # The agents path's own real population: one Asset per FINDING (not
+    # per inventory row) -- exactly what coordinator.state.enriched_by_id
+    # .values() gives a real caller, and what makes an asset with zero
+    # findings this run correctly invisible to both sides alike.
+    _assets, enriched = load_batch(demo_dir, get_adapter("native"))
+    finding_assets = [e.asset for e in enriched]
+    agents_side = summarize_for_assets(Memory(db_path), finding_assets)
+
+    assert agents_side.digest == deterministic.digest
+    assert [r.constraint_id for r in agents_side.applied] == [r.constraint_id for r in deterministic.applied]
+    assert {r.constraint_id for r in agents_side.skipped_legacy} == {
+        r.constraint_id for r in deterministic.skipped_legacy
+    }
+    assert {r.constraint_id for r in agents_side.skipped_identity_mismatch} == {
+        r.constraint_id for r in deterministic.skipped_identity_mismatch
+    }
+
+
 def test_importing_constraint_apply_does_not_import_crewai():
     """The whole point of extracting this module out of
     agents/constraint_intake.py: the deterministic path must be able to

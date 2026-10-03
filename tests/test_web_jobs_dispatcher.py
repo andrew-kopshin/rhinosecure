@@ -664,6 +664,88 @@ def test_run_deterministic_scores_provisionally_against_an_unconfirmed_upload_co
     assert provenance_memory.provisional_provenance_formats("F02") == [name]
 
 
+def test_run_deterministic_never_applies_a_constraint_against_a_provisional_mapping_but_does_once_confirmed(
+    client: TestClient, tmp_path: Path, monkeypatch
+):
+    """CLAUDE.md's 'provisional plans never apply constraints' fix: before
+    it, `_run_run_deterministic` passed a real Memory into `run_with_report`
+    unconditionally, so a matching, identity-correct constraint silently
+    changed a PROVISIONAL plan's output even though no human had reviewed
+    the mapping producing it -- the deterministic job disagreed with
+    `_run_run_agents`'s own provisional branch, which already correctly
+    runs with `memory=None`. CVE-2021-26855 (ProxyLogon) is KEV-listed and
+    already snapshotted (used the same way elsewhere in this file); A01/
+    EXCH01 declares no compensating control or patch window in this
+    one-row fixture, so F01 lands `contested` on its own -- exactly the
+    shape a real constraint should be able to move to `next_window`, and
+    exactly what must NOT happen while the mapping is still unconfirmed."""
+    from rhinosecure.adapters.config_io import confirm_contract, overwrite_contract, write_contract
+    from rhinosecure.memory import Memory
+
+    monkeypatch.setattr(jobs_module, "REPO_ROOT", REPO_ROOT)
+
+    upload_id = "7" * 32
+    upload_dir = uploads_module.DEFAULT_UPLOADS_DIR / upload_id
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "mystery.csv").write_text(
+        "Asset_ID,Hostname,Finding_ID,Cve,Col\nA01,EXCH01,F01,CVE-2021-26855,srv\n",
+        encoding="utf-8",
+    )
+    adapters_dir = tmp_path / "adapters"
+    monkeypatch.setattr(jobs_module, "resolve_config_path", lambda name: adapters_dir / f"{name}.json")
+    name = jobs_module._default_propose_name(upload_id)
+
+    # A fully-resolved proposal (no unresolved slots) -- assemble_contract
+    # succeeds directly, review.state == "proposed", never confirmed yet.
+    contract = _build_contract_for_upload(upload_dir, name)
+    contract_path = adapters_dir / f"{contract.format}.json"
+    write_contract(contract_path, contract)
+
+    seed_memory = Memory(tmp_path / "mem.db")
+    seed_memory.add_constraint(
+        "A01", "EXCH01 can only patch on Sundays",
+        effect_kind="patch_window", effect_value="Sun 02:00-06:00", hostname="EXCH01",
+    )
+    seed_memory.close()
+
+    # --- while unconfirmed: the matcher is never even consulted ---------
+    resp = client.post("/api/jobs", json={"kind": "run_deterministic", "input": {"source_ref": upload_id}})
+    body = _wait_for_terminal(client, resp.json()["job_id"])
+
+    assert body["status"] == "succeeded", body.get("error")
+    assert body["result"]["provisional"] is True
+    assert body["result"]["constraints_applied"] == 0
+    assert body["result"]["constraint_digest"] is None
+    assert body["result"]["constraint_application_reason"] == "provisional_mapping"
+
+    export_data = json.loads((tmp_path / "export.json").read_text(encoding="utf-8"))
+    [f01] = [f for f in export_data["findings"] if f["finding_id"] == "F01"]
+    assert f01["bucket"] == "contested"  # the constraint is on file but never consulted
+    assert export_data["constraint_application"] == {
+        "applied": False, "reason": "provisional_mapping", "digest": None,
+        "applied_constraint_ids": [], "skipped": {"legacy": [], "identity_mismatch": []},
+    }
+
+    # --- confirm the identical contract, re-run the identical upload -----
+    confirmed = confirm_contract(contract, at="2026-01-01T01:00:00Z", by="test-suite")
+    overwrite_contract(contract_path, confirmed)
+
+    resp2 = client.post("/api/jobs", json={"kind": "run_deterministic", "input": {"source_ref": upload_id}})
+    body2 = _wait_for_terminal(client, resp2.json()["job_id"])
+
+    assert body2["status"] == "succeeded", body2.get("error")
+    assert body2["result"]["provisional"] is False
+    assert body2["result"]["constraints_applied"] == 1
+    assert body2["result"]["constraint_digest"] is not None
+    assert body2["result"]["constraint_application_reason"] is None
+
+    export_data2 = json.loads((tmp_path / "export.json").read_text(encoding="utf-8"))
+    [f01_confirmed] = [f for f in export_data2["findings"] if f["finding_id"] == "F01"]
+    assert f01_confirmed["bucket"] == "next_window"
+    assert export_data2["constraint_application"]["applied"] is True
+    assert export_data2["constraint_application"]["reason"] is None
+
+
 def test_run_agents_scores_provisionally_against_an_unconfirmed_upload_contract(
     client: TestClient, tmp_path: Path, monkeypatch
 ):
@@ -777,6 +859,44 @@ def test_run_agents_scores_provisionally_against_an_unconfirmed_upload_contract(
     from rhinosecure.memory import Memory
 
     assert Memory(tmp_path / "mem.db").provisional_provenance_formats("F01") == [name]
+
+
+def test_run_agents_job_result_mirrors_run_deterministic_s_constraint_fields(
+    client: TestClient, tmp_path: Path, data_dir_a: Path, monkeypatch
+):
+    """CLAUDE.md's "agents path reports constraint application honestly"
+    fix closed the export/CLI gap; this closes the one adjacent asymmetry
+    an adversarial review flagged (low severity, not in the original
+    acceptance criteria, but cheap and worth closing for consistency): a
+    CONFIRMED `run_agents` job's own JobOutcome.result now carries the
+    identical `constraints_applied`/`constraints_skipped_*`/
+    `constraint_digest`/`constraint_application_reason` fields
+    `run_deterministic`'s job result already does, computed via the same
+    shared `summarize_for_assets` engine, filtered to `state.risk_by_id`
+    exactly like the export block is."""
+    from rhinosecure.memory import Memory
+
+    monkeypatch.setattr(jobs_module, "REPO_ROOT", REPO_ROOT)
+    seed_memory = Memory(tmp_path / "mem.db")
+    seed_memory.add_constraint(
+        "A01", "EXCH01 can only patch on Sundays",
+        effect_kind="patch_window", effect_value="Sun 02:00-06:00", hostname="EXCH01",
+    )
+    seed_memory.close()
+
+    _queue_seed_run("F01", "CVE-2021-26855", "A01", "EXCH01")
+    resp = client.post("/api/jobs", json={"kind": "run_agents", "input": {"source_ref": str(data_dir_a)}})
+    body = _wait_for_terminal(client, resp.json()["job_id"])
+
+    assert body["status"] == "succeeded", body.get("error")
+    assert body["result"]["constraints_applied"] == 1
+    assert body["result"]["constraints_skipped_legacy"] == 0
+    assert body["result"]["constraints_skipped_identity_mismatch"] == 0
+    assert body["result"]["constraint_digest"] is not None
+    assert body["result"]["constraint_application_reason"] is None
+
+    export_data = json.loads((tmp_path / "export.json").read_text(encoding="utf-8"))
+    assert export_data["constraint_application"]["digest"] == body["result"]["constraint_digest"]
 
 
 def test_run_agents_provisional_branch_never_clobbers_an_existing_confirmed_plan(
@@ -999,6 +1119,16 @@ def test_run_agents_dispatch_reuses_active_source_verbatim_without_calling_resol
             contract=None,
             ingest_format=resolved.fmt,
             ranked=lambda: [],
+            # memory=None + an empty state -- _run_run_agents's own
+            # constraint-application summary (CLAUDE.md's "agents path
+            # reports constraint application honestly" fix) reads
+            # coordinator.memory/.state.enriched_by_id/.state.risk_by_id
+            # unconditionally now; this fake has neither a real Memory nor
+            # any findings, so the summary is trivially None/empty and
+            # doesn't need exercising here -- only the dispatch/routing
+            # decision is under test in this function.
+            memory=None,
+            state=SimpleNamespace(enriched_by_id={}, risk_by_id={}),
         )
 
     monkeypatch.setattr(PlanState, "run_agents_pipeline", _fake_run_agents_pipeline)
